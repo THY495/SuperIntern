@@ -1,0 +1,26 @@
+# 派生镜像：把本机这一份出口代理 CA 烘焙进系统信任库。
+#
+# 为什么必须是**构建期**：沙箱的 rootfs 是只读的（写边界的落点），
+# 运行期跑不了 `update-ca-certificates`。而生产镜像应把 CA 装进系统信任库 ——
+# 靠环境变量逐个覆盖必漏。
+#
+# 为什么还要**再设一遍环境变量**：因为"装进系统信任库"对一部分工具无效。
+# 实测各工具认 CA 的机制互不相通，其中 node 根本不读系统信任库，
+# 只认 NODE_EXTRA_CA_CERTS。漏配任一项，那个工具就会静默失败，
+# 而失败长得像"外网不通"—— 测试脚本很容易就这么误判。
+# 所以两条路都走：系统信任库是主，环境变量是补。
+#
+# 这个镜像按 CA 指纹打 tag，CA 换了自然换 tag，不会用到陈的那份。
+
+ARG BASE=superintern/sandbox:v0.1
+FROM ${BASE}
+
+COPY mitmproxy-ca-cert.pem /usr/local/share/ca-certificates/superintern-egress.crt
+RUN update-ca-certificates
+
+ENV SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt \
+    NODE_EXTRA_CA_CERTS=/etc/ssl/certs/ca-certificates.crt \
+    GIT_SSL_CAINFO=/etc/ssl/certs/ca-certificates.crt \
+    CURL_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt \
+    REQUESTS_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt \
+    PIP_CERT=/etc/ssl/certs/ca-certificates.crt

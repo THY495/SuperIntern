@@ -1,0 +1,17 @@
+{
+  "name": "superintern",
+  "version": "0.1.0",
+  "description": "A long-running, self-hosted autonomous coding agent: you answer, decide, change course or stop it; it plans, codes in a sandbox and verifies. Multi-user, multi-vendor.",
+  "type": "module",
+  "license": "MIT",
+  "author": "THY495",
+  "engines": { "node": ">=22.13" },
+  "bin": { "superintern": "src/cli.mjs" },
+  "scripts": {
+    "setup": "node scripts/setup.mjs",
+    "start": "node --disable-warning=ExperimentalWarning src/cli.mjs web --daemon",
+    "test": "node tests/run.mjs --all",
+    "test:no-docker": "node tests/run.mjs --all --except container,egress"
+  },
+  "keywords": ["autonomous-agent", "coding-agent", "llm", "human-in-the-loop", "self-hosted", "sandbox"]
+}

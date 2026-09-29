@@ -1,0 +1,16 @@
+{
+  "ProxyMode": "direct",
+  "BackgroundModeEnabled": false,
+  "ComponentUpdatesEnabled": false,
+  "MetricsReportingEnabled": false,
+  "SafeBrowsingProtectionLevel": 0,
+  "TranslateEnabled": false,
+  "SyncDisabled": true,
+  "PasswordManagerEnabled": false,
+  "AutofillAddressEnabled": false,
+  "AutofillCreditCardEnabled": false,
+  "SearchSuggestEnabled": false,
+  "NetworkPredictionOptions": 2,
+  "SpellcheckEnabled": false,
+  "UrlKeyedAnonymizedDataCollectionEnabled": false
+}

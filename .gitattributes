@@ -1,0 +1,4 @@
+# 跨平台换行统一为 LF：验收任务要靠 git diff 判定，CRLF 抖动会淹没真实改动
+* text=auto eol=lf
+*.sql text eol=lf
+*.mjs text eol=lf

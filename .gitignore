@@ -1,0 +1,10 @@
+node_modules/
+.env
+.env.local
+*.log
+
+# 运行时状态：状态库、令牌、日志、工作区 / runtime state: database, tokens, logs, workspaces
+.superintern/
+
+.claude/settings.local.json
+.claude/launch.json

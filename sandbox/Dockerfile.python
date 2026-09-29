@@ -1,0 +1,27 @@
+# Python 变体：在默认沙箱镜像之上加 python3。
+#
+# 默认镜像故意没有 python（见 Dockerfile 的注释：用不上的工具就是白送的攻击面），所以这里
+# **不改默认镜像**，只给显式选了 python 的项目用。选哪个是项目设置（project.sandbox），不是全局开关。
+#
+# 只装解释器本身 + venv：运行期容器是 `--network none`，pip 装不了东西（要装包得先开出网），
+# 所以不预装任何第三方包 —— 装了也只是替任务猜它要什么。`python-is-python3` 让 `python` 这个名字也能用
+# （规划器和人写验收命令时两种都常见）。
+#
+# v0.2：加 chromium + 中文字体，给"验收通过后把页面截图给签收人看"用。
+# 用的是 chromium 自带的 `--headless --screenshot`，不装 puppeteer / playwright —— 一个二进制、零 npm 依赖。
+# 字体：fonts-wqy-microhei（几 MB；fonts-noto-cjk 全字重要大几百 MB），否则中文页面截出来是一排方块。沙箱是只读根、非 root、cap-drop ALL：
+# chromium 得带 --no-sandbox（它自己的沙箱要 user namespace / setuid，容器本身就是那层隔离）、
+# --disable-dev-shm-usage（/dev/shm 默认 64MB）、--user-data-dir 指到 /tmp。
+ARG BASE=superintern/sandbox:v0.1
+FROM ${BASE}
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      python3 python3-venv python-is-python3 \
+      chromium fonts-wqy-microhei \
+ && rm -rf /var/lib/apt/lists/*
+# v0.3：agent 自己在沙箱里起的 chromium 也不许往外连 —— 只给系统截图的那个加
+# --no-proxy-server 不够，agent 起的没带，会连 Google 被拒几十次、撞上"联网连续被拒"上限。两层：
+#   /etc/chromium.d/ 里的默认参数（走 /usr/bin/chromium 启动脚本的都带上）；
+#   managed 策略 ProxyMode=direct + 关后台服务（直接调 /usr/lib/chromium/chromium 二进制也躲不过）。
+# 直连在 --network none 的沙箱里就是连不上，不经过出网代理，所以不留"被拒"记录；页面在 127.0.0.1 上，照常能开。
+COPY chromium/si-sandbox /etc/chromium.d/si-sandbox
+COPY chromium/si-policy.json /etc/chromium/policies/managed/si-policy.json

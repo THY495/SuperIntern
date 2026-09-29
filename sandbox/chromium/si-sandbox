@@ -1,0 +1,3 @@
+# 沙箱里任何人起的 chromium（系统截图、agent 自己截图）都带上：不走出网代理、关后台联网。
+# Debian 的 /usr/bin/chromium 启动脚本会 source /etc/chromium.d/* —— 否则 agent 自己起的浏览器会连 Google，撞上"联网连续被拒"上限。
+export CHROMIUM_FLAGS="$CHROMIUM_FLAGS --no-proxy-server --no-first-run --no-default-browser-check --disable-background-networking --disable-component-update --disable-sync --disable-default-apps --disable-domain-reliability --disable-client-side-phishing-detection --metrics-recording-only --safebrowsing-disable-auto-update --disable-features=Translate,OptimizationHints,MediaRouter,AutofillServerCommunication,CertificateTransparencyComponentUpdater"

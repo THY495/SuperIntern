@@ -1,0 +1,26 @@
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  linux:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: git identity for tests
+        run: |
+          git config --global user.name "ci"
+          git config --global user.email "ci@example.invalid"
+      - name: build sandbox images
+        run: |
+          docker build -t superintern/sandbox:v0.1 sandbox/
+          docker pull mitmproxy/mitmproxy:latest
+      - name: tests (all suites, including container and egress)
+        run: node tests/run.mjs --all

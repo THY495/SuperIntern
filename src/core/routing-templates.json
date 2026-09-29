@@ -1,0 +1,119 @@
+{
+  "_comment": "六个预设模板 = 一组预填行 + 界面遮罩。是数据不是代码：选模板把 rows 复制进项目自己的表，之后只改项目的表。resolver 写法：user:<id> / user:lead / user:$占位 / group:<tag> / group:* / on_duty / parties（仅 conflict）/ inform:<resolver>。quorum：'1' / 'N' / 'all'。timeout_after：'30m' / '8h' / '1d' / '1bd'（工作日）。",
+  "templates": {
+    "solo": {
+      "label": "单负责人",
+      "summary": "所有决策由负责人作出，其他成员只读",
+      "placeholders": {},
+      "mask": { "rows": ["*"], "columns": ["decision_type", "recipients"], "knobs": ["interveners", "ownership"] },
+      "rows": [
+        { "decision_type": "spec_choice",       "scope": "*", "position": 0, "recipients": ["user:lead"], "quorum": "1", "conflict_policy": "block", "timeout_action": "hang", "timeout_after": null },
+        { "decision_type": "structural",        "scope": "*", "position": 0, "recipients": ["user:lead"], "quorum": "1", "conflict_policy": "block", "timeout_action": "hang", "timeout_after": null },
+        { "decision_type": "ops",               "scope": "*", "position": 0, "recipients": ["user:lead"], "quorum": "1", "conflict_policy": "block", "timeout_action": "hang", "timeout_after": null },
+        { "decision_type": "contract_approval", "scope": "*", "position": 0, "recipients": ["user:lead"], "quorum": "1", "conflict_policy": "block", "timeout_action": "hang", "timeout_after": null },
+        { "decision_type": "signoff",           "scope": "*", "position": 0, "recipients": ["user:lead"], "quorum": "1", "conflict_policy": "block", "timeout_action": "hang", "timeout_after": null },
+        { "decision_type": "budget",            "scope": "*", "position": 0, "recipients": ["user:lead"], "quorum": "1", "conflict_policy": "block", "timeout_action": "hang", "timeout_after": null },
+        { "decision_type": "egress",            "scope": "*", "position": 0, "recipients": ["user:lead"], "quorum": "1", "conflict_policy": "block", "timeout_action": "hang", "timeout_after": null },
+        { "decision_type": "delivery",          "scope": "*", "position": 0, "recipients": ["user:lead"], "quorum": "1", "conflict_policy": "block", "timeout_action": "hang", "timeout_after": null },
+        { "decision_type": "conflict",          "scope": "*", "position": 0, "recipients": ["parties"],   "quorum": "all", "conflict_policy": "block", "timeout_action": "next", "timeout_after": "1bd" },
+        { "decision_type": "conflict",          "scope": "*", "position": 1, "recipients": ["user:lead"], "quorum": "1", "conflict_policy": "block", "timeout_action": "hang", "timeout_after": null }
+      ]
+    },
+    "by_domain": {
+      "label": "按目录分工",
+      "summary": "按目录指定负责小组：该目录下的规格取舍、结构矛盾与签收先由小组决定，超时未答复则转负责人",
+      "placeholders": {},
+      "mask": { "rows": ["spec_choice", "structural", "ops", "signoff"], "columns": ["decision_type", "scope", "recipients"], "knobs": ["interveners", "ownership", "scopes"] },
+      "rows": [
+        { "decision_type": "spec_choice",       "scope": "*", "position": 0, "recipients": ["user:lead"], "quorum": "1", "conflict_policy": "block", "timeout_action": "hang", "timeout_after": null },
+        { "decision_type": "structural",        "scope": "*", "position": 0, "recipients": ["user:lead"], "quorum": "1", "conflict_policy": "block", "timeout_action": "hang", "timeout_after": null },
+        { "decision_type": "ops",               "scope": "*", "position": 0, "recipients": ["user:lead"], "quorum": "1", "conflict_policy": "block", "timeout_action": "hang", "timeout_after": null },
+        { "decision_type": "contract_approval", "scope": "*", "position": 0, "recipients": ["user:lead"], "quorum": "1", "conflict_policy": "block", "timeout_action": "hang", "timeout_after": null },
+        { "decision_type": "signoff",           "scope": "*", "position": 0, "recipients": ["user:lead"], "quorum": "1", "conflict_policy": "block", "timeout_action": "hang", "timeout_after": null },
+        { "decision_type": "budget",            "scope": "*", "position": 0, "recipients": ["user:lead"], "quorum": "1", "conflict_policy": "block", "timeout_action": "hang", "timeout_after": null },
+        { "decision_type": "egress",            "scope": "*", "position": 0, "recipients": ["user:lead"], "quorum": "1", "conflict_policy": "block", "timeout_action": "hang", "timeout_after": null },
+        { "decision_type": "delivery",          "scope": "*", "position": 0, "recipients": ["user:lead"], "quorum": "1", "conflict_policy": "block", "timeout_action": "hang", "timeout_after": null },
+        { "decision_type": "conflict",          "scope": "*", "position": 0, "recipients": ["parties"],   "quorum": "all", "conflict_policy": "block", "timeout_action": "next", "timeout_after": "1bd" },
+        { "decision_type": "conflict",          "scope": "*", "position": 1, "recipients": ["user:lead"], "quorum": "1", "conflict_policy": "block", "timeout_action": "hang", "timeout_after": null }
+      ],
+      "scope_row_shape": { "recipients": ["group:$tag"], "quorum": "1", "conflict_policy": "block", "timeout_action": "next", "timeout_after": "1bd" }
+    },
+    "peer_review": {
+      "label": "同行评审",
+      "summary": "签收需多位评审人一致同意（默认 2 位），超时转负责人；其余决策由负责人作出",
+      "placeholders": {},
+      "mask": { "rows": ["signoff"], "columns": ["decision_type", "recipients", "quorum"], "knobs": ["interveners", "ownership", "signoff_quorum"] },
+      "rows": [
+        { "decision_type": "spec_choice",       "scope": "*", "position": 0, "recipients": ["user:lead"], "quorum": "1", "conflict_policy": "block", "timeout_action": "hang", "timeout_after": null },
+        { "decision_type": "structural",        "scope": "*", "position": 0, "recipients": ["user:lead"], "quorum": "1", "conflict_policy": "block", "timeout_action": "hang", "timeout_after": null },
+        { "decision_type": "ops",               "scope": "*", "position": 0, "recipients": ["user:lead"], "quorum": "1", "conflict_policy": "block", "timeout_action": "hang", "timeout_after": null },
+        { "decision_type": "contract_approval", "scope": "*", "position": 0, "recipients": ["user:lead"], "quorum": "1", "conflict_policy": "block", "timeout_action": "hang", "timeout_after": null },
+        { "decision_type": "signoff",           "scope": "*", "position": 0, "recipients": ["group:reviewer"], "quorum": "2", "conflict_policy": "block", "timeout_action": "next", "timeout_after": "1bd" },
+        { "decision_type": "signoff",           "scope": "*", "position": 1, "recipients": ["user:lead"], "quorum": "1", "conflict_policy": "block", "timeout_action": "hang", "timeout_after": null },
+        { "decision_type": "budget",            "scope": "*", "position": 0, "recipients": ["user:lead"], "quorum": "1", "conflict_policy": "block", "timeout_action": "hang", "timeout_after": null },
+        { "decision_type": "egress",            "scope": "*", "position": 0, "recipients": ["user:lead"], "quorum": "1", "conflict_policy": "block", "timeout_action": "hang", "timeout_after": null },
+        { "decision_type": "delivery",          "scope": "*", "position": 0, "recipients": ["user:lead"], "quorum": "1", "conflict_policy": "block", "timeout_action": "hang", "timeout_after": null },
+        { "decision_type": "conflict",          "scope": "*", "position": 0, "recipients": ["parties"],   "quorum": "all", "conflict_policy": "block", "timeout_action": "next", "timeout_after": "1bd" },
+        { "decision_type": "conflict",          "scope": "*", "position": 1, "recipients": ["user:lead"], "quorum": "1", "conflict_policy": "block", "timeout_action": "hang", "timeout_after": null }
+      ]
+    },
+    "rotation": {
+      "label": "轮值",
+      "summary": "规格取舍、上限追加、联网放行与签收先由值班人决定，超时转负责人；结构矛盾、方案批准与交付由值班人或负责人决定；值班人多次答复时以最后一次为准",
+      "placeholders": {},
+      "mask": { "rows": ["spec_choice", "budget", "egress"], "columns": ["decision_type", "recipients"], "knobs": ["interveners", "ownership", "duty_calendar"] },
+      "rows": [
+        { "decision_type": "spec_choice",       "scope": "*", "position": 0, "recipients": ["on_duty"], "quorum": "1", "conflict_policy": "latest", "timeout_action": "next", "timeout_after": "8h" },
+        { "decision_type": "spec_choice",       "scope": "*", "position": 1, "recipients": ["user:lead"], "quorum": "1", "conflict_policy": "block", "timeout_action": "hang", "timeout_after": null },
+        { "decision_type": "structural",        "scope": "*", "position": 0, "recipients": ["on_duty", "user:lead"], "quorum": "1", "conflict_policy": "latest", "timeout_action": "hang", "timeout_after": null },
+        { "decision_type": "ops",               "scope": "*", "position": 0, "recipients": ["on_duty", "user:lead"], "quorum": "1", "conflict_policy": "latest", "timeout_action": "hang", "timeout_after": null },
+        { "decision_type": "contract_approval", "scope": "*", "position": 0, "recipients": ["on_duty", "user:lead"], "quorum": "1", "conflict_policy": "latest", "timeout_action": "hang", "timeout_after": null },
+        { "decision_type": "signoff",           "scope": "*", "position": 0, "recipients": ["on_duty"], "quorum": "1", "conflict_policy": "latest", "timeout_action": "next", "timeout_after": "1bd" },
+        { "decision_type": "signoff",           "scope": "*", "position": 1, "recipients": ["user:lead"], "quorum": "1", "conflict_policy": "block", "timeout_action": "hang", "timeout_after": null },
+        { "decision_type": "budget",            "scope": "*", "position": 0, "recipients": ["on_duty"], "quorum": "1", "conflict_policy": "latest", "timeout_action": "next", "timeout_after": "8h" },
+        { "decision_type": "budget",            "scope": "*", "position": 1, "recipients": ["user:lead"], "quorum": "1", "conflict_policy": "block", "timeout_action": "hang", "timeout_after": null },
+        { "decision_type": "egress",            "scope": "*", "position": 0, "recipients": ["on_duty"], "quorum": "1", "conflict_policy": "latest", "timeout_action": "next", "timeout_after": "8h" },
+        { "decision_type": "egress",            "scope": "*", "position": 1, "recipients": ["user:lead"], "quorum": "1", "conflict_policy": "block", "timeout_action": "hang", "timeout_after": null },
+        { "decision_type": "delivery",          "scope": "*", "position": 0, "recipients": ["on_duty", "user:lead"], "quorum": "1", "conflict_policy": "latest", "timeout_action": "hang", "timeout_after": null },
+        { "decision_type": "conflict",          "scope": "*", "position": 0, "recipients": ["parties"],   "quorum": "all", "conflict_policy": "block", "timeout_action": "next", "timeout_after": "1bd" },
+        { "decision_type": "conflict",          "scope": "*", "position": 1, "recipients": ["user:lead"], "quorum": "1", "conflict_policy": "block", "timeout_action": "hang", "timeout_after": null }
+      ]
+    },
+    "pm_tl": {
+      "label": "产品技术分权",
+      "summary": "规格取舍和签收由产品负责人决定；联网放行由技术负责人决定；结构矛盾、方案批准由技术负责人或项目负责人决定；其余由项目负责人决定",
+      "placeholders": { "pm": "产品负责人", "tl": "技术负责人" },
+      "mask": { "rows": ["spec_choice", "structural", "ops", "contract_approval", "signoff", "egress"], "columns": ["decision_type", "recipients"], "knobs": ["interveners", "ownership", "placeholders"] },
+      "rows": [
+        { "decision_type": "spec_choice",       "scope": "*", "position": 0, "recipients": ["user:$pm"], "quorum": "1", "conflict_policy": "block", "timeout_action": "hang", "timeout_after": null },
+        { "decision_type": "structural",        "scope": "*", "position": 0, "recipients": ["user:$tl", "user:lead"], "quorum": "1", "conflict_policy": "block", "timeout_action": "hang", "timeout_after": null },
+        { "decision_type": "ops",               "scope": "*", "position": 0, "recipients": ["user:$tl", "user:lead"], "quorum": "1", "conflict_policy": "block", "timeout_action": "hang", "timeout_after": null },
+        { "decision_type": "contract_approval", "scope": "*", "position": 0, "recipients": ["user:$tl", "user:lead"], "quorum": "1", "conflict_policy": "block", "timeout_action": "hang", "timeout_after": null },
+        { "decision_type": "signoff",           "scope": "*", "position": 0, "recipients": ["user:$pm"], "quorum": "1", "conflict_policy": "block", "timeout_action": "hang", "timeout_after": null },
+        { "decision_type": "budget",            "scope": "*", "position": 0, "recipients": ["user:lead"], "quorum": "1", "conflict_policy": "block", "timeout_action": "hang", "timeout_after": null },
+        { "decision_type": "egress",            "scope": "*", "position": 0, "recipients": ["user:$tl"], "quorum": "1", "conflict_policy": "block", "timeout_action": "hang", "timeout_after": null },
+        { "decision_type": "delivery",          "scope": "*", "position": 0, "recipients": ["user:lead"], "quorum": "1", "conflict_policy": "block", "timeout_action": "hang", "timeout_after": null },
+        { "decision_type": "conflict",          "scope": "*", "position": 0, "recipients": ["parties"],   "quorum": "all", "conflict_policy": "block", "timeout_action": "next", "timeout_after": "1bd" },
+        { "decision_type": "conflict",          "scope": "*", "position": 1, "recipients": ["user:lead"], "quorum": "1", "conflict_policy": "block", "timeout_action": "hang", "timeout_after": null }
+      ]
+    },
+    "unattended": {
+      "label": "无人值守",
+      "summary": "规格取舍不通知任何人，30 分钟后按默认处理；其余决策仍等待负责人",
+      "placeholders": {},
+      "mask": { "rows": ["spec_choice", "budget", "egress"], "columns": ["decision_type", "recipients", "timeout_action"], "knobs": ["interveners", "ownership"] },
+      "rows": [
+        { "decision_type": "spec_choice",       "scope": "*", "position": 0, "recipients": [], "quorum": "1", "conflict_policy": "block", "timeout_action": "default", "timeout_after": "30m" },
+        { "decision_type": "structural",        "scope": "*", "position": 0, "recipients": ["user:lead"], "quorum": "1", "conflict_policy": "block", "timeout_action": "hang", "timeout_after": null },
+        { "decision_type": "ops",               "scope": "*", "position": 0, "recipients": ["user:lead"], "quorum": "1", "conflict_policy": "block", "timeout_action": "hang", "timeout_after": null },
+        { "decision_type": "contract_approval", "scope": "*", "position": 0, "recipients": ["user:lead"], "quorum": "1", "conflict_policy": "block", "timeout_action": "hang", "timeout_after": null },
+        { "decision_type": "signoff",           "scope": "*", "position": 0, "recipients": ["user:lead"], "quorum": "1", "conflict_policy": "block", "timeout_action": "hang", "timeout_after": null },
+        { "decision_type": "budget",            "scope": "*", "position": 0, "recipients": ["user:lead"], "quorum": "1", "conflict_policy": "block", "timeout_action": "hang", "timeout_after": null },
+        { "decision_type": "egress",            "scope": "*", "position": 0, "recipients": ["user:lead"], "quorum": "1", "conflict_policy": "block", "timeout_action": "hang", "timeout_after": null },
+        { "decision_type": "delivery",          "scope": "*", "position": 0, "recipients": ["user:lead"], "quorum": "1", "conflict_policy": "block", "timeout_action": "hang", "timeout_after": null },
+        { "decision_type": "conflict",          "scope": "*", "position": 0, "recipients": ["parties"],   "quorum": "all", "conflict_policy": "block", "timeout_action": "next", "timeout_after": "1bd" },
+        { "decision_type": "conflict",          "scope": "*", "position": 1, "recipients": ["user:lead"], "quorum": "1", "conflict_policy": "block", "timeout_action": "hang", "timeout_after": null }
+      ]
+    }
+  }
+}
