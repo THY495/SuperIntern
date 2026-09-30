@@ -9,15 +9,16 @@
 
 import { now, audit } from '../db/db.mjs';
 import { recordGoalChange } from './decisions.mjs';
+import { I18nError } from '../i18n/index.mjs';
 
 export const VISIBILITIES = { all: '全体成员可见', members: '仅本项目成员可见' };
 
 const projectOf = (db, projectId) => {
   const p = db.one(`SELECT id, owner_id, title, visibility, goal, done_definition, status FROM projects WHERE id=?`, projectId);
-  if (!p) throw new Error(`没有这个项目：${projectId}`);
+  if (!p) throw new I18nError('没有这个项目：{id}', { id: projectId });
   return p;
 };
-const requireOwner = (p, userId) => { if (p.owner_id !== userId) throw new Error('只有该项目的负责人能执行此操作'); };
+const requireOwner = (p, userId) => { if (p.owner_id !== userId) throw new I18nError('只有该项目的负责人能执行此操作'); };
 
 /** 项目成员（不含负责人本人）。 */
 export const listMembers = (db, projectId) => db.all(
@@ -30,10 +31,10 @@ export function setMember(db, { projectId, userId, canAddTasks = false, note = '
   const p = projectOf(db, projectId);
   requireOwner(p, by);
   const u = db.one(`SELECT id, role, disabled_at FROM users WHERE id=?`, userId);
-  if (!u) throw new Error(`没有这个用户：${userId}`);
-  if (u.disabled_at) throw new Error('该用户已停用');
-  if (u.id === p.owner_id) throw new Error('负责人不需要加入成员名单：负责人拥有该项目的全部权限');
-  if (canAddTasks && u.role === 'observer') throw new Error('旁观者不能添加任务；可以只把他加为成员（可见），或先在"成员"页把他改为成员');
+  if (!u) throw new I18nError('没有这个用户：{id}', { id: userId });
+  if (u.disabled_at) throw new I18nError('该用户已停用');
+  if (u.id === p.owner_id) throw new I18nError('负责人不需要加入成员名单：负责人拥有该项目的全部权限');
+  if (canAddTasks && u.role === 'observer') throw new I18nError('旁观者不能添加任务；可以只把他加为成员（可见），或先在"成员"页把他改为成员');
   const text = String(note ?? '').trim().slice(0, 200);
   const at = now();
   const had = db.one(`SELECT can_add_tasks, note FROM project_members WHERE project_id=? AND user_id=?`, projectId, userId);
@@ -49,7 +50,7 @@ export function removeMember(db, { projectId, userId, by }) {
   const p = projectOf(db, projectId);
   requireOwner(p, by);
   const had = db.one(`SELECT 1 FROM project_members WHERE project_id=? AND user_id=?`, projectId, userId);
-  if (!had) throw new Error('该用户不是这个项目的成员');
+  if (!had) throw new I18nError('该用户不是这个项目的成员');
   db.run(`DELETE FROM project_members WHERE project_id=? AND user_id=?`, projectId, userId);
   audit(db, { actorKind: 'user', actorId: by, action: 'project_member_removed', targetType: 'project', targetId: projectId, payload: { userId } });
   return { projectId, userId, removed: true };
@@ -58,7 +59,7 @@ export function removeMember(db, { projectId, userId, by }) {
 export function setVisibility(db, { projectId, visibility, by }) {
   const p = projectOf(db, projectId);
   requireOwner(p, by);
-  if (!VISIBILITIES[visibility]) throw new Error(`可见性只能是：${Object.keys(VISIBILITIES).join(' / ')}`);
+  if (!VISIBILITIES[visibility]) throw new I18nError('可见性只能是：{values}', { values: Object.keys(VISIBILITIES).join(' / ') });
   if (p.visibility === visibility) return { projectId, visibility, changed: false };
   db.run(`UPDATE projects SET visibility=? WHERE id=?`, visibility, projectId);
   audit(db, { actorKind: 'user', actorId: by, action: 'project_visibility_changed', targetType: 'project', targetId: projectId, payload: { from: p.visibility, to: visibility } });
@@ -107,11 +108,11 @@ export function canSeeTask(db, taskId, userId) {
 export function editProjectGoal(db, { projectId, goal = null, doneDefinition = null, by }) {
   const p = projectOf(db, projectId);
   requireOwner(p, by);
-  if (['aborted'].includes(p.status)) throw new Error('项目已中止，不能修改目标');
+  if (['aborted'].includes(p.status)) throw new I18nError('项目已中止，不能修改目标');
   const g = goal === null ? p.goal : String(goal).trim();
   const d = doneDefinition === null ? p.done_definition : String(doneDefinition).trim();
-  if (!g) throw new Error('项目目标不能为空');
-  if (!d) throw new Error('完成定义不能为空');
+  if (!g) throw new I18nError('项目目标不能为空');
+  if (!d) throw new I18nError('完成定义不能为空');
   if (g === p.goal && d === p.done_definition) return { projectId, changed: false };
   db.run(`UPDATE projects SET goal=?, done_definition=? WHERE id=?`, g, d, projectId);
   audit(db, { actorKind: 'user', actorId: by, action: 'project_goal_changed', targetType: 'project', targetId: projectId,

@@ -14,6 +14,8 @@
 // ③ **默认不设**。不设 = 没有闸门 = 自动挡挂不上。这是有意的：让"AI 自己
 //    开工"这件事的前提之一是人先说出一个数字，而不是给一个默认值让人忘了它存在。
 
+import { markLike, markOf } from '../i18n/marks.mjs';
+import { tl, contentLang, N_, I18nError } from '../i18n/index.mjs';
 import { now, newId, audit, insertEdge } from '../db/db.mjs';
 import { getParam, getProjectParam, setProjectParam } from './params.mjs';
 import { routeQuestion } from './routing.mjs';
@@ -37,13 +39,15 @@ export const MAX_OPEN_CEILING = 4;
 export const SANDBOX_KEY = 'project.sandbox';
 // 默认带 Python：它是 Node 镜像的超集。默认只有 Node 的话，选 FastAPI 做后端的项目从空仓库起就没有 Python，
 // 得有人先去项目设置里换镜像 —— 那就是在让人配环境。只要 Node 的项目仍可选瘦一点的那个。
-export const SANDBOX_FLAVORS = { python: 'Node + Python 3（默认）', node: '只有 Node（镜像小一些）' };
+export const SANDBOX_FLAVORS = { python: N_('Node + Python 3（默认）'), node: N_('只有 Node（镜像小一些）') };
+// 用 N_ 登记过的原文（挡位 / 前提的 label、why）按变量查：抽取器只认字面量，所以不写成 tl(L, 变量)。
+const tlN = tl;
 export const sandboxFlavorOf = (db, projectId) => {
   const v = projectId ? getProjectParam(db, projectId, SANDBOX_KEY) : null;
   return SANDBOX_FLAVORS[v] ? v : 'python';
 };
 export function setSandboxFlavor(db, { projectId, flavor, userId }) {
-  if (!SANDBOX_FLAVORS[flavor]) throw new Error(`沙箱只有这几种：${Object.keys(SANDBOX_FLAVORS).join(' / ')}`);
+  if (!SANDBOX_FLAVORS[flavor]) throw new I18nError('沙箱只有这几种：{list}', { list: Object.keys(SANDBOX_FLAVORS).join(' / ') });
   return writeOne(db, { projectId, key: SANDBOX_KEY, value: flavor, userId, action: 'project_sandbox_set', payload: { flavor } });
 }
 
@@ -54,8 +58,8 @@ export const maxOpenOf = (db, projectId) => {
 
 /** 挡位。default 是 propose —— 沉默的默认永远是"提议"，显式授权才进自动挡。 */
 export const GEARS = {
-  propose: { label: '提议', blurb: '每次签收后，规划器对照项目目标提下一批任务或声明已达成；建任务前都要人批一次。' },
-  auto: { label: '预算内自动开工、合并', blurb: '在项目预算闸之内：草案直接开工、验收过了直接合并、事后通知、随时可中止。四条前提缺一不可；交付（push）永远要人点。' },
+  propose: { label: N_('提议'), blurb: N_('每次签收后，规划器对照项目目标提下一批任务或声明已达成；建任务前都要人批一次。') },
+  auto: { label: N_('预算内自动开工、合并'), blurb: N_('在项目预算闸之内：草案直接开工、验收过了直接合并、事后通知、随时可中止。四条前提缺一不可；交付（push）永远要人点。') },
 };
 export const DEFAULT_GEAR = 'propose';
 
@@ -67,11 +71,12 @@ export const projectSpendMicroUsd = (db, projectId) => db.one(
 
 /** 闸门的当前状态。`gate === null` = 没设闸门（`over` 恒 false）。 */
 export function budgetState(db, projectId) {
+  const L = contentLang(db);
   const gate = getProjectParam(db, projectId, BUDGET_KEY);
   const spent = projectSpendMicroUsd(db, projectId);
   const g = Number.isFinite(Number(gate)) && gate !== null ? Number(gate) : null;
   return { gate: g, spent, remaining: g === null ? null : g - spent, over: g !== null && spent >= g,
-    human: g === null ? `已花 ${fmtUsd(spent)}（没有设预算闸）` : `已花 ${fmtUsd(spent)} / 闸门 ${fmtUsd(g)}` };
+    human: g === null ? tl(L, '已花 {spent}（没有设预算闸）', { spent: fmtUsd(spent) }) : tl(L, '已花 {spent} / 闸门 {gate}', { spent: fmtUsd(spent), gate: fmtUsd(g) }) };
 }
 
 export const gearOf = (db, projectId) => {
@@ -91,10 +96,10 @@ export const projectVerifyCommand = (db, projectId) => {
 // 决定登记表里这个项目有没有东西可比。判得出的三条在这里判死，判不出的那条
 // 写清楚它在哪儿生效，不假装这里判过。
 export const GEAR_PREREQS = [
-  { key: 'budget', label: '项目预算闸已设', why: '自动挡下 AI 自己开工，爆炸半径就是这个数字' },
-  { key: 'verify', label: '项目级验收命令已填', why: '没有机械验收，"达成"就只能由人一次次宣布，自动挡没有出口' },
-  { key: 'guardrails', label: '草案要过现有全部护栏', why: '与提议挡完全同一道检查（契约齐全、规则带出处、验收命令不经 shell）—— 自动挡一条都不放松' },
-  { key: 'decisions', label: '与已定的约定冲突时退回提议挡', why: '新任务落地前先对着项目页那份「已定的约定」比一遍；撞上任何一条，这一批就退回提议挡等你批' },
+  { key: 'budget', label: N_('项目预算闸已设'), why: N_('自动挡下 AI 自己开工，爆炸半径就是这个数字') },
+  { key: 'verify', label: N_('项目级验收命令已填'), why: N_('没有机械验收，"达成"就只能由人一次次宣布，自动挡没有出口') },
+  { key: 'guardrails', label: N_('草案要过现有全部护栏'), why: N_('与提议挡完全同一道检查（契约齐全、规则带出处、验收命令不经 shell）—— 自动挡一条都不放松') },
+  { key: 'decisions', label: N_('与已定的约定冲突时退回提议挡'), why: N_('新任务落地前先对着项目页那份「已定的约定」比一遍；撞上任何一条，这一批就退回提议挡等你批') },
 ];
 
 /** 四条前提的当前状态。返回 [{key,label,why,ok,note}]；`ok` 全真才挂得上自动挡。 */
@@ -102,11 +107,12 @@ export function gearPrereqStatus(db, projectId) {
   const b = budgetState(db, projectId);
   const v = projectVerifyCommand(db, projectId);
   return GEAR_PREREQS.map((p) => {
-    if (p.key === 'budget') return { ...p, ok: b.gate !== null, note: b.gate === null ? '还没设' : fmtUsd(b.gate) };
-    if (p.key === 'verify') return { ...p, ok: !!v, note: v ? v.join(' ') : '还没填' };
+    // note 里的固定文字用 N_ 登记（看板 T(note) 翻）；金额、命令原样
+    if (p.key === 'budget') return { ...p, ok: b.gate !== null, note: b.gate === null ? N_('还没设') : fmtUsd(b.gate) };
+    if (p.key === 'verify') return { ...p, ok: !!v, note: v ? v.join(' ') : N_('还没填') };
     // 后两条是**机制**，不是旋钮：它们随代码走，挂挡时恒为真，列出来是为了让人看见自动挡到底靠什么兜底。
     // 界面上要明说"不可关闭"——读者从"没有控件"反推不出这是设计，还是功能没做完。
-    return { ...p, ok: true, note: '随代码生效，不可关闭' };
+    return { ...p, ok: true, note: N_('随代码生效，不可关闭') };
   });
 }
 
@@ -124,7 +130,7 @@ const writeOne = (db, { projectId, key, value, userId, action, payload }) => db.
 export function setProjectBudget(db, { projectId, microUsd, userId }) {
   if (microUsd !== null) {
     const n = Number(microUsd);
-    if (!Number.isFinite(n) || n <= 0) throw new Error('预算闸要是正数（撤掉闸门请清空，不要填 0 —— 0 的意思是"一分钱都不许花"，那不是"不限"）');
+    if (!Number.isFinite(n) || n <= 0) throw new I18nError('预算闸要是正数（撤掉闸门请清空，不要填 0 —— 0 的意思是"一分钱都不许花"，那不是"不限"）');
     microUsd = Math.round(n);
   }
   const spent = projectSpendMicroUsd(db, projectId);
@@ -134,17 +140,17 @@ export function setProjectBudget(db, { projectId, microUsd, userId }) {
       payload: { gate: microUsd, spent } });
   }
   const r = writeOne(db, { projectId, key: BUDGET_KEY, value: microUsd, userId, action: 'project_budget_set', payload: { microUsd, spent } });
-  if (microUsd === null && gearOf(db, projectId) === 'auto') setGear(db, { projectId, gear: 'propose', userId, why: '预算闸被撤掉' });
+  if (microUsd === null && gearOf(db, projectId) === 'auto') setGear(db, { projectId, gear: 'propose', userId, why: tl(contentLang(db), '预算闸被撤掉') });
   return r;
 }
 
 /** 设项目级验收命令。`command` 是一条命令的字符串（按空白切成 argv，**不经 shell**），空 = 清掉。 */
 export function setProjectVerify(db, { projectId, command, userId }) {
   const s = String(command ?? '').trim();
-  if (s) for (const p of verifyCommandProblems(s)) throw new Error(`项目级验收命令：${p}`);
+  if (s) for (const p of verifyCommandProblems(s)) throw new I18nError('项目级验收命令：{problem}', { problem: p });
   const argv = s ? s.split(/\s+/) : null;
   const r = writeOne(db, { projectId, key: VERIFY_KEY, value: argv, userId, action: 'project_verify_set', payload: { argv } });
-  if (!argv && gearOf(db, projectId) === 'auto') setGear(db, { projectId, gear: 'propose', userId, why: '项目级验收命令被清空' });
+  if (!argv && gearOf(db, projectId) === 'auto') setGear(db, { projectId, gear: 'propose', userId, why: tl(contentLang(db), '项目级验收命令被清空') });
   return r;
 }
 
@@ -162,8 +168,8 @@ export const setupCommandsOf = (db, projectId) => {
 };
 export function setSetupCommands(db, { projectId, commands, userId }) {
   const lines = (Array.isArray(commands) ? commands : String(commands ?? '').split('\n')).map((x) => String(x).trim()).filter(Boolean);
-  if (lines.length > MAX_SETUP_COMMANDS) throw new Error(`环境准备命令最多 ${MAX_SETUP_COMMANDS} 条（把多步合进一个脚本文件，再用一条命令跑它）`);
-  for (const [i, l] of lines.entries()) for (const p of verifyCommandProblems(l)) throw new Error(`环境准备命令第 ${i + 1} 条：${p.replace(/^verify_command/, '命令')}`);
+  if (lines.length > MAX_SETUP_COMMANDS) throw new I18nError('环境准备命令最多 {max} 条（把多步合进一个脚本文件，再用一条命令跑它）', { max: MAX_SETUP_COMMANDS });
+  for (const [i, l] of lines.entries()) for (const p of verifyCommandProblems(l)) throw new I18nError('环境准备命令第 {n} 条：{problem}', { n: i + 1, problem: p.replace(/^verify_command/, tl(contentLang(db), '命令')) });
   const argvs = lines.map((l) => l.split(/\s+/));
   return writeOne(db, { projectId, key: SETUP_KEY, value: argvs, userId, action: 'project_setup_set', payload: { commands: lines } });
 }
@@ -173,11 +179,11 @@ export function setSetupCommands(db, { projectId, commands, userId }) {
  * 但不连累别的生态：Python 那边失败，前端的 npm ci 照跑（否则 pip 一失败前端依赖就没装，回归里的前端构建报 vite: not found）。
  */
 const familyOf = (argv) => { const f = String(argv[0] ?? '').split('/').pop(); return /^(python\d*(\.\d+)?|pip\d*)$/.test(f) ? 'py' : /^(npm|npx|pnpm|yarn|corepack)$/.test(f) ? 'node' : 'other'; };
-export async function runSetupCommands(exec, dir, argvs) {
+export async function runSetupCommands(exec, dir, argvs, lang = 'zh') {
   const results = [], failed = new Set();
   for (const argv of argvs) {
     const fam = familyOf(argv);
-    if (failed.has(fam) || failed.has('other')) { results.push({ argv, code: null, timedOut: false, tail: '（前面同类的一步失败了，这条没跑）', skipped: true }); continue; }
+    if (failed.has(fam) || failed.has('other')) { results.push({ argv, code: null, timedOut: false, tail: tl(lang, '（前面同类的一步失败了，这条没跑）'), skipped: true }); continue; }
     let r;
     try { r = await exec.execute({ file: argv[0], args: argv.slice(1) }, dir, { mode: 'write', timeoutMs: 600_000 }); }
     catch (e) { r = { code: null, stdout: '', stderr: String(e.message), timedOut: false }; }
@@ -238,16 +244,21 @@ export function effectiveSetupOf(db, projectId, dir) {
 /** 设"同时最多开几个任务"。1 = 回到串行。 */
 export function setMaxOpen(db, { projectId, n, userId }) {
   const v = Number(n);
-  if (!Number.isInteger(v) || v < 1 || v > MAX_OPEN_CEILING) throw new Error(`同时开着的任务上限要是 1 到 ${MAX_OPEN_CEILING} 之间的整数（1 = 串行，一次只做一个）`);
+  if (!Number.isInteger(v) || v < 1 || v > MAX_OPEN_CEILING) throw new I18nError('同时开着的任务上限要是 1 到 {max} 之间的整数（1 = 串行，一次只做一个）', { max: MAX_OPEN_CEILING });
   return writeOne(db, { projectId, key: MAX_OPEN_KEY, value: v, userId, action: 'project_max_open_set', payload: { n: v } });
 }
 
 /** 挂挡。挂自动挡时四条前提逐条查，缺哪条就把哪条的原话报回去。 */
 export function setGear(db, { projectId, gear, userId, why = null }) {
-  if (!GEARS[gear]) throw new Error(`挡位无效：${gear}（应为 ${Object.keys(GEARS).join(' / ')}）`);
+  if (!GEARS[gear]) throw new I18nError('挡位无效：{gear}（应为 {list}）', { gear, list: Object.keys(GEARS).join(' / ') });
   if (gear === 'auto') {
     const missing = gearPrereqStatus(db, projectId).filter((p) => !p.ok);
-    if (missing.length) throw new Error(`挂不上自动挡，还差 ${missing.length} 条前提：${missing.map((m) => `${m.label}（${m.why}）`).join('；')}`);
+    if (missing.length) {
+      // 参数按内容语言填（报错模板由服务端按看的人的语言翻，参数翻不了）
+      const L = contentLang(db);
+      throw new I18nError('挂不上自动挡，还差 {n} 条前提：{list}', { n: missing.length,
+        list: missing.map((m) => tl(L, '{label}（{why}）', { label: tlN(L, m.label), why: tlN(L, m.why) })).join(tl(L, '；')) });
+    }
   }
   return writeOne(db, { projectId, key: GEAR_KEY, value: gear, userId, action: 'project_gear_set', payload: { gear, why } });
 }
@@ -277,9 +288,9 @@ export const deferredSignoffs = (db, projectId) => db.all(
 
 // ── 撞闸 ──────────────────────────────────────────────────────────────────
 /** 这个项目此刻有没有一条开着的预算闸事项（撞闸只报一次，别每轮弹一条）。 */
-export const openBudgetQuestion = (db, projectId) => db.one(
+export const openBudgetQuestion = (db, projectId) => { const B = markLike('q.text', 'projectBudget'); return db.one(
   `SELECT q.id FROM questions q JOIN tasks t ON t.id=q.task_id
-    WHERE t.project_id=? AND q.status IN ('open','escalated') AND q.text LIKE '【项目预算闸】%' LIMIT 1`, projectId)?.id ?? null;
+    WHERE t.project_id=? AND q.status IN ('open','escalated') AND ${B.sql} LIMIT 1`, projectId, ...B.params)?.id ?? null; };
 
 /**
  * 撞闸 → 一条 Ⅲ 级事项。**全程零 LLM 调用**（与硬上限触顶同一条道理：钱花光了还要再花一次钱
@@ -293,20 +304,21 @@ export function raiseProjectBudget(db, { projectId, taskId = null }) {
   if (exist) return { questionId: exist, existed: true };
   const host = taskId ?? db.one(`SELECT id FROM tasks WHERE project_id=? ORDER BY COALESCE(project_order,0) DESC LIMIT 1`, projectId)?.id;
   if (!host) throw new Error(`项目 ${projectId} 没有任何任务，无处挂预算闸事项`);
+  const L = contentLang(db);
   const b = budgetState(db, projectId);
   const p = db.one(`SELECT title FROM projects WHERE id=?`, projectId);
   const gear = gearOf(db, projectId);
   const t = now();
   const id = newId('q');
-  const text = `【项目预算闸】项目「${p?.title ?? projectId}」已达预算闸：${b.human}。\n\n`
-    + `已经开着的任务会在下一轮停下来，不会再有新任务开工。已经花掉的钱要不回来。\n`
-    + `本事项由系统直接生成，未调用模型。\n\n`
-    + (gear === 'auto' ? '当前是**预算内自动开工、合并**挡 —— 闸门就是它的边界，撞到这里说明这个项目的目标比当初估的贵。\n\n' : '')
-    + `请选一条：\n`
-    + `(A) 提高闸门后继续：在项目设置的「预算与上限」里改，或运行 node src/cli.mjs project budget ${projectId} --usd <新值>\n`
-    + `(B) 中止项目：已合并的前缀仍可交付（node src/cli.mjs project deliver ${projectId} --remote …）\n`
-    + `(C) 撤掉闸门：node src/cli.mjs project budget ${projectId} --clear（撤掉后自动挡会掉回提议挡）\n\n`
-    + `已花 ${fmtUsd(b.spent)}｜闸门 ${fmtUsd(b.gate)}`;
+  const text = `${markOf(L, 'projectBudget')}${tl(L, '项目「{title}」已达预算闸：{state}。', { title: p?.title ?? projectId, state: b.human })}\n\n`
+    + `${tl(L, '已经开着的任务会在下一轮停下来，不会再有新任务开工。已经花掉的钱要不回来。')}\n`
+    + `${tl(L, '本事项由系统直接生成，未调用模型。')}\n\n`
+    + (gear === 'auto' ? `${tl(L, '当前是**预算内自动开工、合并**挡 —— 闸门就是它的边界，撞到这里说明这个项目的目标比当初估的贵。')}\n\n` : '')
+    + `${tl(L, '请选一条：')}\n`
+    + `(A) ${tl(L, '提高闸门后继续：在项目设置的「预算与上限」里改，或运行 node src/cli.mjs project budget {id} --usd <新值>', { id: projectId })}\n`
+    + `(B) ${tl(L, '中止项目：已合并的前缀仍可交付（node src/cli.mjs project deliver {id} --remote …）', { id: projectId })}\n`
+    + `(C) ${tl(L, '撤掉闸门：node src/cli.mjs project budget {id} --clear（撤掉后自动挡会掉回提议挡）', { id: projectId })}\n\n`
+    + tl(L, '已花 {spent}｜闸门 {gate}', { spent: fmtUsd(b.spent), gate: fmtUsd(b.gate) });
   return db.tx(() => {
     db.run(`INSERT INTO questions (id,task_id,node_id,level,level_source,text,default_action,asked_at,timeout_at,status)
             VALUES (?,?,NULL,3,'hard_rule',?,NULL,?,NULL,'open')`, id, host, text, t);

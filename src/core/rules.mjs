@@ -27,6 +27,8 @@
  *   - 代价是草案变长（例如 10 条规则拆完约 15 条），而负责人本来就不逐条比对引文。
  *     **这两条保护的是下游的机器（验收员、执行器），不是批准的人**，别高估。
  */
+import { tl } from '../i18n/index.mjs';
+
 export const RULE_QUOTE_MIN_SIM = 0.20;
 const CLEAN = /[\s\p{P}\p{S}]+/gu;
 const bigrams = (s) => {
@@ -114,10 +116,11 @@ export function validateRules(rules, { brief = null, at = 'rules' } = {}) {
   });
   return errs;
 }
-export function renderRules(rules) {
+// lang 只管给人看的草案（项目规划 / 追加方案）；折进契约的那份（foldRules）是给执行器、验收员读的，保持中文。
+export function renderRules(rules, lang = 'zh') {
   return (rules ?? []).map((r) => (String(r.quote ?? '').trim()
-    ? `〔规格〕${r.rule} ← “${normalizeQuote(r.quote)}”`
-    : `〔规划器假设〕${r.rule}（${normalizeQuote(r.assumption)}）`));
+    ? tl(lang, '〔规格〕{rule} ← “{quote}”', { rule: r.rule, quote: normalizeQuote(r.quote) })
+    : tl(lang, '〔规划器假设〕{rule}（{assumption}）', { rule: r.rule, assumption: normalizeQuote(r.assumption) })));
 }
 export const RULES_HEADER = '行为规则（每条带出处：〔规格〕后是规格原文，是最高依据，实现与它矛盾时提问；〔规划器假设〕是规格没写、规划器定的，人批准时已看到，按字面执行）：';
 

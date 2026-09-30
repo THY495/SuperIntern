@@ -12,6 +12,7 @@ import { commentOnQuestion } from './answers.mjs';
 import { classify } from './classifier.mjs';
 import { flushLedger } from './ledger.mjs';
 import { hasComparableDecisions } from './decisions.mjs';
+import { tl, contentLang, I18nError } from '../i18n/index.mjs';
 
 // 答复的实现搬到了 answers.mjs（一对多、法定人数、冲突、负责人覆盖）。这里保留同名导出，调用方不变。
 export { recordAnswer } from './answers.mjs';
@@ -55,17 +56,17 @@ export function recordMessage(db, {
   classificationWhy = null, replyToMessageId = null, aboutQuestionId = null, plaintextToken,
   holdForCheck: hold = false,
 }) {
-  if (!body?.trim()) throw new Error('消息内容不能为空');
+  if (!body?.trim()) throw new I18nError('消息内容不能为空');
 
   // 分类器判为"这是在回答某个开着的问题"：**绝不插 messages、绝不自动 recordAnswer**。
   // 回答要挂 answers 边、要解冻分支、要签人的名字，必须由人显式做（cli answer）。
   // 这里只把 questionId 向上返回，让 CLI / 看板给出一条可直接执行的答复命令。
   if (questionId) {
     const q = db.one(`SELECT * FROM questions WHERE id=?`, questionId);
-    if (!q) throw new Error(`消息被识别为对事项的答复，但事项不存在：${questionId}`);
-    if (q.task_id !== taskId) throw new Error(`事项 ${questionId} 不属于任务 ${taskId}`);
+    if (!q) throw new I18nError('消息被识别为对事项的答复，但事项不存在：{id}', { id: questionId });
+    if (q.task_id !== taskId) throw new I18nError('事项 {id} 不属于任务 {taskId}', { id: questionId, taskId });
     if (!['open', 'escalated'].includes(q.status)) {
-      throw new Error(`事项 ${questionId} 状态为 ${q.status}，已不接受答复，消息未作为答复处理`);
+      throw new I18nError('事项 {id} 状态为 {status}，已不接受答复，消息未作为答复处理', { id: questionId, status: q.status });
     }
     return { questionId: q.id, kind: 'answer', messageId: null, taskId,
       ...(confidence != null ? { confidence } : {}),
@@ -73,11 +74,11 @@ export function recordMessage(db, {
   }
 
   if (!MESSAGE_KINDS[kind]) {
-    throw new Error(`必须指定消息类别（kind）。可选：\n`
-      + Object.entries(MESSAGE_KINDS).map(([k, d]) => `  ${k.padEnd(12)} ${d}`).join('\n'));
+    throw new I18nError('必须指定消息类别（kind）。可选：\n{kinds}',
+      { kinds: Object.entries(MESSAGE_KINDS).map(([k, d]) => `  ${k.padEnd(12)} ${d}`).join('\n') });
   }
   if (kind === 'answer') {
-    throw new Error('答复不能作为消息发送，请对该事项使用答复操作');
+    throw new I18nError('答复不能作为消息发送，请对该事项使用答复操作');
   }
   if (!['explicit', 'classifier'].includes(kindSource)) {
     throw new Error(`kind_source 无效：${kindSource}（应为 explicit 或 classifier）`);
@@ -89,17 +90,18 @@ export function recordMessage(db, {
   // 认证在前。失败不该泄露"这个任务存不存在"（与 recordAnswer 同规矩）。
   const auth = authenticate(db, plaintextToken);
   if (!auth) {
-    throw new Error('令牌无效或已吊销');
+    throw new I18nError('令牌无效或已吊销');
   }
   const task = db.one(`SELECT id, status FROM tasks WHERE id=?`, taskId);
-  if (!task) throw new Error(`任务不存在：${taskId}`);
+  if (!task) throw new I18nError('任务不存在：{taskId}', { taskId });
 
   // 旁观者：留言的 trust_label 是 observed-untrusted、类别只能是 context —— 不进任何决策，但必须被看到。
   // 有令牌不等于有指令效力：效力由角色与路由表给，令牌只证明"是谁"。
   const role = db.one(`SELECT role FROM users WHERE id=?`, auth.user_id)?.role;
   const observer = role === 'observer';
   if (observer && kind !== 'context') {
-    throw new Error(`旁观者只能留言（类别为 context），不能发送${kind === 'instruction' ? '指令' : '修正'}；如需调整任务方向，请联系负责人`);
+    throw kind === 'instruction' ? new I18nError('旁观者只能留言（类别为 context），不能发送指令；如需调整任务方向，请联系负责人')
+      : new I18nError('旁观者只能留言（类别为 context），不能发送修正；如需调整任务方向，请联系负责人');
   }
   const trust = observer ? 'observed-untrusted' : 'user-authenticated';
 
@@ -141,7 +143,7 @@ export async function sayWithClassifier(db, {
   replyToMessageId = null, aboutQuestionId = null, plaintextToken, llmClient, openQuestions: openQs,
   holdForCheck: hold = false,
 }) {
-  if (!body?.trim()) throw new Error('消息内容不能为空');
+  if (!body?.trim()) throw new I18nError('消息内容不能为空');
 
   if (kind) {
     // 人显式给了类别：分类器不参与。urgencySource 也如实按调用方（--urgent）给。
@@ -152,7 +154,7 @@ export async function sayWithClassifier(db, {
   }
 
   if (!llmClient) {
-    throw new Error('未指定消息类别，且分类器不可用');
+    throw new I18nError('未指定消息类别，且分类器不可用');
   }
 
   const qs = openQs ?? openQuestions(db, taskId);
@@ -264,11 +266,11 @@ export function releaseCheckHold(db, { taskId, ids, at = now() }) {
   }
   if (freed.length) {
     audit(db, { actorKind: 'system', actorId: 'decision-check', action: 'message_released', targetType: 'task', targetId: taskId,
-      payload: { messageIds: freed, why: '比对已跑完，没有撞上仍然有效的旧决定' } });
+      payload: { messageIds: freed, why: tl(contentLang(db), '比对已跑完，没有撞上仍然有效的旧决定') } });
   }
   for (const w of waiting) {
     audit(db, { actorKind: 'system', actorId: 'decision-check', action: 'message_held_for_verdict', targetType: 'task', targetId: taskId,
-      payload: { messageId: w.id, questionIds: w.questionIds, why: '这条修正里有说法撞上了仍然有效的旧决定，等那条冲突事项有结论再执行' } });
+      payload: { messageId: w.id, questionIds: w.questionIds, why: tl(contentLang(db), '这条修正里有说法撞上了仍然有效的旧决定，等那条冲突事项有结论再执行') } });
   }
   return { freed, waiting };
 }

@@ -16,9 +16,13 @@ import { answersOf } from './answers.mjs';
 import { lastCatalogCheck } from '../llm/catalog-check.mjs';
 import { listHandoverRequests, canDecideHandover } from './handover.mjs';
 import { projectsToDeliver } from './delivery-due.mjs';
+import { tl, userLang, I18nError, CATALOGS } from '../i18n/index.mjs';
 
+// 摘要是按人发的（0.2.0）：用这个人的界面语言 userLang(db, userId)。buildDigest 把语言放进结果（d.lang），渲染照它写。
+/** 目录里查一条原文（决策类型的 label 这类由 N_ 登记、在别处定义的原文）。 */
+const byCatalog = (lang, zh) => (lang && lang !== 'zh' ? CATALOGS[lang]?.[zh] ?? zh : zh);
 const oneLine = (s, n = 160) => { const t = String(s ?? '').replace(/\s+/g, ' ').trim(); return t.length > n ? `${t.slice(0, n - 1)}…` : t; };
-export const ageText = (ms) => (ms < 0 ? '0 分钟' : ms < 3_600_000 ? `${Math.max(1, Math.round(ms / 60_000))} 分钟` : ms < 86_400_000 ? `${(ms / 3_600_000).toFixed(1)} 小时` : `${(ms / 86_400_000).toFixed(1)} 天`);
+export const ageText = (ms, lang = 'zh') => (ms < 0 ? tl(lang, '{n} 分钟', { n: 0 }) : ms < 3_600_000 ? tl(lang, '{n} 分钟', { n: Math.max(1, Math.round(ms / 60_000)) }) : ms < 86_400_000 ? tl(lang, '{n} 小时', { n: (ms / 3_600_000).toFixed(1) }) : tl(lang, '{n} 天', { n: (ms / 86_400_000).toFixed(1) }));
 
 /** 负责人名下的任务：独立任务按 owner，项目任务按项目 owner。 */
 function tasksLedBy(db, userId) {
@@ -33,7 +37,9 @@ function tasksLedBy(db, userId) {
  */
 export function buildDigest(db, { userId, at = now(), since = null, projectId = null, daemonAlive = null }) {
   const u = db.one(`SELECT id, display_name, role FROM users WHERE id=?`, userId);
-  if (!u) throw new Error(`没有这个用户：${userId}`);
+  if (!u) throw new I18nError('没有这个用户：{id}', { id: userId });
+  const lang = userLang(db, userId);
+  const en = lang === 'en';
   const names = Object.fromEntries(db.all(`SELECT id, display_name FROM users`).map((x) => [x.id, x.display_name]));
   const nm = (id) => names[id] ?? id;
   const inProject = (q) => projectId === null || (q.project_id ?? '') === projectId;
@@ -47,11 +53,12 @@ export function buildDigest(db, { userId, at = now(), since = null, projectId = 
     const tag = lines[0]?.match(/^【([^】]*)】/)?.[1] ?? null;
     // 第一行只有一个【…】标签（方案草案那种）时，标签本身就是标题，再接正文第二行
     const rest = (lines[0] ?? '').replace(/^【[^】]*】\s*/, '');
-    const first = rest || (tag ? `${tag}：${lines[1] ?? ''}` : '');
+    const first = rest || (tag ? `${tag}${en ? ': ' : '：'}${lines[1] ?? ''}` : '');
+    const typeLabel = DECISION_TYPES[q.decision_type]?.label;
     return { questionId: q.id, taskId: q.task_id, taskTitle: q.task_title, nodeId: q.node_id, decisionType: q.decision_type,
       projectId: q.project_id ?? null, projectTitle: q.project_title ?? null, carrier: q.project_order === 0,
       tag, headline: oneLine(first, 90),
-      label: DECISION_TYPES[q.decision_type]?.label ?? q.decision_type ?? '事项', level: q.level, text: oneLine(q.text),
+      label: (typeLabel ? byCatalog(lang, typeLabel) : null) ?? q.decision_type ?? tl(lang, '事项'), level: q.level, text: oneLine(q.text),
       askedAt: q.asked_at, ageMs: at - q.asked_at, dueAt: dues.length ? Math.min(...dues) : null, defaultAction: q.default_action ?? null,
       // 轮到你的时候，先看得见别人已经说了什么 —— 不然只能各写各的，然后被系统判成"不一致"。
       answers: answersOf(db, q.id).filter((a) => ['answer', 'agree'].includes(a.stance))
@@ -94,7 +101,7 @@ export function buildDigest(db, { userId, at = now(), since = null, projectId = 
           to.filter((uid) => !ans.some((a) => a.user_id === uid && ['answer', 'agree'].includes(a.stance))).forEach((uid) => who.add(uid));
         }
         if (unaddressedHere) who.add(userId);
-        const names = [...(who.has(userId) ? ['你'] : []), ...[...who].filter((uid) => uid !== userId).map(nm)];
+        const names = [...(who.has(userId) ? [en ? 'you' : '你'] : []), ...[...who].filter((uid) => uid !== userId).map(nm)];
         return { taskId: t.id, title: t.title, status: t.status === 'done' ? 'awaiting_signoff' : t.status, waitingOn: names };
       });
     const ids = led.map((t) => t.id);
@@ -108,14 +115,14 @@ export function buildDigest(db, { userId, at = now(), since = null, projectId = 
                          AND a.target_id IN (SELECT id FROM questions WHERE task_id IN (${ph})) ORDER BY a.ts`, from, at, ...ids)
       .map((a) => { const p = JSON.parse(a.payload || '{}'); const q = db.one(`SELECT task_id, text FROM questions WHERE id=?`, a.target_id);
         return { at: a.ts, questionId: a.target_id, taskId: q?.task_id ?? null, questionText: oneLine(q?.text, 60), by: nm(a.actor_id), action: a.action,
-          text: oneLine(a.action === 'answer_overridden' ? (p.dissent ?? []).map((d) => `${nm(d.userId)}：${d.body}`).join('；') : p.body, 120) }; });
+          text: oneLine(a.action === 'answer_overridden' ? (p.dissent ?? []).map((d) => `${nm(d.userId)}${en ? ': ' : '：'}${d.body}`).join(en ? '; ' : '；') : p.body, 120) }; });
   }
   // 模型目录漂移（只给负责人）：最近一次检查有问题、且不超过 30 天就列出来；代答检测（model_drift）取上次摘要以来的。
   let catalog = null;
   if (u.role === 'lead' && projectId === null) {
     const last = lastCatalogCheck(db);
     const drifts = db.all(`SELECT ts, payload FROM audit_log WHERE action='model_drift' AND ts > ? AND ts <= ? ORDER BY ts`, since ?? at - 7 * 86_400_000, at)
-      .map((a) => { const p = JSON.parse(a.payload || '{}'); return `${p.requested} 实际由 ${p.served} 代答（目录键 ${p.key}）`; });
+      .map((a) => { const p = JSON.parse(a.payload || '{}'); return tl(lang, '{requested} 实际由 {served} 代答（目录键 {key}）', { requested: `${p.requested}`, served: `${p.served}`, key: `${p.key}` }); });
     const uniq = [...new Set(drifts)];
     if ((last && last.warnings > 0 && at - (last.checkedAt ?? last.ts) < 30 * 86_400_000) || uniq.length) {
       catalog = { checkedAt: last?.checkedAt ?? last?.ts ?? null, warnings: last?.warnings ?? 0, lines: last?.lines ?? [], drifts: uniq };
@@ -161,61 +168,65 @@ export function buildDigest(db, { userId, at = now(), since = null, projectId = 
     .filter((t) => projectId === null || t.project_id === projectId)
     .map((t) => ({ taskId: t.id, title: t.title, at: t.merged_at, projectId: t.project_id, projectTitle: t.project_title }));
   const total = requestsDone.length + waitingOnMe.length + inConflict.length + waitingOnOthers.length + informed.length + unaddressed.length + tasksWaiting.length + dissents.length + (unreadReports ? 1 : 0) + (catalog ? 1 : 0) + handoverRequests.length + stalledProjects.length + toDeliver.length + (daemonOffItem ? 1 : 0) + autoBatches.length;
-  return { userId, name: u.display_name, role: u.role, at, since, projectId, waitingOnMe, inConflict, waitingOnOthers, informed, unaddressed,
+  return { userId, name: u.display_name, role: u.role, lang, at, since, projectId, waitingOnMe, inConflict, waitingOnOthers, informed, unaddressed,
     tasksWaiting, unreadReports, unreadReportTasks, dissents, catalog, handoverRequests, stalledProjects, toDeliver, autoBatches, requestsDone, daemonOff: daemonOffItem, total, actionable: waitingOnMe.length + inConflict.length + unaddressed.length + hrActionable + stalledProjects.length + toDeliver.length + (daemonOffItem ? 1 : 0) };
 }
 
 /** 任务在等什么（文本与看板同一句）："做完了，等 alice 签收" / "停着，等你、bob 答" / "已暂停"。 */
-export function taskWaitText(t) {
-  if (t.status === 'suspended') return '已暂停';
-  const who = t.waitingOn?.length ? t.waitingOn.join('、') : null;
-  if (t.status === 'awaiting_signoff') return who ? `做完了，等 ${who} 签收` : '做完了，等签收';
-  return who ? `停着，等 ${who} 答` : '停着';
+export function taskWaitText(t, lang = 'zh') {
+  if (t.status === 'suspended') return tl(lang, '已暂停');
+  const who = t.waitingOn?.length ? t.waitingOn.join(lang === 'en' ? ', ' : '、') : null;
+  if (t.status === 'awaiting_signoff') return who ? tl(lang, '做完了，等 {who} 签收', { who }) : tl(lang, '做完了，等签收');
+  return who ? tl(lang, '停着，等 {who} 答', { who }) : tl(lang, '停着');
 }
 
 /** 纯文本（CLI 与通知共用）。每条带它的命令；没有"系统怎么工作"的话。 */
 export function renderDigest(d, { at = d.at } = {}) {
   const L = [];
-  const line = (x) => `- ${x.label}｜${x.taskTitle}｜${ageText(at - x.askedAt)}前提出${x.dueAt ? `，${x.dueAt > at ? `${ageText(x.dueAt - at)}后` : '已'}到期` : '，一直等到有人答'}\n  ${x.text}\n  → node src/cli.mjs answer ${x.questionId} "..."${x.defaultAction && x.dueAt ? `（到期没人答就按默认：${oneLine(x.defaultAction, 60)}）` : ''}`;
-  L.push(`${d.name} 的待办（${new Date(at).toISOString().slice(0, 16).replace('T', ' ')} UTC）`);
-  if (!d.total) { L.push('没有等你的事。'); return L.join('\n'); }
-  if (d.daemonOff) L.push(`\n自动运行未开启：有 ${d.daemonOff.unfinished} 个未结束的任务不会自动推进，超时与通知也不会处理。启动：node src/cli.mjs web --daemon（或 daemon）`);
+  const lang = d.lang ?? 'zh', en = lang === 'en';
+  const age = (ms) => ageText(ms, lang);
+  const bar = en ? ' | ' : '｜', colon = en ? ': ' : '：';
+  const list = (xs) => xs.join(en ? ', ' : '、');
+  const line = (x) => `- ${x.label}${bar}${x.taskTitle}${bar}${tl(lang, '{age}前提出', { age: age(at - x.askedAt) })}${x.dueAt ? (x.dueAt > at ? tl(lang, '，{age}后到期', { age: age(x.dueAt - at) }) : tl(lang, '，已到期')) : tl(lang, '，一直等到有人答')}\n  ${x.text}\n  → node src/cli.mjs answer ${x.questionId} "..."${x.defaultAction && x.dueAt ? tl(lang, '（到期没人答就按默认：{action}）', { action: oneLine(x.defaultAction, 60) }) : ''}`;
+  L.push(tl(lang, '{name} 的待办（{time} UTC）', { name: d.name, time: new Date(at).toISOString().slice(0, 16).replace('T', ' ') }));
+  if (!d.total) { L.push(tl(lang, '没有等你的事。')); return L.join('\n'); }
+  if (d.daemonOff) L.push(`\n${tl(lang, '自动运行未开启：有 {n} 个未结束的任务不会自动推进，超时与通知也不会处理。启动：node src/cli.mjs web --daemon（或 daemon）', { n: d.daemonOff.unfinished })}`);
   if (d.stalledProjects?.length) {
-    L.push(`\n已停滞的项目 ${d.stalledProjects.length} 个（等你决定）：`);
+    L.push(`\n${tl(lang, '已停滞的项目 {n} 个（等你决定）：', { n: d.stalledProjects.length })}`);
     d.stalledProjects.forEach((p) => L.push(p.kind === 'review_shelved'
-      ? `- ${p.title}｜全部任务已合并，复盘时选了「先放着」，还没宣布达成\n    node src/cli.mjs project review ${p.projectId}（重新复盘）｜project append / abort ${p.projectId}`
-      : `- ${p.title}｜已中止的任务：${p.taskTitle ?? '无'}${p.why ? `｜中止原因：${oneLine(p.why, 80)}` : ''}\n    node src/cli.mjs project reopen|redo|abort ${p.projectId}`));
+      ? `- ${p.title}${bar}${tl(lang, '全部任务已合并，复盘时选了「先放着」，还没宣布达成\n    node src/cli.mjs project review {id}（重新复盘）｜project append / abort {id}', { id: p.projectId })}`
+      : `- ${p.title}${bar}${tl(lang, '已中止的任务：{title}', { title: p.taskTitle ?? (en ? 'none' : '无') })}${p.why ? `${bar}${tl(lang, '中止原因：{why}', { why: oneLine(p.why, 80) })}` : ''}\n    node src/cli.mjs project reopen|redo|abort ${p.projectId}`));
   }
   if (d.toDeliver?.length) {
-    L.push(`\n已达成、等你交付的项目 ${d.toDeliver.length} 个（任务都已合进项目分支，还只在这套系统里；到项目页点「交付项目」才推到你们的代码仓库 —— 只能你亲自点，推出去收不回）：`);
-    d.toDeliver.forEach((p) => L.push(`- ${p.title}｜${p.again ? `上次交付之后又合并了 ${p.sinceDelivery} 个任务（${(p.newTitles ?? []).join('、')}），还没推到你们的仓库，要再交付一次` : `已合并 ${p.merged} 个任务`}`));
+    L.push(`\n${tl(lang, '已达成、等你交付的项目 {n} 个（任务都已合进项目分支，还只在这套系统里；到项目页点「交付项目」才推到你们的代码仓库 —— 只能你亲自点，推出去收不回）：', { n: d.toDeliver.length })}`);
+    d.toDeliver.forEach((p) => L.push(`- ${p.title}${bar}${p.again ? tl(lang, '上次交付之后又合并了 {n} 个任务（{titles}），还没推到你们的仓库，要再交付一次', { n: p.sinceDelivery, titles: list(p.newTitles ?? []) }) : tl(lang, '已合并 {n} 个任务', { n: p.merged })}`));
   }
   if (d.handoverRequests?.length) {
-    L.push(`\n交接申请 ${d.handoverRequests.length} 条：`);
-    d.handoverRequests.forEach((r) => L.push(`- ${r.fromName} 申请把${r.scopeText}范围内的责任交给 ${r.toName}${r.thenDisable ? '，交接后停用' : ''}${r.note ? `｜备注：${oneLine(r.note, 80)}` : ''}${r.canDecide ? `\n  → node src/cli.mjs handover requests（看清单后 approve / reject ${r.id}）` : '｜等管理员批准'}`));
+    L.push(`\n${tl(lang, '交接申请 {n} 条：', { n: d.handoverRequests.length })}`);
+    d.handoverRequests.forEach((r) => L.push(`- ${tl(lang, '{from} 申请把{scope}范围内的责任交给 {to}', { from: r.fromName, scope: r.scopeText, to: r.toName })}${r.thenDisable ? tl(lang, '，交接后停用') : ''}${r.note ? `${bar}${tl(lang, '备注：{note}', { note: oneLine(r.note, 80) })}` : ''}${r.canDecide ? `\n  → ${tl(lang, 'node src/cli.mjs handover requests（看清单后 approve / reject {id}）', { id: r.id })}` : `${bar}${tl(lang, '等管理员批准')}`}`));
   }
   if (d.autoBatches?.length) {
     // 事后通知（自动挡）。放在"等你决定"之前：它不要求你做什么，但你该先知道 AI 已经开始做什么了。
     const n = d.autoBatches.reduce((s, b) => s + b.count, 0);
-    L.push(`\n自动挡替你开工了 ${n} 个任务（${d.since ? '上次摘要以来' : '最近 7 天'}；不用你批，随时可中止）：`);
-    d.autoBatches.forEach((b) => L.push(`- ${b.title}｜${ageText(at - b.at)}前${b.review ? '（复盘给出的）' : ''}：${b.titles.join('、') || `${b.count} 个任务`}\n  → 要停：node src/cli.mjs project gear ${b.projectId} propose（改回提议挡），或 project abort ${b.projectId}`));
+    L.push(`\n${tl(lang, '自动挡替你开工了 {n} 个任务（{when}；不用你批，随时可中止）：', { n, when: d.since ? tl(lang, '上次摘要以来') : tl(lang, '最近 7 天') })}`);
+    d.autoBatches.forEach((b) => L.push(`- ${b.title}${bar}${tl(lang, '{age}前', { age: age(at - b.at) })}${b.review ? tl(lang, '（复盘给出的）') : ''}${colon}${list(b.titles) || tl(lang, '{n} 个任务', { n: b.count })}\n  → ${tl(lang, '要停：node src/cli.mjs project gear {id} propose（改回提议挡），或 project abort {id}', { id: b.projectId })}`));
   }
-  if (d.requestsDone?.length) { L.push(`\n你提的需求做完并合并了 ${d.requestsDone.length} 个：`); d.requestsDone.forEach((x) => L.push(`- ${x.projectTitle}｜${x.title}｜${ageText(at - x.at)}前合并`)); }
-  if (d.waitingOnMe.length) { L.push(`\n等你决定 ${d.waitingOnMe.length} 件：`); d.waitingOnMe.forEach((x) => L.push(line(x))); }
-  if (d.inConflict.length) { L.push(`\n答复不一致、等结论 ${d.inConflict.length} 件（${d.inConflict.some((x) => x.canRule) ? '双方先商量；你可以直接裁定' : '双方先商量，谈不拢或到期转负责人裁定'}）：`); d.inConflict.forEach((x) => L.push(`- ${x.label}｜${x.taskTitle}｜${x.text}${x.parties?.length ? `｜在商量的：${x.parties.join('、')}` : ''}${x.canRule && x.conflictId ? `\n  → 直接裁定：node src/cli.mjs answer ${x.conflictId} "..."` : ''}`)); }
-  if (d.unaddressed.length) { L.push(`\n没人接的 ${d.unaddressed.length} 件（没有路由到任何人；你答，或在任务页转给别人）：`); d.unaddressed.forEach((x) => L.push(line(x))); }
-  if (d.waitingOnOthers.length) { L.push(`\n你答过、还在等别人的 ${d.waitingOnOthers.length} 件：`); d.waitingOnOthers.forEach((x) => L.push(`- ${x.label}｜${x.taskTitle}｜还差：${x.missing.join('、') || '—'}`)); }
-  if (d.informed.length) { L.push(`\n只是知会你的 ${d.informed.length} 件（不用你答）：`); d.informed.forEach((x) => L.push(`- ${x.label}｜${x.taskTitle}｜${x.text}`)); }
-  if (d.tasksWaiting.length) { L.push(`\n任务状态：`); d.tasksWaiting.forEach((t) => L.push(`- ${t.title}（${t.taskId}）：${taskWaitText(t)}`)); }
-  if (d.unreadReports) L.push(`\n未读汇报 ${d.unreadReports} 份：${(d.unreadReportTasks ?? []).map((t) => `${t.title} ${t.n} 份（node src/cli.mjs reports ${t.taskId}）`).join('；')}`);
+  if (d.requestsDone?.length) { L.push(`\n${tl(lang, '你提的需求做完并合并了 {n} 个：', { n: d.requestsDone.length })}`); d.requestsDone.forEach((x) => L.push(`- ${x.projectTitle}${bar}${x.title}${bar}${tl(lang, '{age}前合并', { age: age(at - x.at) })}`)); }
+  if (d.waitingOnMe.length) { L.push(`\n${tl(lang, '等你决定 {n} 件：', { n: d.waitingOnMe.length })}`); d.waitingOnMe.forEach((x) => L.push(line(x))); }
+  if (d.inConflict.length) { L.push(`\n${tl(lang, '答复不一致、等结论 {n} 件（{how}）：', { n: d.inConflict.length, how: d.inConflict.some((x) => x.canRule) ? tl(lang, '双方先商量；你可以直接裁定') : tl(lang, '双方先商量，谈不拢或到期转负责人裁定') })}`); d.inConflict.forEach((x) => L.push(`- ${x.label}${bar}${x.taskTitle}${bar}${x.text}${x.parties?.length ? `${bar}${tl(lang, '在商量的：{names}', { names: list(x.parties) })}` : ''}${x.canRule && x.conflictId ? `\n  → ${tl(lang, '直接裁定：{cmd}', { cmd: `node src/cli.mjs answer ${x.conflictId} "..."` })}` : ''}`)); }
+  if (d.unaddressed.length) { L.push(`\n${tl(lang, '没人接的 {n} 件（没有路由到任何人；你答，或在任务页转给别人）：', { n: d.unaddressed.length })}`); d.unaddressed.forEach((x) => L.push(line(x))); }
+  if (d.waitingOnOthers.length) { L.push(`\n${tl(lang, '你答过、还在等别人的 {n} 件：', { n: d.waitingOnOthers.length })}`); d.waitingOnOthers.forEach((x) => L.push(`- ${x.label}${bar}${x.taskTitle}${bar}${tl(lang, '还差：{names}', { names: list(x.missing) || '—' })}`)); }
+  if (d.informed.length) { L.push(`\n${tl(lang, '只是知会你的 {n} 件（不用你答）：', { n: d.informed.length })}`); d.informed.forEach((x) => L.push(`- ${x.label}${bar}${x.taskTitle}${bar}${x.text}`)); }
+  if (d.tasksWaiting.length) { L.push(`\n${tl(lang, '任务状态：')}`); d.tasksWaiting.forEach((t) => L.push(`- ${t.title}${en ? ` (${t.taskId})` : `（${t.taskId}）`}${colon}${taskWaitText(t, lang)}`)); }
+  if (d.unreadReports) L.push(`\n${tl(lang, '未读汇报 {n} 份：', { n: d.unreadReports })}${(d.unreadReportTasks ?? []).map((t) => tl(lang, '{title} {n} 份（{cmd}）', { title: t.title, n: t.n, cmd: `node src/cli.mjs reports ${t.taskId}` })).join(en ? '; ' : '；')}`);
   if (d.catalog) {
-    L.push(`\n模型目录${d.catalog.checkedAt ? `（上次检查 ${ageText(at - d.catalog.checkedAt)}前）` : ''}：${d.catalog.warnings ? `${d.catalog.warnings} 项要看一眼` : ''}${d.catalog.drifts.length ? `${d.catalog.warnings ? '；' : ''}调用时发现 ${d.catalog.drifts.length} 处厂商代答` : ''}`);
+    L.push(`\n${tl(lang, '模型目录')}${d.catalog.checkedAt ? tl(lang, '（上次检查 {age}前）', { age: age(at - d.catalog.checkedAt) }) : ''}${colon}${d.catalog.warnings ? tl(lang, '{n} 项要看一眼', { n: d.catalog.warnings }) : ''}${d.catalog.drifts.length ? `${d.catalog.warnings ? (en ? '; ' : '；') : ''}${tl(lang, '调用时发现 {n} 处厂商代答', { n: d.catalog.drifts.length })}` : ''}`);
     for (const x of d.catalog.drifts) L.push(`- ${x}`);
     for (const x of d.catalog.lines.slice(0, 8)) L.push(`- ${x}`);
-    if (d.catalog.lines.length > 8) L.push(`- …还有 ${d.catalog.lines.length - 8} 行`);
-    L.push(`  → 全文：node src/cli.mjs catalog check；目录只由人改（src/llm/canonical.mjs）`);
+    if (d.catalog.lines.length > 8) L.push(`- ${tl(lang, '…还有 {n} 行', { n: d.catalog.lines.length - 8 })}`);
+    L.push(`  → ${tl(lang, '全文：node src/cli.mjs catalog check；目录只由人改（src/llm/canonical.mjs）')}`);
   }
-  if (d.dissents.length) { L.push(`\n${d.since ? '上次摘要以来' : '最近 7 天'}的不同意见 ${d.dissents.length} 条（已记录，不改结论）：`); d.dissents.forEach((x) => L.push(`- ${x.by} 对「${x.questionText}」的结论：${x.text}`)); }
+  if (d.dissents.length) { L.push(`\n${tl(lang, '{when}的不同意见 {n} 条（已记录，不改结论）：', { when: d.since ? tl(lang, '上次摘要以来') : tl(lang, '最近 7 天'), n: d.dissents.length })}`); d.dissents.forEach((x) => L.push(`- ${tl(lang, '{by} 对「{question}」的结论：{text}', { by: x.by, question: x.questionText, text: x.text })}`)); }
   return L.join('\n');
 }
 
@@ -236,7 +247,8 @@ export async function sendDigest(db, { userId, kind = 'manual', projectId = '', 
   let receipts = [];
   const shouldSend = channels.length && (!onlyIfAny || digest.total > 0);
   if (shouldSend) {
-    const title = `[SuperIntern] ${kind === 'handover' ? '接班：' : ''}${digest.name} 的待办 ${digest.actionable} 件等你${digest.total > digest.actionable ? `，另 ${digest.total - digest.actionable} 项` : ''}`;
+    const lang = digest.lang ?? 'zh';
+    const title = `[SuperIntern] ${kind === 'handover' ? tl(lang, '接班：') : ''}${tl(lang, '{name} 的待办 {n} 件等你', { name: digest.name, n: digest.actionable })}${digest.total > digest.actionable ? tl(lang, '，另 {n} 项', { n: digest.total - digest.actionable }) : ''}`;
     receipts = await notify(db, { taskId: null, kind: 'digest', title, text, ref: `digest:${kind}:${userId}`, channels, fetchFn, ...(spawn ? { spawn } : {}) });
   }
   if (record) {
@@ -253,7 +265,7 @@ export async function sendDigest(db, { userId, kind = 'manual', projectId = '', 
  * 没东西不记（下一轮再看，查询便宜）。返回发出的列表。
  */
 export async function scheduledDigests(db, { every, at = now(), ...opts } = {}) {
-  if (!isValidAfter(every)) throw new Error(`摘要间隔写法不对：${every}（可用 30m / 8h / 1d / 1bd）`);
+  if (!isValidAfter(every)) throw new I18nError('摘要间隔写法不对：{every}（可用 30m / 8h / 1d / 1bd）', { every: `${every}` });
   const out = [];
   for (const u of db.all(`SELECT id FROM users WHERE role IN ('lead','member') AND disabled_at IS NULL ORDER BY created_at`)) {
     const last = lastDigest(db, { userId: u.id, kind: 'scheduled' });
@@ -294,26 +306,30 @@ export async function handoverDigests(db, { at = now(), ...opts } = {}) {
 }
 
 /** 交接清单的纯文本（CLI 预览、通知共用）。 */
-export function renderHandover(ch) {
+export function renderHandover(ch, lang = 'zh') {
   const L = [];
-  const key = (k) => (k ? `项目「${ch.projectTitles?.[k] ?? k}」` : '默认决策路由');
+  const en = lang === 'en';
+  const bar = en ? ' | ' : '｜';
+  const list = (xs) => xs.join(en ? ', ' : '、');
+  const paren = (x) => (en ? ` (${x})` : `（${x}）`);
+  const key = (k) => (k ? tl(lang, '项目「{title}」', { title: ch.projectTitles?.[k] ?? k }) : tl(lang, '默认决策路由'));
   const nm = (id) => ch.names?.[id] ?? id;
-  const one = (s) => (s === 'group:*' ? '所有成员' : s.startsWith('group:') ? `标签 ${s.slice(6)}` : s === 'on_duty' ? '值班人' : s === 'parties' ? '冲突双方' : s.replace(/user:([A-Za-z0-9_-]+)$/, (m, id) => (id === 'lead' ? '负责人' : nm(id))));
-  const rs = (list) => list.map((s) => { const t = String(s); return t.startsWith('inform:') ? `知会 ${one(t.slice(7))}` : one(t); }).join('、');
-  L.push(`${ch.from.name} → ${ch.to.name}（范围：${ch.scopeText}）`);
-  if (ch.projects.length) L.push(`负责人变更 · 项目 ${ch.projects.length} 个：${ch.projects.map((p) => `${p.title}（${p.id}）`).join('、')}`);
-  if (ch.soloTasks.length) L.push(`负责人变更 · 不属于项目的任务 ${ch.soloTasks.length} 个：${ch.soloTasks.map((t) => `${t.title}（${t.id}）`).join('、')}`);
-  if (ch.routing.length) { L.push(`决策路由 ${ch.routing.length} 行：`); ch.routing.forEach((r) => L.push(`  - ${key(r.key)}｜${r.label}（范围 ${r.scope}）顺位 ${r.position} 的接收人：${rs(r.before)} → ${rs(r.after)}${r.merged ? '（接手人已在该行，已合并）' : ''}`)); }
-  if (ch.duty.length) ch.duty.forEach((d) => L.push(`值班表（${key(d.key)}）：${d.before.map(nm).join(' → ')} 改为 ${d.after.map(nm).join(' → ')}`));
-  if (ch.transferred.length) { L.push(`转给接手人的待决事项 ${ch.transferred.length} 条：`); ch.transferred.forEach((q) => L.push(`  - ${q.label}｜${q.taskTitle}｜${q.text}（${q.id}）`)); }
-  if (ch.escalated.length) { L.push(`转负责人裁定的冲突事项 ${ch.escalated.length} 条（交出方是冲突方，其立场不随交接转移）：`); ch.escalated.forEach((q) => L.push(`  - ${q.taskTitle}｜${q.text}（${q.id}）`)); }
-  if (ch.informed.length) L.push(`知会对象改为接手人的事项 ${ch.informed.length} 条`);
-  if (ch.kept.length) L.push(`不作变更 ${ch.kept.length} 条（交出方已答复）`);
-  if (ch.disabled) L.push(`交接后停用 ${ch.from.name}：吊销令牌 ${ch.tokensRevoked} 个，通知通道不转移`);
-  for (const w of ch.warnings) L.push(`注意：${w}`);
-  if (ch.empty) L.push('没有需要交接的内容。');
-  L.push('已有的答复与签收记录、审计日志、已结束的项目与任务不受影响。');
-  if (ch.note) L.push(`\n交出方备注：${ch.note}`);
+  const one = (s) => (s === 'group:*' ? tl(lang, '所有成员') : s.startsWith('group:') ? tl(lang, '标签 {tag}', { tag: s.slice(6) }) : s === 'on_duty' ? tl(lang, '值班人') : s === 'parties' ? tl(lang, '冲突双方') : s.replace(/user:([A-Za-z0-9_-]+)$/, (m, id) => (id === 'lead' ? tl(lang, '负责人') : nm(id))));
+  const rs = (xs) => list(xs.map((s) => { const t = String(s); return t.startsWith('inform:') ? tl(lang, '知会 {who}', { who: one(t.slice(7)) }) : one(t); }));
+  L.push(`${ch.from.name} → ${ch.to.name}${paren(tl(lang, '范围：{scope}', { scope: ch.scopeText }))}`);
+  if (ch.projects.length) L.push(tl(lang, '负责人变更 · 项目 {n} 个：{list}', { n: ch.projects.length, list: list(ch.projects.map((p) => `${p.title}${paren(p.id)}`)) }));
+  if (ch.soloTasks.length) L.push(tl(lang, '负责人变更 · 不属于项目的任务 {n} 个：{list}', { n: ch.soloTasks.length, list: list(ch.soloTasks.map((t) => `${t.title}${paren(t.id)}`)) }));
+  if (ch.routing.length) { L.push(tl(lang, '决策路由 {n} 行：', { n: ch.routing.length })); ch.routing.forEach((r) => L.push(`  - ${key(r.key)}${bar}${tl(lang, '{label}（范围 {scope}）顺位 {position} 的接收人：{before} → {after}', { label: byCatalog(lang, r.label), scope: r.scope, position: r.position, before: rs(r.before), after: rs(r.after) })}${r.merged ? tl(lang, '（接手人已在该行，已合并）') : ''}`)); }
+  if (ch.duty.length) ch.duty.forEach((d) => L.push(tl(lang, '值班表（{key}）：{before} 改为 {after}', { key: key(d.key), before: d.before.map(nm).join(' → '), after: d.after.map(nm).join(' → ') })));
+  if (ch.transferred.length) { L.push(tl(lang, '转给接手人的待决事项 {n} 条：', { n: ch.transferred.length })); ch.transferred.forEach((q) => L.push(`  - ${byCatalog(lang, q.label)}${bar}${q.taskTitle}${bar}${q.text}${paren(q.id)}`)); }
+  if (ch.escalated.length) { L.push(tl(lang, '转负责人裁定的冲突事项 {n} 条（交出方是冲突方，其立场不随交接转移）：', { n: ch.escalated.length })); ch.escalated.forEach((q) => L.push(`  - ${q.taskTitle}${bar}${q.text}${paren(q.id)}`)); }
+  if (ch.informed.length) L.push(tl(lang, '知会对象改为接手人的事项 {n} 条', { n: ch.informed.length }));
+  if (ch.kept.length) L.push(tl(lang, '不作变更 {n} 条（交出方已答复）', { n: ch.kept.length }));
+  if (ch.disabled) L.push(tl(lang, '交接后停用 {name}：吊销令牌 {n} 个，通知通道不转移', { name: ch.from.name, n: ch.tokensRevoked }));
+  for (const w of ch.warnings) L.push(tl(lang, '注意：{warning}', { warning: w }));
+  if (ch.empty) L.push(tl(lang, '没有需要交接的内容。'));
+  L.push(tl(lang, '已有的答复与签收记录、审计日志、已结束的项目与任务不受影响。'));
+  if (ch.note) L.push(`\n${tl(lang, '交出方备注：{note}', { note: ch.note })}`);
   return L.join('\n');
 }
 
@@ -321,7 +337,8 @@ export function renderHandover(ch) {
 export async function sendHandoverNotice(db, { changes, at = now(), env = process.env, extraCmd = null, fetchFn = globalThis.fetch, spawn }) {
   const channels = channelsForUsers(db, [changes.to.id]);
   if (!channels.length) return { sent: false, receipts: [] };
-  const text = `${renderHandover(changes)}\n\n${renderDigest(buildDigest(db, { userId: changes.to.id, at }), { at })}`;
-  const receipts = await notify(db, { taskId: null, kind: 'digest', title: `[SuperIntern] ${changes.from.name} 把${changes.scopeText}范围内的责任交给了你`, text, ref: `handover:${changes.from.id}:${changes.to.id}`, channels, fetchFn, ...(spawn ? { spawn } : {}) });
+  const lang = userLang(db, changes.to.id);
+  const text = `${renderHandover(changes, lang)}\n\n${renderDigest(buildDigest(db, { userId: changes.to.id, at }), { at })}`;
+  const receipts = await notify(db, { taskId: null, kind: 'digest', title: `[SuperIntern] ${tl(lang, '{from} 把{scope}范围内的责任交给了你', { from: changes.from.name, scope: changes.scopeText })}`, text, ref: `handover:${changes.from.id}:${changes.to.id}`, channels, fetchFn, ...(spawn ? { spawn } : {}) });
   return { sent: true, receipts };
 }

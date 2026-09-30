@@ -27,6 +27,7 @@ import { DECISION_TYPES, loadTemplates, rulesOf, profileOf, knobsOf, setKnobs, a
   dutyCalendarOf, setDutyCalendar, transferQuestion, leadOf, leadOfKey, routingKeyOf, validateRules, authorize } from '../core/routing.mjs';
 import { addUser, listUsers, usersView, setUserChannel, removeUserChannel, setUserTags, setUserRole, renameUser, reissueToken } from '../core/users.mjs';
 import { canCreate, setSetting, settingsView, getSetting } from '../core/settings.mjs';
+import { CATALOGS, normLang, contentLang, userLang, translateError, localizeHtml, tl, I18nError } from '../i18n/index.mjs';
 import { permissionsOf } from '../core/permissions.mjs';
 import { reopenTask, redoProjectTask, abortProject, renameTask, renameProject, setTaskArchived, setProjectArchived } from '../core/lifecycle.mjs';
 import { daemonStatus, assessTask } from '../core/daemon.mjs';
@@ -50,7 +51,7 @@ import { projectTasks, chainGraph, advanceProject, deliverProject, acceptDeferre
 import { getParam } from '../core/params.mjs';
 import { LlmClient } from '../llm/client.mjs';
 import { afterInput } from '../core/decision-check.mjs';
-import { activeDecisions, SOURCE_NAMES, overruledContractRules } from '../core/decisions.mjs';
+import { activeDecisions, SOURCE_NAMES, sourceNamesOf, overruledContractRules } from '../core/decisions.mjs';
 import { budgetState, setProjectBudget, projectVerifyCommand, setProjectVerify, gearOf, setGear, gearPrereqStatus, GEARS, deferredSignoffs, maxOpenOf, setMaxOpen, MAX_OPEN_CEILING, setupCommandsOf, setSetupCommands, detectSetupCommands } from '../core/project-settings.mjs';
 import { TIERS, EFFORTS } from '../llm/canonical.mjs';
 import { registryFor, endpointsOf, endpointDiff, keyPresence, catalogOf, bindable, bindingOf, bindingProblems, setBinding, saveEndpoint, setEndpointEnabled,
@@ -62,7 +63,10 @@ import { egressSources, addSource, removeSource, sourceUsage, projectEgressOf, s
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 
+// 报错按请求人的界面语言翻（看板每次请求带 X-SI-Lang；见 src/i18n/index.mjs）。error 可以是字符串或异常本身：
+// 传异常才翻得了带参数的 I18nError；字符串只能整句查目录。
 const json = (res, status, body) => {
+  if (status >= 400 && body?.error != null) body = { ...body, error: translateError(body.error instanceof Error ? body.error : { message: String(body.error) }, res.__lang) };
   res.writeHead(status, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store', 'x-content-type-options': 'nosniff' });
   res.end(JSON.stringify(body));
 };
@@ -80,13 +84,13 @@ const readBody = (req) => new Promise((ok, bad) => {
  *   2. POST 的 content-type 必须是 application/json（text/plain 是 CORS 简单请求，不预检）
  *   3. POST 的 Sec-Fetch-Site 为 same-origin / none，或 Origin 与 Host 一致；两个头都没有的
  *      （curl / 脚本 / 测试，不是浏览器）放行
- * @returns 拒绝理由，或 null
+ * @returns 拒绝理由（字符串，或带参数的 I18nError —— 出口 json() 按看的人的语言翻），或 null
  */
 export function crossSiteReason(req, { host = '127.0.0.1', allowHosts = [] } = {}) {
   const h = String(req.headers.host ?? '');
   const hostname = h.replace(/:\d+$/, '').replace(/^\[|\]$/g, '').toLowerCase();
   // 团队模式：另放行对外地址的主机名（--public-url）。只放这一个，不放"任意"——DNS 重绑定照样挡。
-  if (!['127.0.0.1', 'localhost', '::1', String(host).toLowerCase(), ...allowHosts.map((x) => String(x).toLowerCase())].includes(hostname)) return `跨站请求被拒：Host 不是本机（${h.slice(0, 80)}）`;
+  if (!['127.0.0.1', 'localhost', '::1', String(host).toLowerCase(), ...allowHosts.map((x) => String(x).toLowerCase())].includes(hostname)) return new I18nError('跨站请求被拒：Host 不是本机（{host}）', { host: h.slice(0, 80) });
   if (req.method !== 'POST') return null;
   if (!/^application\/json\b/i.test(String(req.headers['content-type'] ?? ''))) return '跨站请求被拒：POST 的 content-type 必须是 application/json';
   const sfs = req.headers['sec-fetch-site'], origin = req.headers.origin;
@@ -100,7 +104,7 @@ export function crossSiteReason(req, { host = '127.0.0.1', allowHosts = [] } = {
 
 // ── 视图数据（只读）──────────────────────────────────────────────────────
 /** 项目列表：契约任务顺序、合并 / 签收进度、草案状态。看板用它给任务选择器分组、画项目行。 */
-export function projectList(db) {
+export function projectList(db, lang = 'zh') {   // lang：上限数值按看的人的界面语言格式化（"45 分钟" / "45 min"）
   return db.all(`SELECT * FROM projects ORDER BY created_at DESC`).map((p) => {
     const graph = chainGraph(db, p.id);
     const startedIds = new Set(graph.filter((g) => g.started).map((g) => g.id));
@@ -129,7 +133,7 @@ export function projectList(db) {
     return { ...p, tasks, carrier, superseded, spendMicro, planningMicro, append, appendQueue, delivered, deliverDue, evidence, members: listMembers(db, p.id),
       gear: gearOf(db, p.id), gears: GEARS, gearPrereqs: gearPrereqStatus(db, p.id),
       budget: { gate: budget.gate, spent: budget.spent, remaining: budget.remaining, over: budget.over },
-      verifyCommand: projectVerifyCommand(db, p.id), limits: projectLimits(db, p.id), layerNames: LAYER_NAMES,
+      verifyCommand: projectVerifyCommand(db, p.id), limits: projectLimits(db, p.id, lang), layerNames: LAYER_NAMES,
       deferredSignoffs: deferredSignoffs(db, p.id).map((t) => ({ id: t.id, order: t.project_order, title: t.title })),
       merged: tasks.filter((t) => t.merged_at).length,
       awaitingSignoff: tasks.find((t) => t.status === 'done' && !t.merged_at && t.signoff !== 'accepted')?.id ?? null,
@@ -204,7 +208,7 @@ export function taskDetail(db, taskId, { userId = null } = {}) {
       const th = approvalThreadOf(db, q.id);
       if (!th) continue;
       if (['open', 'escalated'].includes(q.status)) q.interpretable = true;
-      else if (q.answer) q.reading = { ...describeReading({ body: q.answer.body, labels: th.labels, reached: th.reached }), final: false };
+      else if (q.answer) q.reading = { ...describeReading({ body: q.answer.body, labels: th.labels, reached: th.reached, lang: contentLang(db) }), final: false };
     } }
   const messages = db.all(`SELECT id,kind,kind_source,urgency,trust_label,body,received_at,consumed_at,sender_id FROM messages
                            WHERE task_id=? ORDER BY received_at DESC LIMIT 100`, taskId);
@@ -225,7 +229,7 @@ export function taskDetail(db, taskId, { userId = null } = {}) {
     const rev = { impact: JSON.parse(rv.impact), salvage: JSON.parse(rv.salvage), changed_nodes: JSON.parse(rv.changed_nodes),
       new_nodes: JSON.parse(rv.new_nodes), constitution_patch: rv.constitution_patch ? JSON.parse(rv.constitution_patch) : null, rationale: rv.rationale };
     let diff = '';
-    try { diff = renderDiff(gateOf(db, { taskId, rev, nodes: nodesForReplan(db, taskId) }), rev); } catch (e) { diff = `（无法生成变更对比：${e.message}）`; }
+    try { diff = renderDiff(gateOf(db, { taskId, rev, nodes: nodesForReplan(db, taskId) }), rev); } catch (e) { diff = tl(contentLang(db), '（无法生成变更对比：{msg}）', { msg: e.message }); }
     revision = { id: rv.id, status: rv.status, gate: rv.gate, message: db.one(`SELECT body FROM messages WHERE id=?`, rv.message_id)?.body ?? '', diff, rationale: rv.rationale };
   }
   const limits = Object.fromEntries(Object.keys(LIMITS).map((k) => [k, { label: LIMITS[k].label, value: limitOf(db, taskId, k), onHit: LIMITS[k].on_hit }]));
@@ -265,7 +269,8 @@ function pickEndpointFields(b) {
  * 注册表三层的视图：服务商（key 只报"填没填"）/ 模型（生效目录 + 能不能绑 + 上次漂移检查的发现）/ 绑定（三档 + 推理强度 + 问题）。
  * 全部按生效值现算，与代码默认值的差异标在行上。
  */
-export function llmView(db, { env = process.env } = {}) {
+// lang：给人看的原因（不能分配的原因、绑定问题）用哪种语言写 —— 看板传请求人的界面语言
+export function llmView(db, { env = process.env, lang = 'zh' } = {}) {
   const endpoints = endpointsOf(db);
   const keys = keyPresence(endpoints, env);
   const catalog = catalogOf(db);
@@ -276,9 +281,9 @@ export function llmView(db, { env = process.env } = {}) {
   return {
     endpoints: Object.values(endpoints).map((e) => ({ ...e, keyPresent: keys[e.id].present, diff: endpointDiff(e), adapterLabel: ADAPTER_DEFAULTS[e.adapter]?.label ?? e.adapter,
       models: Object.values(catalog).filter((m) => m.vendor === e.id).length, boundTiers: TIERS.filter((t) => catalog[b.binding[t]]?.vendor === e.id) })),
-    models: Object.values(catalog).map((m) => ({ ...m, cannotBind: bindable(m, endpoints), boundTiers: TIERS.filter((t) => b.binding[t] === m.key), findings: findings[m.key] ?? [],
+    models: Object.values(catalog).map((m) => ({ ...m, cannotBind: bindable(m, endpoints, lang), boundTiers: TIERS.filter((t) => b.binding[t] === m.key), findings: findings[m.key] ?? [],
       endpointEnabled: !!endpoints[m.vendor]?.enabled, keyPresent: !!keys[m.vendor]?.present })),
-    binding: { ...b, problems: bindingProblems(db, { env }) },
+    binding: { ...b, problems: bindingProblems(db, { env, lang }) },
     adapters: ADAPTERS.map((a) => ({ id: a, ...ADAPTER_DEFAULTS[a] })), efforts: EFFORTS, tiers: TIERS,
     lastCheck: last ? { at: last.checkedAt ?? last.ts, warnings: last.warnings, fetchErrors: last.fetchErrors, probe: last.probe } : null,
   };
@@ -311,7 +316,7 @@ export function makeControls(db, { home, tokenPlain, launcher = makeLauncher(db,
       }
       // 方案批准的答复：回显系统怎么读这句话。判读本身仍由状态机做，这里用的是同一个函数。
       const th = (o.stance ?? 'answer') === 'answer' ? approvalThreadOf(db, o.questionId) : null;
-      return th ? { ...r, reading: describeReading({ body: o.body, labels: th.labels, reached: th.reached, tense: 'did' }) } : r;
+      return th ? { ...r, reading: describeReading({ body: o.body, labels: th.labels, reached: th.reached, tense: 'did', lang: contentLang(db) }) } : r;
     },
     // 答之前的实时预览：只读，不落库。看不见这个任务的人拿不到（与任务详情同一道可见性）。
     interpret: (o) => {
@@ -319,9 +324,9 @@ export function makeControls(db, { home, tokenPlain, launcher = makeLauncher(db,
       if (!canSeeTask(db, o.taskId, userId)) throw new Error('任务不存在');
       const th = approvalThreadOf(db, o.questionId);
       if (!th || th.taskId !== o.taskId) return { reading: null };
-      return { reading: describeReading({ body: String(o.body ?? ''), labels: th.labels, reached: th.reached, tense: 'will' }) };
+      return { reading: describeReading({ body: String(o.body ?? ''), labels: th.labels, reached: th.reached, tense: 'will', lang: contentLang(db) }) };
     },
-    transfer: (o) => transferQuestion(db, { questionId: o.questionId, to: [].concat(o.to ?? []), byUserId: auth(o).userId }),
+    transfer: (o) => transferQuestion(db, { questionId: o.questionId, to: [].concat(o.to ?? []), reason: o.reason ?? null, byUserId: auth(o).userId }),
     say: async (o) => {
       const { taskId, body, kind, urgent, about } = o;
       const hasKind = !!kind;
@@ -343,9 +348,9 @@ export function makeControls(db, { home, tokenPlain, launcher = makeLauncher(db,
         ...(hasKind ? {} : { llmClient: newClassifierClient() }),
       });
       if (merged && ['correction', 'instruction'].includes(out.kind)) {
-        markConsumed(db, { taskId, ids: [out.messageId], why: '任务已合并：这句话转成了项目的「添加任务」' });
+        markConsumed(db, { taskId, ids: [out.messageId], why: tl(contentLang(db), '任务已合并：这句话转成了项目的「添加任务」') });
         try { return { ...out, appended: true, append: requestAppend(db, { projectId: tk.project_id, userId: auth(o).userId, brief: body }) }; }
-        catch (e) { return { ...out, appended: false, appendError: `这个任务已经合并，改不了了；这句话读着像新需求，但没能转成「添加任务」：${e.message}` }; }
+        catch (e) { return { ...out, appended: false, appendError: tl(o._lang, '这个任务已经合并，改不了了；这句话读着像新需求，但没能转成「添加任务」：{msg}', { msg: translateError(e, o._lang) }) }; }
       }
       // 变更消息落地之后再比对：只比 correction / instruction —— 补充信息不改变要做什么。
       if (['correction', 'instruction'].includes(out.kind)) {
@@ -364,12 +369,13 @@ export function makeControls(db, { home, tokenPlain, launcher = makeLauncher(db,
       // 卡片一点就生效，绕过了其他会签人；事项还挂着等他再答一遍）
       const rq = rv.question_id ? db.one(`SELECT status FROM questions WHERE id=?`, rv.question_id) : null;
       if (rq && ['open', 'escalated'].includes(rq.status)) {
-        const body = approve ? (reservation ? `A\n保留：${reservation}` : 'A') : `B：${why || '在看板上驳回（未填理由）'}`;
+        const L = contentLang(db);
+        const body = approve ? (reservation ? tl(L, 'A\n保留：{reservation}', { reservation }) : 'A') : tl(L, 'B：{why}', { why: why || tl(L, '在看板上驳回（未填理由）') });
         const r = recordAnswer(db, { questionId: rv.question_id, body, plaintextToken: auth(o).plaintextToken });
         return { ...r, viaQuestion: true, pending: !r.resolved };
       }
       return approve ? applyRevision(db, { taskId, revisionId: rv.id, by: 'user', userId, reservation: reservation ?? null })
-        : rejectRevision(db, { taskId, revisionId: rv.id, userId, why: why || '在看板上驳回（未填理由）' });
+        : rejectRevision(db, { taskId, revisionId: rv.id, userId, why: why || tl(contentLang(db), '在看板上驳回（未填理由）') });
     },
     limit: (o) => setLimit(db, { taskId: o.taskId, key: o.key, value: Number(o.value), userId: auth(o).userId }),
     priority: (o) => {
@@ -378,8 +384,8 @@ export function makeControls(db, { home, tokenPlain, launcher = makeLauncher(db,
       const p = Number(priority);
       if (!Number.isFinite(p)) throw new Error('优先级必须是数字');
       const n = db.one(`SELECT id, priority, status FROM nodes WHERE id=? AND task_id=?`, nodeId, taskId);
-      if (!n) throw new Error(`步骤不存在：${nodeId}`);
-      if (!['pending', 'ready', 'blocked'].includes(n.status)) throw new Error(`步骤状态为 ${n.status}，只能调整尚未开始的步骤`);
+      if (!n) throw new I18nError('步骤不存在：{nodeId}', { nodeId });
+      if (!['pending', 'ready', 'blocked'].includes(n.status)) throw new I18nError('步骤状态为 {status}，只能调整尚未开始的步骤', { status: n.status });
       db.run(`UPDATE nodes SET priority=? WHERE id=?`, p, nodeId);
       audit(db, { actorKind: 'user', actorId: userId, action: 'node_priority_set', targetType: 'node', targetId: nodeId, payload: { from: n.priority, to: p } });
       return { nodeId, priority: p };
@@ -423,9 +429,12 @@ export function makeControls(db, { home, tokenPlain, launcher = makeLauncher(db,
 
 function setTaskStatus(db, taskId, to, from, userId, action, extra = {}) {
   const task = db.one(`SELECT status FROM tasks WHERE id=?`, taskId);
-  if (!task) throw new Error(`任务不存在：${taskId}`);
+  if (!task) throw new I18nError('任务不存在：{taskId}', { taskId });
   const verb = { task_paused: '暂停', task_resumed: '恢复', task_aborted: '中止' }[action] ?? action;
-  if (!from.includes(task.status)) throw new Error(`任务状态为 ${task.status}，无法${verb}`);
+  const status = task.status;
+  const cannot = { task_paused: () => new I18nError('任务状态为 {status}，无法暂停', { status }), task_resumed: () => new I18nError('任务状态为 {status}，无法恢复', { status }),
+    task_aborted: () => new I18nError('任务状态为 {status}，无法中止', { status }) }[action] ?? (() => new Error(`任务状态为 ${status}，无法${verb}`));
+  if (!from.includes(task.status)) throw cannot();
   db.run(`UPDATE tasks SET status=? WHERE id=?`, to, taskId);
   audit(db, { actorKind: 'user', actorId: userId, action, targetType: 'task', targetId: taskId, payload: { from: task.status, to, ...extra } });
   return { from: task.status, to };
@@ -442,11 +451,11 @@ function setTaskStatus(db, taskId, to, from, userId, action, extra = {}) {
  *      令牌不再放在页面脚本读得到的 localStorage 里。服务端认证照旧按令牌 —— 答复、消息的认证链（token_id）一处不改。
  *   3. **Host 放行对外地址**（--public-url 的主机名）。反向代理要原样转 Host（nginx：proxy_set_header Host $host）。
  */
-export const TEAM_OPEN_PATHS = new Set(['/api/login', '/api/logout', '/api/session']);
+export const TEAM_OPEN_PATHS = new Set(['/api/login', '/api/logout', '/api/session', '/api/i18n']);
 export function startWeb(db, { home, port = 7357, host = '127.0.0.1', tokenPlain, launcher, daemon = false, pollMs = 1000, makeClassifierClient = null, envFile = null, env = process.env, fetchFn = globalThis.fetch, team = false, publicUrl = null, runtime = undefined } = {}) {
   ensureOwner(db);
   // 容器运行时健康：测试可注入；不给就真探（起看板时先探一次，之后按 30 秒缓存在后台刷新）
-  const runtimeHealth = runtime === undefined ? makeRuntimeHealth() : runtime;
+  const runtimeHealth = runtime === undefined ? makeRuntimeHealth({ lang: () => contentLang(db) }) : runtime;
   runtimeHealth?.current?.();
   let pub = null;
   if (team) {
@@ -483,10 +492,18 @@ export function startWeb(db, { home, port = 7357, host = '127.0.0.1', tokenPlain
     return m ? decodeURIComponent(m[1]) : null;
   };
   const identity = (req) => { const t = tokenOf(req) || fallbackToken; const a = authenticate(db, t); if (!a) throw new Error('令牌无效或已吊销'); return { userId: a.user_id, role: db.one(`SELECT role FROM users WHERE id=?`, a.user_id)?.role, token: t }; };
+  // 页面用哪种语言出：浏览器上选过的（cookie si_lang）→ 登录的人自己的 → 部署的内容语言
+  const pageLang = (req) => {
+    const c = /(?:^|;\s*)si_lang=([^;]+)/.exec(req.headers.cookie ?? '')?.[1];
+    if (normLang(c)) return normLang(c);
+    const a = authenticate(db, tokenOf(req) || fallbackToken);
+    return a ? userLang(db, a.user_id) : contentLang(db);
+  };
   const cookie = (value, maxAge) => `si_token=${encodeURIComponent(value)}; Path=/; HttpOnly; SameSite=Strict; Max-Age=${maxAge}${secureCookie ? '; Secure' : ''}`;
   const server = createServer(async (req, res) => {
     const url = new URL(req.url, `http://${req.headers.host ?? 'localhost'}`);
     const p = url.pathname;
+    res.__lang = normLang(req.headers['x-si-lang']) ?? contentLang(db);
     const xs = crossSiteReason(req, { host, allowHosts: pub ? [pub.hostname] : [] });
     if (xs) { req.resume(); return json(res, 403, { error: xs }); }
     // 团队模式的总闸：路由之前，/api/* 一律要有效身份
@@ -495,7 +512,7 @@ export function startWeb(db, { home, port = 7357, host = '127.0.0.1', tokenPlain
     }
     try {
       // 不许被别的页面嵌进 iframe（点击劫持：团队模式下页面对内网可见，别的站可以把它叠在一个诱饵按钮下面）
-      if (req.method === 'GET' && p === '/') { res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'x-frame-options': 'DENY', 'content-security-policy': "frame-ancestors 'none'", 'x-content-type-options': 'nosniff', 'referrer-policy': 'no-referrer', 'cache-control': 'no-store' }); return res.end(html); }
+      if (req.method === 'GET' && p === '/') { res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'x-frame-options': 'DENY', 'content-security-policy': "frame-ancestors 'none'", 'x-content-type-options': 'nosniff', 'referrer-policy': 'no-referrer', 'cache-control': 'no-store' }); return res.end(localizeHtml(html, pageLang(req))); }
       if (req.method === 'GET' && p === '/api/session') {
         const a = authenticate(db, tokenOf(req) || fallbackToken);
         // 没登录的新人得知道去找谁要令牌（只写"找本看板的管理员"不够：管理员是谁页面上没有）。只给管理员的显示名，别的一概不给。
@@ -544,7 +561,7 @@ export function startWeb(db, { home, port = 7357, host = '127.0.0.1', tokenPlain
           if (JSON.parse(q.addressed_to || '[]').includes(who) || JSON.parse(q.informed || '[]').includes(who)) touching.add(q.task_id);
         }
         // 可见性：'members' 的项目及其任务，只给管理员与 involvedIn 的人；旧的独立任务一律可见。
-        const projs = projectList(db).filter((pj) => canSeeProject(db, pj.id, who))
+        const projs = projectList(db, res.__lang).filter((pj) => canSeeProject(db, pj.id, who))
           .map((pj) => ({ ...pj, mine: involvedIn(db, pj.id, who), canAdd: canAddTasks(db, pj.id, who) }));
         const seen = new Set(projs.map((pj) => pj.id));
         const mineProj = new Set(projs.filter((pj) => pj.mine).map((pj) => pj.id));
@@ -555,8 +572,17 @@ export function startWeb(db, { home, port = 7357, host = '127.0.0.1', tokenPlain
           runtime: runtimeHealth ? runtimeHealth.current() : null });
       }
       if (req.method === 'GET' && p === '/api/repos') return json(res, 200, { repos: knownRepos(db) });
-      if (req.method === 'GET' && p === '/api/me') { const me = controls.me({ _token: tokenOf(req) }); return json(res, 200, { ...me, canCreate: canCreate(db, me.id).ok, users: listUsers(db) }); }
-      // 待决事项打包摘要：按请求身份现算，跨任务。旁观者也能调，结果是空的（解析器不把旁观者放进收件人）。
+      if (req.method === 'GET' && p === '/api/me') { const me = controls.me({ _token: tokenOf(req) }); return json(res, 200, { ...me, canCreate: canCreate(db, me.id).ok, users: listUsers(db), lang: userLang(db, me.id), ownLang: db.one(`SELECT lang FROM users WHERE id=?`, me.id)?.lang ?? null, contentLang: contentLang(db) }); }
+      // 界面语言（0.2.0）：词表公开（登录页也要用，里面没有秘密）；每人改自己的界面语言，null = 跟随部署的内容语言
+      if (req.method === 'GET' && p === '/api/i18n') { const l = normLang(url.searchParams.get('lang')) ?? res.__lang; return json(res, 200, { lang: l, catalog: CATALOGS[l] ?? {} }); }
+      if (req.method === 'POST' && p === '/api/me/lang') {
+        const me = identity(req); const body = await readBody(req);
+        const l = body.lang == null || body.lang === '' ? null : normLang(body.lang);
+        if (body.lang != null && body.lang !== '' && !l) return json(res, 400, { error: new I18nError('不认识的语言：{lang}', { lang: body.lang }) });
+        db.run(`UPDATE users SET lang=? WHERE id=?`, l, me.userId);
+        return json(res, 200, { ok: true, lang: userLang(db, me.userId), ownLang: l });
+      }
+      // 待决事项打包摘要（A6）：按请求身份现算，跨任务。旁观者也能调，结果是空的（解析器不把旁观者放进收件人）。
       if (req.method === 'GET' && p === '/api/digest') { const me = identity(req); const d = buildDigest(db, { userId: me.userId, daemonAlive: daemon || daemonStatus(home).alive }); return json(res, 200, { ...d, text: renderDigest(d) }); }
       // ── 角色与路由。读：所有人；写：负责人。 ──
       if (req.method === 'GET' && p === '/api/routing') {
@@ -575,14 +601,14 @@ export function startWeb(db, { home, port = 7357, host = '127.0.0.1', tokenPlain
         // 项目的表：该项目的负责人；默认表（不属于项目的任务共用）：任何一个负责人 —— 按项目交接后负责人不止一个。
         if (key ? me.userId !== leadOfKey(db, key) : me.role !== 'lead') return json(res, 403, { error: key ? '只有该项目的负责人能修改其决策路由' : '只有管理员能修改默认决策路由' });
         let result;
-        if (body.action === 'template') result = applyTemplate(db, { key, name: body.name, bindings: body.bindings ?? {}, userId: me.userId });
-        else if (body.action === 'rows') result = saveRules(db, { key, rules: body.rows, template: body.template ?? profileOf(db, key).template, bindings: body.bindings ?? safeJson(profileOf(db, key).bindings) ?? {}, userId: me.userId });
-        else if (body.action === 'validate') result = { errors: validateRules(db, key, body.rows) };
-        else if (body.action === 'owner') result = setKnobs(db, { key, ownership: { [body.type]: [].concat(body.recipients ?? []) }, userId: me.userId });
-        else if (body.action === 'remove') result = setKnobs(db, { key, removeInterveners: [body.userId], userId: me.userId });
+        if (body.action === 'template') result = applyTemplate(db, { key, name: body.name, bindings: body.bindings ?? {}, userId: me.userId, lang: res.__lang });
+        else if (body.action === 'rows') result = saveRules(db, { key, rules: body.rows, template: body.template ?? profileOf(db, key).template, bindings: body.bindings ?? safeJson(profileOf(db, key).bindings) ?? {}, userId: me.userId, lang: res.__lang });
+        else if (body.action === 'validate') result = { errors: validateRules(db, key, body.rows, { lang: res.__lang }) };
+        else if (body.action === 'owner') result = setKnobs(db, { key, ownership: { [body.type]: [].concat(body.recipients ?? []) }, userId: me.userId, lang: res.__lang });
+        else if (body.action === 'remove') result = setKnobs(db, { key, removeInterveners: [body.userId], userId: me.userId, lang: res.__lang });
         else if (body.action === 'duty') { setDutyCalendar(db, { key, users: body.users, startAt: Number(body.startAt), periodDays: Number(body.periodDays ?? 7), userId: me.userId }); result = dutyCalendarOf(db, key); }
         else if (body.action === 'preview') result = previewRouting(db, { key, rules: body.rows ?? rulesOf(db, key) });
-        else return json(res, 400, { error: `不支持的操作：${body.action}` });
+        else return json(res, 400, { error: new I18nError('不支持的操作：{action}', { action: body.action }) });
         return json(res, 200, { ok: true, result });
       }
       // ── 注册表三层：服务商 / 模型 / 绑定。读：所有人（key 只报填没填）；写：负责人。凭证只写 .env，不进库不回显。 ──
@@ -598,7 +624,7 @@ export function startWeb(db, { home, port = 7357, host = '127.0.0.1', tokenPlain
           // 「新项目默认放行」—— 部署级设置，只有管理员能改（与往目录里加源同一个理由）
           if (body.action === 'default') {
             if (me.role !== 'lead') return json(res, 403, { error: '只有管理员能设新项目默认放行哪些源' });
-            if (!egressSources(db).some((x) => x.id === body.id)) return json(res, 400, { error: `联网目录里没有：${body.id}` });
+            if (!egressSources(db).some((x) => x.id === body.id)) return json(res, 400, { error: new I18nError('联网目录里没有：{id}', { id: body.id }) });
             const cur = new Set(getSetting(db, 'deploy.egress_defaults') ?? []);
             if (body.on) cur.add(body.id); else cur.delete(body.id);
             return json(res, 200, { ok: true, result: setSetting(db, { key: 'deploy.egress_defaults', value: [...cur], userId: me.userId }) });
@@ -606,7 +632,7 @@ export function startWeb(db, { home, port = 7357, host = '127.0.0.1', tokenPlain
           const r = body.action === 'remove' ? removeSource(db, { id: body.id, userId: me.userId })
             : addSource(db, { name: body.name, kind: body.kind, hosts: body.hosts, readOnly: body.readOnly ?? null, toolEnv: body.toolEnv ?? {}, note: body.note ?? '', userId: me.userId });
           return json(res, 200, { ok: true, result: r });
-        } catch (e) { return json(res, 400, { error: e.message }); }
+        } catch (e) { return json(res, 400, { error: e }); }
       }
       // 交付凭证：原来只能在服务器上改 .env。与模型 key 同一条规矩：只报"填没填"、写 .env、不进库、不回显。
       if (p === '/api/secrets') {
@@ -622,7 +648,7 @@ export function startWeb(db, { home, port = 7357, host = '127.0.0.1', tokenPlain
           return json(res, 200, { ok: true, result: { GITHUB_TOKEN: r.present } });
         }
       }
-      if (req.method === 'GET' && p === '/api/llm') return json(res, 200, llmView(db, { env }));
+      if (req.method === 'GET' && p === '/api/llm') return json(res, 200, llmView(db, { env, lang: res.__lang }));
       if (req.method === 'POST' && p === '/api/llm') {
         const body = await readBody(req);
         const me = identity(req);
@@ -632,17 +658,17 @@ export function startWeb(db, { home, port = 7357, host = '127.0.0.1', tokenPlain
         if (body.action === 'endpoint_save') result = saveEndpoint(db, { ...pickEndpointFields(body), userId });
         else if (body.action === 'endpoint_enable') result = setEndpointEnabled(db, { id: body.id, enabled: !!body.enabled, userId });
         else if (body.action === 'endpoint_remove') result = removeEndpoint(db, { id: body.id, userId });
-        else if (body.action === 'endpoint_test') result = await testEndpoint(db, { id: body.id, model: body.model || null, env, fetchFn });
+        else if (body.action === 'endpoint_test') result = await testEndpoint(db, { id: body.id, model: body.model || null, env, fetchFn, lang: res.__lang });
         else if (body.action === 'endpoint_models') {
           const e = endpointsOf(db)[body.id];
-          if (!e) return json(res, 400, { error: `服务商不存在：${body.id}` });
-          const r = await listEndpointModels(e, { env, fetchFn });
+          if (!e) return json(res, 400, { error: new I18nError('服务商不存在：{id}', { id: body.id }) });
+          const r = await listEndpointModels(e, { env, fetchFn, lang: res.__lang });
           const cat = catalogOf(db);
           result = { ...r, rows: r.rows.map((m) => ({ ...m, key: `${e.id}/${m.id}`, inCatalog: !!cat[`${e.id}/${m.id}`] })) };
         } else if (body.action === 'key_set') {
           // 值只经这里写进 .env（600），不进库、不进审计正文、不回显；审计只记变量名。
           const e = endpointsOf(db)[body.id];
-          if (!e) return json(res, 400, { error: `服务商不存在：${body.id}` });
+          if (!e) return json(res, 400, { error: new I18nError('服务商不存在：{id}', { id: body.id }) });
           if (!envFile) return json(res, 400, { error: '看板启动时未指定 .env 文件，无法保存 API 密钥' });
           const r = setEnvVar(envFile, e.keyEnv, String(body.value ?? ''), { env });
           audit(db, { actorKind: 'user', actorId: userId, action: 'key_set', targetType: 'endpoint', targetId: e.id, payload: { keyEnv: e.keyEnv, present: r.present } });
@@ -653,18 +679,18 @@ export function startWeb(db, { home, port = 7357, host = '127.0.0.1', tokenPlain
         else if (body.action === 'bind_set') result = setBinding(db, { tier: body.tier, modelKey: body.key, effort: body.effort === undefined ? undefined : (body.effort || null), userId });
         else if (body.action === 'catalog_check') {
           const reg = checkableCatalog(db);
-          const r = await checkCatalog({ catalog: reg.catalog, vendors: reg.vendors, env, fetchFn, probe: !!body.probe, only: body.vendor || null });
-          recordCatalogCheck(db, r, { by: userId, actorKind: 'user' });
+          const r = await checkCatalog({ catalog: reg.catalog, vendors: reg.vendors, env, fetchFn, probe: !!body.probe, only: body.vendor || null, lang: contentLang(db) });
+          recordCatalogCheck(db, r, { by: userId, actorKind: 'user', lang: contentLang(db) });
           result = { warnings: r.warnings, fetchErrors: r.fetchErrors, keys: r.keys };
         }
-        else return json(res, 400, { error: `不支持的操作：${body.action}` });
-        return json(res, 200, { ok: true, result, view: llmView(db, { env }) });
+        else return json(res, 400, { error: new I18nError('不支持的操作：{action}', { action: body.action }) });
+        return json(res, 200, { ok: true, result, view: llmView(db, { env, lang: res.__lang }) });
       }
       // ── 成员。读：所有人（没有令牌明文与通道地址）；写：负责人，本人可以管自己的通道与令牌。 ──
       const usersPayload = (me) => ({ users: usersView(db), settings: settingsView(db), local: authenticate(db, tokenPlain)?.user_id ?? null,
         requests: listHandoverRequests(db, { status: 'open' }).map((r) => ({ ...r, canDecide: canDecideHandover(db, { byUserId: me.userId, scope: r.scope }) })).filter((r) => r.canDecide || r.fromUserId === me.userId).map((r) => {
-          try { const pv = previewHandover(db, { fromUserId: r.fromUserId, toUserId: r.toUserId, scope: r.scope, thenDisable: r.thenDisable, byUserId: me.userId }); return { ...r, text: renderHandover(pv), needsQuorumConfirm: !!pv.needsQuorumConfirm }; }
-          catch (e) { return { ...r, text: null, error: e.message }; }
+          try { const pv = previewHandover(db, { fromUserId: r.fromUserId, toUserId: r.toUserId, scope: r.scope, thenDisable: r.thenDisable, byUserId: me.userId }); return { ...r, text: renderHandover(pv, res.__lang), needsQuorumConfirm: !!pv.needsQuorumConfirm }; }
+          catch (e) { return { ...r, text: null, error: translateError(e, res.__lang) }; }
         }) });
       if (req.method === 'GET' && p === '/api/users') return json(res, 200, usersPayload(identity(req)));
       // 权限一览（只读）：所有成员都能看任何人的 —— 与"所有成员可读全部项目"同一条边界。
@@ -689,10 +715,10 @@ export function startWeb(db, { home, port = 7357, host = '127.0.0.1', tokenPlain
           if (body.userId === authenticate(db, tokenPlain)?.user_id) return json(res, 400, { error: '不能在看板中重新生成本机身份的令牌。请运行 node src/cli.mjs user token <id>，然后重启看板与守护进程' });
           result = reissueToken(db, by);                                                      // 明文同样只出现这一次
         }
-        else if (body.action === 'disable') { try { result = disableUser(db, by); } catch (e) { return json(res, 400, { error: e.message, needsHandover: !!e.needsHandover }); } }
+        else if (body.action === 'disable') { try { result = disableUser(db, by); } catch (e) { return json(res, 400, { error: e, needsHandover: !!e.needsHandover }); } }
         else if (body.action === 'enable') result = enableUser(db, by);
         else if (body.action === 'setting') result = setSetting(db, { key: body.key, value: body.value, userId: me.userId });
-        else return json(res, 400, { error: `不支持的操作：${body.action}` });
+        else return json(res, 400, { error: new I18nError('不支持的操作：{action}', { action: body.action }) });
         return json(res, 200, { ok: true, result, ...usersPayload(me) });
       }
       // 交接：预览（真做一遍再回滚）/ 执行或批准（管理员；项目范围另加该项目负责人）/ 申请（其余人，只能交自己的）/ 撤回（申请人）。权限在 handover.mjs 里判。
@@ -707,13 +733,13 @@ export function startWeb(db, { home, port = 7357, host = '127.0.0.1', tokenPlain
           else { const r = requestHandover(db, o); result = { requestId: r.requestId, changes: r.preview, requested: true }; }
         }
         else if (['approve', 'reject', 'withdraw'].includes(body.action)) { const r = decideHandoverRequest(db, { requestId: body.requestId, decision: body.action, byUserId: me.userId, note: body.note || null, allowQuorumDrop: !!body.allowQuorumDrop }); result = { status: r.status, changes: r.changes }; }
-        else return json(res, 400, { error: `不支持的操作：${body.action}` });
-        if (result.changes) result.text = renderHandover(result.changes);
+        else return json(res, 400, { error: new I18nError('不支持的操作：{action}', { action: body.action }) });
+        if (result.changes) result.text = renderHandover(result.changes, res.__lang);
         if (result.changes && !result.requested && body.action !== 'preview') result.notified = (await sendHandoverNotice(db, { changes: result.changes, env, fetchFn })).sent;
         return json(res, 200, { ok: true, result, ...usersPayload(me) });
       }
       const qm = p.match(/^\/api\/questions\/([^/]+)\/transfer$/);
-      if (qm && req.method === 'POST') { const body = await readBody(req); return json(res, 200, { ok: true, result: controls.transfer({ questionId: qm[1], to: body.to, _token: tokenOf(req) }) }); }
+      if (qm && req.method === 'POST') { const body = await readBody(req); return json(res, 200, { ok: true, result: controls.transfer({ questionId: qm[1], to: body.to, reason: body.reason, _token: tokenOf(req) }) }); }
       // 决定登记：按需拉，不塞进项目列表 —— 列表每次刷新都要走，清单长了不该跟着走一遍。
       const dm = p.match(/^\/api\/projects\/([^/]+)\/decisions$/);
       if (dm && req.method === 'GET') {
@@ -732,18 +758,18 @@ export function startWeb(db, { home, port = 7357, host = '127.0.0.1', tokenPlain
           const n = db.one(`SELECT id, subject, decided_at, decided_by, statement FROM decision_registry WHERE supersedes=?`, d.id);
           return { ...who_(d), supersededBy: n ? { ...n, byName: n.decided_by ? names[n.decided_by] ?? n.decided_by : null } : null };
         };
-        return json(res, 200, { active: active.map(who_), voided: voided.map(withNext), sources: SOURCE_NAMES });
+        return json(res, 200, { active: active.map(who_), voided: voided.map(withNext), sources: sourceNamesOf(res.__lang) });
       }
       // 项目层：列表、从规划文本新建（proposed，守护进程拉规划器）、手动推进、交付。写只经已有入口。
       if (req.method === 'GET' && p === '/api/projects') { let who = null; try { who = identity(req).userId; } catch { /* 同上 */ }
-        return json(res, 200, { projects: projectList(db).filter((pj) => canSeeProject(db, pj.id, who)).map((pj) => ({ ...pj, mine: involvedIn(db, pj.id, who), canAdd: canAddTasks(db, pj.id, who) })), visibilities: VISIBILITIES }); }
+        return json(res, 200, { projects: projectList(db, res.__lang).filter((pj) => canSeeProject(db, pj.id, who)).map((pj) => ({ ...pj, mine: involvedIn(db, pj.id, who), canAdd: canAddTasks(db, pj.id, who) })), visibilities: VISIBILITIES }); }
       if (req.method === 'POST' && p === '/api/projects') {
         const body = await readBody(req);
         const a = authenticate(db, tokenPlain);
         if (!a) return json(res, 400, { error: '看板的本机令牌无效或已吊销；请用命令行重新生成令牌后重启看板' });
         const me = identity(req);
         const cc = canCreate(db, me.userId);
-        if (!cc.ok) return json(res, 403, { error: `无法新建项目：${cc.why}` });
+        if (!cc.ok) return json(res, 403, { error: new I18nError('无法新建项目：{why}', { why: translateError({ message: cc.why }, res.__lang) }) });
         // 新建的唯一入口。目标 + 完成定义必填；plan 给了 = 已写好的规划（规划器切），没给 = 第一个任务从目标起草（追问器）。
         const empty = !!body.empty;
         if (!empty) checkRepoSource(body.source, { required: true });
@@ -758,18 +784,18 @@ export function startWeb(db, { home, port = 7357, host = '127.0.0.1', tokenPlain
         if (!a) return json(res, 400, { error: '看板的本机令牌无效或已吊销；请用命令行重新生成令牌后重启看板' });
         const me = identity(req);
         const owner = db.one(`SELECT owner_id FROM projects WHERE id=?`, pm[1])?.owner_id;
-        if (!owner) return json(res, 404, { error: `项目不存在：${pm[1]}` });
+        if (!owner) return json(res, 404, { error: new I18nError('项目不存在：{id}', { id: pm[1] }) });
         // 添加任务：负责人或被授予的成员（requestAppend 自己查）；其余一律只有负责人。
         if (pm[2] !== 'append' && me.userId !== owner) return json(res, 403, { error: '只有该项目的负责人能执行此操作' });
         if (pm[2] === 'append' && !canAddTasks(db, pm[1], me.userId)) return json(res, 403, { error: '你没有给这个项目添加任务的权限（需要是负责人，或由负责人在项目成员里授予）' });
         // 项目的旋钮 + 后置签收：一律只有负责人（上面那道 403 已经挡住别人了）。
         if (pm[2] === 'setup') {
           try { return json(res, 200, { ok: true, result: setSetupCommands(db, { projectId: pm[1], commands: body.commands ?? '', userId: me.userId }) }); }
-          catch (e) { return json(res, 400, { error: e.message }); }
+          catch (e) { return json(res, 400, { error: e }); }
         }
         if (pm[2] === 'egress') {
           try { return json(res, 200, { ok: true, result: setProjectEgress(db, { projectId: pm[1], sources: Array.isArray(body.sources) ? body.sources : [], userId: me.userId }) }); }
-          catch (e) { return json(res, 400, { error: e.message }); }
+          catch (e) { return json(res, 400, { error: e }); }
         }
         if (['budget', 'verify', 'gear', 'limit', 'signoff_all', 'max_open'].includes(pm[2])) {
           try {
@@ -781,7 +807,7 @@ export function startWeb(db, { home, port = 7357, host = '127.0.0.1', tokenPlain
                     : pm[2] === 'max_open' ? setMaxOpen(db, { projectId: pm[1], n: Number(body.n), userId: me.userId })
                       : acceptDeferredSignoffs(db, { projectId: pm[1], userId: me.userId });
             return json(res, 200, { ok: true, result: r3 });
-          } catch (e) { return json(res, 400, { error: e.message }); }
+          } catch (e) { return json(res, 400, { error: e }); }
         }
         if (['abort', 'redo', 'rename', 'archive', 'append', 'member', 'visibility', 'goal', 'review'].includes(pm[2])) {
           const r2 = pm[2] === 'member' ? (body.remove ? removeMember(db, { projectId: pm[1], userId: body.userId, by: me.userId })
@@ -827,7 +853,7 @@ export function startWeb(db, { home, port = 7357, host = '127.0.0.1', tokenPlain
       // 读接口一律先过可见性。原来只有详情过了，log / report 看不见任务的人也拉得到。
       if (req.method === 'GET' && action) {
         let who = null; try { who = identity(req).userId; } catch { /* 同上 */ }
-        if (!canSeeTask(db, taskId, who)) return json(res, 404, { error: `任务不存在：${taskId}` });
+        if (!canSeeTask(db, taskId, who)) return json(res, 404, { error: new I18nError('任务不存在：{taskId}', { taskId }) });
       }
       // 改动对比（任务口径：接手时的代码 → 任务头）；diff_lines = "展开 N 行未改动"
       // scope：all = 全部（接手时的代码 → 现在）；round = 返工这一轮；node = 某一步（&node=）；不给 = 有返工那一轮就给这一轮
@@ -852,7 +878,7 @@ export function startWeb(db, { home, port = 7357, host = '127.0.0.1', tokenPlain
       if (req.method === 'GET' && !action) {
         let who = null; try { who = identity(req).userId; } catch { /* 无效令牌：详情照常给，can 为空 */ }
         const d = canSeeTask(db, taskId, who) ? taskDetail(db, taskId, { userId: who }) : null;
-        if (!d) return json(res, 404, { error: `任务不存在：${taskId}` });
+        if (!d) return json(res, 404, { error: new I18nError('任务不存在：{taskId}', { taskId }) });
         // schedule：自动运行会不会拉它、拉哪一步、不拉的原因（纯读审计轨，与守护进程同一个判断）。页面据此显示"下一步"。
         const a = assessTask(db, d.task, { isLive: (id) => controls.running(id), hasWorkspace: (id) => existsSync(join(home, 'workspaces', id)) });
         return json(res, 200, { ...d, running: controls.running(taskId), schedule: { due: !!a.due, verb: a.verb ?? null, reason: a.reason ?? null, readyAt: a.readyAt ?? null, attempts: a.attempts ?? null } });
@@ -864,12 +890,12 @@ export function startWeb(db, { home, port = 7357, host = '127.0.0.1', tokenPlain
       }
       if (req.method === 'POST' && action && controls[action] && !['running', 'logTail', 'me'].includes(action)) {
         const body = await readBody(req);
-        const out = await controls[action]({ taskId, ...body, _token: tokenOf(req) });
+        const out = await controls[action]({ taskId, ...body, _token: tokenOf(req), _lang: res.__lang });
         return json(res, 200, { ok: true, result: out });
       }
       return json(res, 404, { error: '接口不存在' });
     } catch (e) {
-      return json(res, 400, { error: e.message });
+      return json(res, 400, { error: e });
     }
   });
   return new Promise((ok) => server.listen(port, host, () => ok({

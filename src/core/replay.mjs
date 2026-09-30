@@ -13,6 +13,8 @@
 // **状态库里有这件事发生过的痕迹，审计轨里找得到对应的记录吗？**
 // 找不到就是一个洞，如实报出来，而不是让它安静地不存在。
 
+import { I18nError } from '../i18n/index.mjs';
+
 const fmtUsd = (micro) => `$${(micro / 1e6).toFixed(6)}`;
 const fmtTs = (ms) => new Date(ms).toISOString().replace('T', ' ').slice(0, 19);
 const j = (s) => { try { return JSON.parse(s || '{}'); } catch { return {}; } };
@@ -23,7 +25,7 @@ const j = (s) => { try { return JSON.parse(s || '{}'); } catch { return {}; } };
  */
 export function replay(db, taskId) {
   const task = db.one(`SELECT * FROM tasks WHERE id=?`, taskId);
-  if (!task) throw new Error(`没有这个任务：${taskId}`);
+  if (!task) throw new I18nError('没有这个任务：{taskId}', { taskId });
   const constitution = db.one(`SELECT * FROM constitutions WHERE task_id=? AND superseded_at IS NULL
                                ORDER BY version DESC LIMIT 1`, taskId);
   const nodes = db.all(`SELECT * FROM nodes WHERE task_id=? ORDER BY rowid`, taskId);

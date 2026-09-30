@@ -9,6 +9,8 @@
 //   ② 新版出来时，系统逐字比对上一版：少了哪个任务、哪条约束 / 规则找不到原文、从"给任务"变成了"已达成"，
 //      写在批准事项的最前面。不经 AI —— 比对本身不能也是一次"重建"。
 
+import { hasMark, markOf } from '../i18n/marks.mjs';
+import { tl } from '../i18n/index.mjs';
 import { answerOf } from './elicitor.mjs';
 
 const norm = (s) => String(s ?? '').replace(/\s+/g, '').replace(/[，。、；;,.!！:："“”'‘’（）()]/g, '').toLowerCase();
@@ -52,25 +54,27 @@ export function diffSpecs(prev, next) {
   return out;
 }
 
-/** 放在批准事项最前面的那一段；没有可说的返回 ''。 */
-export function renderSpecDiff(d, { prevVersion }) {
+/** 放在批准事项最前面的那一段；没有可说的返回 ''。`lang`：内容语言（调用方传 contentLang(db)；默认中文）。 */
+export function renderSpecDiff(d, { prevVersion, lang = 'zh' }) {
   if (!d) return '';
+  const lg = lang;
+  const names = (ts) => ts.map((t) => tl(lg, '「{s}」', { s: t })).join(tl(lg, '、'));
   const L = [];
   if (d.toReached) {
-    L.push(`⚠ 上一版（v${prevVersion}）给出的任务这一版都没有了：${d.droppedTasks.map((t) => `「${t}」`).join('、')} —— AI 这一版改判为"已经达成"。如果你没同意去掉它们：别确认达成，回复写明"还差这些"。`);
+    L.push(tl(lg, '⚠ 上一版（v{prev}）给出的任务这一版都没有了：{tasks} —— AI 这一版改判为"已经达成"。如果你没同意去掉它们：别确认达成，回复写明"还差这些"。', { prev: prevVersion, tasks: names(d.droppedTasks) }));
   } else if (d.fromReached) {
-    L.push(`上一版（v${prevVersion}）判的是"已经达成"；这一版按你的反馈改为给出任务。`);
+    L.push(tl(lg, '上一版（v{prev}）判的是"已经达成"；这一版按你的反馈改为给出任务。', { prev: prevVersion }));
   } else {
-    if (d.droppedTasks.length) L.push(`⚠ 上一版有、这一版没有的任务：${d.droppedTasks.map((t) => `「${t}」`).join('、')}`);
+    if (d.droppedTasks.length) L.push(tl(lg, '⚠ 上一版有、这一版没有的任务：{tasks}', { tasks: names(d.droppedTasks) }));
     if (d.droppedItems.length) {
-      L.push(`⚠ 下面这些上一版的约束 / 规则，这一版里找不到一字不差的原文 —— 可能被删了，也可能只是改了措辞，请核对：`);
-      for (const x of d.droppedItems.slice(0, 12)) L.push(`  - 「${x.task}」的${x.kind}：${x.text}`);
-      if (d.droppedItems.length > 12) L.push(`  - ……另有 ${d.droppedItems.length - 12} 条`);
+      L.push(tl(lg, '⚠ 下面这些上一版的约束 / 规则，这一版里找不到一字不差的原文 —— 可能被删了，也可能只是改了措辞，请核对：'));
+      for (const x of d.droppedItems.slice(0, 12)) L.push(tl(lg, '  - 「{task}」的{kind}：{text}', { task: x.task, kind: x.kind === '约束' ? tl(lg, '约束') : tl(lg, '规则'), text: x.text }));
+      if (d.droppedItems.length > 12) L.push(tl(lg, '  - ……另有 {n} 条', { n: d.droppedItems.length - 12 }));
     }
-    if (d.addedTasks.length) L.push(`新增的任务：${d.addedTasks.map((t) => `「${t}」`).join('、')}`);
+    if (d.addedTasks.length) L.push(tl(lg, '新增的任务：{tasks}', { tasks: names(d.addedTasks) }));
   }
-  if (!L.length) return `【和上一版（v${prevVersion}）比】任务都在，上一版的约束与规则原文都还在（系统逐字比对，不经 AI）。\n\n`;
-  return `【和上一版（v${prevVersion}）比】（系统逐字比对，不经 AI）\n${L.join('\n')}\n\n`;
+  if (!L.length) return `${markOf(lg, 'specDiff', { version: prevVersion })}${tl(lg, '任务都在，上一版的约束与规则原文都还在（系统逐字比对，不经 AI）。')}\n\n`;
+  return `${markOf(lg, 'specDiff', { version: prevVersion })}${tl(lg, '（系统逐字比对，不经 AI）')}\n${L.join('\n')}\n\n`;
 }
 
 /**
@@ -84,7 +88,7 @@ export function roundHistory(db, { carrierId, sinceTs = 0 }) {
   let prevText = null;
   for (const q of qs) {
     const a = answerOf(db, q.id);
-    const isConfirm = String(q.text).startsWith('【先确认一下】');
+    const isConfirm = hasMark(q.text, 'confirm');
     const v = Number(String(q.text).match(/v(\d+)】/)?.[1] ?? NaN);
     if (!isConfirm) { prevText = q.text; rounds.push({ version: Number.isFinite(v) ? v : rounds.length + 1, answers: [] }); }
     if (a && rounds.length) rounds.at(-1).answers.push(String(a.body).trim());

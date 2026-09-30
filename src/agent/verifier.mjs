@@ -11,6 +11,7 @@
 // 出口只有一个 submit_verdict。没给结论 = **打回**，不是放行：验收员挂了不能变成
 // 免检通道（与"schema 校验失败就拒"同一条纪律）。
 
+import { withOutputLang, contentLang } from '../i18n/index.mjs';
 import { runToolLoop } from '../llm/client.mjs';
 import { audit } from '../db/db.mjs';
 import { TOOLS, makeHandlers } from './executor.mjs';
@@ -121,7 +122,7 @@ ${files.map((p) => `- ${p}`).join('\n') || '（工作区不是 git，无法列�
   // （"这是最后一轮，必须给结论"）完全无效 —— 提示词管不住它。护栏要住在模型外：
   // 前 maxIterations-1 轮带只读工具；没结论就用同一份 messages 再起 1 轮，
   // **工具只剩 submit_verdict**，它想读也没得读。这一轮仍不给结论才算打回。
-  const canon = { tier, system: SYSTEM, maxTokens: 4000, effort: 'medium' };
+  const canon = { tier, system: withOutputLang(SYSTEM, contentLang(db)), maxTokens: 4000, effort: 'medium' };
   const readRounds = Math.max(0, maxIterations - 1);
   const loop = await runToolLoop(client, {
     ...canon, tools: [...TOOLS.filter((t) => READ_ONLY.has(t.name)), SUBMIT_VERDICT],

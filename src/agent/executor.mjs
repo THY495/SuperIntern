@@ -10,6 +10,7 @@
 // 它会带着一份假的交接记录污染整条下游链。
 
 import { routeQuestion, decisionTypeOfQuestion, prefixesOf, scopeFilesOf, scopePathsOf } from '../core/routing.mjs';
+import { tl, contentLang } from '../i18n/index.mjs';
 import { writeFileSync, mkdirSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { runToolLoop } from '../llm/client.mjs';
@@ -289,7 +290,7 @@ const VERIFIABLE = new Set(['spec', 'vendor_docs', 'command', 'repo_findings']);
  * "什么都问"。软信号走披露通道，不走阻塞通道。
  */
 const hasCitation = (s = '') => s.length >= 10
-  && /[`\/§]|\.mjs|\.js|\.json|:\d|exit=|PASS|FAIL|第.{1,4}[节条章]|一节|原文|line \d/.test(s);
+  && /[`\/§]|\.mjs|\.js|\.json|:\d|exit=|PASS|FAIL|第.{1,4}[节条章]|一节|原文|line \d|\b(section|clause|chapter) \d|\bverbatim\b|\bquoted?\b/i.test(s);
 
 /**
  * 假设的认识论校验。
@@ -467,18 +468,15 @@ export function persistHandoff(db, { taskId, nodeId, args, narrativeRef }) {
  * 直接 MODULE_NOT_FOUND。它把这一串实测写进了下一条事项，又问了一遍。
  * 一轮白白的往返，起因只是这段话没说**谁**该去发。所以现在明写"这条得由你来发"。
  */
-const SCOPE_NOTE = '\n\n——\n**系统附注（不由模型生成）**：如果这条矛盾的出路是**改契约**（范围 scope / 行为规则 / 验收标准），'
-  + '请注意**在这条事项里答复改不了契约**。执行方仍然受宪法块里那份 scope 的机械校验：照你的授权去做，交接时会被判越界并撤销，'
-  + '于是又回到这条问题上。要真正改，**这条得由你来发**（做这个任务的 AI 只能改代码，改不了自己的契约）：'
-  + '到任务页「发送」，类别选「修正」，写清楚把范围 / 规则改成什么。系统会给出影响评估与计划变更；触及契约的要按路由表批准后才生效。'
-  + '如果不想改契约，就在答复里给一条**在现有范围内可行**的出路。';
+// 按内容语言写（0.2.0）：L = contentLang(db)
+const SCOPE_NOTE = (L) => '\n\n——\n' + tl(L, '**系统附注（不由模型生成）**：如果这条矛盾的出路是**改契约**（范围 scope / 行为规则 / 验收标准），请注意**在这条事项里答复改不了契约**。执行方仍然受宪法块里那份 scope 的机械校验：照你的授权去做，交接时会被判越界并撤销，于是又回到这条问题上。要真正改，**这条得由你来发**（做这个任务的 AI 只能改代码，改不了自己的契约）：到任务页「发送」，类别选「修正」，写清楚把范围 / 规则改成什么。系统会给出影响评估与计划变更；触及契约的要按路由表批准后才生效。如果不想改契约，就在答复里给一条**在现有范围内可行**的出路。');
 
 function recordQuestion(db, { taskId, nodeId, args, narrativeRef, contextTokens }) {
   const id = newId('q');
   const t = now();
   const def = args.level === 3 ? null : (args.default_action ?? null);
   const kind = decisionTypeOfQuestion({ kind: args.kind, text: args.text });
-  if (kind.decisionType === 'structural') args = { ...args, text: `${args.text}${SCOPE_NOTE}` };
+  if (kind.decisionType === 'structural') args = { ...args, text: `${args.text}${SCOPE_NOTE(contentLang(db))}` };
   // 超时链：Ⅰ/Ⅱ 级从提出那一刻起计时；Ⅲ 级 NULL（库层 CHECK 也不许它有）。
   const ttl = timeoutFor(db, taskId, args.level);
   let bid;
@@ -513,10 +511,11 @@ function recordQuestion(db, { taskId, nodeId, args, narrativeRef, contextTokens 
 function recordBriefing(db, { taskId, nodeId, questionId, args, narrativeRef, contextTokens }) {
   const bid = newId('b');
   const t = now();
+  const unfilled = tl(contentLang(db), '（未填写）');
   db.run(`INSERT INTO briefings (id,task_id,node_id,question_id,work_done,blocked_by,plan_after,
             context_tokens,narrative_ref,valid_from,recorded_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
-    bid, taskId, nodeId, questionId, args.work_done ?? '（未填写）', args.blocked_by ?? '（未填写）',
-    args.plan_after_answer ?? '（未填写）', contextTokens ?? null, narrativeRef ?? null, t, t);
+    bid, taskId, nodeId, questionId, args.work_done ?? unfilled, args.blocked_by ?? unfilled,
+    args.plan_after_answer ?? unfilled, contextTokens ?? null, narrativeRef ?? null, t, t);
   insertEdge(db, bid, nodeId, 'about_node', t);
   return bid;
 }
@@ -665,7 +664,7 @@ export async function executeNode(db, {
     const a = outcome.args;
     const last = client.ledger?.at?.(-1);
     const contextTokens = last ? last.inputTokens + last.cacheReadTokens + last.cacheWriteTokens : null;
-    const blockedBy = `联网未放行 \`${a.group}\`（沙箱默认断网）`;
+    const blockedBy = tl(contentLang(db), '联网未放行 `{group}`（沙箱默认断网）', { group: String(a.group) });
     const q = raiseEgressQuestion(db, { taskId, nodeId, group: a.group, why: a.why,
       auditFile: exec?.egress?.auditFile ?? null });
     const briefingId = recordBriefing(db, { taskId, nodeId, questionId: q.questionId, args: {

@@ -20,6 +20,8 @@ import { recordFromRevision, recordReservation } from './decisions.mjs';
 import { normScopePaths } from './project.mjs';
 import { RESOLUTION_HOOKS, revisionSide } from './answers.mjs';
 import { reservationOf } from '../agent/approval.mjs';
+import { tl, contentLang, I18nError } from '../i18n/index.mjs';
+import { markOf } from '../i18n/marks.mjs';
 
 export const DISCARD_THRESHOLD_KEY = 'revision.discard_threshold';
 export const DEFAULT_DISCARD_THRESHOLD = 0.30;   // 确认门，"阈值可配置"
@@ -105,6 +107,8 @@ export function gateOf(db, { taskId, rev, nodes }) {
   const threshold = thresholdOf(db, taskId);
   const floorMicro = floorMicroOf(db, taskId);
 
+  const lang = contentLang(db);
+  const usd = (m, d) => `$${(m / 1e6).toFixed(d)}`;
   const reasons = [];
   // ⚠️ 判空口径从 `Object.keys(patch).length` 换成"真正会被应用的字段有几个"。
   // 前者在补丁是**字符串**时给出它的长度（例如 402），门因此会触发，
@@ -113,21 +117,22 @@ export function gateOf(db, { taskId, rev, nodes }) {
   // 万一漏过来，宁可多问一次人，也不要让一份看不懂的宪法补丁悄悄生效。
   const patched = patchFields(rev.constitution_patch);
   if (patched.length) {
-    reasons.push(`触及宪法层（方案要改 ${patched.join(' / ')}）—— agent 无权自行改宪法块`);
+    reasons.push(tl(lang, '触及宪法层（方案要改 {fields}）—— agent 无权自行改宪法块', { fields: patched.join(' / ') }));
   } else if (rev.constitution_patch) {
-    reasons.push('方案带了 constitution_patch 但形状不对（没有一个字段会被应用）—— '
-      + '这本身就该人来看一眼，不能当成"没填"放过去');
+    reasons.push(tl(lang, '方案带了 constitution_patch 但形状不对（没有一个字段会被应用）—— 这本身就该人来看一眼，不能当成"没填"放过去'));
   }
   // 比例与金额是**与**关系：占比过阈值、且受影响的钱够得上下限，才值得打断一个人。
   const overRatio = ratio > threshold;
   const belowFloor = overRatio && affectedMicro < floorMicro;
   if (overRatio && !belowFloor) {
-    reasons.push(`要重来的已完成工作占比 ${(ratio * 100).toFixed(1)}% > 阈值 ${(threshold * 100).toFixed(0)}%`
-      + `（作废 $${(discardedMicro / 1e6).toFixed(4)} + 重做 $${(redoneMicro / 1e6).toFixed(4)}`
-      + ` / 已完成 $${(doneMicro / 1e6).toFixed(4)}，合计 $${(affectedMicro / 1e6).toFixed(4)} ≥ 下限 $${(floorMicro / 1e6).toFixed(2)}）`);
+    reasons.push(tl(lang, '要重来的已完成工作占比 {ratio}% > 阈值 {threshold}%（作废 {discarded} + 重做 {redone} / 已完成 {done}，合计 {affected} ≥ 下限 {floor}）', {
+      ratio: (ratio * 100).toFixed(1), threshold: (threshold * 100).toFixed(0),
+      discarded: usd(discardedMicro, 4), redone: usd(redoneMicro, 4), done: usd(doneMicro, 4),
+      affected: usd(affectedMicro, 4), floor: usd(floorMicro, 2) }));
   }
   return {
-    gate: reasons.length ? reasons.join('；') : null,
+    lang,   // renderDiff 按它写（服务端 / 命令行拿 gateOf 的结果直接渲染，不用另传语言）
+    gate: reasons.length ? reasons.join(tl(lang, '；')) : null,
     doneMicro, discardedMicro, redoneMicro, affectedMicro, ratio, threshold, floorMicro, belowFloor,
     discardedNodes: discarded.map((n) => ({ id: n.id, title: n.title, microUsd: n.microUsd })),
     redoneNodes: redone.map((n) => ({ id: n.id, title: n.title, microUsd: n.microUsd })),
@@ -149,20 +154,21 @@ export function proposeRevision(db, { taskId, message, rev, nodes }) {
     let questionId = null;
     if (g.gate) {
       questionId = newId('q');
-      const text = `【修正需要你批准】\n\n`
-        + `人发来的修正：\n> ${String(message.body).replace(/\n/g, '\n> ')}\n\n`
-        + `重规划器给出的方案：\n${renderDiff(g, rev)}\n\n`
-        + `为什么要你批：${g.gate}\n\n`
-        + `这条问题由**状态机**生成、强制定为 Ⅲ 级（触及安全边界或宪法层的操作`
-        + `由 harness 定级，不是模型自评）。\n\n`
-        + `请选一条。发给了几个人的，可能要几个人都批才生效 —— 还差谁，看这条事项上方的「待…答复」。负责人在任务页「计划变更」卡片上点批准 / 驳回，就等于在这里答了一次，不用再答：\n`
-        + `(A) 批准：回「A」—— 够数后变更生效，任务接着跑\n`
-        + `(B) 驳回：回「B：理由」—— 计划原样不动，修正记为已处理；要换个改法，再发一条修正\n`
-        + `(C) 先看细节：任务页的「计划变更」卡片（改哪几步、新增哪几步、范围怎么变）\n`
-        + `(D) 批准，但留一句保留意见：回「A」，另起一行写「保留：……」。\n`
-        + `　　**它不挡任何东西**：这份变更照样全部生效，效果与 (A) 一模一样。它只把你那句话留在项目的\n`
-        + `　　约定清单上、标成〔保留意见〕，让下一个碰这一处的人看得到。\n`
-        + `　　要**挡住**里面某一条，只能 (B) 驳回并说清哪一条不要，让它重出一版 —— 这份方案不能只批一半。`;
+      const L = g.lang;
+      const text = `${markOf(L, 'revisionApproval')}\n\n`
+        + `${tl(L, '人发来的修正：')}\n> ${String(message.body).replace(/\n/g, '\n> ')}\n\n`
+        + `${tl(L, '重规划器给出的方案：')}\n${renderDiff(g, rev, L)}\n\n`
+        + `${tl(L, '为什么要你批：{gate}', { gate: g.gate })}\n\n`
+        + tl(L, `这条问题由**状态机**生成、强制定为 Ⅲ 级（触及安全边界或宪法层的操作由 harness 定级，不是模型自评）。
+
+请选一条。发给了几个人的，可能要几个人都批才生效 —— 还差谁，看这条事项上方的「待…答复」。负责人在任务页「计划变更」卡片上点批准 / 驳回，就等于在这里答了一次，不用再答：
+(A) 批准：回「A」—— 够数后变更生效，任务接着跑
+(B) 驳回：回「B：理由」—— 计划原样不动，修正记为已处理；要换个改法，再发一条修正
+(C) 先看细节：任务页的「计划变更」卡片（改哪几步、新增哪几步、范围怎么变）
+(D) 批准，但留一句保留意见：回「A」，另起一行写「保留：……」。
+　　**它不挡任何东西**：这份变更照样全部生效，效果与 (A) 一模一样。它只把你那句话留在项目的
+　　约定清单上、标成〔保留意见〕，让下一个碰这一处的人看得到。
+　　要**挡住**里面某一条，只能 (B) 驳回并说清哪一条不要，让它重出一版 —— 这份方案不能只批一半。`);
       db.run(`INSERT INTO questions (id,task_id,node_id,level,level_source,text,default_action,
                 asked_at,timeout_at,status) VALUES (?,?,NULL,3,'hard_rule',?,NULL,?,NULL,'open')`,
       questionId, taskId, text, t);
@@ -199,8 +205,9 @@ export function proposeRevision(db, { taskId, message, rev, nodes }) {
  */
 export function applyRevision(db, { taskId, revisionId, by = 'auto', userId = null, reservation = null }) {
   const rv = db.one(`SELECT * FROM revisions WHERE id=? AND task_id=?`, revisionId, taskId);
-  if (!rv) throw new Error(`没有这份提案：${revisionId}`);
-  if (rv.status !== 'proposed') throw new Error(`提案 ${revisionId} 状态是 ${rv.status}，不能重复应用`);
+  if (!rv) throw new I18nError('没有这份提案：{id}', { id: revisionId });
+  if (rv.status !== 'proposed') throw new I18nError('提案 {id} 状态是 {status}，不能重复应用', { id: revisionId, status: rv.status });
+  const L = contentLang(db);
 
   const impact = JSON.parse(rv.impact);
   const salvage = new Map(JSON.parse(rv.salvage).map((s) => [s.node_id, s]));
@@ -227,9 +234,9 @@ export function applyRevision(db, { taskId, revisionId, by = 'auto', userId = nu
         const did = newId('d');
         db.run(`INSERT INTO decisions (id,task_id,node_id,summary,rationale,actor_kind,actor_id,layer,
                   valid_from,recorded_at) VALUES (?,?,?,?,?,'agent','replanner','execution',?,?)`,
-        did, taskId, m.node_id, `节点因修正 ${rv.message_id} 作废`,
-        `${m.reason}\n\n产物处置：${s ? `${s.disposition} —— ${s.note}` : '（未完成，无产物）'}\n`
-          + `⚠️ 产物**没有被删除**：git 历史里仍然在，这条记录是为了让人知道那条路径不再算数。`,
+        did, taskId, m.node_id, tl(L, '节点因修正 {msg} 作废', { msg: rv.message_id }),
+        `${m.reason}\n\n${tl(L, '产物处置：{what}', { what: s ? `${s.disposition} —— ${s.note}` : tl(L, '（未完成，无产物）') })}\n`
+          + tl(L, '⚠️ 产物**没有被删除**：git 历史里仍然在，这条记录是为了让人知道那条路径不再算数。'),
         t, t);
         insertEdge(db, did, rv.message_id, 'derived_from', t);
       } else if (m.mark === 'needs_change') {
@@ -290,10 +297,9 @@ export function applyRevision(db, { taskId, revisionId, by = 'auto', userId = nu
       // 人批准的是"改目标"，落库的是"什么都没改"。这条 assert 让它变成一次响亮的失败。
       const fields = patchFields(patch);
       if (!fields.length) {
-        throw new Error(`提案 ${revisionId} 的 constitution_patch 里没有任何会被应用的字段`
-          + `（收到 ${Array.isArray(patch) ? 'array' : typeof patch}）。`
-          + `\n继续下去会把宪法升一版而内容一字未改 —— 那比直接报错坏得多：`
-          + `\n人以为批准的改动生效了，审计轨也说生效了，其实什么都没发生。`);
+        throw new I18nError(`提案 {id} 的 constitution_patch 里没有任何会被应用的字段（收到 {kind}）。
+继续下去会把宪法升一版而内容一字未改 —— 那比直接报错坏得多：
+人以为批准的改动生效了，审计轨也说生效了，其实什么都没发生。`, { id: revisionId, kind: Array.isArray(patch) ? 'array' : typeof patch });
       }
     }
     if (patch && patchFields(patch).length) {
@@ -317,14 +323,14 @@ export function applyRevision(db, { taskId, revisionId, by = 'auto', userId = nu
       const did = newId('d');
       db.run(`INSERT INTO decisions (id,task_id,summary,rationale,actor_kind,actor_id,layer,
                 valid_from,recorded_at) VALUES (?,?,?,?,'user',?,'constitutional',?,?)`,
-      did, taskId, `宪法块修订至 v${cur.version + 1}`,
-      `因修正 ${rv.message_id}：${rv.rationale}`, userId, t, t);
+      did, taskId, tl(L, '宪法块修订至 v{version}', { version: cur.version + 1 }),
+      tl(L, '因修正 {msg}：{why}', { msg: rv.message_id, why: rv.rationale }), userId, t, t);
       insertEdge(db, did, rv.message_id, 'derived_from', t);
     }
 
     db.run(`UPDATE revisions SET status='applied', resolved_at=? WHERE id=?`, t, revisionId);
     closeRevisionQuestion(db, rv, t);
-    markConsumed(db, { taskId, ids: [rv.message_id], why: `已由修正提案 ${revisionId} 处理` });
+    markConsumed(db, { taskId, ids: [rv.message_id], why: tl(L, '已由修正提案 {id} 处理', { id: revisionId }) });
     // 任务从 waiting 解冻的条件是"没有别的问题还开着"，与 recordAnswer 同一条规矩。
     const stillOpen = db.one(`SELECT count(*) AS n FROM questions WHERE task_id=?
                               AND status IN ('open','escalated')`, taskId).n;
@@ -342,7 +348,7 @@ export function applyRevision(db, { taskId, revisionId, by = 'auto', userId = nu
     if (String(reservation ?? '').trim()) {
       try {
         recordReservation(db, { projectId: db.one(`SELECT project_id FROM tasks WHERE id=?`, taskId)?.project_id ?? null,
-          taskId, subject: '批准计划变更时的保留意见', text: reservation, sourceKind: 'revision', sourceId: revisionId, by: userId ?? null, at: t });
+          taskId, subject: tl(L, '批准计划变更时的保留意见'), text: reservation, sourceKind: 'revision', sourceId: revisionId, by: userId ?? null, at: t });
       } catch (e) { audit(db, { actorKind: 'system', action: 'decision_register_failed', targetType: 'task', targetId: taskId, payload: { error: e.message, kind: 'reservation' } }); }
     }
     // 决定登记：变更是人提的、也是人（或沉默默认）放行的，进项目的约定清单。
@@ -362,13 +368,14 @@ export function applyRevision(db, { taskId, revisionId, by = 'auto', userId = nu
 /** 驳回。计划原样不动，但那条修正算处理过了 —— 否则下一轮又会停在同一处。 */
 export function rejectRevision(db, { taskId, revisionId, userId = null, why = '' }) {
   const rv = db.one(`SELECT * FROM revisions WHERE id=? AND task_id=?`, revisionId, taskId);
-  if (!rv) throw new Error(`没有这份提案：${revisionId}`);
-  if (rv.status !== 'proposed') throw new Error(`提案 ${revisionId} 状态是 ${rv.status}`);
+  if (!rv) throw new I18nError('没有这份提案：{id}', { id: revisionId });
+  if (rv.status !== 'proposed') throw new I18nError('提案 {id} 状态是 {status}', { id: revisionId, status: rv.status });
   const t = now();
+  const L = contentLang(db);
   return db.tx(() => {
     db.run(`UPDATE revisions SET status='rejected', resolved_at=? WHERE id=?`, t, revisionId);
     closeRevisionQuestion(db, rv, t);
-    markConsumed(db, { taskId, ids: [rv.message_id], why: `修正提案 ${revisionId} 被驳回` });
+    markConsumed(db, { taskId, ids: [rv.message_id], why: tl(L, '修正提案 {id} 被驳回', { id: revisionId }) });
     const stillOpen = db.one(`SELECT count(*) AS n FROM questions WHERE task_id=?
                               AND status IN ('open','escalated')`, taskId).n;
     // 从 waiting **或 done** 回到 running：修正可以重开一个已完成的任务（编排器那头
@@ -385,22 +392,21 @@ export const pendingRevision = (db, taskId) => db.one(
   `SELECT * FROM revisions WHERE task_id=? AND status='proposed' ORDER BY rowid DESC LIMIT 1`, taskId);
 
 /** 计划 diff 的人类可读形态（"不默默换计划"）。 */
-export function renderDiff(g, rev) {
+export function renderDiff(g, rev, lang = g?.lang ?? 'zh') {
   const L = [];
-  L.push(`影响：无关 ${g.counts.unaffected ?? 0} 个｜需修改 ${g.counts.needs_change ?? 0} 个`
-    + `｜**作废 ${g.counts.obsolete ?? 0} 个**｜新增 ${g.newCount} 个`);
+  const usd = (m, d) => `$${(m / 1e6).toFixed(d)}`;
+  L.push(tl(lang, '影响：无关 {unaffected} 个｜需修改 {needsChange} 个｜**作废 {obsolete} 个**｜新增 {added} 个', {
+    unaffected: g.counts.unaffected ?? 0, needsChange: g.counts.needs_change ?? 0, obsolete: g.counts.obsolete ?? 0, added: g.newCount }));
   if (g.discardedNodes.length || g.redoneNodes.length) {
     // 两类**分开列**：作废是"这活白干了"，重做是"这活要再干一遍"。
     // 花的钱一样，但人该看见的东西不一样 —— 合成一个数就分不出来了。
-    L.push(`受影响的已完成工作（按花费算，这是确认门的口径）：`);
-    for (const n of g.discardedNodes) L.push(`  - [作废] ${n.title}　$${(n.microUsd / 1e6).toFixed(4)}`);
-    for (const n of g.redoneNodes) L.push(`  - [重做] ${n.title}　$${(n.microUsd / 1e6).toFixed(4)}`);
-    L.push(`  作废 $${(g.discardedMicro / 1e6).toFixed(4)} + 重做 $${(g.redoneMicro / 1e6).toFixed(4)}`
-      + ` / 已完成 $${(g.doneMicro / 1e6).toFixed(4)}`
-      + `　= ${(g.ratio * 100).toFixed(1)}%（阈值 ${(g.threshold * 100).toFixed(0)}%`
-      + `，金额下限 $${((g.floorMicro ?? 0) / 1e6).toFixed(2)}）`);
-    if (g.belowFloor) L.push(`  占比过了阈值，但受影响的金额 $${(g.affectedMicro / 1e6).toFixed(4)} 不到下限，`
-      + `按"不值得为这点钱打断人"处理：方案直接生效，这份 diff 就是通知。`);
+    L.push(tl(lang, '受影响的已完成工作（按花费算，这是确认门的口径）：'));
+    for (const n of g.discardedNodes) L.push(`  - ${tl(lang, '[作废] {title}　{usd}', { title: n.title, usd: usd(n.microUsd, 4) })}`);
+    for (const n of g.redoneNodes) L.push(`  - ${tl(lang, '[重做] {title}　{usd}', { title: n.title, usd: usd(n.microUsd, 4) })}`);
+    L.push(`  ${tl(lang, '作废 {discarded} + 重做 {redone} / 已完成 {done}　= {ratio}%（阈值 {threshold}%，金额下限 {floor}）', {
+      discarded: usd(g.discardedMicro, 4), redone: usd(g.redoneMicro, 4), done: usd(g.doneMicro, 4),
+      ratio: (g.ratio * 100).toFixed(1), threshold: (g.threshold * 100).toFixed(0), floor: usd(g.floorMicro ?? 0, 2) })}`);
+    if (g.belowFloor) L.push(`  ${tl(lang, '占比过了阈值，但受影响的金额 {affected} 不到下限，按"不值得为这点钱打断人"处理：方案直接生效，这份 diff 就是通知。', { affected: usd(g.affectedMicro, 4) })}`);
   }
   // 原则是"**不默默换计划**"。若这里只列作废与重做 —— 也就是只列
   // **花过钱**的那部分 —— 打出来的 diff
@@ -411,38 +417,37 @@ export function renderDiff(g, rev) {
   const respecced = (rev.impact ?? [])
     .filter((m) => m.mark === 'needs_change' && g.byId.get(m.node_id)?.status !== 'done');
   if (respecced.length) {
-    L.push(`改了规格的未完成节点（没花过钱，所以不进上面的比例，但计划确实变了）：`);
+    L.push(tl(lang, '改了规格的未完成节点（没花过钱，所以不进上面的比例，但计划确实变了）：'));
     for (const m of respecced) {
       const c = changedMap.get(m.node_id) ?? {};
       const bits = ['title', 'spec', 'acceptance'].filter((k) => c[k]?.trim());
       if (Array.isArray(c.depends_on)) bits.push('depends_on');
-      L.push(`  - ${g.byId.get(m.node_id)?.title ?? m.node_id}　改了 ${bits.join('/') || '（没说改什么）'}`);
+      L.push(`  - ${g.byId.get(m.node_id)?.title ?? m.node_id}　${tl(lang, '改了 {what}', { what: bits.join('/') || tl(lang, '（没说改什么）') })}`);
     }
   }
   const rewired = (rev.changed_nodes ?? []).filter((c) => Array.isArray(c.depends_on));
   if (rewired.length) {
-    L.push(`依赖边重挂 ${rewired.length} 处（旧边 supersede，不删）：`);
+    L.push(tl(lang, '依赖边重挂 {n} 处（旧边 supersede，不删）：', { n: rewired.length }));
     for (const c of rewired) {
-      L.push(`  - ${g.byId.get(c.node_id)?.title ?? c.node_id} → 依赖 `
-        + `${c.depends_on.map((d) => g.byId.get(d)?.title ?? d).join('、') || '（无）'}`);
+      L.push(`  - ${g.byId.get(c.node_id)?.title ?? c.node_id} → `
+        + tl(lang, '依赖 {deps}', { deps: c.depends_on.map((d) => g.byId.get(d)?.title ?? d).join(tl(lang, '、')) || tl(lang, '（无）') }));
     }
   }
   if (g.newCount) {
-    L.push(`新增 ${g.newCount} 个节点：`);
+    L.push(tl(lang, '新增 {n} 个节点：', { n: g.newCount }));
     for (const n of rev.new_nodes ?? []) L.push(`  + ${n.title}`);
   }
   if (g.partialNodes.length) {
-    L.push(`部分抢救 ${g.partialNodes.length} 个 —— **不计入上面的比例**：`
-      + `"留了多少"没法机械判定，算全丢会高估、算没丢会低估，两边都是编数字。自己看：`);
+    L.push(tl(lang, '部分抢救 {n} 个 —— **不计入上面的比例**："留了多少"没法机械判定，算全丢会高估、算没丢会低估，两边都是编数字。自己看：', { n: g.partialNodes.length }));
     for (const n of g.partialNodes) L.push(`  - ${n.title}`);
   }
   if (rev.constitution_patch && Object.keys(rev.constitution_patch).length) {
-    L.push(`**宪法块改动**（这是要你批的主要理由）：`);
+    L.push(tl(lang, '**宪法块改动**（这是要你批的主要理由）：'));
     for (const [k, v] of Object.entries(rev.constitution_patch)) {
-      L.push(`  ${k}：${typeof v === 'string' ? v.slice(0, 300) : JSON.stringify(v).slice(0, 300)}`);
+      L.push(`  ${tl(lang, '{field}：{value}', { field: k, value: typeof v === 'string' ? v.slice(0, 300) : JSON.stringify(v).slice(0, 300) })}`);
     }
   }
-  L.push(`理由：${rev.rationale}`);
+  L.push(tl(lang, '理由：{why}', { why: rev.rationale }));
   return L.join('\n');
 }
 
@@ -490,7 +495,7 @@ function closeRevisionQuestion(db, rv, t) {
       applyRevision(db, { taskId: rv.task_id, revisionId: rv.id, by: 'user', userId: ctx.by, reservation: reservationOf(ctx.finalBody) });
       return { revision: 'applied', revisionId: rv.id };
     }
-    const why = String(ctx.finalBody ?? '').replace(/^\s*[（(]?\s*(B|驳回)\s*[)）]?[\s：:，,。.、]*/i, '').trim() || '在事项里驳回（未写理由）';
+    const why = String(ctx.finalBody ?? '').replace(/^\s*[（(]?\s*(B|驳回|reject(?:ed)?)\s*[)）]?[\s：:，,。.、]*/i, '').trim() || tl(contentLang(db), '在事项里驳回（未写理由）');
     rejectRevision(db, { taskId: rv.task_id, revisionId: rv.id, userId: ctx.by, why });
     return { revision: 'rejected', revisionId: rv.id };
   };

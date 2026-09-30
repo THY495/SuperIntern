@@ -5,6 +5,7 @@
 // 递归 CTE / WAL）已全部验过够用。代价是启动打一行 ExperimentalWarning。
 // 整个驱动面被这一个文件包住，真要换只改这里。
 
+import { N_ } from '../i18n/index.mjs';
 import { DatabaseSync } from 'node:sqlite';
 import { randomUUID, randomBytes, createHash } from 'node:crypto';
 import { readFileSync, mkdirSync } from 'node:fs';
@@ -545,13 +546,14 @@ const MIGRATIONS = [
       removed_at  INTEGER
     )`);
     const t = Date.now();
+    // 名称 / 说明是数据（入库后可改），N_ 只为登记给目录：看板显示时 T(name) 能翻出内置源的英文，用户自己加的原样
     const seed = raw.prepare(`INSERT INTO egress_sources (id,name,kind,hosts,read_only,tool_env,note,builtin,created_at) VALUES (?,?,'package',?,0,'{}',?,1,?)`);
     for (const [id, name, hosts, note] of [
-      ['npm', 'npm 官方源', ['registry.npmjs.org'], 'npm install 用'],
-      ['pypi', 'PyPI 官方源', ['pypi.org', 'files.pythonhosted.org'], 'pip install 用：元数据与下载分属两个域，缺一个会在下载阶段失败'],
-      ['github', 'GitHub', ['github.com', 'api.github.com', 'codeload.github.com', 'objects.githubusercontent.com', 'raw.githubusercontent.com'], 'git clone、API、源码包与原始文件'],
-      ['crates', 'crates.io', ['crates.io', 'static.crates.io', 'index.crates.io'], 'Rust / cargo 用'],
-      ['goproxy', 'Go 模块代理', ['proxy.golang.org', 'sum.golang.org'], 'go mod download 用'],
+      ['npm', N_('npm 官方源'), ['registry.npmjs.org'], N_('npm install 用')],
+      ['pypi', N_('PyPI 官方源'), ['pypi.org', 'files.pythonhosted.org'], N_('pip install 用：元数据与下载分属两个域，缺一个会在下载阶段失败')],
+      ['github', 'GitHub', ['github.com', 'api.github.com', 'codeload.github.com', 'objects.githubusercontent.com', 'raw.githubusercontent.com'], N_('git clone、API、源码包与原始文件')],
+      ['crates', 'crates.io', ['crates.io', 'static.crates.io', 'index.crates.io'], N_('Rust / cargo 用')],
+      ['goproxy', N_('Go 模块代理'), ['proxy.golang.org', 'sum.golang.org'], N_('go mod download 用')],
     ]) seed.run(id, name, JSON.stringify(hosts), note, t);
     const rows = raw.prepare(`SELECT t.project_id AS pid, p.value AS v FROM params p JOIN tasks t ON t.id=p.task_id
                               WHERE p.key='egress.groups' AND p.superseded_at IS NULL AND t.project_id IS NOT NULL`).all();
@@ -590,6 +592,9 @@ const MIGRATIONS = [
       raw.exec('COMMIT');
     } catch (e) { raw.exec('ROLLBACK'); throw e; }
   },
+  // v21 → v22（0.2.0 多语言）：每人的界面语言。NULL = 跟随部署的内容语言（设置 deploy.content_lang）。
+  // 先看列在不在：测试会把新库的版本号拨回去重跑某一段迁移，已有的列再加一次会报 duplicate column。
+  (raw) => { if (!raw.prepare(`SELECT 1 FROM pragma_table_info('users') WHERE name='lang'`).get()) raw.exec(`ALTER TABLE users ADD COLUMN lang TEXT CHECK (lang IS NULL OR lang IN ('zh','en'))`); },
 ];
 
 /**

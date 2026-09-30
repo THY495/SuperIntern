@@ -26,6 +26,8 @@
 // 没做（有意）：模型写整批契约的项目规划器（`project new --file` 由人给 JSON，等于"整批批一次"）；任务 done 后的重规划
 // （目前没有证据说它常被需要，留位）；并行任务。
 
+import { hasMark, markOf } from '../i18n/marks.mjs';
+import { tl, contentLang, I18nError } from '../i18n/index.mjs';
 import { applyEgressDefaults } from './egress.mjs';
 import { existsSync, mkdirSync, mkdtempSync, rmSync, readFileSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
@@ -41,12 +43,12 @@ import { setLimit } from './limits.mjs';
 import { getParam, setParam } from './params.mjs';
 import { recordFromContract, recordGoalChange } from './decisions.mjs';
 import { budgetState, raiseProjectBudget, projectVerifyCommand, deferredSignoffs, maxOpenOf, effectiveSetupOf, runSetupCommands } from './project-settings.mjs';
-import { routeQuestion, prefixesOfScope, filesOfScope, prefixesOfPaths, filesOfPaths, scopePathProblems, normScopePaths, renderScopePaths, SCOPE_PATHS_NOTE } from './routing.mjs';
+import { routeQuestion, prefixesOfScope, filesOfScope, prefixesOfPaths, filesOfPaths, scopePathProblems, normScopePaths, renderScopePaths, SCOPE_PATHS_NOTE, scopePathsNote } from './routing.mjs';
 import { waitingOnHuman } from './addressee.mjs';
 import { RESOLUTION_HOOKS } from './answers.mjs';
 export { validateRules, renderRules, normalizeQuote };
 // 结构化范围的三个纯函数住在 routing.mjs（scope 那一族的家，且是叶子：elicitor 也要用，从这里取会成环）。
-export { scopePathProblems, normScopePaths, renderScopePaths, SCOPE_PATHS_NOTE };
+export { scopePathProblems, normScopePaths, renderScopePaths, SCOPE_PATHS_NOTE, scopePathsNote };
 
 const gitEnv = (cwd, env, ...args) => execFileSync('git', args, {
   cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 120_000, env,
@@ -125,10 +127,10 @@ function validateDeps(tasks, { startOrder = 1, existing = [] }) {
   return errs;
 }
 /** 依赖一行：给人看的。`order` = 本任务编号，`startOrder` = 本草案第一个任务的编号。 */
-export function renderDeps(t, order, startOrder) {
+export function renderDeps(t, order, startOrder, lang = 'zh') {
   const d = Array.isArray(t.depends_on) ? t.depends_on : (order > startOrder || order > 1 ? [order - 1] : []);
-  const s = d.length ? d.map((n) => `#${n}`).join('、') : '无（不等其他任务）';
-  return s + (Array.isArray(t.blocks) && t.blocks.length ? `；并让 ${t.blocks.map((n) => `#${n}`).join('、')} 等本任务完成后再开工` : '');
+  const s = d.length ? d.map((n) => `#${n}`).join(tl(lang, '、')) : tl(lang, '无（不等其他任务）');
+  return s + (Array.isArray(t.blocks) && t.blocks.length ? tl(lang, '；并让 {list} 等本任务完成后再开工', { list: t.blocks.map((n) => `#${n}`).join(tl(lang, '、')) }) : '');
 }
 
 /**
@@ -189,14 +191,14 @@ export function scopeOverlaps(spec, { startAt = 1 } = {}) {
  * 预警那一段的正文。**做成带动作的问句，不是一行灰字** —— 批准页已经是注意力过载的页面，
  * 而"摆在那儿但没要求做什么"的提示会被整段略过。
  */
-export function renderScopeOverlaps(pairs) {
+export function renderScopeOverlaps(pairs, lang = 'zh') {
   if (!pairs?.length) return null;
-  const L = [`⚠ 范围重叠（机械检查，零模型）：下面 ${pairs.length} 对任务在依赖图上互不可达 —— 按上面那条调度规则，它们**可能同时开着**，而它们声明要动同一处。`];
-  for (const p of pairs) L.push(`  - #${p.a}「${p.aTitle}」与 #${p.b}「${p.bTitle}」都声明要动：${p.where.join('、')}`);
-  L.push('  同时改同一处 = 合并时大概率冲突，而解冲突要回头问你取哪一侧。要不要现在就处理？**在反馈里回一句就行**：');
-  L.push(`    · 「把 #${pairs[0].b} 对 ${pairs[0].where[0]} 的改动并进 #${pairs[0].a}」—— 让一个任务负责那一处（最常用）`);
-  L.push(`    · 「#${pairs[0].b} 依赖 #${pairs[0].a}」—— 排成先后，就不会同时开着（代价：不能让路了）`);
-  L.push('    · 「知道了，就这样」—— 接受这个风险；真撞上了会按冲突那条路来问你取哪一侧');
+  const L = [tl(lang, '⚠ 范围重叠（机械检查，零模型）：下面 {n} 对任务在依赖图上互不可达 —— 按上面那条调度规则，它们**可能同时开着**，而它们声明要动同一处。', { n: pairs.length })];
+  for (const p of pairs) L.push(tl(lang, '  - #{a}「{aTitle}」与 #{b}「{bTitle}」都声明要动：{where}', { a: p.a, aTitle: p.aTitle, b: p.b, bTitle: p.bTitle, where: p.where.join(tl(lang, '、')) }));
+  L.push(tl(lang, '  同时改同一处 = 合并时大概率冲突，而解冲突要回头问你取哪一侧。要不要现在就处理？**在反馈里回一句就行**：'));
+  L.push(tl(lang, '    · 「把 #{b} 对 {where} 的改动并进 #{a}」—— 让一个任务负责那一处（最常用）', { b: pairs[0].b, where: pairs[0].where[0], a: pairs[0].a }));
+  L.push(tl(lang, '    · 「#{b} 依赖 #{a}」—— 排成先后，就不会同时开着（代价：不能让路了）', { b: pairs[0].b, a: pairs[0].a }));
+  L.push(tl(lang, '    · 「知道了，就这样」—— 接受这个风险；真撞上了会按冲突那条路来问你取哪一侧'));
   return L.join('\n');
 }
 
@@ -230,7 +232,7 @@ export function createTaskFromSpec(db, spec, { userId, projectId = null, order =
     if (projectId && batch !== null) param('task.batch', batch);
     db.run(`INSERT INTO constitutions (id,task_id,version,goal,scope,scope_paths,definition_of_done,constraints,valid_from,recorded_at)
             VALUES (?,?,1,?,?,?,?,?,?,?)`,
-      constId, taskId, spec.goal, spec.scope ?? '未限定', JSON.stringify(normScopePaths(spec.scope_paths)), dod, JSON.stringify(spec.constraints ?? []), t, t);
+      constId, taskId, spec.goal, spec.scope ?? tl(contentLang(db), '未限定'),JSON.stringify(normScopePaths(spec.scope_paths)), dod, JSON.stringify(spec.constraints ?? []), t, t);
     audit(db, { actorKind: 'user', actorId: userId, action: 'task_created', targetType: 'task', targetId: taskId,
       payload: { title: spec.title, constitution: constId, ...(projectId ? { projectId, order } : {}) } });
     // 决定登记：契约是人批准过的，逐条进项目的约定清单（每条行为规则、范围、验收命令）。
@@ -255,13 +257,13 @@ export function initProjectRepo({ home, projectId, source, base = null, empty = 
   mkdirSync(dir, { recursive: true });
   // 从零开始（复现实验 / 新项目）：空仓库 + 一个空提交，后面"基线 = HEAD"、ff 合并、交付都照常成立。
   if (empty) {
-    if (source) throw new Error('--empty 与 --source 只能给一个');
+    if (source) throw new I18nError('--empty 与 --source 只能给一个');
     mkdirSync(repo, { recursive: true });
     git(repo, 'init', '-q', '-b', branch);
     git(repo, '-c', 'user.name=superintern', '-c', 'user.email=superintern@local', 'commit', '-q', '--allow-empty', '-m', `init: ${projectId}`);
     return { repo, branch, baseRef: git(repo, 'rev-parse', 'HEAD'), source: null };
   }
-  if (!source) throw new Error('要给 --source（项目仓库：本机路径或 URL）或 --empty（从零开始）');
+  if (!source) throw new I18nError('要给 --source（项目仓库：本机路径或 URL）或 --empty（从零开始）');
   const src = existsSync(source) ? resolve(source) : source;
   // 克隆 / 检出失败不留半截目录（新建项目时当场克隆，路径或 URL 不对是常见的人为错误）。
   try {
@@ -270,7 +272,7 @@ export function initProjectRepo({ home, projectId, source, base = null, empty = 
     git(repo, 'checkout', '-q', '-b', branch);
   } catch (e) {
     try { rmSync(dir, { recursive: true, force: true }); } catch { /* 尽力 */ }
-    throw new Error(`仓库克隆失败：${String(e.stderr ?? e.message).trim().split('\n').at(-1)}`);
+    throw new I18nError('仓库克隆失败：{detail}', { detail: String(e.stderr ?? e.message).trim().split('\n').at(-1) });
   }
   return { repo, branch, baseRef: git(repo, 'rev-parse', 'HEAD'), source: String(source) };
 }
@@ -318,7 +320,7 @@ export function chainGraph(db, projectId, { home = null } = {}) {
 
 export function createProject(db, { userId, spec, source, home, base = null }) {
   const errs = validateProjectSpec(spec);
-  if (errs.length) throw new Error(`项目 JSON 不合规：\n  - ${errs.join('\n  - ')}`);
+  if (errs.length) throw new I18nError('项目 JSON 不合规：\n  - {errs}', { errs: errs.join('\n  - ') });
   const projectId = newId('pj');
   const { repo, branch, baseRef } = initProjectRepo({ home, projectId, source, base });
   const t = now();
@@ -400,8 +402,9 @@ function startTask(db, { project, task, tasks, home }) {
  */
 export async function advanceProject(db, { projectId, home, userId = null, makeExec = null, onEvent = () => {} }) {
   const p = db.one(`SELECT * FROM projects WHERE id=?`, projectId);
-  if (!p) throw new Error(`没有这个项目：${projectId}`);
+  if (!p) throw new I18nError('没有这个项目：{id}', { id: projectId });
   if (p.status !== 'active') return { advanced: false, reason: `status:${p.status}` };
+  const L = contentLang(db);
   // 预算闸：撞闸之后**不再开新任务**。正在跑的那个不掐 —— 它会在自己的下一轮体检停下来
   // （走 checkLimits 同一条路），半路 kill 容器留下的是一个说不清状态的工作区，比超支几分钱贵。
   // 合并与"项目达成"照常：那两步不花钱，而且撞闸时把已完成的东西卡在半路才是真的损失。
@@ -450,7 +453,7 @@ export async function advanceProject(db, { projectId, home, userId = null, makeE
       // 人回了 C（先放着）。项目不是完成，也不是失败 —— 它在等人：添加任务、或中止。
       db.run(`UPDATE projects SET status='stalled' WHERE id=?`, projectId);
       audit(db, { actorKind: 'system', action: 'project_stalled', targetType: 'project', targetId: projectId,
-        payload: { why: '复盘被搁置：全部任务已合并，但没有宣布达成。项目等人：添加任务 / 宣布达成 / 中止项目' } });
+        payload: { why: tl(L, '复盘被搁置：全部任务已合并，但没有宣布达成。项目等人：添加任务 / 宣布达成 / 中止项目') } });
       return { advanced: true, reason: 'review_abandoned' };
     }
     // 还有排着队的需求就先做它们：复盘要回答"还差什么"，人明确提了的那几条不该让规划器再猜一遍。
@@ -485,12 +488,12 @@ export async function advanceProject(db, { projectId, home, userId = null, makeE
     if (stage && stage !== 'approved' && sch.tasks.length === 1) {
       db.run(`UPDATE projects SET status='aborted' WHERE id=?`, projectId);
       audit(db, { actorKind: 'system', action: 'project_aborted', targetType: 'project', targetId: projectId,
-        payload: { taskId: blocker.id, why: '唯一的任务在草案阶段被放弃' } });
+        payload: { taskId: blocker.id, why: tl(L, '唯一的任务在草案阶段被放弃') } });
       return { advanced: true, reason: 'draft_abandoned', taskId: blocker.id };
     }
     db.run(`UPDATE projects SET status='stalled' WHERE id=?`, projectId);
     audit(db, { actorKind: 'system', action: 'project_stalled', targetType: 'project', targetId: projectId,
-      payload: { taskId: blocker.id, aborted: sch.aborted.map((t) => t.id), why: '剩下的任务都被已中止的任务卡住；项目等人：恢复 / 重做该任务，或中止项目' } });
+      payload: { taskId: blocker.id, aborted: sch.aborted.map((t) => t.id), why: tl(L, '剩下的任务都被已中止的任务卡住；项目等人：恢复 / 重做该任务，或中止项目') } });
     return { advanced: true, reason: 'task_aborted', taskId: blocker.id };
   }
   // 集成（原语是 merge）：并发之后，后完成的那个的分支不再是项目分支的快进。
@@ -532,7 +535,7 @@ export async function advanceProject(db, { projectId, home, userId = null, makeE
       if (open) return { advanced: false, reason: 'waiting:dirty_workspace', taskId: cur.id, questionId: open.questionId };
       // 只给文件名的话，人看不出 tickets.db 是新生成的还是仓库里本来就有的 —— 写"都不要"之前得知道这个。
       const how = new Map((() => { try { return describeChanges(wsDir); } catch { return []; } })().map((c) => [c.path, c.how]));
-      const q = raiseDirtyWorkspace(db, { taskId: cur.id, files: rest.map((f) => (how.get(f) ? `${f}（${how.get(f)}）` : f)) });
+      const q = raiseDirtyWorkspace(db, { taskId: cur.id, files: rest.map((f) => (how.get(f) ? tl(L, '{file}（{how}）', { file: f, how: how.get(f) }) : f)) });
       return { advanced: true, reason: 'dirty_workspace', taskId: cur.id, questionId: q.questionId, files: rest };
     }
   }
@@ -543,7 +546,7 @@ export async function advanceProject(db, { projectId, home, userId = null, makeE
     try {
       git(p.repo, 'merge', '--ff-only', d.branch);
     } catch (e) {
-      throw new Error(`项目分支 ${p.branch} 无法快进到 ${d.branch}（${String(e.stderr ?? e.message).trim().split('\n').at(-1)}）—— 任务分支不是从项目分支当前头起的？`);
+      throw new I18nError('项目分支 {branch} 无法快进到 {taskBranch}（{detail}）—— 任务分支不是从项目分支当前头起的？', { branch: p.branch, taskBranch: d.branch, detail: String(e.stderr ?? e.message).trim().split('\n').at(-1) });
     }
   } catch (e) {
     e.taskId = cur.id;   // 守护进程挂"推进反复失败"事项时要知道挂在哪个任务上
@@ -610,23 +613,23 @@ export function deliveryEvidence(db, { projectId }) {
  */
 export async function deliverProject(db, { projectId, remote, pr = false, base = null, token = process.env.GITHUB_TOKEN, fetchFn = globalThis.fetch, userId = null, acceptDeferred = false }) {
   const p = db.one(`SELECT * FROM projects WHERE id=?`, projectId);
-  if (!p) throw new Error(`没有这个项目：${projectId}`);
+  if (!p) throw new I18nError('没有这个项目：{id}', { id: projectId });
+  const L = contentLang(db);
   const allTasks = projectTasks(db, projectId);
   const mergedTasks = allTasks.filter((t) => t.merged_at);
   const partial = p.status === 'aborted';
   if (p.status !== 'done' && !(partial && mergedTasks.length)) {
-    throw new Error(partial ? '项目已中止且没有任何已合并的任务，没有可交付的内容' : `项目状态是 ${p.status}，只交付已完成的项目，或已中止但有已合并任务的项目`);
+    throw (partial ? new I18nError('项目已中止且没有任何已合并的任务，没有可交付的内容') : new I18nError('项目状态是 {status}，只交付已完成的项目，或已中止但有已合并任务的项目', { status: p.status }));
   }
-  if (!remote) throw new Error('要给 --remote <url>：项目分支推到哪里。不默认取源仓库 —— 那可能是别人的仓库');
+  if (!remote) throw new I18nError('要给 --remote <url>：项目分支推到哪里。不默认取源仓库 —— 那可能是别人的仓库');
   // 后置签收：自动挡下 AI 自己加的任务是"验收过了就合并、签收攒着"。攒到这里必须清掉 ——
   // **交付是爆炸半径的真正边界**，草案里那句"交付永远要人点"，具体就是这一下。
   // 清掉的方式是显式的 acceptDeferred，不是看见有就自动过：一次点掉 N 个任务是一次真实的决定，
   // 要人在知道 N 是几、都是哪些的前提下做。
   const deferred = deferredSignoffs(db, projectId);
   if (deferred.length && !acceptDeferred) {
-    throw new Error(`还有 ${deferred.length} 个任务的签收被后置了（自动挡下 AI 自己加的）：`
-      + `${deferred.map((t) => `#${t.project_order}「${t.title}」`).join('、')}。`
-      + `交付前要一次签掉：命令行加 --accept-pending，或先 node src/cli.mjs project signoff ${projectId} --accept-all`);
+    throw new I18nError('还有 {n} 个任务的签收被后置了（自动挡下 AI 自己加的）：{list}。交付前要一次签掉：命令行加 --accept-pending，或先 node src/cli.mjs project signoff {id} --accept-all',
+      { n: deferred.length, list: deferred.map((t) => `#${t.project_order}「${t.title}」`).join('、'), id: projectId });
   }
   if (deferred.length) acceptDeferredSignoffs(db, { projectId, userId, tasks: deferred });
   const gh = parseGithub(remote);
@@ -649,20 +652,20 @@ export async function deliverProject(db, { projectId, remote, pr = false, base =
   const head = git(p.repo, 'rev-parse', p.branch);
   out.head = head;
   if (pr) {
-    if (!gh) out.prSkipped = `远端不是 GitHub（${remote}），已推送，未创建 PR`;
-    else if (!token) out.prSkipped = '未设置 GITHUB_TOKEN：已推送，未创建 PR。在 .env 中设置后重新交付即可';
+    if (!gh) out.prSkipped = tl(L, '远端不是 GitHub（{remote}），已推送，未创建 PR', { remote });
+    else if (!token) out.prSkipped = tl(L, '未设置 GITHUB_TOKEN：已推送，未创建 PR。在 .env 中设置后重新交付即可');
     else {
       const tasks = mergedTasks;
-      const lines = tasks.map((t) => { const r = finalReport(db, t.id); return `${t.project_order}. **${t.title}**（\`${t.id}\`）\n   ${r.summary}`; });
+      const lines = tasks.map((t) => { const r = finalReport(db, t.id); return tl(L, '{order}. **{title}**（`{id}`）\n   {summary}', { order: t.project_order, title: t.title, id: t.id, summary: r.summary }); });
       const baseBranch = base ?? await defaultBranch(gh, token, fetchFn);
       const res = await fetchFn(`https://api.github.com/repos/${gh.owner}/${gh.repo}/pulls`, {
         method: 'POST',
         headers: { authorization: `Bearer ${token}`, accept: 'application/vnd.github+json', 'content-type': 'application/json', 'user-agent': 'superintern' },
         body: JSON.stringify({ title: p.title, head: p.branch, base: baseBranch,
-          body: `${partial ? `> 项目已中止：本次只交付已签收并合并的第 1–${mergedTasks.length} 个任务（共 ${allTasks.length} 个）。\n\n` : ''}${p.brief ? `${p.brief}\n\n` : ''}## 任务\n\n${lines.join('\n')}\n\n---\n由 SuperIntern 交付：项目 \`${projectId}\`，分支 \`${p.branch}\` @ ${head.slice(0, 8)}。摘要取自各任务真相源里的终版汇报。` }),
+          body: `${partial ? tl(L, '> 项目已中止：本次只交付已签收并合并的第 1–{merged} 个任务（共 {total} 个）。\n\n', { merged: mergedTasks.length, total: allTasks.length }) : ''}${p.brief ? `${p.brief}\n\n` : ''}${tl(L, '## 任务')}\n\n${lines.join('\n')}\n\n---\n${tl(L, '由 SuperIntern 交付：项目 `{id}`，分支 `{branch}` @ {head}。摘要取自各任务真相源里的终版汇报。', { id: projectId, branch: p.branch, head: head.slice(0, 8) })}` }),
       });
       const json = await res.json().catch(() => ({}));
-      if (!res.ok) throw new Error(`开 PR 失败：HTTP ${res.status} ${JSON.stringify(json).slice(0, 300)}`);
+      if (!res.ok) throw new I18nError('开 PR 失败：HTTP {status} {body}', { status: res.status, body: JSON.stringify(json).slice(0, 300) });
       out.pr = { url: json.html_url, number: json.number, base: baseBranch };
     }
   }
@@ -674,7 +677,7 @@ async function defaultBranch(gh, token, fetchFn) {
   const res = await fetchFn(`https://api.github.com/repos/${gh.owner}/${gh.repo}`, {
     headers: { authorization: `Bearer ${token}`, accept: 'application/vnd.github+json', 'user-agent': 'superintern' } });
   const json = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(`读仓库信息失败：HTTP ${res.status} ${JSON.stringify(json).slice(0, 200)}`);
+  if (!res.ok) throw new I18nError('读仓库信息失败：HTTP {status} {body}', { status: res.status, body: JSON.stringify(json).slice(0, 200) });
   return json.default_branch ?? 'main';
 }
 
@@ -693,13 +696,14 @@ async function defaultBranch(gh, token, fetchFn) {
 
 export async function runProjectVerify(db, { projectId, home, makeExec = null, onEvent = () => {} }) {
   const p = db.one(`SELECT * FROM projects WHERE id=?`, projectId);
-  if (!p) throw new Error(`没有这个项目：${projectId}`);
+  if (!p) throw new I18nError('没有这个项目：{id}', { id: projectId });
+  const L = contentLang(db);
   const argv = projectVerifyCommand(db, projectId);
   // 没填不是失败，是"没有机械核实这一说"——ok 为 null，调用方据此决定文案（"人宣布的"而不是"验过的"）。
   if (!argv) return { ok: null, skipped: true, why: 'no_command' };
   const carrier = db.one(`SELECT id FROM tasks WHERE project_id=? AND project_order=0`, projectId)
     ?? db.one(`SELECT id FROM tasks WHERE project_id=? ORDER BY project_order DESC LIMIT 1`, projectId);
-  if (!carrier) return { ok: false, argv, code: null, tail: '项目里没有任何任务，无处建验收工作区', timedOut: false };
+  if (!carrier) return { ok: false, argv, code: null, tail: tl(L, '项目里没有任何任务，无处建验收工作区'), timedOut: false };
   const dir = join(home, 'verify', projectId);
   const t0 = now();
   let exec = null;
@@ -721,35 +725,36 @@ export async function runProjectVerify(db, { projectId, home, makeExec = null, o
     // 人填了用人填的；没填就按这份干净克隆里的依赖清单自动识别
     const { argvs: setupArgvs, source: setupSource } = effectiveSetupOf(db, projectId, dir);
     if (setupArgvs.length) {
-      const su = await runSetupCommands(exec, dir, setupArgvs);
+      const su = await runSetupCommands(exec, dir, setupArgvs, contentLang(db));
       audit(db, { actorKind: 'system', action: su.ok ? 'env_setup_done' : 'env_setup_failed', targetType: 'project', targetId: projectId,
         payload: { for: 'project_verify', source: setupSource, results: su.results.map((x) => ({ cmd: x.argv.join(' '), code: x.code, timedOut: x.timedOut, tail: x.tail.slice(-600) })) } });
       if (!su.ok) {
         const bad = su.results.at(-1);
         const r = { ok: false, argv, code: bad.code, timedOut: bad.timedOut, head: ws.head, setupFailed: true,
-          tail: `环境准备命令失败，验收命令没有跑：\n$ ${bad.argv.join(' ')}\n${bad.tail}` };
+          tail: `${tl(L, '环境准备命令失败，验收命令没有跑：')}\n$ ${bad.argv.join(' ')}\n${bad.tail}` };
         audit(db, { actorKind: 'system', action: 'project_verified', targetType: 'project', targetId: projectId,
           payload: { ok: false, argv, code: bad.code, timedOut: bad.timedOut, head: ws.head, tail: r.tail, setupFailed: true, elapsedMs: now() - t0 } });
         return r;
       }
     }
     const out = await exec.execute({ file: argv[0], args: argv.slice(1) }, dir, { mode: 'write', timeoutMs: 600_000 });
-    // 原来只留最后 40 行。曾出现过：尾部恰好是五条配置自检（MAX_PAGE_SIZE 等于 50、
-    // package.json 的 type 是 module…），负责人看不到另外那几十条测的是啥 —— 项目真正会出幺蛾子的
-    // 分页边界与渲染正确性，一条都没露出来。**任何固定切片都答不了"测的是不是要紧的东西"**，
+    // 原来只留最后 40 行。例：负责人展开一看，尾部恰好是五条配置自检
+    // （MAX_PAGE_SIZE 等于 50、package.json 的 type 是 module…），于是问：
+    // 「39 条里另外 34 条测的是啥，它没给我看」——而那个项目真正会出问题的分页边界与
+    // 渲染正确性，一条都没露出来。**任何固定切片都答不了"测的是不是要紧的东西"**，
     // 所以这里做两件事：留多一点（最后 120 行），以及在正文里如实说这是"最后 N 行，不是全部"。
     // 不做的：解析 TAP 去挑失败用例 —— 验收命令是任意一条命令，按某种输出格式去猜就是
     // 又一处"同一段启发式喂给两个判断"的坑。
     const lines = (out.stdout + out.stderr).trim().split('\n');
     const kept = lines.slice(-120);
-    const tail = (kept.length < lines.length ? `（输出共 ${lines.length} 行，这里是最后 ${kept.length} 行，不是全部）\n` : '') + kept.join('\n');
+    const tail = (kept.length < lines.length ? `${tl(L, '（输出共 {total} 行，这里是最后 {kept} 行，不是全部）', { total: lines.length, kept: kept.length })}\n` : '') + kept.join('\n');
     const ok = out.code === 0 && !out.timedOut;
-    // **在同一个容器、同一份代码上，把每个已合并任务自己的验收命令也各跑一遍。**
+    // 另一半：**在同一个容器、同一份代码上，把每个已合并任务自己的验收命令也各跑一遍。**
     //
-    // 负责人点交付前真正想问的是："另外那些测试测的是啥？"
-    // 上面的输出尾巴只能回答"这里是最后 120 行，不是全部"—— 那是**说清楚它不证明什么**，
-    // 答不了他真正问的。这一半答得了，而且**精确、零启发式**：每个任务自己那条命令的退出码，
-    // 按任务列出来。不解析任何输出格式。
+    // 起因是上面那句「39 条里另外 34 条测的是啥，它没给我看」。
+    // 上半截只能回答"这里是最后 120 行，不是全部"—— 那是**说清楚它不证明什么**，
+    // 答不了真正问的。这一半答得了，而且**精确、零启发式**：每个任务自己那条命令的退出码，
+    // 按任务列出来。不解析任何输出格式（理由同上）。
     //
     // ⚠️ 它是**证据，不是闸门**：`ok` 仍然只由项目级验收命令决定。
     // 某个任务自己的命令在这里挂了，说明项目级那条没覆盖到它 —— 那是要摆给人看的事实，
@@ -766,7 +771,7 @@ export async function runProjectVerify(db, { projectId, home, makeExec = null, o
     // "验收命令没能跑起来"与"验收命令跑过了"之间的距离，正是这道闸门存在的全部理由。
     audit(db, { actorKind: 'system', action: 'project_verify_error', targetType: 'project', targetId: projectId,
       payload: { argv, error: String(e.message).slice(0, 400) } });
-    return { ok: false, argv, code: null, timedOut: false, tail: `验收没能跑起来：${String(e.message).slice(0, 400)}` };
+    return { ok: false, argv, code: null, timedOut: false, tail: tl(L, '验收没能跑起来：{error}', { error: String(e.message).slice(0, 400) }) };
   } finally {
     try { await disposeExec(exec); } catch { /* 清理失败不改结论 */ }
   }
@@ -810,15 +815,16 @@ export function raiseProjectVerifyFailed(db, { projectId, carrierId = null, resu
   const host = carrierId ?? db.one(`SELECT id FROM tasks WHERE project_id=? ORDER BY COALESCE(project_order,0) DESC LIMIT 1`, projectId)?.id;
   const t = now();
   const id = newId('q');
-  const text = `【项目验收没过】项目「${p?.title ?? projectId}」的全部任务都已合并，你也确认了达成，但项目级验收命令没过。\n\n`
-    + `命令：${result.argv.join(' ')}（在项目分支的一个干净克隆里跑）\n`
-    + `退出码：${result.code === null ? '（没跑起来）' : result.code}${result.timedOut ? '（超时）' : ''}\n\n`
-    + `输出尾部：\n${result.tail || '（空）'}\n\n`
-    + `项目**没有**转为已完成。这条事项是系统按规则直接生成的，没有经过 AI。\n\n`
-    + `请选一条：\n`
-    + `(A) 加一个任务把它修好：到项目页「添加任务」，把上面的输出尾部贴进去（在这条里回复不会替你加任务）；新任务合并之后系统会再复盘、再跑这条验收\n`
-    + `(B) 验收命令本身不对：到「项目设置 → 自动化」改项目级验收命令，然后回这条「再跑一次」—— 系统用新命令重新验收，过了就宣布完成\n`
-    + `(C) 这条验收不该拦：到「项目设置 → 自动化」清空项目级验收命令，然后回「再跑一次」（清空后"达成"就完全由人宣布，没有机械核实）`;
+  const L = contentLang(db);
+  const text = `${markOf(L, 'projectVerifyFailed')}${tl(L, '项目「{title}」的全部任务都已合并，你也确认了达成，但项目级验收命令没过。', { title: p?.title ?? projectId })}\n\n`
+    + `${tl(L, '命令：{cmd}（在项目分支的一个干净克隆里跑）', { cmd: result.argv.join(' ') })}\n`
+    + `${tl(L, '退出码：')}${result.code === null ? tl(L, '（没跑起来）') : result.code}${result.timedOut ? tl(L, '（超时）') : ''}\n\n`
+    + `${tl(L, '输出尾部：')}\n${result.tail || tl(L, '（空）')}\n\n`
+    + `${tl(L, '项目**没有**转为已完成。这条事项是系统按规则直接生成的，没有经过 AI。')}\n\n`
+    + `${tl(L, '请选一条：')}\n`
+    + `${tl(L, '(A) 加一个任务把它修好：到项目页「添加任务」，把上面的输出尾部贴进去（在这条里回复不会替你加任务）；新任务合并之后系统会再复盘、再跑这条验收')}\n`
+    + `${tl(L, '(B) 验收命令本身不对：到「项目设置 → 自动化」改项目级验收命令，然后回这条「再跑一次」—— 系统用新命令重新验收，过了就宣布完成')}\n`
+    + tl(L, '(C) 这条验收不该拦：到「项目设置 → 自动化」清空项目级验收命令，然后回「再跑一次」（清空后"达成"就完全由人宣布，没有机械核实）');
   return db.tx(() => {
     db.run(`INSERT INTO questions (id,task_id,node_id,level,level_source,text,default_action,asked_at,timeout_at,status)
             VALUES (?,?,NULL,3,'hard_rule',?,NULL,?,NULL,'open')`, id, host, text, t);
@@ -837,7 +843,7 @@ export function raiseProjectVerifyFailed(db, { projectId, carrierId = null, resu
 export function acceptDeferredSignoffs(db, { projectId, userId, tasks = null }) {
   const list = tasks ?? deferredSignoffs(db, projectId);
   if (!list.length) return { accepted: 0, tasks: [] };
-  if (!userId) throw new Error('批量签收要说明是谁签的');
+  if (!userId) throw new I18nError('批量签收要说明是谁签的');
   return db.tx(() => {
     for (const t of list) {
       setParam(db, { taskId: t.id, key: 'signoff.status', value: 'accepted', by: { kind: 'user', id: userId }, governance: 'constitutional' });
@@ -914,6 +920,8 @@ function conflictHunks(wsDir, files) {
 }
 
 export const SIDE_NAME = { ours: '这个任务这一侧', theirs: '项目分支那一侧' };
+/** 按内容语言写出那一侧的名字（写进库里的文字用它；SIDE_NAME 是中文原文）。 */
+const sideName = (lang, side) => (side === 'ours' ? tl(lang, '这个任务这一侧') : side === 'theirs' ? tl(lang, '项目分支那一侧') : SIDE_NAME[side]);
 
 /**
  * 按人选定的一侧，机械地解掉这一趟合并的全部冲突。**零模型、零判断**：
@@ -988,9 +996,10 @@ function alreadyIntegrated(wsDir, projectRepo, branch) {
  */
 export async function integrateProjectBranch(db, { project, task, home, makeExec = null, onEvent = () => {} }) {
   const wsDir = join(home, 'workspaces', task.id);
-  if (!existsSync(wsDir)) return { kind: 'error', why: '工作区不在了，没法集成' };
+  const L = contentLang(db);
+  if (!existsSync(wsDir)) return { kind: 'error', why: tl(L, '工作区不在了，没法集成') };
   const { ff, target, error } = alreadyIntegrated(wsDir, project.repo, project.branch);
-  if (error) return { kind: 'error', why: `取项目分支失败：${error}` };
+  if (error) return { kind: 'error', why: tl(L, '取项目分支失败：{error}', { error }) };
   if (ff) return { kind: 'ff', target };
 
   const before = git(wsDir, 'rev-parse', 'HEAD');
@@ -998,7 +1007,7 @@ export async function integrateProjectBranch(db, { project, task, home, makeExec
   let resolved = null;
   try {
     git(wsDir, '-c', 'user.name=superintern', '-c', 'user.email=superintern@local',
-      'merge', '--no-edit', '-m', `集成项目分支 ${String(target).slice(0, 8)}`, target);
+      'merge', '--no-edit', '-m', tl(L, '集成项目分支 {head}', { head: String(target).slice(0, 8) }), target);
   } catch (e) {
     const msg = String(e.stderr ?? e.message ?? '').trim().split('\n').slice(-12).join('\n');
     let files = [];
@@ -1024,7 +1033,7 @@ export async function integrateProjectBranch(db, { project, task, home, makeExec
         payload: { projectId: project.id, onto: target, files, hunks: String(hunks).slice(0, 400), message: msg.slice(0, 600),
           resolveError, triedSide: resolveError ? pick.side : null } });
       return { kind: 'conflict', target, files, hunks,
-        tail: resolveError ? `${msg}\n\n（按你选的「${SIDE_NAME[pick.side]}」机械解冲突没成功：${resolveError}）` : msg };
+        tail: resolveError ? `${msg}\n\n${tl(L, '（按你选的「{side}」机械解冲突没成功：{error}）', { side: sideName(L, pick.side), error: resolveError })}` : msg };
     }
     setParam(db, { taskId: task.id, key: 'task.integrate_resolution', value: null, by: { kind: 'agent', id: 'project' }, governance: 'execution' });
     audit(db, { actorKind: 'system', action: 'project_task_conflict_resolved', targetType: 'task', targetId: task.id,
@@ -1046,13 +1055,13 @@ export async function integrateProjectBranch(db, { project, task, home, makeExec
   if (JSON.stringify(extra) !== JSON.stringify(getParam(db, task.id, 'task.verify_extra') ?? [])) {
     setParam(db, { taskId: task.id, key: 'task.verify_extra', value: extra, by: { kind: 'user', id: project.owner_id }, governance: 'constitutional' });
     audit(db, { actorKind: 'system', action: 'project_task_regression_refreshed', targetType: 'task', targetId: task.id,
-      payload: { projectId: project.id, onto: target, commands: extra.length, why: '集成之后按此刻已合并的任务重算回归义务' } });
+      payload: { projectId: project.id, onto: target, commands: extra.length, why: tl(L, '集成之后按此刻已合并的任务重算回归义务') } });
   }
   const argvs = [...(Array.isArray(own) && own.length ? [own] : []), ...extra].filter((a) => Array.isArray(a) && a.length);
   if (!argvs.length) {
     // 没有任何机械验收可跑（老任务）。集成本身成功了就放行，并如实记一笔：这一次合并没有机械证据。
     audit(db, { actorKind: 'system', action: 'project_task_integrate_unverified', targetType: 'task', targetId: task.id,
-      payload: { projectId: project.id, onto: target, why: '这个任务没有验收命令，集成后无从重跑' } });
+      payload: { projectId: project.id, onto: target, why: tl(L, '这个任务没有验收命令，集成后无从重跑') } });
     return { kind: 'integrated', target, head: after, verified: false, ran: 0, resolved };
   }
   try {
@@ -1076,7 +1085,7 @@ export async function integrateProjectBranch(db, { project, task, home, makeExec
     // 跑不起来（没有容器运行时、镜像缺失）**算不过** —— 与项目级验收同一条道理。
     audit(db, { actorKind: 'system', action: 'project_task_integrate_verify_failed', targetType: 'task', targetId: task.id,
       payload: { projectId: project.id, onto: target, error: String(e.message).slice(0, 400) } });
-    return { kind: 'verify_failed', target, head: after, code: null, tail: `集成后的重跑没能跑起来：${String(e.message).slice(0, 400)}` };
+    return { kind: 'verify_failed', target, head: after, code: null, tail: tl(L, '集成后的重跑没能跑起来：{error}', { error: String(e.message).slice(0, 400) }) };
   }
   audit(db, { actorKind: 'system', action: 'project_task_integrate_verified', targetType: 'task', targetId: task.id,
     payload: { projectId: project.id, onto: target, head: after, ran: argvs.length } });
@@ -1126,18 +1135,19 @@ function signerOf(db, taskId) {
 export function mergeChainOf(db, project) {
   const rows = db.all(`SELECT payload FROM audit_log WHERE action='project_task_merged' AND target_id=? ORDER BY id`, project.id);
   const tasks = [];
+  const L = contentLang(db);
   let prev = project.base_ref, broken = null;
   for (const r of rows) {
     let pl = {};
     try { pl = JSON.parse(r.payload || '{}'); } catch { continue; }
     if (!pl.head) continue;
     try { git(project.repo, 'merge-base', '--is-ancestor', prev, pl.head); }
-    catch { broken = `#${pl.order ?? '?'} 合并时记下的头接不上前一个（老项目或手工改过）`; break; }
+    catch { broken = tl(L, '#{order} 合并时记下的头接不上前一个（老项目或手工改过）', { order: pl.order ?? '?' }); break; }
     let files = [], commits = null;
     try {
       files = git(project.repo, 'diff', '--name-only', `${prev}..${pl.head}`).split('\n').filter(Boolean);
       commits = Number(git(project.repo, 'rev-list', '--count', '--no-merges', `${prev}..${pl.head}`)) || 0;
-    } catch { broken = `读不到 #${pl.order ?? '?'} 那一段的提交`; break; }
+    } catch { broken = tl(L, '读不到 #{order} 那一段的提交', { order: pl.order ?? '?' }); break; }
     const task = db.one(`SELECT title, project_order FROM tasks WHERE id=?`, pl.taskId);
     tasks.push({ taskId: pl.taskId, order: task?.project_order ?? pl.order ?? null, title: task?.title ?? pl.taskId,
       signer: signerOf(db, pl.taskId), from: prev, head: pl.head, files, commits });
@@ -1150,7 +1160,7 @@ export function mergeChainOf(db, project) {
       const head = git(project.repo, 'rev-parse', project.branch);
       if (head !== prev) {
         // 连带谁提交的、写了什么（只给一条 git log 命令的话，等于把"安不安全"整个甩给人去查）
-        const log = git(project.repo, 'log', '--no-merges', '--format=%h %an：%s', '-n', '5', `${prev}..${head}`).split('\n').filter(Boolean);
+        const log = git(project.repo, 'log', '--no-merges', `--format=${tl(L, '%h %an：%s')}`, '-n', '5', `${prev}..${head}`).split('\n').filter(Boolean);
         tail = { from: prev, head, commits: Number(git(project.repo, 'rev-list', '--count', '--no-merges', `${prev}..${head}`)) || 0, log };
       }
     } catch { /* 分支读不到：交付页上面那一段已经会说 */ }
@@ -1161,12 +1171,14 @@ export function mergeChainOf(db, project) {
 function theirSideOwners(db, { project, files }) {
   const want = new Set(files);
   const hits = [];
+  const L = contentLang(db);
   for (const t of mergeChainOf(db, project).tasks) {
     const inter = t.files.filter((f) => want.has(f));
     if (!inter.length) continue;
-    hits.push(`任务 #${t.order ?? '?'}「${t.title}」（${inter.join('、')}${t.signer ? `，由${t.signer}签收` : ''}）`);
+    hits.push(tl(L, '任务 #{order}「{title}」（{files}{signer}）', { order: t.order ?? '?', title: t.title, files: inter.join(tl(L, '、')),
+      signer: t.signer ? tl(L, '，由{name}签收', { name: t.signer }) : '' }));
   }
-  return hits.length ? hits.join('；') : '项目分支上已经合并、已经各自签过收的那些任务（算不出具体是哪一个）';
+  return hits.length ? hits.join(tl(L, '；')) : tl(L, '项目分支上已经合并、已经各自签过收的那些任务（算不出具体是哪一个）');
 }
 
 /**
@@ -1188,39 +1200,41 @@ export function raiseIntegrateBlocked(db, { project, task, result }) {
   const head = String(result.target ?? '').slice(0, 8);
   const theirs = conflict ? theirSideOwners(db, { project, files: result.files ?? [] }) : '';
   const mineSigner = signerOf(db, task.id);
-  const text = `【结构矛盾】任务 #${task.project_order}「${task.title}」合不进项目分支：${conflict ? '合并有冲突' : '合并之后重跑验收没过'}。\n\n`
-    + `原因：这个任务开工之后，项目分支上又合并了别的任务（现在是 ${head}）。系统已经机械地把项目分支合进它的分支`
-    + (conflict ? `，但有冲突，已回滚到合并前的状态：\n冲突文件：${(result.files ?? []).join('、') || '（拿不到清单）'}\n`
-      + (result.hunks ? `\n撞在一起的是这几行：\n${result.hunks}\n` : '')
+  const L = contentLang(db);
+  const order = task.project_order;
+  const text = `${markOf(L, 'structural')}${tl(L, '任务 #{order}「{title}」合不进项目分支：{why}。', { order, title: task.title, why: conflict ? tl(L, '合并有冲突') : tl(L, '合并之后重跑验收没过') })}\n\n`
+    + tl(L, '原因：这个任务开工之后，项目分支上又合并了别的任务（现在是 {head}）。系统已经机械地把项目分支合进它的分支', { head })
+    + (conflict ? `${tl(L, '，但有冲突，已回滚到合并前的状态：')}\n${tl(L, '冲突文件：')}${(result.files ?? []).join(tl(L, '、')) || tl(L, '（拿不到清单）')}\n`
+      + (result.hunks ? `\n${tl(L, '撞在一起的是这几行：')}\n${result.hunks}\n` : '')
       // **署名恰恰是判断的全部依据**。两侧各是谁的活、谁签过字，机器手里全有。
-      + `\n两侧分别是谁的：\n`
-      // 「我这侧」的"我"容易被读者当成他自己，而不是那个任务。
+      + `\n${tl(L, '两侧分别是谁的：')}\n`
+      // 「我这侧」这类说法里的"我"容易被读成读者自己，而不是那个任务。
       // 这个误读会直接把 A/B 选反 —— 全事项里最不能含糊的就是这一处，所以两侧一律按名字叫。
-      + `　　**任务 #${task.project_order} 这一侧**（\`<<<<<<< HEAD\` 那一段）= 「${task.title}」${mineSigner ? `，由${mineSigner}签收` : '，还没有人签收过'}\n`
-      + `　　**项目分支这一侧**（\`>>>>>>> ${head}…\` 那一段）= ${theirs}\n`
-      : `并重跑了它的验收命令与全部回归义务，其中一条没过：\n命令：${(result.argv ?? []).join(' ') || '（没能跑起来）'}${result.regression ? '（这是回归义务里的，不是它自己那条）' : ''}\n退出码：${result.code === null ? '（没跑起来）' : result.code}${result.timedOut ? '（超时）' : ''}\n`)
+      + `${tl(L, '　　**任务 #{order} 这一侧**（`<<<<<<< HEAD` 那一段）= 「{title}」', { order, title: task.title })}${mineSigner ? tl(L, '，由{name}签收', { name: mineSigner }) : tl(L, '，还没有人签收过')}\n`
+      + `${tl(L, '　　**项目分支这一侧**（`>>>>>>> {head}…` 那一段）= {owners}', { head, owners: theirs })}\n`
+      : `${tl(L, '并重跑了它的验收命令与全部回归义务，其中一条没过：')}\n${tl(L, '命令：')}${(result.argv ?? []).join(' ') || tl(L, '（没能跑起来）')}${result.regression ? tl(L, '（这是回归义务里的，不是它自己那条）') : ''}\n${tl(L, '退出码：')}${result.code === null ? tl(L, '（没跑起来）') : result.code}${result.timedOut ? tl(L, '（超时）') : ''}\n`)
     // 尾巴是空的就整段不给 —— 一个空的「输出尾部：」看起来像是这一页坏了。
-    + (String(result.tail ?? '').trim() ? `\n输出尾部：\n${String(result.tail).split('\n').slice(-20).join('\n')}\n\n` : '\n')
-    + `任务没有合并，产物原样留着；项目分支不前进就不会再试一次。本事项由系统直接生成，未调用模型。\n\n`
+    + (String(result.tail ?? '').trim() ? `\n${tl(L, '输出尾部：')}\n${String(result.tail).split('\n').slice(-20).join('\n')}\n\n` : '\n')
+    + `${tl(L, '任务没有合并，产物原样留着；项目分支不前进就不会再试一次。本事项由系统直接生成，未调用模型。')}\n\n`
     // 冲突的答案空间是**封闭的三选一**，系统永远不让 agent 决定合并后长什么样。
     // 先例：answers.mjs 里"签收的答案空间是封闭的：接受 / 打回"，以及会签的 附议/弃权/重申。
     // 曾经有第四条"打回让它自己改"，它曾烧掉一整轮（人看懂了冲突却没法把结论表达成一侧），
     // 换成 merge 之后正确答案基本都落在某一侧上，那条出路的价值没了、代价还在。
     + (conflict
-      ? `请选一条（答复里写 A、B 或 C 就行）：\n`
-      + `(A) **取任务 #${task.project_order} 这一侧** —— 冲突的每一处都按它的写法定。系统会重做一次合并、只在冲突处取这一侧\n`
-      + `　　（同一个文件里没冲突的部分照常合并，不受影响），然后重跑它自己的验收命令与全部回归义务。\n`
-      + `(B) **取项目分支这一侧** —— 冲突的每一处都按项目分支上已有的写法定。其余同 (A)。\n`
-      + `(C) **两边都不对** —— 系统不动手。出路是在项目页加一个任务去修这一处，或者中止这个任务（都得你自己去点）。\n\n`
-      + `⚠ 选 A 或 B 之后，合并出来的是一份**谁都还没签过字的新状态**，所以会重新找你签收一次；\n`
-      + `　那一次只给你看这一轮真正变了什么，集成带进来的别人的产物会单独列出来、不混在里面。\n`
-      + `⚠ 重跑验收拦得住"合起来跑不起来"，**拦不住这一侧在语义上选错了** —— A/B 是一次取舍，不是一道审批。\n`
-      + `⚠ 粒度是"全部冲突文件一起取一侧"，没有逐块挑。如果两处冲突要往不同方向定，那就是 (C)。`
-      : `请选一条：\n`
-      + `(A) 让它自己改：**直接在下面写下要它怎么改**。你写的那段会原样当成打回理由发给它，\n`
-      + `　　任务重新开工，改完再签收 —— 和手敲 node src/cli.mjs signoff ${task.id} --reject "…" 是同一条路，不用再去敲命令。\n`
-      + `(B) 先看清楚：到任务页看「改动」「活动」和「日志」，看完再回来选\n`
-      + `(C) 这个任务不要了：在项目页中止它（它的下游会跟着停，项目会转停滞等你处理）。这一步不可逆，答复里写"中止"不算数，得你自己去点。`);
+      ? `${tl(L, '请选一条（答复里写 A、B 或 C 就行）：')}\n`
+      + `${tl(L, '(A) **取任务 #{order} 这一侧** —— 冲突的每一处都按它的写法定。系统会重做一次合并、只在冲突处取这一侧', { order })}\n`
+      + `${tl(L, '　　（同一个文件里没冲突的部分照常合并，不受影响），然后重跑它自己的验收命令与全部回归义务。')}\n`
+      + `${tl(L, '(B) **取项目分支这一侧** —— 冲突的每一处都按项目分支上已有的写法定。其余同 (A)。')}\n`
+      + `${tl(L, '(C) **两边都不对** —— 系统不动手。出路是在项目页加一个任务去修这一处，或者中止这个任务（都得你自己去点）。')}\n\n`
+      + `${tl(L, '⚠ 选 A 或 B 之后，合并出来的是一份**谁都还没签过字的新状态**，所以会重新找你签收一次；')}\n`
+      + `${tl(L, '　那一次只给你看这一轮真正变了什么，集成带进来的别人的产物会单独列出来、不混在里面。')}\n`
+      + `${tl(L, '⚠ 重跑验收拦得住"合起来跑不起来"，**拦不住这一侧在语义上选错了** —— A/B 是一次取舍，不是一道审批。')}\n`
+      + tl(L, '⚠ 粒度是"全部冲突文件一起取一侧"，没有逐块挑。如果两处冲突要往不同方向定，那就是 (C)。')
+      : `${tl(L, '请选一条：')}\n`
+      + `${tl(L, '(A) 让它自己改：**直接在下面写下要它怎么改**。你写的那段会原样当成打回理由发给它，')}\n`
+      + `${tl(L, '　　任务重新开工，改完再签收 —— 和手敲 node src/cli.mjs signoff {id} --reject "…" 是同一条路，不用再去敲命令。', { id: task.id })}\n`
+      + `${tl(L, '(B) 先看清楚：到任务页看「改动」「活动」和「日志」，看完再回来选')}\n`
+      + tl(L, '(C) 这个任务不要了：在项目页中止它（它的下游会跟着停，项目会转停滞等你处理）。这一步不可逆，答复里写"中止"不算数，得你自己去点。'));
   return db.tx(() => {
     db.run(`INSERT INTO questions (id,task_id,node_id,level,level_source,text,default_action,asked_at,timeout_at,status)
             VALUES (?,?,NULL,3,'hard_rule',?,NULL,?,NULL,'open')`, id, task.id, text, t);
@@ -1264,12 +1278,12 @@ RESOLUTION_HOOKS.structural = (db, o) => projectVerifyHook(db, o) ?? structuralH
  * 项目放回 active：advanceProject 下一拍走 allMerged → 复盘停在 reached → 按当前的验收命令再跑（清空了就直接宣布）。
  */
 function projectVerifyHook(db, { question, finalBody, by, at }) {
-  if (!String(question.text ?? '').startsWith('【项目验收没过】')) return null;
+  if (!hasMark(question.text, 'projectVerifyFailed')) return null;
   const pid = db.one(`SELECT project_id FROM tasks WHERE id=?`, question.task_id)?.project_id;
   if (!pid) return null;
   if (!/^\s*(再跑一次|再跑|重跑|重新验收|再试一次|再试|retry)/i.test(String(finalBody ?? ''))) {
     audit(db, { actorKind: 'user', actorId: by, action: 'project_verify_answer_noted', targetType: 'project', targetId: pid,
-      payload: { questionId: question.id, why: '答复不是"再跑一次"：加任务要到项目页「添加任务」，改 / 清验收命令要到项目设置', body: String(finalBody ?? '').slice(0, 200) } });
+      payload: { questionId: question.id, why: tl(contentLang(db), '答复不是"再跑一次"：加任务要到项目页「添加任务」，改 / 清验收命令要到项目设置'), body: String(finalBody ?? '').slice(0, 200) } });
     return { handled: false };
   }
   db.run(`UPDATE projects SET status='active' WHERE id=? AND status='stalled'`, pid);
@@ -1284,6 +1298,7 @@ function structuralHook(db, { question, finalBody, by, messageId, at }) {
   const blocked = getParam(db, taskId, 'task.rebase_blocked');
   if (!blocked || blocked.questionId !== question.id) return null;   // 别的结构矛盾照旧，不插手
   const body = String(finalBody ?? '').trim();
+  const L = contentLang(db);
   // ── 冲突那一档：答案空间是封闭的三选一 ───────────────────────────────────────
   // 系统只记下"取哪一侧"，真正的合并在下一拍由 integrateProjectBranch 机械执行 ——
   // 这样解冲突、重跑验收、写审计全都还在那条唯一的路上，不在这里另起一套。
@@ -1303,19 +1318,19 @@ function structuralHook(db, { question, finalBody, by, messageId, at }) {
     // 任务因此停在"说不出在等谁"上 —— 那正是停等账本会报警的形状，它会挂一条报警事项把接收者补回来。
     audit(db, { actorKind: 'user', actorId: by, action: 'project_task_conflict_declined', targetType: 'task', targetId: taskId,
       payload: { questionId: question.id, body: body.slice(0, 300),
-        why: side === 'other' ? '答复是(C)两边都不对：出路是加任务去修或中止，都要人自己去点' : '答复不是 A/B/C 里的任何一条，系统不猜一侧' } });
+        why: side === 'other' ? tl(L, '答复是(C)两边都不对：出路是加任务去修或中止，都要人自己去点') : tl(L, '答复不是 A/B/C 里的任何一条，系统不猜一侧') } });
     return { handled: false, declined: true };
   }
-  if (/^(中止|放弃|不要了|abort)/.test(body)) {
+  if (/^(中止|放弃|不要了|abort|cancel|give up)/i.test(body)) {
     audit(db, { actorKind: 'user', actorId: by, action: 'project_task_integrate_answer_abort', targetType: 'task', targetId: taskId,
-      payload: { questionId: question.id, why: '答复要求中止，这一步不可逆，留给人在项目页做' } });
+      payload: { questionId: question.id, why: tl(L, '答复要求中止，这一步不可逆，留给人在项目页做') } });
     return { handled: false, abort: true };
   }
   // 与 signoff --reject 同一条路：复用那条答复的令牌（同一人、同一决策、系统代拟），
   // 与 RESOLUTION_HOOKS.signoff 的边界说明同理 —— 别把这个模式推广到别处。
   const tok = messageId ? db.one(`SELECT token_id FROM messages WHERE id=?`, messageId)?.token_id ?? null : null;
   const mid = newId('m');
-  const reason = `【集成冲突】${body}`;
+  const reason = `${markOf(L, 'integrationConflict')}${body}`;
   db.run(`INSERT INTO messages (id,task_id,sender_id,body,kind,kind_source,urgency,urgency_source,trust_label,token_id,received_at)
           VALUES (?,?,?,?,'correction','explicit','urgent','explicit','user-authenticated',?,?)`, mid, taskId, by, reason, tok, at);
   if (messageId) insertEdge(db, mid, messageId, 'derived_from', at);

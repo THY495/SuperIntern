@@ -1,6 +1,7 @@
 // 花费入库。LlmClient 只在内存里记账，落库是这一层的事。
 
 import { now, audit } from '../db/db.mjs';
+import { tl, contentLang } from '../i18n/index.mjs';
 
 /**
  * 把客户端内存账本**排空**并写进 usage_ledger。
@@ -16,7 +17,8 @@ export function flushLedger(db, client, { taskId, nodeId = null, role }) {
   // 不改账（账按请求的目录键算，代答的模型价格未知）。同一 (键, 代答模型) 一个客户端寿命内只记一次。
   for (const d of (client.drifts ?? []).splice(0)) {
     audit(db, { actorKind: 'system', action: 'model_drift', targetType: 'task', targetId: taskId,
-      payload: { ...d, role, nodeId, hint: `请求 ${d.requested} 实际由 ${d.served} 代答 —— 目录键 ${d.key} 可能已退役或改名，跑 node src/cli.mjs catalog check` } });
+      payload: { ...d, role, nodeId, hint: tl(contentLang(db), '请求 {requested} 实际由 {served} 代答 —— 目录键 {key} 可能已退役或改名，跑 node src/cli.mjs catalog check',
+        { requested: d.requested, served: d.served, key: d.key }) } });
   }
   const entries = client.ledger.splice(0, client.ledger.length);
   let microUsd = 0;

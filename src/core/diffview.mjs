@@ -14,6 +14,10 @@ import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { contributionOf } from './workspace.mjs';
 import { mergeChainOf } from './project.mjs';
+import { tl, contentLang } from '../i18n/index.mjs';
+
+// 读不到时的 reason 是给看板上的人看的：取区间的几个函数（有 db）默认按内容语言写，调用方可传 lang（看的人的界面语言）；
+// 区间对象上带着 lang，viewOf / linesOf 据此写自己的 reason。没带就是中文。
 
 const git = (dir, ...a) => execFileSync('git', ['-c', 'core.quotepath=off', ...a], { cwd: dir, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 64 * 1024 * 1024 });
 
@@ -69,13 +73,13 @@ export function parseGitDiff(text) {
 }
 
 /** 一个区间的结构化 diff。 */
-export function diffRange(dir, base, head) {
-  if (!dir || !existsSync(dir)) return { ok: false, reason: '仓库目录不在了' };
-  if (!base || !head) return { ok: false, reason: '说不出这个任务从哪一版开始（没有基线记录）' };
+export function diffRange(dir, base, head, lang = 'zh') {
+  if (!dir || !existsSync(dir)) return { ok: false, reason: tl(lang, '仓库目录不在了') };
+  if (!base || !head) return { ok: false, reason: tl(lang, '说不出这个任务从哪一版开始（没有基线记录）') };
   if (base === head) return { ok: true, base, head, files: [], adds: 0, dels: 0 };
   let text;
   try { text = git(dir, 'diff', '--no-color', '--no-ext-diff', '-M', '-U3', `${base}..${head}`); }
-  catch (e) { return { ok: false, reason: `读不到这一段的提交：${String(e.stderr ?? e.message).trim().split('\n')[0]}` }; }
+  catch (e) { return { ok: false, reason: tl(lang, '读不到这一段的提交：{err}', { err: String(e.stderr ?? e.message).trim().split('\n')[0] }) }; }
   const files = parseGitDiff(text);
   let budget = DIFF_LIMITS.totalLines;
   for (const f of files) {
@@ -94,13 +98,13 @@ export function diffRange(dir, base, head) {
 }
 
 /** 任务口径：工作区里 基线 → 任务头。 */
-export function taskRange(db, { taskId, home }) {
+export function taskRange(db, { taskId, home, lang = contentLang(db) }) {
   const dir = join(home, 'workspaces', taskId);
-  if (!existsSync(dir)) return { ok: false, reason: '这个任务还没有工作区（没开工，或已清理）' };
+  if (!existsSync(dir)) return { ok: false, reason: tl(lang, '这个任务还没有工作区（没开工，或已清理）') };
   let head;
-  try { head = git(dir, 'rev-parse', 'HEAD').trim(); } catch { return { ok: false, reason: '工作区不是一个可读的 git 仓库' }; }
+  try { head = git(dir, 'rev-parse', 'HEAD').trim(); } catch { return { ok: false, reason: tl(lang, '工作区不是一个可读的 git 仓库') }; }
   const c = contributionOf(db, { taskId, dir, head });
-  return { ok: true, dir, base: c.base, head, via: c.via };
+  return { ok: true, dir, base: c.base, head, via: c.via, lang };
 }
 
 /**
@@ -120,52 +124,52 @@ export function roundSinceOf(db, taskId) {
  * 这一轮：上次请求签收时的头 → 任务头。把项目分支合进来带进来的文件摘出去单列（与签收正文同一个口径：
  * 签收人要判的是这一轮做了什么，集成不是任何人的内容决定）。
  */
-export function roundRange(db, { taskId, home }) {
-  const t = taskRange(db, { taskId, home });
+export function roundRange(db, { taskId, home, lang = contentLang(db) }) {
+  const t = taskRange(db, { taskId, home, lang });
   if (!t.ok) return t;
   const since = roundSinceOf(db, taskId);
-  if (!since) return { ok: false, reason: '这次签收不是返工，没有"这一轮"可比' };
+  if (!since) return { ok: false, reason: tl(lang, '这次签收不是返工，没有"这一轮"可比') };
   const c = contributionOf(db, { taskId, dir: t.dir, head: t.head });
-  return { ok: true, dir: t.dir, base: since, head: t.head, via: 'round', keep: c.via === 'merge-base' && Array.isArray(c.files) ? c.files : null };
+  return { ok: true, dir: t.dir, base: since, head: t.head, via: 'round', keep: c.via === 'merge-base' && Array.isArray(c.files) ? c.files : null, lang };
 }
 
 /** 某一步：这一步完成时的那个提交（提交信息里写着 `node: <id>`）。做过几次的，给最后一次。 */
-export function nodeRange(db, { taskId, home, nodeId }) {
-  const t = taskRange(db, { taskId, home });
+export function nodeRange(db, { taskId, home, nodeId, lang = contentLang(db) }) {
+  const t = taskRange(db, { taskId, home, lang });
   if (!t.ok) return t;
-  if (!/^n_[0-9a-z]+$/.test(String(nodeId ?? ''))) return { ok: false, reason: '步骤编号不对' };
+  if (!/^n_[0-9a-z]+$/.test(String(nodeId ?? ''))) return { ok: false, reason: tl(lang, '步骤编号不对') };
   let shas;
   try { shas = git(t.dir, 'log', '--format=%H', `--grep=^node: ${nodeId}$`, 'HEAD').split('\n').filter(Boolean); }
-  catch { return { ok: false, reason: '读不到这个任务的提交历史' }; }
-  if (!shas.length) return { ok: false, reason: '这一步没有留下提交（没改文件，或还没做完）' };
+  catch { return { ok: false, reason: tl(lang, '读不到这个任务的提交历史') }; }
+  if (!shas.length) return { ok: false, reason: tl(lang, '这一步没有留下提交（没改文件，或还没做完）') };
   const sha = shas[0];
   let base;
   try { base = git(t.dir, 'rev-parse', `${sha}^`).trim(); } catch { base = '4b825dc642cb6eb9a060e54bf8d69288fbee4904'; }   // 根提交：和空树比
-  return { ok: true, dir: t.dir, base, head: sha, via: 'node', times: shas.length };
+  return { ok: true, dir: t.dir, base, head: sha, via: 'node', times: shas.length, lang };
 }
 
 /** 接口用：按口径取区间。scope 不给 = 有返工那一轮就给这一轮，否则给全部。 */
-export function rangeFor(db, { taskId, home, scope = null, node = null }) {
-  if (scope === 'node') return nodeRange(db, { taskId, home, nodeId: node });
-  if (scope === 'round') return roundRange(db, { taskId, home });
-  if (scope === 'all') return taskRange(db, { taskId, home });
-  const r = roundSinceOf(db, taskId) ? roundRange(db, { taskId, home }) : null;
-  return r?.ok ? r : taskRange(db, { taskId, home });
+export function rangeFor(db, { taskId, home, scope = null, node = null, lang = contentLang(db) }) {
+  if (scope === 'node') return nodeRange(db, { taskId, home, nodeId: node, lang });
+  if (scope === 'round') return roundRange(db, { taskId, home, lang });
+  if (scope === 'all') return taskRange(db, { taskId, home, lang });
+  const r = roundSinceOf(db, taskId) ? roundRange(db, { taskId, home, lang }) : null;
+  return r?.ok ? r : taskRange(db, { taskId, home, lang });
 }
 
 /** 交付口径：项目仓库里这个任务合并进来的那一段。 */
-export function deliveryRange(db, { projectId, taskId }) {
+export function deliveryRange(db, { projectId, taskId, lang = contentLang(db) }) {
   const p = db.one(`SELECT * FROM projects WHERE id=?`, projectId);
-  if (!p) return { ok: false, reason: '项目不存在' };
+  if (!p) return { ok: false, reason: tl(lang, '项目不存在') };
   const bt = mergeChainOf(db, p);
   const t = bt.tasks.find((x) => x.taskId === taskId);
-  if (!t) return { ok: false, reason: bt.broken ?? '这个任务还没合并进项目分支' };
-  return { ok: true, dir: p.repo, base: t.from, head: t.head };
+  if (!t) return { ok: false, reason: bt.broken ?? tl(lang, '这个任务还没合并进项目分支') };
+  return { ok: true, dir: p.repo, base: t.from, head: t.head, lang };
 }
 
 export function viewOf(range, { roundSince = null } = {}) {
   if (!range.ok) return range;
-  const v = { ...diffRange(range.dir, range.base, range.head), via: range.via ?? null, times: range.times ?? null, roundSince };
+  const v = { ...diffRange(range.dir, range.base, range.head, range.lang), via: range.via ?? null, times: range.times ?? null, roundSince };
   if (v.ok && range.keep) {
     const keep = new Set(range.keep);
     v.brought = v.files.filter((f) => !keep.has(f.path)).map((f) => f.path);
@@ -182,12 +186,13 @@ export function viewOf(range, { roundSince = null } = {}) {
  */
 export function linesOf(range, { path, from, to = null }) {
   if (!range.ok) return range;
+  const lang = range.lang ?? 'zh';
   let changed;
   try { changed = git(range.dir, 'diff', '--name-only', '-M', `${range.base}..${range.head}`).split('\n').filter(Boolean); }
-  catch { return { ok: false, reason: '读不到这一段的提交' }; }
-  if (!changed.includes(path) || (range.keep && !range.keep.includes(path))) return { ok: false, reason: '这个文件不在这次的改动里' };
+  catch { return { ok: false, reason: tl(lang, '读不到这一段的提交') }; }
+  if (!changed.includes(path) || (range.keep && !range.keep.includes(path))) return { ok: false, reason: tl(lang, '这个文件不在这次的改动里') };
   let text;
-  try { text = git(range.dir, 'show', `${range.head}:${path}`); } catch { return { ok: false, reason: '读不到这个文件' }; }
+  try { text = git(range.dir, 'show', `${range.head}:${path}`); } catch { return { ok: false, reason: tl(lang, '读不到这个文件') }; }
   const all = text.split('\n');
   if (all.length && all[all.length - 1] === '') all.pop();
   const a = Math.max(1, Number(from) || 1), b = Math.min(all.length, to === null || to === undefined || to === '' ? all.length : Number(to));

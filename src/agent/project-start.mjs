@@ -14,19 +14,21 @@ import { newId, now, audit } from '../db/db.mjs';
 import { initProjectRepo, PROJECT_TASK_RUNTIME_MS } from '../core/project.mjs';
 import { setLimit } from '../core/limits.mjs';
 import { startFromIdea } from './elicitor.mjs';
-import { startProjectFromBrief } from './project-planner.mjs';
+import { startProjectFromBrief, titleFromText } from './project-planner.mjs';
+import { I18nError, tl, contentLang } from '../i18n/index.mjs';
 
 /** 项目的"原文"：目标 + 完成定义。追加任务时规划器引文核对的原文之一（projects.brief）。 */
-export const goalBrief = (goal, doneDefinition) => `# 项目目标\n${goal}\n\n# 完成定义\n${doneDefinition}`;
+// 两个小标题按内容语言写（项目页、追问器看到的原文）；规划器核对引文时引的是目标 / 完成定义的正文，不引标题
+export const goalBrief = (goal, doneDefinition, lang = 'zh') => `# ${tl(lang, '项目目标')}\n${goal}\n\n# ${tl(lang, '完成定义')}\n${doneDefinition}`;
 
 export function startProject(db, { userId, goal, doneDefinition, plan = null, title = null, source = null, empty = false, base = null, home }) {
   const g = String(goal ?? '').trim();
   const d = String(doneDefinition ?? '').trim();
-  if (!g) throw new Error('项目目标不能为空：用一两句话写明要做成什么');
-  if (!d) throw new Error('完成定义不能为空：用一两句话写明怎样算做完');
-  const ttl = String(title ?? '').trim() || g.split('\n')[0].trim().slice(0, 80);
+  if (!g) throw new I18nError('项目目标不能为空：用一两句话写明要做成什么');
+  if (!d) throw new I18nError('完成定义不能为空：用一两句话写明怎样算做完');
+  const ttl = String(title ?? '').trim() || titleFromText(g);
   const planText = plan === null ? '' : String(plan).trim();
-  if (plan !== null && !planText) throw new Error('勾选了"已有规划"，但规划全文为空');
+  if (plan !== null && !planText) throw new I18nError('勾选了"已有规划"，但规划全文为空');
 
   if (planText) {
     const r = startProjectFromBrief(db, { userId, brief: planText, source, home, base, title: ttl, empty });
@@ -38,12 +40,12 @@ export function startProject(db, { userId, goal, doneDefinition, plan = null, ti
   const { repo, branch, baseRef } = initProjectRepo({ home, projectId, source, base, empty });
   db.run(`INSERT INTO projects (id,owner_id,title,brief,goal,done_definition,repo,branch,base_ref,source,status,draft_version,created_at)
           VALUES (?,?,?,?,?,?,?,?,?,?,'active',0,?)`,
-    projectId, userId, ttl, goalBrief(g, d), g, d, repo, branch, baseRef, (source ? String(source) : null), now());
+    projectId, userId, ttl, goalBrief(g, d, contentLang(db)), g, d, repo, branch, baseRef, (source ? String(source) : null), now());
   audit(db, { actorKind: 'user', actorId: userId, action: 'project_created', targetType: 'project', targetId: projectId,
     payload: { title: ttl, repo, branch, baseRef, source: (source ? String(source) : null), fromGoal: true } });
   applyEgressDefaults(db, { projectId, userId });   // 管理员勾过的默认放行源
-  const { taskId } = startFromIdea(db, { userId, idea: goalBrief(g, d), title: ttl, projectId, order: 1 });
-  // 与规划出来的项目任务同一个运行时长上限（否则从目标起草的第一个任务会用部署默认 45 分钟，返工时容易撞顶、暂停、给负责人一条事项）
+  const { taskId } = startFromIdea(db, { userId, idea: goalBrief(g, d, contentLang(db)), title: ttl, projectId, order: 1 });
+  // 与规划出来的项目任务同一个运行时长上限（否则从目标起草的第一个任务用的是部署默认 45 分钟，返工时会撞顶、暂停、给负责人添一条事项）
   setLimit(db, { taskId, key: 'limit.runtime_ms', value: PROJECT_TASK_RUNTIME_MS, userId });
   return { projectId, firstTaskId: taskId, repo, branch, baseRef, planned: false };
 }

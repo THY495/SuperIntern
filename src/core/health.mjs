@@ -10,33 +10,40 @@
 // 不会因为探测把请求卡住。
 
 import { execFile } from 'node:child_process';
+import { tl } from '../i18n/index.mjs';
 
-const probeOne = (cli, timeoutMs) => new Promise((resolve) => {
+// why 显示在看板顶部的提示条与通知里：按 lang 写（调用方传内容语言；可以是函数，每次探测时再取，改了设置不用重启）。
+const langOf = (lang) => (typeof lang === 'function' ? lang() : lang);
+
+const probeOne = (cli, timeoutMs, lang = 'zh') => new Promise((resolve) => {
   execFile(cli, ['version', '--format', '{{.Server.Version}}'], { encoding: 'utf8', timeout: timeoutMs, windowsHide: true }, (err, stdout, stderr) => {
     const v = String(stdout ?? '').trim();
     if (!err && v) return resolve({ ok: true, cli, version: v });
-    const why = String(stderr || err?.message || '').trim().split('\n')[0].slice(0, 200) || '没有应答';
-    resolve({ ok: false, cli, why: err?.code === 'ENOENT' ? `没装 ${cli}` : why });
+    const why = String(stderr || err?.message || '').trim().split('\n')[0].slice(0, 200) || tl(lang, '没有应答');
+    resolve({ ok: false, cli, why: err?.code === 'ENOENT' ? tl(lang, '没装 {cli}', { cli }) : why, ...(err?.code === 'ENOENT' ? { missing: true } : {}) });
   });
 });
 
 /** 探测一次：docker 优先、podman 其次；都不行就报第一个的原因（通常是 docker）。 */
-export async function probeRuntime({ candidates = ['docker', 'podman'], timeoutMs = 8000 } = {}) {
+export async function probeRuntime({ candidates = ['docker', 'podman'], timeoutMs = 8000, lang = 'zh' } = {}) {
+  const L = langOf(lang);
   const tried = [];
   for (const cli of candidates) {
-    const r = await probeOne(cli, timeoutMs);
+    const r = await probeOne(cli, timeoutMs, L);
     if (r.ok) return { ...r, checkedAt: Date.now() };
-    tried.push(r);
+    const { missing, ...rest } = r;
+    tried.push({ ...rest, missing: !!missing });
   }
-  const first = tried.find((t) => !/^没装/.test(t.why)) ?? tried[0];
-  return { ok: false, cli: first?.cli ?? null, why: first?.why ?? '没有可用的容器运行时', checkedAt: Date.now() };
+  // 没装的排后面（原来按 why 是否以"没装"开头判；why 现在按语言写，改看 missing）
+  const first = tried.find((t) => !t.missing) ?? tried[0];
+  return { ok: false, cli: first?.cli ?? null, why: first?.why ?? tl(L, '没有可用的容器运行时'), checkedAt: Date.now() };
 }
 
 /**
  * 带缓存的健康状态。`current()` 立刻返回上一次的结论（第一次之前是 null = 还不知道），
  * 过期了顺手在后台再探一次。`refresh()` 等这一次探完（守护进程每拍用它）。
  */
-export function makeRuntimeHealth({ ttlMs = 30_000, probe = probeRuntime } = {}) {
+export function makeRuntimeHealth({ ttlMs = 30_000, lang = 'zh', probe = () => probeRuntime({ lang }) } = {}) {
   let last = null, pending = null, downSince = null;
   const refresh = () => {
     // downSince：从哪一刻起不在（页面上写"发现于几点"：没有时间就判断不了是不是已经等太久了）

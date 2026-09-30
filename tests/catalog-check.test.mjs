@@ -62,7 +62,7 @@ const F = (key) => r.entries.find((e) => e.key === key).findings;
 const has = (key, level, re, m) => assert(F(key).some((f) => f.level === level && re.test(f.msg)), `${m}\n         └ ${F(key).map((f) => `[${f.level}] ${f.msg}`).join(' | ').slice(0, 300)}`);
 {
   has('deepseek/deepseek-flash', 'OK', /在厂商 \/models 列表中/, 'flash：在列表里');
-  has('deepseek/deepseek-flash', 'OK', /窗口 1000000 与 OpenRouter一致/, 'flash：窗口一致');
+  has('deepseek/deepseek-flash', 'OK', /窗口 1000000 与 OpenRouter 一致/, 'flash：窗口一致');
   eq(F('deepseek/deepseek-flash').filter((f) => f.level === 'WARN').length, 0, 'flash：零告警');
   has('deepseek/deepseek-v4-flash', 'WARN', /\*\*不在\*\* deepseek 的 \/models 列表中/, 'v4-flash：退役 → 不在列表');
   has('deepseek/deepseek-v4-flash', 'SKIP', /差值完全一致（0\.50×）/, 'v4-flash：三项单价同一比值 → 档位指纹，不当漂移');

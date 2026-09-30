@@ -7,6 +7,7 @@
 import { existsSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { execFileSync } from 'node:child_process';
+import { I18nError } from '../i18n/index.mjs';
 
 const looksLikeUrl = (s) => /^(https?|ssh|git|file):\/\//i.test(s) || /^[\w.-]+@[\w.-]+:/.test(s);
 
@@ -33,11 +34,11 @@ export function knownRepos(db, { limit = 12 } = {}) {
 /** 提交前校验。不合格就抛（报错直接上屏）。空值：required 才拒。 */
 export function checkRepoSource(source, { required = false } = {}) {
   const s = String(source ?? '').trim();
-  if (!s) { if (required) throw new Error('目标仓库不能为空'); return null; }
+  if (!s) { if (required) throw new I18nError('目标仓库不能为空'); return null; }
   if (looksLikeUrl(s)) return { kind: 'url', source: s };
-  if (!existsSync(s)) throw new Error(`仓库路径不存在：${s}`);
+  if (!existsSync(s)) throw new I18nError('仓库路径不存在：{path}', { path: s });
   try {
     execFileSync('git', ['-C', s, 'rev-parse', '--git-dir'], { stdio: ['ignore', 'pipe', 'pipe'], timeout: 10_000 });
-  } catch { throw new Error(`该路径不是 git 仓库：${s}`); }
+  } catch { throw new I18nError('该路径不是 git 仓库：{path}', { path: s }); }
   return { kind: 'path', source: s };
 }

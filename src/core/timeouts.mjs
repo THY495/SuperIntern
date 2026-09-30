@@ -18,6 +18,7 @@
 
 import { newId, now, audit, insertEdge } from '../db/db.mjs';
 import { advanceRoute } from './routing.mjs';
+import { tl, contentLang } from '../i18n/index.mjs';
 
 export const TIMEOUT_DEFAULTS_MS = {
   l1: 30 * 60_000,          // Ⅰ 级 → 默认动作
@@ -52,6 +53,7 @@ export function sweepTimeouts(db, { taskId = null, at = now(), onEvent = () => {
   const due = db.all(`SELECT * FROM questions WHERE status IN ('open','escalated') AND timeout_at IS NOT NULL
                       AND timeout_at <= ? AND task_id NOT IN (SELECT id FROM tasks WHERE status='aborted') ${taskId ? 'AND task_id=?' : ''} ORDER BY timeout_at`, ...(taskId ? [at, taskId] : [at]));
   const out = { defaulted: [], escalated: [], stuck: [], rerouted: [] };
+  const L = contentLang(db);
   for (const q of due) {
     if (q.level === 3) continue;   // 结构上到不了这里（CHECK），留着当断言
     if (q.level === 2 && q.status === 'open') {
@@ -72,14 +74,14 @@ export function sweepTimeouts(db, { taskId = null, at = now(), onEvent = () => {
       db.tx(() => {
         db.run(`UPDATE questions SET timeout_at=NULL WHERE id=?`, q.id);
         audit(db, { actorKind: 'system', action: 'question_stuck', targetType: 'question', targetId: q.id,
-          payload: { taskId: q.task_id, nodeId: q.node_id, level: q.level, why: '升级后仍无人答，且没有默认动作可退；分支继续挂起' } });
+          payload: { taskId: q.task_id, nodeId: q.node_id, level: q.level, why: tl(L, '升级后仍无人答，且没有默认动作可退；分支继续挂起') } });
       });
       const ev = { questionId: q.id, taskId: q.task_id, nodeId: q.node_id, level: q.level, text: q.text };
       out.stuck.push(ev); onEvent({ type: 'question_stuck', ...ev });
       continue;
     }
     // Ⅰ 级到期，或 Ⅱ 级升级后再到期：走默认动作。答复由系统写，不冒充人。
-    const ev = applyDefault(db, q, at, `问题在 ${q.level === 1 ? 'Ⅰ' : 'Ⅱ'} 级超时窗口内无人答复`);
+    const ev = applyDefault(db, q, at, tl(L, '问题在 {level} 级超时窗口内无人答复', { level: q.level === 1 ? 'Ⅰ' : 'Ⅱ' }));
     out.defaulted.push(ev); onEvent({ type: 'question_defaulted', ...ev });
   }
 
@@ -98,7 +100,7 @@ export function sweepTimeouts(db, { taskId = null, at = now(), onEvent = () => {
         if (!adv) db.run(`UPDATE questions SET route_due_at=NULL WHERE id=?`, q.id);
         audit(db, { actorKind: 'system', action: adv ? 'question_rerouted' : 'question_stuck', targetType: 'question', targetId: q.id,
           payload: { taskId: q.task_id, nodeId: q.node_id, decisionType: q.decision_type, from, to: adv?.answerers ?? null, stage: adv?.route?.stage ?? null,
-            nextDueAt: adv?.dueAt ?? null, why: adv ? '路由行时限到，转下一行' : '路由行时限到但没有下一行；继续挂起' } });
+            nextDueAt: adv?.dueAt ?? null, why: adv ? tl(L, '路由行时限到，转下一行') : tl(L, '路由行时限到但没有下一行；继续挂起') } });
         return adv;
       });
       const ev = { questionId: q.id, taskId: q.task_id, nodeId: q.node_id, level: q.level, decisionType: q.decision_type, from, to: r?.answerers ?? [], text: q.text };
@@ -107,14 +109,14 @@ export function sweepTimeouts(db, { taskId = null, at = now(), onEvent = () => {
       continue;
     }
     if (actions.has('default') && q.default_action) {
-      const ev = applyDefault(db, q, at, '路由行时限到，收件人为空或无人答复');
+      const ev = applyDefault(db, q, at, tl(L, '路由行时限到，收件人为空或无人答复'));
       out.defaulted.push(ev); onEvent({ type: 'question_defaulted', ...ev });
       continue;
     }
     db.tx(() => {
       db.run(`UPDATE questions SET route_due_at=NULL WHERE id=?`, q.id);
       audit(db, { actorKind: 'system', action: 'question_stuck', targetType: 'question', targetId: q.id,
-        payload: { taskId: q.task_id, nodeId: q.node_id, level: q.level, why: '路由行时限到，兜底是 default 但事项没有默认动作；继续挂起' } });
+        payload: { taskId: q.task_id, nodeId: q.node_id, level: q.level, why: tl(L, '路由行时限到，兜底是 default 但事项没有默认动作；继续挂起') } });
     });
     const ev = { questionId: q.id, taskId: q.task_id, nodeId: q.node_id, level: q.level, text: q.text };
     out.stuck.push(ev); onEvent({ type: 'question_stuck', ...ev });
@@ -128,8 +130,7 @@ function applyDefault(db, q, at, why) {
   db.tx(() => {
     db.run(`INSERT INTO messages (id,task_id,sender_id,body,kind,kind_source,urgency,urgency_source,trust_label,token_id,received_at)
             VALUES (?,?,NULL,?,'answer','explicit','normal','explicit','agent-generated',NULL,?)`,
-    mid, q.task_id, `[超时默认] ${why}，按你提出时登记的默认动作执行：
-${q.default_action}`, at);
+    mid, q.task_id, tl(contentLang(db), '[超时默认] {why}，按你提出时登记的默认动作执行：\n{action}', { why, action: q.default_action }), at);
     insertEdge(db, mid, q.id, 'answers', at);
     db.run(`INSERT INTO answers (id,question_id,user_id,message_id,body,stance,created_at) VALUES (?,?,NULL,?,?,'answer',?)`, newId('a'), q.id, mid, q.default_action, at);
     db.run(`UPDATE questions SET status='defaulted', resolved_at=?, route_due_at=NULL WHERE id=?`, at, q.id);

@@ -1,5 +1,24 @@
 # 更新记录 / Changelog
 
+## v0.2.0 — 2026-10-01
+
+**中英双语 / English and Chinese**
+
+- 看板与命令行支持中文和英文。每人在看板右上角选自己的界面语言；管理员在「设置 → 成员」里定团队的内容语言（事项正文、汇报、AI 写给人的文字）。
+  The board and the CLI are available in English and Chinese. Each person picks an interface language (top right of the board); an admin sets the team's content language under Settings → Members (open items, reports, and everything the AI writes for people).
+- 答复用哪种语言写都能读懂（批准 / 放弃 / 保留意见 / 接受 / 打回 / 中止等）。
+  Answers are understood in either language (approve / drop / reservation / accept / send back / abort, …).
+- 报错按看的人的界面语言显示；命令行按 `SI_LANG` 或本人的界面语言输出。
+  Errors are shown in the viewer's interface language; the CLI follows `SI_LANG` or your own interface language.
+
+**修正 / Fixes**
+
+- 没写标题时，项目标题不再取成目标原文的"目标："标签。/ The default project title no longer becomes the "Goal:" label of the pasted goal.
+- 路由表"结构矛盾必须包含负责人"的报错写明原因和改法（「系统卡住」那一行不受此限）。/ The routing-table error for structural conflicts now explains why the owner must be included and how to fix it.
+- 转交可以附一句理由；活动记录写清是谁转给了谁。/ Handing over an item can carry a reason; the activity feed says who handed it to whom.
+- 项目达成确认里明说"还想加的新需求也写在这里"。/ The "is the project done?" item now says new requests can be written there too.
+- 页面截图接了后端却没有样例数据时，系统补一步放样例数据，截图不再是空列表。/ When the page screenshot talks to a backend but has no sample data, the system adds a step to seed some, so screenshots no longer show empty lists.
+
 ## v0.1.0 — 2026-09-29
 
 第一个公开版本。/ First public release.

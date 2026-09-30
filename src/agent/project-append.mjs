@@ -16,10 +16,12 @@
 // 谁能加：负责人，或负责人在项目成员里勾了"可添加任务"的人（project-members.mjs）。加的人只描述；
 // 草案的批准仍按路由表走（方案批准类，收件人必含负责人）—— 成员提、负责人批。
 
+import { withOutputLang, contentLang, tl, I18nError } from '../i18n/index.mjs';
+import { markOf } from '../i18n/marks.mjs';
 import { newId, now, audit } from '../db/db.mjs';
 import { getParam, setParam } from '../core/params.mjs';
 import { routeQuestion, specPrefixes, wholeProjectPrefixes } from '../core/routing.mjs';
-import { createProjectTasks, validateProjectSpec, projectTasks, chainGraph, renderRules, renderDeps, scopeOverlaps, renderScopeOverlaps, renderScopePaths, SCOPE_PATHS_NOTE, PROJECT_TASK_RUNTIME_MS } from '../core/project.mjs';
+import { createProjectTasks, validateProjectSpec, projectTasks, chainGraph, renderRules, renderDeps, scopeOverlaps, renderScopeOverlaps, renderScopePaths, scopePathsNote, SCOPE_PATHS_NOTE, PROJECT_TASK_RUNTIME_MS } from '../core/project.mjs';
 import { canAddTasks } from '../core/project-members.mjs';
 import { projectVerifyCommand, gearOf, gearPrereqStatus, budgetState, maxOpenOf } from '../core/project-settings.mjs';
 import { activeDecisions, recordReservation } from '../core/decisions.mjs';
@@ -73,19 +75,21 @@ export const REVIEW_BRIEF = '【复盘】项目的全部任务都已完成并合
  */
 export function requestReview(db, { projectId }) {
   const p = db.one(`SELECT * FROM projects WHERE id=?`, projectId);
-  if (!p) throw new Error(`项目不存在：${projectId}`);
-  if (appendPending(appendStateOf(db, projectId))) throw new Error('已有一次追加 / 复盘在进行中');
+  if (!p) throw new I18nError('项目不存在：{id}', { id: projectId });
+  if (appendPending(appendStateOf(db, projectId))) throw new I18nError('已有一次追加 / 复盘在进行中');
+  const L = contentLang(db);
   let carrier = carrierOf(db, projectId);
   const t = now();
   return db.tx(() => {
     if (!carrier) {
       const id = newId('t');
-      db.run(`INSERT INTO tasks (id,owner_id,title,status,created_at,project_id,project_order) VALUES (?,?,?,'planning',?,?,0)`, id, p.owner_id, `项目规划：${p.title}`, t, projectId);
+      db.run(`INSERT INTO tasks (id,owner_id,title,status,created_at,project_id,project_order) VALUES (?,?,?,'planning',?,?,0)`, id, p.owner_id, tl(L, '项目规划：{title}', { title: p.title }), t, projectId);
       carrier = { id };
     } else db.run(`UPDATE tasks SET status='planning' WHERE id=?`, carrier.id);
     const since = db.one(`SELECT COALESCE(MAX(id),0) m FROM audit_log`).m;
     const set = (key, value) => setParam(db, { taskId: carrier.id, key, value, by: { kind: 'agent', id: 'project' }, governance: 'execution' });
-    set('append.kind', 'review'); set('append.brief', REVIEW_BRIEF); set('append.stage', 'drafting'); set('append.version', 0);
+    // 与 REVIEW_BRIEF 同一句（中文逐字相同），按内容语言写
+    set('append.kind', 'review'); set('append.brief', `${markOf(L, 'review')}${tl(L, '项目的全部任务都已完成并合并。对照项目目标与完成定义判断：还差什么，或者已经达成。')}`); set('append.stage', 'drafting'); set('append.version', 0);
     set('append.question', null); set('append.spec', null); set('append.notes', null); set('append.since', since);
     set('append.reached', null); set('append.seed', null); set('append.requested_by', null);   // 复盘不是谁提的需求；上一轮的出处别带过来
     audit(db, { actorKind: 'system', action: 'project_review_requested', targetType: 'project', targetId: projectId, payload: { carrier: carrier.id } });
@@ -100,11 +104,11 @@ export function requestReview(db, { projectId }) {
  */
 export function reviewAgain(db, { projectId, userId }) {
   const p = db.one(`SELECT * FROM projects WHERE id=?`, projectId);
-  if (!p) throw new Error(`项目不存在：${projectId}`);
-  if (p.owner_id !== userId) throw new Error('只有项目负责人能重新复盘');
-  if (p.status !== 'stalled') throw new Error(`项目状态为 ${p.status}，不需要重新复盘`);
-  if (db.one(`SELECT 1 FROM tasks WHERE project_id=? AND project_order>0 AND merged_at IS NULL AND status<>'aborted'`, projectId)) throw new Error('还有没合并的任务，先把它们做完');
-  if (db.one(`SELECT 1 FROM tasks WHERE project_id=? AND project_order>0 AND merged_at IS NULL AND status='aborted'`, projectId)) throw new Error('有已中止的任务：先在项目页恢复或重做它');
+  if (!p) throw new I18nError('项目不存在：{id}', { id: projectId });
+  if (p.owner_id !== userId) throw new I18nError('只有项目负责人能重新复盘');
+  if (p.status !== 'stalled') throw new I18nError('项目状态为 {status}，不需要重新复盘', { status: p.status });
+  if (db.one(`SELECT 1 FROM tasks WHERE project_id=? AND project_order>0 AND merged_at IS NULL AND status<>'aborted'`, projectId)) throw new I18nError('还有没合并的任务，先把它们做完');
+  if (db.one(`SELECT 1 FROM tasks WHERE project_id=? AND project_order>0 AND merged_at IS NULL AND status='aborted'`, projectId)) throw new I18nError('有已中止的任务：先在项目页恢复或重做它');
   const r = requestReview(db, { projectId });
   db.run(`UPDATE projects SET status='active' WHERE id=?`, projectId);
   audit(db, { actorKind: 'user', actorId: userId, action: 'project_review_again', targetType: 'project', targetId: projectId, payload: { carrier: r.carrierId } });
@@ -121,14 +125,18 @@ export function reviewAgain(db, { projectId, userId }) {
  */
 export function requestAppend(db, { projectId, userId, brief, seed = null, viaQuestion = null }) {
   const p = db.one(`SELECT * FROM projects WHERE id=?`, projectId);
-  if (!p) throw new Error(`项目不存在：${projectId}`);
+  if (!p) throw new I18nError('项目不存在：{id}', { id: projectId });
   // viaQuestion：负责人的路由表把某条事项派给了这个人，这个人在答复里要求改 —— 答复本身就是授权入口
-  if (!viaQuestion && !canAddTasks(db, projectId, userId)) throw new Error('你没有给这个项目添加任务的权限（需要是负责人，或由负责人在项目成员里授予）');
+  if (!viaQuestion && !canAddTasks(db, projectId, userId)) throw new I18nError('你没有给这个项目添加任务的权限（需要是负责人，或由负责人在项目成员里授予）');
   const text = String(brief ?? '').trim();
-  if (!text) throw new Error('要追加的内容不能为空');
-  if (!['active', 'stalled', 'done'].includes(p.status)) throw new Error(`项目状态为 ${p.status}，不能追加任务${p.status === 'proposed' ? '（方案还没批准：直接在方案的反馈里说）' : ''}`);
-  // 交付过的项目照样能追加（初版交付之后应当允许持续维护迭代）。新合并的部分会在「等你交付」里再提示一次（delivery-due.mjs）。
-  if (p.archived_at) throw new Error('项目已归档，请先取消归档');
+  if (!text) throw new I18nError('要追加的内容不能为空');
+  if (!['active', 'stalled', 'done'].includes(p.status)) {
+    throw p.status === 'proposed'
+      ? new I18nError('项目状态为 {status}，不能追加任务（方案还没批准：直接在方案的反馈里说）', { status: p.status })
+      : new I18nError('项目状态为 {status}，不能追加任务', { status: p.status });
+  }
+  // 交付过的项目照样能追加（2026-09-25 用户拍板：初版交付之后应当允许持续维护迭代）。新合并的部分会在「等你交付」里再提示一次（delivery-due.mjs）。
+  if (p.archived_at) throw new I18nError('项目已归档，请先取消归档');
   const cur = appendStateOf(db, projectId);
   if (appendPending(cur)) return enqueueAppend(db, { projectId, userId, brief: text, cur, viaQuestion });
   return beginAppend(db, { project: p, userId, brief: text, seed });
@@ -137,12 +145,13 @@ export function requestAppend(db, { projectId, userId, brief, seed = null, viaQu
 /** 真正开一轮追加（requestAppend 与排队出队共用）。每一轮开头把上一轮留下的流程状态清干净。 */
 function beginAppend(db, { project: p, userId, brief: text, seed = null, fromQueue = null }) {
   const projectId = p.id;
+  const L = contentLang(db);
   let carrier = carrierOf(db, projectId);
   const t = now();
   return db.tx(() => {
     if (!carrier) {
       const id = newId('t');
-      db.run(`INSERT INTO tasks (id,owner_id,title,status,created_at,project_id,project_order) VALUES (?,?,?,'planning',?,?,0)`, id, p.owner_id, `项目规划：${p.title}`, t, projectId);
+      db.run(`INSERT INTO tasks (id,owner_id,title,status,created_at,project_id,project_order) VALUES (?,?,?,'planning',?,?,0)`, id, p.owner_id, tl(L, '项目规划：{title}', { title: p.title }), t, projectId);
       carrier = { id };
     } else db.run(`UPDATE tasks SET status='planning' WHERE id=?`, carrier.id);
     const since = db.one(`SELECT COALESCE(MAX(id),0) m FROM audit_log`).m;
@@ -163,12 +172,13 @@ function beginAppend(db, { project: p, userId, brief: text, seed = null, fromQue
 function enqueueAppend(db, { projectId, userId, brief, cur, viaQuestion = null }) {
   const item = { id: newId('aq'), userId, brief, at: now(), ...(viaQuestion ? { viaQuestion } : {}) };
   const queue = [...(cur.queue ?? []), item];
+  const L = contentLang(db);
   db.tx(() => {
     setParam(db, { taskId: cur.carrierId, key: 'append.queue', value: queue, by: BY(userId), governance: 'constitutional' });
     const q = cur.questionId ? db.one(`SELECT id, status FROM questions WHERE id=?`, cur.questionId) : null;
     if (q && ['open', 'escalated'].includes(q.status)) {
       db.run(`INSERT INTO answers (id,question_id,user_id,message_id,body,stance,created_at) VALUES (?,?,?,NULL,?,'comment',?)`,
-        newId('a'), q.id, userId, `（添加任务，已排队）${brief}\n—— 这条会在这一轮${cur.kind === 'review' ? '复盘' : '添加'}结束后单独起草、单独批准；不影响你现在这条怎么答。${cur.kind === 'review' ? '要是这条需求没做完就不该算达成，就别回「确认达成」，把它写进"还差什么"。' : ''}`, item.at);
+        newId('a'), q.id, userId, `${tl(L, '（添加任务，已排队）')}${brief}\n${cur.kind === 'review' ? tl(L, '—— 这条会在这一轮复盘结束后单独起草、单独批准；不影响你现在这条怎么答。') : tl(L, '—— 这条会在这一轮添加结束后单独起草、单独批准；不影响你现在这条怎么答。')}${cur.kind === 'review' ? tl(L, '要是这条需求没做完就不该算达成，就别回「确认达成」，把它写进"还差什么"。') : ''}`, item.at);
     }
     audit(db, { actorKind: 'user', actorId: userId, action: 'project_append_queued', targetType: 'project', targetId: projectId,
       payload: { queueId: item.id, position: queue.length, behind: cur.kind, stage: cur.stage, human: brief.slice(0, 200) } });
@@ -187,12 +197,13 @@ export function startQueuedAppend(db, { projectId }) {
     const [head, ...rest] = st.queue;
     setParam(db, { taskId: st.carrierId, key: 'append.queue', value: rest, by: { kind: 'agent', id: 'project' }, governance: 'execution' });
     const p = db.one(`SELECT * FROM projects WHERE id=?`, projectId);
-    const why = !head.viaQuestion && !canAddTasks(db, projectId, head.userId) ? '提出人已经没有添加任务的权限'
-      : !['active', 'stalled', 'done'].includes(p.status) ? `项目状态为 ${p.status}`
-        : p.archived_at ? '项目已归档' : null;
+    const L = contentLang(db);
+    const why = !head.viaQuestion && !canAddTasks(db, projectId, head.userId) ? tl(L, '提出人已经没有添加任务的权限')
+      : !['active', 'stalled', 'done'].includes(p.status) ? tl(L, '项目状态为 {status}', { status: p.status })
+        : p.archived_at ? tl(L, '项目已归档') : null;
     if (why) {
       audit(db, { actorKind: 'system', action: 'project_append_queue_dropped', targetType: 'project', targetId: projectId,
-        payload: { queueId: head.id, by: head.userId, why, human: `排队的需求没有起草：${why}。还要做的话，请有添加权限的人重新「添加任务」（原话：${String(head.brief).slice(0, 200)}）` } });
+        payload: { queueId: head.id, by: head.userId, why, human: tl(L, '排队的需求没有起草：{why}。还要做的话，请有添加权限的人重新「添加任务」（原话：{brief}）', { why, brief: String(head.brief).slice(0, 200) }) } });
       continue;
     }
     return beginAppend(db, { project: p, userId: head.userId, brief: head.brief, fromQueue: head.id });
@@ -209,11 +220,11 @@ export function startQueuedAppend(db, { projectId }) {
 const roundSinceTs = (db, st) => (st.sinceAuditId ? (db.one(`SELECT ts FROM audit_log WHERE id=?`, st.sinceAuditId)?.ts ?? 0) : 0);
 
 /** 新版正文的标题行之后插一段"和上一版比"。第一版没有上一版，原样返回。 */
-function withDiff(text, prevVer, next) {
+function withDiff(text, prevVer, next, lang = 'zh') {
   if (!prevVer) return text;
   const prev = prevVer.reached ? { reached: prevVer.reached } : prevVer.spec ? { tasks: prevVer.spec.tasks ?? [] } : null;
   if (!prev) return text;
-  const d = renderSpecDiff(diffSpecs(prev, next), { prevVersion: prevVer.version });
+  const d = renderSpecDiff(diffSpecs(prev, next), { prevVersion: prevVer.version, lang });
   const i = text.indexOf('\n');
   return i < 0 ? `${text}\n${d}` : `${text.slice(0, i + 1)}${d}${text.slice(i + 1)}`;
 }
@@ -225,7 +236,7 @@ function sideInput(db, { st, carrierId }) {
     ...db.all(`SELECT sender_id AS who, body, received_at AS at FROM messages WHERE task_id=? AND received_at>=? AND kind<>'answer' AND trust_label='user-authenticated'`, carrierId, sinceTs),
     ...db.all(`SELECT a.user_id AS who, a.body, a.created_at AS at FROM answers a JOIN questions q ON q.id=a.question_id
                WHERE q.task_id=? AND q.asked_at>=? AND a.stance='comment' AND a.user_id IS NOT NULL`, carrierId, sinceTs)
-      .filter((c) => !String(c.body).startsWith('（添加任务，已排队）')),
+      .filter((c) => !['（添加任务，已排队）', tl('en', '（添加任务，已排队）')].some((pre) => String(c.body).startsWith(pre))),   // 排队评论（enqueueAppend 写的）中英都认
   ].sort((x, y) => x.at - y.at);
   const out = [];
   if (said.length) out.push(`## 这一轮期间项目成员留的话（经认证通道；**供参考** —— 采纳与否以负责人的答复为准，没被负责人提到的不要当成已批准的要求；与目标 / 完成定义相关的，在 notes 里说你怎么处理的）\n${said.map((m) => `- ${names[m.who] ?? m.who}：${String(m.body).trim()}`).join('\n')}`);
@@ -243,25 +254,27 @@ function existingContracts(db, projectId) {
 }
 
 export function renderAppendProposal(db, { project, spec, version, notes, startOrder, seedCount, continued = false, review = false }) {
-  const L = [`【项目契约草案 · 追加 v${version}】`, `项目：${project.title}（现有任务编号到 #${startOrder - 1}，以下从 #${startOrder} 起；已有任务的契约不变）`, ''];
+  const lg = contentLang(db);
+  const L = [markOf(lg, 'appendDraft', { version }), tl(lg, '项目：{title}（现有任务编号到 #{last}，以下从 #{first} 起；已有任务的契约不变）', { title: project.title, last: startOrder - 1, first: startOrder }), ''];
   spec.tasks.forEach((t, i) => {
-    L.push(`${startOrder + i}. ${t.title}`, `   依赖：${renderDeps(t, startOrder + i, startOrder)}`, `   目标：${t.goal}`, `   范围：${t.scope}`, `   可动路径（判据）：${renderScopePaths(t.scope_paths)}`, `   完成定义：${t.definition_of_done}`);
-    if (t.rules?.length) L.push(`   规则：${renderRules(t.rules).map((r) => `\n     - ${r}`).join('')}`);
-    if (t.constraints?.length) L.push(`   约束：${t.constraints.map((c) => `\n     - ${c}`).join('')}`);
-    L.push(`   验收命令：${t.verify_command}（开工时系统会再累加当时已合并的全部任务的验收命令）`, '');
+    // 行首的几个键与项目契约草案（project-planner renderProposal）共用，译文在 content-5
+    L.push(`${startOrder + i}. ${t.title}`, tl(lg, '   依赖：{v}', { v: renderDeps(t, startOrder + i, startOrder, lg) }), tl(lg, '   目标：{v}', { v: t.goal }), tl(lg, '   范围：{v}', { v: t.scope }), tl(lg, '   可动路径（判据）：{v}', { v: renderScopePaths(t.scope_paths, lg) }), tl(lg, '   完成定义：{v}', { v: t.definition_of_done }));
+    if (t.rules?.length) L.push(tl(lg, '   规则：{v}', { v: renderRules(t.rules, lg).map((r) => `\n     - ${r}`).join('') }));
+    if (t.constraints?.length) L.push(tl(lg, '   约束：{v}', { v: t.constraints.map((c) => `\n     - ${c}`).join('') }));
+    L.push(tl(lg, '   验收命令：{v}{extra}', { v: t.verify_command, extra: tl(lg, '（开工时系统会再累加当时已合并的全部任务的验收命令）') }), '');
   });
-  L.push(SCOPE_PATHS_NOTE, '');
-  const assumptions = spec.tasks.flatMap((t, i) => (t.rules ?? []).filter((r) => !String(r.quote ?? '').trim()).map((r) => `第 ${startOrder + i} 个 · ${r.rule}（${r.assumption}）`));
-  L.push(assumptions.length ? `⚠ 规划器假设（你没写、规划器定的，共 ${assumptions.length} 条；批准即认可，不同意就在反馈里改）：${assumptions.map((a) => `\n  - ${a}`).join('')}` : '规划器假设：无（每条规则都引了你的原文）', '');
-  if (!seedCount && startOrder > 1) L.push('注意：此前的任务没有机械验收命令，回归义务从本次追加的第一个任务起算。', '');
-  if (!seedCount && continued && startOrder === 1) L.push('注意：本项目接续自一个已签收的任务，而原任务没有机械验收命令 —— 回归义务从本项目第一个任务起算，原任务的行为不在自动回归之内。', '');
+  L.push(scopePathsNote(lg), '');
+  const assumptions = spec.tasks.flatMap((t, i) => (t.rules ?? []).filter((r) => !String(r.quote ?? '').trim()).map((r) => tl(lg, '第 {n} 个 · {rule}（{assumption}）', { n: startOrder + i, rule: r.rule, assumption: r.assumption })));
+  L.push(assumptions.length ? tl(lg, '⚠ 规划器假设（你没写、规划器定的，共 {n} 条；批准即认可，不同意就在反馈里改）：{list}', { n: assumptions.length, list: assumptions.map((a) => `\n  - ${a}`).join('') }) : tl(lg, '规划器假设：无（每条规则都引了你的原文）'), '');
+  if (!seedCount && startOrder > 1) L.push(tl(lg, '注意：此前的任务没有机械验收命令，回归义务从本次追加的第一个任务起算。'), '');
+  if (!seedCount && continued && startOrder === 1) L.push(tl(lg, '注意：本项目接续自一个已签收的任务，而原任务没有机械验收命令 —— 回归义务从本项目第一个任务起算，原任务的行为不在自动回归之内。'), '');
   // 范围重叠预警。只看这一批自己 —— 不同批次之间不可能同时开着（前一批定稿时早合并了）。
   const maxOpen = maxOpenOf(db, project.id);
-  const overlaps = maxOpen > 1 ? renderScopeOverlaps(scopeOverlaps(spec, { startAt: startOrder })) : null;
+  const overlaps = maxOpen > 1 ? renderScopeOverlaps(scopeOverlaps(spec, { startAt: startOrder }), lg) : null;
   if (overlaps) L.push(overlaps, '');
-  if (notes) L.push(`规划器说明：${notes}`, '');
-  L.push(`每个任务的硬上限：累计运行时长 ${Math.round(PROJECT_TASK_RUNTIME_MS / 3600000)} h（其余按默认）。`, '');
-  L.push(`批准后新任务按上面的依赖关系排进项目：依赖的任务都签收并合并后才开工；已有任务的契约不受影响。${schedLine(maxOpen)}依赖关系不对，直接在反馈里说。请回复：`, '(A) 批准 —— 回 "A" 或 "批准"', '(B) 要改 —— 直接写要改什么，会出下一版', review ? '(C) 先放着（还没想好） —— 回 "C" 或 "先放着"：这批任务不加，项目也不算做完，转为停滞，以后再添加任务、重新复盘或中止' : '(C) 放弃 —— 回 "C" 或 "放弃"（不追加，项目其余照旧）', '(D) 批准，但留一句保留意见 —— **它不挡任何东西**：这一批照样全部生效，效果与 (A) 一模一样。它只把你那句话留在项目的约定清单上、标成〔保留意见〕，让下一个碰这一处的人看得到。要**挡住**其中某一条，只能 (B) 说清哪一条不要、让它重出一版。写法：先回 A，**另起一行**写「保留：…」。', ...(review ? ['(E) 项目其实已经做完了，这些任务都不需要 —— 回 "E" 或 "已达成"：这批任务不加，项目算做完（之后可以交付）'] : []));
+  if (notes) L.push(tl(lg, '规划器说明：{v}', { v: notes }), '');
+  L.push(tl(lg, '每个任务的硬上限：累计运行时长 {h} h（其余按默认）。', { h: Math.round(PROJECT_TASK_RUNTIME_MS / 3600000) }), '');
+  L.push(tl(lg, '批准后新任务按上面的依赖关系排进项目：依赖的任务都签收并合并后才开工；已有任务的契约不受影响。{sched}依赖关系不对，直接在反馈里说。请回复：', { sched: schedLine(maxOpen, lg) }), tl(lg, '(A) 批准 —— 回 "A" 或 "批准"'), tl(lg, '(B) 要改 —— 直接写要改什么，会出下一版'), review ? tl(lg, '(C) 先放着（还没想好） —— 回 "C" 或 "先放着"：这批任务不加，项目也不算做完，转为停滞，以后再添加任务、重新复盘或中止') : tl(lg, '(C) 放弃 —— 回 "C" 或 "放弃"（不追加，项目其余照旧）'), tl(lg, '(D) 批准，但留一句保留意见 —— **它不挡任何东西**：这一批照样全部生效，效果与 (A) 一模一样。它只把你那句话留在项目的约定清单上、标成〔保留意见〕，让下一个碰这一处的人看得到。要**挡住**其中某一条，只能 (B) 说清哪一条不要、让它重出一版。写法：先回 A，**另起一行**写「保留：…」。'), ...(review ? [tl(lg, '(E) 项目其实已经做完了，这些任务都不需要 —— 回 "E" 或 "已达成"：这批任务不加，项目算做完（之后可以交付）')] : []));
   return L.join('\n');
 }
 
@@ -291,6 +304,7 @@ export async function planAppend(db, { client, project, tier = 'heavy', maxAttem
   if (!appendPending(st)) return { kind: 'noop', why: `项目 ${project.status}，没有进行中的追加` };
   const review = st.kind === 'review';
   const carrierId = st.carrierId;
+  const lg = contentLang(db);
   // 与追问器同一条规矩：规划器写的流程状态记 agent / execution；人的批准 / 放弃记人的名字。
   const set = (key, value, userId = null) => setParam(db, { taskId: carrierId, key, value, ...(userId ? { by: BY(userId), governance: 'constitutional' } : { by: { kind: 'agent', id: 'project_planner' }, governance: 'execution' }) });
   if (db.one(`SELECT status FROM tasks WHERE id=?`, carrierId).status === 'running') db.run(`UPDATE tasks SET status='planning' WHERE id=?`, carrierId);
@@ -310,7 +324,7 @@ export async function planAppend(db, { client, project, tier = 'heavy', maxAttem
     // 复盘提的任务方案回 E（已经达成，这些都不需要）：与达成确认回 A 同一个结局 —— 记人的判断，项目级验收归 advanceProject
     if (review && !reachedNow && verdict === 'reached') {
       db.tx(() => {
-        set('append.reached', { reason: '人判定已达成：复盘提出的任务都不需要', unverified: [] });
+        set('append.reached', { reason: tl(lg, '人判定已达成：复盘提出的任务都不需要'), unverified: [] });
         set('append.stage', 'reached', a.sender_id);
         db.run(`UPDATE tasks SET status='done' WHERE id=?`, carrierId);
         audit(db, { actorKind: 'user', actorId: a.sender_id, action: 'project_goal_declared', targetType: 'project', targetId: project.id,
@@ -364,7 +378,7 @@ export async function planAppend(db, { client, project, tier = 'heavy', maxAttem
       if (mergedQueue.length) {
         setParam(db, { taskId: carrierId, key: 'append.queue', value: q.filter((x) => x.userId !== who), by: { kind: 'agent', id: 'project' }, governance: 'execution' });
         audit(db, { actorKind: 'system', action: 'project_append_queue_merged', targetType: 'project', targetId: project.id,
-          payload: { by: who, items: mergedQueue.map((x) => x.id), human: `${mergedQueue.length} 条排着的需求并进这一轮（提需求的人在达成确认里回了"还差东西"）` } });
+          payload: { by: who, items: mergedQueue.map((x) => x.id), human: tl(lg, '{n} 条排着的需求并进这一轮（提需求的人在达成确认里回了"还差东西"）', { n: mergedQueue.length }) } });
       }
     }
     if (verdict === 'approve') {
@@ -380,11 +394,11 @@ export async function planAppend(db, { client, project, tier = 'heavy', maxAttem
         if (st.requestedBy) for (const id of taskIds) setParam(db, { taskId: id, key: 'task.requested_by', value: st.requestedBy, by: BY(st.requestedBy), governance: 'constitutional' });
         set('append.stage', 'approved', a.sender_id);
         db.run(`UPDATE tasks SET status='done' WHERE id=?`, carrierId);
-        // 批准时带的保留意见有地方放了
+        // 批准时带的保留意见单独记下
         const resv = reservationOf(a.body);
-        if (resv) recordReservation(db, { projectId: project.id, subject: `批准追加草案 v${st.version} 时的保留意见`, text: resv, sourceKind: 'contract', sourceId: st.questionId, by: a.sender_id });
+        if (resv) recordReservation(db, { projectId: project.id, subject: tl(lg, '批准追加草案 v{version} 时的保留意见', { version: st.version }), text: resv, sourceKind: 'contract', sourceId: st.questionId, by: a.sender_id });
         if (['done', 'stalled'].includes(p.status)) db.run(`UPDATE projects SET status='active' WHERE id=?`, project.id);     // 全部合并完 / 停滞的项目：追加后重新有事可做（停滞的原来不放回 active，新任务永远不开工）
-        db.run(`UPDATE projects SET brief=? WHERE id=?`, `${p.brief ?? ''}\n\n---- 追加（${new Date(now()).toISOString().slice(0, 10)}）----\n${st.brief}`, project.id);
+        db.run(`UPDATE projects SET brief=? WHERE id=?`, `${p.brief ?? ''}\n\n${tl(lg, '---- 追加（{date}）----', { date: new Date(now()).toISOString().slice(0, 10) })}\n${st.brief}`, project.id);
         audit(db, { actorKind: 'user', actorId: a.sender_id, action: 'project_appended', targetType: 'project', targetId: project.id,
           payload: { version: st.version, questionId: st.questionId, startOrder, tasks: taskIds, reopened: p.status === 'done' } });
       });
@@ -429,7 +443,7 @@ export async function planAppend(db, { client, project, tier = 'heavy', maxAttem
   const quoteSource = `${project.brief ?? ''}\n${st.brief}`;
 
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-    const resp = await client.complete({ tier, system: SYSTEM_APPEND(MAX_APPEND_TASKS), messages, tools: [tool], maxTokens: MAX_TOKENS, effort: 'high' });
+    const resp = await client.complete({ tier, system: withOutputLang(SYSTEM_APPEND(MAX_APPEND_TASKS), contentLang(db)), messages, tools: [tool], maxTokens: MAX_TOKENS, effort: 'high' });
     if (truncatedEmpty(resp)) throw new TruncatedEmptyError('项目规划器（追加）', MAX_TOKENS);
     const call = toolCallsOf(resp).find((c) => c.name === 'propose_project');
     const errs = [];
@@ -447,7 +461,7 @@ export async function planAppend(db, { client, project, tier = 'heavy', maxAttem
       const gate = await autoGearGate(db, { project, spec, client });
       if (gate.auto) return landAuto(db, { project, spec, startOrder, seedExtra: [...(st.seed ?? []), ...chainVerify(db, project.id)],
         set, carrierId, version, notes, gate, attempt, review: false });
-      const text = autoFallbackNote(gate) + withDiff(renderAppendProposal(db, { project, spec, version, notes, startOrder, seedCount, continued: st.continued }), prevVer, { tasks: spec.tasks });
+      const text = autoFallbackNote(gate, lg) + withDiff(renderAppendProposal(db, { project, spec, version, notes, startOrder, seedCount, continued: st.continued }), prevVer, { tasks: spec.tasks }, lg);
       db.tx(() => {
         db.run(`INSERT INTO questions (id,task_id,node_id,level,level_source,text,default_action,asked_at,timeout_at,status)
                 VALUES (?,?,NULL,3,'hard_rule',?,NULL,?,NULL,'open')`, qid, carrierId, text, t);
@@ -463,7 +477,7 @@ export async function planAppend(db, { client, project, tier = 'heavy', maxAttem
     }
     audit(db, { actorKind: 'agent', actorId: 'project_planner', action: 'project_plan_attempt', targetType: 'project', targetId: project.id,
       payload: { append: true, attempt, rejections: errs, say: textOf(resp).slice(0, 600) || null, stopReason: resp.stopReason } });
-    if (attempt === maxAttempts) throw new Error(`项目规划器 ${maxAttempts} 次都没给出合规的追加契约：${errs.join('；')}`);
+    if (attempt === maxAttempts) throw new I18nError('项目规划器 {n} 次都没给出合规的追加契约：{errs}', { n: maxAttempts, errs: errs.join('；') });
     messages.push({ role: 'assistant', content: resp.content });
     if (call) messages.push({ role: 'tool_results', results: [{ callId: call.id, name: call.name, isError: true, content: `被拒：\n- ${errs.join('\n- ')}` }] });
     else messages.push({ role: 'user', content: [{ type: 'text', text: errs[0] }] });
@@ -493,22 +507,24 @@ const SYSTEM_REVIEW = (max) => `你是一个长期运行的自主 agent 的"项�
 
 export function renderReached(db, { project, reason, unverified, version }) {
   const merged = projectTasks(db, project.id).filter((t) => t.merged_at);
-  const L = [`【项目达成确认 v${version}】`, `项目：${project.title}`, '',
-    `目标：${project.goal || '（没写）'}`, `完成定义：${project.done_definition || '（没写）'}`, '',
-    `已完成并合并的任务（${merged.length} 个）：`,
+  const lg = contentLang(db);
+  const L = [markOf(lg, 'reached', { version }), tl(lg, '项目：{v}', { v: project.title }), '',
+    tl(lg, '目标：{v}', { v: project.goal || tl(lg, '（没写）') }), tl(lg, '完成定义：{v}', { v: project.done_definition || tl(lg, '（没写）') }), '',
+    tl(lg, '已完成并合并的任务（{n} 个）：', { n: merged.length }),
     ...merged.map((t) => `  ${t.project_order}. ${t.title}`), '',
-    `规划器的判断：${reason}`, ''];
+    tl(lg, '规划器的判断：{reason}', { reason }), ''];
   // 这一节是人点头前唯一该逐条核的地方：规划器看不到代码，只看得到契约的完成定义。
   // 它说不准的每一条都单列出来，别让"已达成"这三个字把它们盖住。
   L.push(unverified?.length
-    ? `⚠ 规划器无法确认的（${unverified.length} 条；它只看得到契约，看不到代码 —— 这几条要你自己判断）：${unverified.map((u) => `\n  - ${u}`).join('')}`
-    : '规划器无法确认的：无（每条完成定义都能对上某个任务的契约）', '');
+    ? tl(lg, '⚠ 规划器无法确认的（{n} 条；它只看得到契约，看不到代码 —— 这几条要你自己判断）：{list}', { n: unverified.length, list: unverified.map((u) => `\n  - ${u}`).join('') })
+    : tl(lg, '规划器无法确认的：无（每条完成定义都能对上某个任务的契约）'), '');
   const vc = projectVerifyCommand(db, project.id);
-  L.push(vc ? `确认之后系统会先跑项目级验收命令「${vc.join(' ')}」（在项目分支的一个干净克隆里），过了才宣布达成。`
-    : '这个项目没有填项目级验收命令 —— **"达成"完全由你这一下决定**，没有机械核实。要加就先到「项目设置 → 自动化」填上项目级验收命令再来。', '');
-  L.push('请回复：', '(A) 确认达成 —— 回 "A" 或 "批准"；项目转为已完成，随后可以交付',
-    '(B) 还差东西 —— 直接写还差什么，规划器按你说的切成任务再来一版',
-    '(C) 先放着 —— 回 "C" 或 "放弃"；项目转为停滞，等你添加任务、或中止项目');
+  L.push(vc ? tl(lg, '确认之后系统会先跑项目级验收命令「{cmd}」（在项目分支的一个干净克隆里），过了才宣布达成。', { cmd: vc.join(' ') })
+    : tl(lg, '这个项目没有填项目级验收命令 —— **"达成"完全由你这一下决定**，没有机械核实。要加就先到「项目设置 → 自动化」填上项目级验收命令再来。'), '');
+  L.push(tl(lg, '请回复：'), tl(lg, '(A) 确认达成 —— 回 "A" 或 "批准"；项目转为已完成，随后可以交付'),
+    // 明说"想加的需求也写在这里"（否则达成确认容易被读成"项目算不算做完"：人回了 A，本想提的需求就没提出来）
+    tl(lg, '(B) 还差东西，或者还想加新需求 —— 直接写还差什么 / 想加什么（例如"还想加：列表能按优先级排序"），系统按你说的拆成新任务、再给你看一版（已经做好的部分保留）；这样提的需求记在你名下'),
+    tl(lg, '(C) 先放着 —— 回 "C" 或 "放弃"；项目转为停滞，等你添加任务、或中止项目'));
   return L.join('\n');
 }
 
@@ -550,7 +566,7 @@ async function planReview(db, { client, project, tier, maxAttempts, tool, doneTo
   const quoteSource = `${project.brief ?? ''}\n${project.goal ?? ''}\n${project.done_definition ?? ''}`;
 
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-    const resp = await client.complete({ tier, system: SYSTEM_REVIEW(MAX_APPEND_TASKS), messages, tools, maxTokens: MAX_TOKENS, effort: 'high' });
+    const resp = await client.complete({ tier, system: withOutputLang(SYSTEM_REVIEW(MAX_APPEND_TASKS), contentLang(db)), messages, tools, maxTokens: MAX_TOKENS, effort: 'high' });
     if (truncatedEmpty(resp)) throw new TruncatedEmptyError('项目规划器（复盘）', MAX_TOKENS);
     const calls = toolCallsOf(resp);
     const done = doneTool ? calls.find((c) => c.name === doneTool.name) : null;
@@ -572,7 +588,7 @@ async function planReview(db, { client, project, tier, maxAttempts, tool, doneTo
       const version = st.version + 1, qid = newId('q'), t = now();
       if (done) {
         const reached = { reason: String(done.args.reason).trim(), unverified: (done.args.unverified ?? []).map(String) };
-        const text = withDiff(renderReached(db, { project, ...reached, version }), prevVer, { reached });
+        const text = withDiff(renderReached(db, { project, ...reached, version }), prevVer, { reached }, contentLang(db));
         db.tx(() => {
           db.run(`INSERT INTO questions (id,task_id,node_id,level,level_source,text,default_action,asked_at,timeout_at,status)
                   VALUES (?,?,NULL,3,'hard_rule',?,NULL,?,NULL,'open')`, qid, carrierId, text, t);
@@ -593,7 +609,7 @@ async function planReview(db, { client, project, tier, maxAttempts, tool, doneTo
       const gate = await autoGearGate(db, { project, spec, client });
       if (gate.auto) return landAuto(db, { project, spec, startOrder, seedExtra: chainVerify(db, project.id),
         set, carrierId, version, notes, gate, attempt, review: true });
-      const text = autoFallbackNote(gate) + withDiff(renderAppendProposal(db, { project, spec, version, notes, startOrder, seedCount, continued: false, review: true }), prevVer, { tasks: spec.tasks });
+      const text = autoFallbackNote(gate, contentLang(db)) + withDiff(renderAppendProposal(db, { project, spec, version, notes, startOrder, seedCount, continued: false, review: true }), prevVer, { tasks: spec.tasks }, contentLang(db));
       db.tx(() => {
         db.run(`INSERT INTO questions (id,task_id,node_id,level,level_source,text,default_action,asked_at,timeout_at,status)
                 VALUES (?,?,NULL,3,'hard_rule',?,NULL,?,NULL,'open')`, qid, carrierId, text, t);
@@ -609,7 +625,7 @@ async function planReview(db, { client, project, tier, maxAttempts, tool, doneTo
     }
     audit(db, { actorKind: 'agent', actorId: 'project_planner', action: 'project_plan_attempt', targetType: 'project', targetId: project.id,
       payload: { review: true, attempt, rejections: errs, say: textOf(resp).slice(0, 600) || null, stopReason: resp.stopReason } });
-    if (attempt === maxAttempts) throw new Error(`项目规划器 ${maxAttempts} 次都没给出合规的复盘结论：${errs.join('；')}`);
+    if (attempt === maxAttempts) throw new I18nError('项目规划器 {n} 次都没给出合规的复盘结论：{errs}', { n: maxAttempts, errs: errs.join('；') });
     messages.push({ role: 'assistant', content: resp.content });
     const bad = done ?? call;
     if (bad) messages.push({ role: 'tool_results', results: [{ callId: bad.id, name: bad.name, isError: true, content: `被拒：\n- ${errs.join('\n- ')}` }] });
@@ -641,7 +657,7 @@ async function autoGearGate(db, { project, spec, client }) {
   if (!list.length) return { auto: true, considered: 0 };
   const text = spec.tasks.map((t, i) => `任务 ${i + 1}「${t.title}」：${t.goal}｜范围：${t.scope}｜完成定义：${t.definition_of_done}`).join('\n');
   let r;
-  try { r = await checkDecisions(text, { decisions: list, llmClient: client, entry: 'task' }); }
+  try { r = await checkDecisions(text, { decisions: list, llmClient: client, entry: 'task', lang: contentLang(db) }); }
   catch (e) { return { auto: false, why: 'check_failed', error: String(e.message).slice(0, 200) }; }
   if (r.skipped && r.skipped !== 'no_decisions') return { auto: false, why: `check_${r.skipped}` };
   if (r.hits.length) {
@@ -652,18 +668,18 @@ async function autoGearGate(db, { project, spec, client }) {
 }
 
 /** 退回提议挡时，把"为什么没自动开工"写进批准事项的开头 —— 人要看到的是判断，不是一条日志。 */
-export function autoFallbackNote(gate) {
+export function autoFallbackNote(gate, lang = 'zh') {
   if (!gate || gate.auto) return '';
+  const mark = markOf(lang, 'autoGateBack');
   if (gate.why === 'decision_conflict') {
-    return `【本该自动开工，但退回给你批】这一批任务里有 ${gate.hits.length} 处与这个项目已经定下的约定对不上，`
-      + `按自动挡的第四条前提退回提议挡：\n${gate.hits.map((h) => `  - 与「${h.decision?.subject ?? h.id}」：${h.why ?? '（没说理由）'}`).join('\n')}\n`
-      + `照做会推翻那条约定，所以不由系统替你拍板。批准即认可这一批；不同意就在反馈里说清以哪条为准。\n\n`;
+    return `${mark}${tl(lang, '这一批任务里有 {n} 处与这个项目已经定下的约定对不上，按自动挡的第四条前提退回提议挡：', { n: gate.hits.length })}`
+      + `\n${gate.hits.map((h) => tl(lang, '  - 与「{subject}」：{why}', { subject: h.decision?.subject ?? h.id, why: h.why ?? tl(lang, '（没说理由）') })).join('\n')}\n`
+      + `${tl(lang, '照做会推翻那条约定，所以不由系统替你拍板。批准即认可这一批；不同意就在反馈里说清以哪条为准。')}\n\n`;
   }
-  if (gate.why === 'budget_over') return `【本该自动开工，但退回给你批】项目已达预算闸（${gate.budget.human}），自动挡不再自己开工。\n\n`;
-  if (gate.why === 'prereq') return `【本该自动开工，但退回给你批】自动挡的前提此刻不成立：${gate.missing.map((m) => m.label).join('；')}。\n\n`;
+  if (gate.why === 'budget_over') return `${mark}${tl(lang, '项目已达预算闸（{budget}），自动挡不再自己开工。', { budget: gate.budget.human })}\n\n`;
+  if (gate.why === 'prereq') return `${mark}${tl(lang, '自动挡的前提此刻不成立：{list}。', { list: gate.missing.map((m) => m.label).join(tl(lang, '；')) })}\n\n`;
   if (String(gate.why).startsWith('check_')) {
-    return `【本该自动开工，但退回给你批】与已定约定的比对这次没跑成（${gate.why}）。`
-      + `比对跑不成不等于没有冲突，所以按提议挡走 —— 多问你一次是一条待办，少问一次是一批没人看过的任务直接开工。\n\n`;
+    return `${mark}${tl(lang, '与已定约定的比对这次没跑成（{why}）。比对跑不成不等于没有冲突，所以按提议挡走 —— 多问你一次是一条待办，少问一次是一批没人看过的任务直接开工。', { why: gate.why })}\n\n`;
   }
   return '';
 }

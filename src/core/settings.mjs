@@ -5,15 +5,18 @@
 // 打开"仅管理员可创建"后只有管理员能建。旁观者与已停用成员恒不可。
 
 import { newId, now, audit } from '../db/db.mjs';
+import { I18nError, CATALOGS, contentLang } from '../i18n/index.mjs';
 
 export const SETTINGS = {
   'deploy.create_admin_only': { default: false, type: 'boolean', label: '仅管理员可新建项目与任务' },
   // 新项目建好就放行的联网源（管理员在联网目录里勾）。原来每个新项目第一次装依赖都要负责人答一条"放不放行"。
   'deploy.egress_defaults': { default: [], type: 'list', label: '新项目默认放行的联网源' },
+  // 0.2.0：写进库里的文字（事项正文、汇报……）与模型写给人的文字用哪种语言。按部署统一，见 src/i18n/index.mjs。
+  'deploy.content_lang': { default: 'zh', type: 'enum', values: ['zh', 'en'], label: '内容语言' },
 };
 
 export function getSetting(db, key) {
-  const def = SETTINGS[key] ?? (() => { throw new Error(`设置项不存在：${key}`); })();
+  const def = SETTINGS[key] ?? (() => { throw new I18nError('设置项不存在：{key}', { key }); })();
   // ⚠️ `project_id IS NULL` 不能省（v16 起 params 多了项目层）：项目层的行 task_id 也是 NULL，
   // 少这一句就会把某个项目的同名设置读成部署级的。
   const row = db.one(`SELECT value FROM params WHERE task_id IS NULL AND project_id IS NULL AND key=? AND superseded_at IS NULL ORDER BY recorded_at DESC, rowid DESC LIMIT 1`, key);
@@ -23,9 +26,12 @@ export function getSetting(db, key) {
 
 /** 调用方保证操作者是管理员。 */
 export function setSetting(db, { key, value, userId }) {
-  const def = SETTINGS[key] ?? (() => { throw new Error(`设置项不存在：${key}`); })();
-  if (def.type === 'boolean' && typeof value !== 'boolean') throw new Error(`${def.label}：值无效（应为 true 或 false）`);
-  if (def.type === 'list' && !(Array.isArray(value) && value.every((x) => typeof x === 'string'))) throw new Error(`${def.label}：值无效（应为一组名字）`);
+  const def = SETTINGS[key] ?? (() => { throw new I18nError('设置项不存在：{key}', { key }); })();
+  // 报错里的设置项名按内容语言取（label 是中文原文，看板上的名字由看板翻）
+  const label = () => CATALOGS[contentLang(db)]?.[def.label] ?? def.label;
+  if (def.type === 'boolean' && typeof value !== 'boolean') throw new I18nError('{label}：值无效（应为 true 或 false）', { label: label() });
+  if (def.type === 'list' && !(Array.isArray(value) && value.every((x) => typeof x === 'string'))) throw new I18nError('{label}：值无效（应为一组名字）', { label: label() });
+  if (def.type === 'enum' && !def.values.includes(value)) throw new I18nError('{label}：值无效（可选：{values}）', { label: label(), values: def.values.join(' / ') });
   const t = now();
   return db.tx(() => {
     const before = getSetting(db, key);

@@ -12,10 +12,12 @@
 //
 // 模型只回答一个问题：**这两句话能不能同时成立**。它不判断谁对、不给建议、不碰任何状态。
 
+import { withOutputLang, contentLang, tl } from '../i18n/index.mjs';
+import { markOf } from '../i18n/marks.mjs';
 import { newId, now, audit, insertEdge } from '../db/db.mjs';
 import { routeQuestion, leadOf, routingKeyOf, rulesOf, matchChains, resolveRecipients, stripTransferHint } from './routing.mjs';
 import { RESOLUTION_HOOKS } from './answers.mjs';
-import { voidOne, activeDecisions, scopeHints, SOURCE_NAMES } from './decisions.mjs';
+import { voidOne, activeDecisions, scopeHints, SOURCE_NAMES, sourceTagOf } from './decisions.mjs';
 import { textOf } from '../llm/canonical.mjs';
 import { flushLedger } from './ledger.mjs';
 import { steeringFrom, releaseCheckHold } from './inbox.mjs';
@@ -73,7 +75,7 @@ const conf = (v) => { const n = typeof v === 'number' ? v : Number(v); return Nu
  *
  * @returns {{hits:Array<{id,quote,why,confidence}>, considered:number, skipped:string|null, dropped:number}}
  */
-export async function checkDecisions(text, { decisions = [], llmClient, entry = 'answer' } = {}) {
+export async function checkDecisions(text, { decisions = [], llmClient, entry = 'answer', lang = null } = {}) {
   if (!String(text ?? '').trim()) return { hits: [], considered: 0, skipped: 'empty_text', dropped: 0 };
   if (!decisions.length) return { hits: [], considered: 0, skipped: 'no_decisions', dropped: 0 };
   if (!llmClient) return { hits: [], considered: decisions.length, skipped: 'no_client', dropped: 0 };
@@ -81,7 +83,7 @@ export async function checkDecisions(text, { decisions = [], llmClient, entry = 
   const messages = [{ role: 'user', content: [{ type: 'text', text: buildPrompt(text, decisions, entry) }] }];
   let raw = null;
   for (let attempt = 0; attempt < 2; attempt++) {
-    const resp = await llmClient.complete({ tier: CHECK_TIER, system: systemPrompt(), messages, maxTokens: 800 });
+    const resp = await llmClient.complete({ tier: CHECK_TIER, system: withOutputLang(systemPrompt(), lang), messages, maxTokens: 800 });
     raw = extractJson(textOf(resp));
     if (raw && Array.isArray(raw.hits)) break;
     raw = null;
@@ -99,7 +101,7 @@ export async function checkDecisions(text, { decisions = [], llmClient, entry = 
     const c = conf(h?.confidence);
     // 编号必须来自清单：模型编一个出来，宁可丢掉也不能拿去作废一条真决定。
     if (!d || c < HIT_CONFIDENCE_FLOOR) { dropped++; continue; }
-    hits.push({ id: d.id, quote: head(h?.quote, 300), why: head(h?.why, 300) || '（模型没给理由）', confidence: c });
+    hits.push({ id: d.id, quote: head(h?.quote, 300), why: head(h?.why, 300) || tl(lang, '（模型没给理由）'), confidence: c });
   }
   return { hits: hits.slice(0, MAX_HITS), considered: decisions.length, skipped: null, dropped: dropped + Math.max(0, hits.length - MAX_HITS) };
 }
@@ -120,7 +122,9 @@ export function routeOf(db, { decision, by }) {
   return { mode: 'parties', parties: [...new Set([by, author.id].filter(Boolean))] };
 }
 
-const nameOf = (db, id) => (id ? db.one(`SELECT display_name FROM users WHERE id=?`, id)?.display_name ?? id : '（系统）');
+const nameOf = (db, id) => (id ? db.one(`SELECT display_name FROM users WHERE id=?`, id)?.display_name ?? id : tl(contentLang(db), '（系统）'));
+/** 事项正文里的入口名（按内容语言）；ENTRY_NAMES 本身给模型的提示词用，保持中文。 */
+const entryNameOf = (L, entry) => (entry === 'task' ? tl(L, '新任务描述') : entry === 'revision' ? tl(L, '变更消息') : entry === 'answer' ? tl(L, '对问题的答复') : entry);
 
 /**
  * 一次输入命中**一组**决定时的走法：
@@ -156,42 +160,48 @@ const roleHint = (db, userId) => {
   const note = db.one(`SELECT m.note FROM project_members m JOIN tasks t ON t.project_id=m.project_id
                        WHERE m.user_id=? AND m.note<>'' LIMIT 1`, userId)?.note;
   const short = note ? String(note).split(/[：:，,；;]/)[0].trim().slice(0, 12) : null;
-  return short ? ` · ${short}` : (u.role === 'lead' ? ' · 管理员' : '');
+  return short ? ` · ${short}` : (u.role === 'lead' ? tl(contentLang(db), ' · 管理员') : '');
 };
 const bodyOf = (db, { group, entry, by, mode, held = false }) => {
   const contract = group.some((g) => g.decision.source_kind === 'contract');
   const one = group.length === 1;
   const lead = mode === 'lead';
-  const listed = group.map(({ decision: d, hit }, i) => `${one ? '' : `（${i + 1}）`}[${d.id}]〔${SOURCE_NAMES[d.source_kind] ?? d.source_kind}〕${d.subject}`
-    + `（${day(d.decided_at)} 由 ${nameOf(db, d.decided_by)} 定下${d.source_kind === 'contract' ? '，是批准过的契约里的条款' : ''}）\n`
-    + `　　${head(d.statement, 400)}\n　　为什么对不上：${hit.why}`).join('\n\n');
+  const L = contentLang(db);
+  const n = group.length;
+  const listed = group.map(({ decision: d, hit }, i) => `${one ? '' : tl(L, '（{i}）', { i: i + 1 })}[${d.id}]${sourceTagOf(L, d.source_kind)}${d.subject}`
+    + `${d.source_kind === 'contract'
+      ? tl(L, '（{day} 由 {who} 定下，是批准过的契约里的条款）', { day: day(d.decided_at), who: nameOf(db, d.decided_by) })
+      : tl(L, '（{day} 由 {who} 定下）', { day: day(d.decided_at), who: nameOf(db, d.decided_by) })}\n`
+    + `　　${head(d.statement, 400)}\n　　${tl(L, '为什么对不上：{why}', { why: hit.why })}`).join('\n\n');
   const quote = group.find((g) => g.hit.quote)?.hit.quote ?? null;
-  return `【决定冲突】${mode === 'self' ? `你这次说的，会推翻你自己先前定下的${one ? '一条决定' : `${group.length} 条决定`}。`
-    : `这次的${ENTRY_NAMES[entry] ?? entry}，和${one ? '一条' : ` ${group.length} 条`}仍然有效的旧决定对不上。`}
+  const entryName = entryNameOf(L, entry);
+  return `${markOf(L, 'decisionConflict')}${mode === 'self'
+    ? (one ? tl(L, '你这次说的，会推翻你自己先前定下的一条决定。') : tl(L, '你这次说的，会推翻你自己先前定下的{n} 条决定。', { n }))
+    : (one ? tl(L, '这次的{entry}，和一条仍然有效的旧决定对不上。', { entry: entryName }) : tl(L, '这次的{entry}，和 {n} 条仍然有效的旧决定对不上。', { entry: entryName, n }))}
 
-这次说的（${nameOf(db, by)}${roleHint(db, by)}）：${quote ? `“${quote}”` : '（见本任务的最新消息）'}
+${tl(L, '这次说的（{who}）：{quote}', { who: `${nameOf(db, by)}${roleHint(db, by)}`, quote: quote ? `“${quote}”` : tl(L, '（见本任务的最新消息）') })}
 
-${one ? '旧决定：' : `被推翻的 ${group.length} 条旧决定：`}
+${one ? tl(L, '旧决定：') : tl(L, '被推翻的 {n} 条旧决定：', { n })}
 ${listed}
 
 ${mode === 'self' ? '' : lead
     ? `${group.some((g) => g.decision.source_kind === 'contract')
-      ? '其中有契约里的条款 —— 契约是你批准过的，改它只能由你来定。'
-      : '定下这些决定的人已经停用，所以这条交给你。'}\n`
-    : `先由 ${nameOf(db, by)} 与${[...new Set(group.map((g) => nameOf(db, g.decision.decided_by)))].join('、')} 商量；谈不拢或超时转项目负责人裁定。\n`}请选一条${one ? '' : `（一次选定，上面 ${group.length} 条一起处理）`}：
-(A) **以新为准** —— 上面${one ? '那条' : '那些'}旧决定就此作废：回「以新为准」
-(B) 以旧为准 —— 这次的说法不算数，照旧决定执行：回「以旧为准」
-(C) 其实不冲突 —— 都能同时成立：回「不冲突：」再写一句为什么
+      ? tl(L, '其中有契约里的条款 —— 契约是你批准过的，改它只能由你来定。')
+      : tl(L, '定下这些决定的人已经停用，所以这条交给你。')}\n`
+    : `${tl(L, '先由 {by} 与{others} 商量；谈不拢或超时转项目负责人裁定。', { by: nameOf(db, by), others: [...new Set(group.map((g) => nameOf(db, g.decision.decided_by)))].join(tl(L, '、')) })}\n`}${one ? tl(L, '请选一条：') : tl(L, '请选一条（一次选定，上面 {n} 条一起处理）：', { n })}
+${one ? tl(L, '(A) **以新为准** —— 上面那条旧决定就此作废：回「以新为准」') : tl(L, '(A) **以新为准** —— 上面那些旧决定就此作废：回「以新为准」')}
+${tl(L, '(B) 以旧为准 —— 这次的说法不算数，照旧决定执行：回「以旧为准」')}
+${tl(L, '(C) 其实不冲突 —— 都能同时成立：回「不冲突：」再写一句为什么')}
 
-系统不替你判谁对。选 (A) 之后，${one ? '它' : '它们'}会在清单里标成"已作废"，并记下是被这次的说法取代的。
-${contract ? '写着这条的任务说明原文不改，但那个任务之后执行时会照新的说法做，不会为这一条再来问你。\n' : ''}${group.length > 1 ? '\n如果只想作废其中一部分，回 (C) 并说明哪几条该留，然后对该留的那几条不必再管；要改的那几条另提一次。\n' : ''}
+${one ? tl(L, '系统不替你判谁对。选 (A) 之后，它会在清单里标成"已作废"，并记下是被这次的说法取代的。') : tl(L, '系统不替你判谁对。选 (A) 之后，它们会在清单里标成"已作废"，并记下是被这次的说法取代的。')}
+${contract ? `${tl(L, '写着这条的任务说明原文不改，但那个任务之后执行时会照新的说法做，不会为这一条再来问你。')}\n` : ''}${group.length > 1 ? `\n${tl(L, '如果只想作废其中一部分，回 (C) 并说明哪几条该留，然后对该留的那几条不必再管；要改的那几条另提一次。')}\n` : ''}
 ${held
     // 这次说的是一条修正（或新指令），它在比对前就被挡住了 —— 上面那句"没有拦住任何事"对它不成立。
-    ? `⚠ 这次说的是一条要改计划的修正，它**在你选定之前不会执行**，这个任务也先停着。
+    ? tl(L, `⚠ 这次说的是一条要改计划的修正，它**在你选定之前不会执行**，这个任务也先停着。
 选 (A)，修正照做；选 (B)，修正里与旧决定相冲的那部分不执行，其余照做。
-旧决定在你选定之前仍然留在"已定的约定"清单上（标成"正在被争议"）。`
-    : `⚠ 这条事项**没有拦住任何事**：这次说的已经生效了，旧决定在你选定之前也仍然留在"已定的约定"清单上
-（它们会被标成"正在被争议"）。在你选之前，两边都在 —— 所以别拖。`}`;
+旧决定在你选定之前仍然留在"已定的约定"清单上（标成"正在被争议"）。`)
+    : tl(L, `⚠ 这条事项**没有拦住任何事**：这次说的已经生效了，旧决定在你选定之前也仍然留在"已定的约定"清单上
+（它们会被标成"正在被争议"）。在你选之前，两边都在 —— 所以别拖。`)}`;
 };
 
 /**
@@ -262,7 +272,7 @@ export function raiseDecisionConflict(db, { taskId, group, entry, by, messageIds
     if (l) {
       db.run(`UPDATE questions SET addressed_to=? WHERE id=?`, JSON.stringify([l]), id);
       audit(db, { actorKind: 'system', actorId: 'decision-check', action: 'question_rerouted', targetType: 'question', targetId: id,
-        payload: { why: '路由表解析出零个收件人，兜底改派给项目负责人', to: [l] } });
+        payload: { why: tl(contentLang(db), '路由表解析出零个收件人，兜底改派给项目负责人'), to: [l] } });
     }
   }
   // **冲突事项按"谁批的契约"路由，不按"这条决定落在谁的地盘上"路由。**
@@ -279,7 +289,7 @@ export function raiseDecisionConflict(db, { taskId, group, entry, by, messageIds
     if (add.length) {
       db.run(`UPDATE questions SET informed=? WHERE id=?`, JSON.stringify([...cur, ...add]), id);
       audit(db, { actorKind: 'system', actorId: 'decision-check', action: 'question_informed_added', targetType: 'question', targetId: id,
-        payload: { added: add, why: '这几条决定落在他们的范围上，按路由表该让他们知道' } });
+        payload: { added: add, why: tl(contentLang(db), '这几条决定落在他们的范围上，按路由表该让他们知道') } });
     }
   }
   audit(db, { actorKind: 'system', actorId: 'decision-check', action: 'decision_conflict_raised', targetType: 'question', targetId: id,
@@ -292,8 +302,9 @@ export function raiseDecisionConflict(db, { taskId, group, entry, by, messageIds
 /** 把答复读成三种结论之一。读不出来当作"不冲突"——最保守：不作废任何东西。 */
 export function verdictOf(body) {
   const s = String(body ?? '').replace(/\s/g, '');
-  if (/^\(?[AaＡ]\)?$/.test(s) || /以新为准|按新的|用新的|作废旧|新的为准/.test(s)) return 'new';
-  if (/^\(?[BbＢ]\)?$/.test(s) || /以旧为准|按旧的|用旧的|维持原|旧的为准|撤回/.test(s)) return 'old';
+  // 英文说法（空白已去掉，所以按连写匹配）：go with the new / keep the old …
+  if (/^\(?[AaＡ]\)?$/.test(s) || /以新为准|按新的|用新的|作废旧|新的为准|gowiththenew|usethenew|thenewone|newwins/i.test(s)) return 'new';
+  if (/^\(?[BbＢ]\)?$/.test(s) || /以旧为准|按旧的|用旧的|维持原|旧的为准|撤回|keeptheold|gowiththeold|theoldone|oldwins|withdraw/i.test(s)) return 'old';
   return 'none';
 }
 
@@ -325,7 +336,7 @@ RESOLUTION_HOOKS.conflict = (db, { question, finalBody, by, at }) => {
   if (!links.length) return null;
   const verdict = verdictOf(finalBody);
   // 一次选定、一起作废：这条事项挂着几条决定，"以新为准"就把这几条一起标掉。
-  if (verdict === 'new') for (const id of links) voidOne(db, { id, by, reason: `由事项 ${question.id} 判定以新为准`, at });
+  if (verdict === 'new') for (const id of links) voidOne(db, { id, by, reason: tl(contentLang(db), '由事项 {id} 判定以新为准', { id: question.id }), at });
   // 作废的若是**契约条款**，它还写在那个任务的契约里。契约原文不改，标注由
   // `overruledContractRules` 从登记表机械算出、进执行器 / 规划器 / 重规划器的上下文 —— 这里只记一笔
   // "哪个任务受了影响、当时合没合并"，事后数得出来这条修法实际碰过几个任务。**不给人另挂事项**：
@@ -367,7 +378,7 @@ export async function checkAndRaise(db, { taskId, projectId = null, text, entry,
   const full = activeDecisions(db, { projectId: pid, taskId: pid ? null : taskId }).filter((d) => !d.reservation);
   const prefiltered = full.length > PREFILTER_ABOVE;
   const list = prefiltered ? activeDecisions(db, { projectId: pid, taskId: pid ? null : taskId, scope: scopeHints(text) }).filter((d) => !d.reservation) : full;
-  const r = await checkDecisions(text, { decisions: list, llmClient, entry });
+  const r = await checkDecisions(text, { decisions: list, llmClient, entry, lang: contentLang(db) });
   // 一次输入 = 一条事项：命中的那一组归并起来挂，不是一条一个（一句话可能命中好几条）。
   const group = [];
   for (const h of r.hits) {

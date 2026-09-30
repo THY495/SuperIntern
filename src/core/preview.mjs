@@ -25,6 +25,7 @@
 import { existsSync, readFileSync, readdirSync, mkdirSync, copyFileSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { describeChanges, discardChanges } from './workspace.mjs';
+import { tl, N_ } from '../i18n/index.mjs';
 
 export const PREVIEW_FILE = 'si-preview.json';
 const OUT_DIR = '.si-preview';           // 截图先落在工作区里（容器能写的地方），再搬到 home/previews；已在 git exclude 里
@@ -50,27 +51,29 @@ export function hasUi(dir) {
   return false;
 }
 
-/** 读并校验 si-preview.json。返回 { spec } 或 { error }；文件不存在返回 null。 */
-export function readPreviewSpec(dir) {
+/** 读并校验 si-preview.json。返回 { spec } 或 { error }；文件不存在返回 null。
+ *  lang：error 与默认页标题写给签收的人看，按内容语言（调用方传 contentLang(db)）。 */
+export function readPreviewSpec(dir, lang = 'zh') {
   const f = join(dir, PREVIEW_FILE);
   if (!existsSync(f)) return null;
+  const file = PREVIEW_FILE;
   let j;
-  try { j = JSON.parse(readFileSync(f, 'utf8')); } catch (e) { return { error: `${PREVIEW_FILE} 不是合法的 JSON：${e.message}` }; }
+  try { j = JSON.parse(readFileSync(f, 'utf8')); } catch (e) { return { error: tl(lang, '{file} 不是合法的 JSON：{msg}', { file, msg: e.message }) }; }
   const start = (Array.isArray(j.start) ? j.start : j.start ? [j.start] : []).map(argvOf).filter((a) => a.length);
-  if (!start.length) return { error: `${PREVIEW_FILE} 缺 start：怎么把服务起起来（每条一个后台进程）` };
-  if (start.length > MAX_START) return { error: `${PREVIEW_FILE} 的 start 最多 ${MAX_START} 条` };
+  if (!start.length) return { error: tl(lang, '{file} 缺 start：怎么把服务起起来（每条一个后台进程）', { file }) };
+  if (start.length > MAX_START) return { error: tl(lang, '{file} 的 start 最多 {n} 条', { file, n: MAX_START }) };
   const url = localUrl(j.url);
-  if (!url) return { error: `${PREVIEW_FILE} 的 url 只能是沙箱里的本机地址（http://127.0.0.1:端口）` };
+  if (!url) return { error: tl(lang, '{file} 的 url 只能是沙箱里的本机地址（http://127.0.0.1:端口）', { file }) };
   const readyRaw = Array.isArray(j.ready) ? j.ready : j.ready ? [j.ready] : [];
-  if (readyRaw.length > MAX_READY) return { error: `${PREVIEW_FILE} 的 ready 最多 ${MAX_READY} 个地址` };
+  if (readyRaw.length > MAX_READY) return { error: tl(lang, '{file} 的 ready 最多 {n} 个地址', { file, n: MAX_READY }) };
   const ready = [];
-  for (const r of readyRaw) { const u = localUrl(r); if (!u) return { error: `${PREVIEW_FILE} 的 ready 里「${r}」不是本机地址（http://127.0.0.1:端口/路径）` }; ready.push(u.href); }
+  for (const r of readyRaw) { const u = localUrl(r); if (!u) return { error: tl(lang, '{file} 的 ready 里「{url}」不是本机地址（http://127.0.0.1:端口/路径）', { file, url: r }) }; ready.push(u.href); }
   const seed = (Array.isArray(j.seed) ? j.seed : j.seed ? [j.seed] : []).map(argvOf).filter((a) => a.length);
-  if (seed.length > MAX_SEED) return { error: `${PREVIEW_FILE} 的 seed 最多 ${MAX_SEED} 条` };
-  const pages = (Array.isArray(j.pages) && j.pages.length ? j.pages : [{ path: '/', title: '首页' }])
+  if (seed.length > MAX_SEED) return { error: tl(lang, '{file} 的 seed 最多 {n} 条', { file, n: MAX_SEED }) };
+  const pages = (Array.isArray(j.pages) && j.pages.length ? j.pages : [{ path: '/', title: tl(lang, '首页') }])
     .map((p) => (typeof p === 'string' ? { path: p, title: p } : { path: String(p.path ?? '/'), title: String(p.title ?? p.path ?? '/') }));
-  if (pages.length > MAX_PAGES) return { error: `${PREVIEW_FILE} 的 pages 最多 ${MAX_PAGES} 页` };
-  if (pages.some((p) => !p.path.startsWith('/'))) return { error: `${PREVIEW_FILE} 的 pages 里 path 要以 / 开头` };
+  if (pages.length > MAX_PAGES) return { error: tl(lang, '{file} 的 pages 最多 {n} 页', { file, n: MAX_PAGES }) };
+  if (pages.some((p) => !p.path.startsWith('/'))) return { error: tl(lang, '{file} 的 pages 里 path 要以 / 开头', { file }) };
   return { spec: { start, url: url.origin, ready: [`${url.origin}/`, ...ready.filter((r) => r !== `${url.origin}/`)], seed, pages, waitMs: Math.min(Number(j.waitMs) || 3000, 15000) } };
 }
 
@@ -86,16 +89,18 @@ export const CHROMIUM_FLAGS = ['--headless', '--no-sandbox', '--disable-gpu', '-
 
 // 渲染后的页面里出现这些，多半是没连上后端 / 后端报错（提示，不是判决）
 const PAGE_TROUBLE = [
-  [/Failed to fetch|NetworkError|Network Error|ERR_CONNECTION_REFUSED|ECONNREFUSED/i, '页面上有"连不上"的报错（多半是页面没连上背后的服务）'],
-  [/Internal Server Error|\b50[0234]\b[^<]{0,20}(Error|错误)|Bad Gateway/i, '页面上有服务器出错的提示（背后的服务出错了）'],
-  [/Traceback \(most recent call last\)|Uncaught \w*Error|TypeError:|ReferenceError:/, '页面上露出了程序报错的原文'],
-  [/Cannot (GET|POST) \//, '这个地址没有对应的页面（页面上写着 Cannot GET）'],
+  [/Failed to fetch|NetworkError|Network Error|ERR_CONNECTION_REFUSED|ECONNREFUSED/i, N_('页面上有"连不上"的报错（多半是页面没连上背后的服务）')],
+  [/Internal Server Error|\b50[0234]\b[^<]{0,20}(Error|错误)|Bad Gateway/i, N_('页面上有服务器出错的提示（背后的服务出错了）')],
+  [/Traceback \(most recent call last\)|Uncaught \w*Error|TypeError:|ReferenceError:/, N_('页面上露出了程序报错的原文')],
+  [/Cannot (GET|POST) \//, N_('这个地址没有对应的页面（页面上写着 Cannot GET）')],
 ];
-export function pageTrouble(dom) {
+/** lang：提示写给签收的人看，按内容语言。 */
+export function pageTrouble(dom, lang = 'zh') {
+  const tlN = tl;   // PAGE_TROUBLE 的说明是用 N_ 登记过的原文，按变量查
   const s = String(dom ?? '');
-  const out = PAGE_TROUBLE.filter(([re]) => re.test(s)).map(([, why]) => why);
+  const out = PAGE_TROUBLE.filter(([re]) => re.test(s)).map(([, why]) => tlN(lang, why));
   const text = s.replace(/<script[\s\S]*?<\/script>|<style[\s\S]*?<\/style>/gi, '').replace(/<[^>]+>/g, '').replace(/\s+/g, '');
-  if (text.length < 8) out.push('页面几乎是空白（渲染后没有文字）');
+  if (text.length < 8) out.push(tl(lang, '页面几乎是空白（渲染后没有文字）'));
   return out;
 }
 
@@ -109,7 +114,7 @@ export function pageTrouble(dom) {
  * 截图起的服务会往工作区写东西（sqlite 库、上传目录、日志……）。不还原，合并时就撞"工作区有未提交的改动" ——
  * 整条链就此卡死。只还原这一段新冒出来的，之前就有的不碰。
  */
-export async function capturePreview(exec, dir, spec, { outDir, readyTimeoutMs = 90_000 } = {}) {
+export async function capturePreview(exec, dir, spec, { outDir, readyTimeoutMs = 90_000, lang = 'zh' } = {}) {
   const run = (argv, timeoutMs = 30_000) => exec.execute({ file: argv[0], args: argv.slice(1) }, dir, { mode: 'write', timeoutMs });
   const shots = [], warnings = [];
   let log = '';
@@ -136,13 +141,13 @@ export async function capturePreview(exec, dir, spec, { outDir, readyTimeoutMs =
     }
     if (pending.length) {
       log = await tail();
-      return { restored, ok: false, shots, why: `${Math.round(readyTimeoutMs / 1000)} 秒内这些地址一直打不开（服务没起来，或者起来了但出错）：${pending.join('、')}`, log };
+      return { restored, ok: false, shots, why: tl(lang, '{sec} 秒内这些地址一直打不开（服务没起来，或者起来了但出错）：{urls}', { sec: Math.round(readyTimeoutMs / 1000), urls: pending.join(tl(lang, '、')) }), log };
     }
     // 样例数据：失败不拦截图，但照实说（空库的截图证明不了功能，签收的人得知道）
     for (const argv of spec.seed ?? []) {
       const r = await run(argv, 60_000);
       if (r.code !== 0) {
-        warnings.push(`样例数据命令「${argv.join(' ')}」出错了、没跑成，截图里可能是空的`);
+        warnings.push(tl(lang, '样例数据命令「{cmd}」出错了、没跑成，截图里可能是空的', { cmd: argv.join(' ') }));
         log += `\n[seed ${argv.join(' ')}] ${String(`${r.stdout ?? ''}${r.stderr ?? ''}`).trim().split('\n').slice(-5).join(' ')}`;
       }
     }
@@ -154,7 +159,7 @@ export async function capturePreview(exec, dir, spec, { outDir, readyTimeoutMs =
         mkdirSync(outDir, { recursive: true });
         copyFileSync(join(dir, OUT_DIR, file), join(outDir, file));
         const d = await run(['timeout', '60', 'chromium', ...CHROMIUM_FLAGS, `--virtual-time-budget=${spec.waitMs}`, '--dump-dom', spec.url + p.path], 90_000);
-        const w = d.code === 0 ? pageTrouble(d.stdout) : [];
+        const w = d.code === 0 ? pageTrouble(d.stdout, lang) : [];
         shots.push({ title: p.title, path: p.path, file, ...(w.length ? { warnings: w } : {}) });
       } else {
         log += `\n[${p.path}] ${String(`${r.stdout ?? ''}${r.stderr ?? ''}`).trim().split('\n').slice(-3).join(' ')}`;
@@ -163,11 +168,11 @@ export async function capturePreview(exec, dir, spec, { outDir, readyTimeoutMs =
     // 截完再查一遍：截图途中死掉的服务（常见：后端第一次查库就崩），图上看不出来
     const dead = [];
     for (const u of ready) if (!(await probe(u))) dead.push(u);
-    if (dead.length) { warnings.push(`服务在截图途中挂了 —— 截完再查，这些地址已经打不开：${dead.join('、')}`); log = `${log}\n${await tail()}`.trim(); }
+    if (dead.length) { warnings.push(tl(lang, '服务在截图途中挂了 —— 截完再查，这些地址已经打不开：{urls}', { urls: dead.join(tl(lang, '、')) })); log = `${log}\n${await tail()}`.trim(); }
     const extra = { ...(warnings.length ? { warnings } : {}), ...(log.trim() ? { log: log.trim() } : {}) };
-    return shots.length ? { restored, ok: true, shots, ...extra } : { restored, ok: false, shots, why: '服务起来了，但一张都没截出来', ...extra };
+    return shots.length ? { restored, ok: true, shots, ...extra } : { restored, ok: false, shots, why: tl(lang, '服务起来了，但一张都没截出来'), ...extra };
   } catch (e) {
-    return { restored, ok: false, shots, why: `截图过程出错：${e.message}`, log, ...(warnings.length ? { warnings } : {}) };
+    return { restored, ok: false, shots, why: tl(lang, '截图过程出错：{msg}', { msg: e.message }), log, ...(warnings.length ? { warnings } : {}) };
   } finally {
     await run(['sh', '-c', 'for p in $(cat /tmp/si-preview.pids 2>/dev/null); do kill -TERM -- -$p 2>/dev/null || kill -TERM $p 2>/dev/null; done; rm -f /tmp/si-preview.pids'], 10_000).catch(() => {});
     try { rmSync(join(dir, OUT_DIR), { recursive: true, force: true }); } catch { /* 下次开头会再清 */ }
@@ -179,4 +184,4 @@ export async function capturePreview(exec, dir, spec, { outDir, readyTimeoutMs =
 }
 
 /** 一次截图的结论有没有该让签收人先看一眼的问题（整体或任何一张图）。 */
-export const previewTroubles = (r) => [...(r?.warnings ?? []), ...(r?.shots ?? []).flatMap((s) => (s.warnings ?? []).map((w) => `「${s.title}」${w}`))];
+export const previewTroubles = (r, lang = 'zh') => [...(r?.warnings ?? []), ...(r?.shots ?? []).flatMap((s) => (s.warnings ?? []).map((w) => tl(lang, '「{title}」{warning}', { title: s.title, warning: w })))];

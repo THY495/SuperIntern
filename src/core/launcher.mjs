@@ -11,6 +11,7 @@ import { mkdirSync, openSync, existsSync, readdirSync, statSync, readFileSync } 
 import { join, dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { audit } from '../db/db.mjs';
+import { I18nError } from '../i18n/index.mjs';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
 
@@ -23,7 +24,7 @@ export function makeLauncher(db, { home, runBinds = [], spawnFn = spawn, onExit 
       // `project-plan` 的"taskId"是项目 id：起 `project plan <projectId>`（项目规划器）。
       if (!['run', 'draft', 'plan', 'project-plan'].includes(verb)) throw new Error(`启动器只认 run / draft / plan / project-plan，实得 ${verb}`);
       const live = runs.get(taskId);
-      if (live && live.exitCode === null) throw new Error(`任务 ${taskId} 已有子进程在跑（pid ${live.pid}）`);
+      if (live && live.exitCode === null) throw new I18nError('任务 {taskId} 已有子进程在跑（pid {pid}）', { taskId, pid: live.pid });
       mkdirSync(logsDir, { recursive: true });
       const logFile = join(logsDir, `${taskId}-${new Date().toISOString().replace(/[:.]/g, '-')}.log`);
       const fd = openSync(logFile, 'a');

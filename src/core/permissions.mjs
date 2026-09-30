@@ -7,6 +7,7 @@
 import { now } from '../db/db.mjs';
 import { rulesOf, resolveRecipients, dutyCalendarOf, onDutyAt, DECISION_TYPES, LEAD_PLACEHOLDER } from './routing.mjs';
 import { canCreate } from './settings.mjs';
+import { I18nError } from '../i18n/index.mjs';
 
 const OPEN_PROJECT = `('proposed','active','stalled')`;
 const ROLE_CAPS = {
@@ -18,7 +19,7 @@ const OWNER_CAPS = ['运行 / 暂停 / 中止', '修改该项目的决策路由'
 
 export function permissionsOf(db, userId, { at = now() } = {}) {
   const u = db.one(`SELECT id, display_name, role, disabled_at FROM users WHERE id=?`, userId);
-  if (!u) throw new Error(`成员不存在：${userId}`);
+  if (!u) throw new I18nError('成员不存在：{id}', { id: userId });
   const out = { userId: u.id, name: u.display_name, role: u.role, disabled: !!u.disabled_at, roleCaps: ROLE_CAPS[u.role] ?? [], ownerCaps: OWNER_CAPS,
     canCreate: canCreate(db, u.id), owns: { projects: [], soloTasks: [] }, routing: [], duty: [] };
   if (u.disabled_at) { out.roleCaps = []; return out; }

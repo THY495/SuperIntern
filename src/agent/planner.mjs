@@ -9,6 +9,7 @@
 // **模型产出的 DAG 能不能满足库层护栏**。所以这里的校验失败是**数据**不是意外：
 // 每一次拒绝都写进审计轨，重试次数就是那条假设的度量。
 
+import { withOutputLang, contentLang, tl, I18nError } from '../i18n/index.mjs';
 import { routeQuestion, decisionTypeOfQuestion } from '../core/routing.mjs';
 import { overruledContractRules, renderOverruled } from '../core/decisions.mjs';
 import { stripTransferHint } from '../core/routing.mjs';
@@ -166,11 +167,13 @@ export function validateNodeSet(nodes, { constitutionText = null } = {}) {
       if (typeof n?.[f] !== 'string' || !n[f].trim()) errs.push(`${at}.${f} 缺失或为空`);
     }
     // 条件节点（"若有缺陷则修"）与"用例存在"式验收：模型外的机械拒收（这两种都实际出现过）。
-    if (/(若|如|如果|视情况)[^。；\n]{0,12}(缺陷|问题|需要|必要)[^。；\n]{0,12}(修|补|改)/.test(`${n?.title ?? ''} ${n?.spec ?? ''}`)) {
+    const titleSpec = `${n?.title ?? ''} ${n?.spec ?? ''}`;
+    if (/(若|如|如果|视情况)[^。；\n]{0,12}(缺陷|问题|需要|必要)[^。；\n]{0,12}(修|补|改)/.test(titleSpec)
+      || /\b(if|when|as needed)\b[^.;\n]{0,24}\b(bugs?|issues?|problems?|defects?|needed|necessary)\b[^.;\n]{0,24}\b(fix|patch|repair|address)\b/i.test(titleSpec)) {
       errs.push(`${at} 是条件节点（"若有…则修"）：没产物的节点交接不了，修复靠任务级验收与重试`);
     }
     const acc = typeof n?.acceptance === 'string' ? n.acceptance.trim() : '';
-    if (acc.length <= 80 && /(存在|已创建|已新建)/.test(acc) && !/(通过|失败|退出|exit|pass|fail|返回|输出|等于|==)/i.test(acc)) {
+    if (acc.length <= 80 && /(存在|已创建|已新建|\bexists?\b|\bis created\b|\bhas been created\b)/i.test(acc) && !/(通过|失败|退出|exit|pass|fail|返回|输出|等于|==|\breturns?\b|\boutputs?\b|\bequals?\b)/i.test(acc)) {
       errs.push(`${at}.acceptance 只说"存在"不算验收：要写跑什么命令、通过多少用例，或测试先行时"实现前失败且原因是目标缺失"`);
     }
     if (n?.key) {
@@ -295,7 +298,7 @@ export async function plan(db, { client, taskId, constitution, tier = 'heavy', m
   try {
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     const resp = await client.complete({
-      tier, system: SYSTEM, messages, tools: [SUBMIT_PLAN, RAISE_QUESTION], maxTokens: MAX_TOKENS, effort: 'high',
+      tier, system: withOutputLang(SYSTEM, contentLang(db)), messages, tools: [SUBMIT_PLAN, RAISE_QUESTION], maxTokens: MAX_TOKENS, effort: 'high',
     });
     if (truncatedEmpty(resp)) throw new TruncatedEmptyError('规划器', MAX_TOKENS);
     const calls = toolCallsOf(resp);
@@ -340,7 +343,7 @@ export async function plan(db, { client, taskId, constitution, tier = 'heavy', m
 
     rejections.push(errs);
     if (attempt === maxAttempts) {
-      throw new Error(`规划器 ${maxAttempts} 次都没产出合法方案。最后一次被拒理由：\n  - ${errs.join('\n  - ')}`);
+      throw new I18nError('规划器 {n} 次都没产出合法方案。最后一次被拒理由：\n  - {errs}', { n: maxAttempts, errs: errs.join('\n  - ') });
     }
     // 把助手轮原样回填后再送拒绝理由 —— 少了助手轮，多数厂商会拒收 tool_results
     messages.push({ role: 'assistant', content: resp.content });
@@ -459,7 +462,7 @@ export function persistPlan(db, { taskId, constitutionId, nodes, rationale }) {
     const decisionId = newId('d');
     db.run(`INSERT INTO decisions (id,task_id,summary,rationale,actor_kind,actor_id,layer,valid_from,recorded_at)
             VALUES (?,?,?,?,'agent','planner','execution',?,?)`,
-      decisionId, taskId, `任务分解为 ${nodes.length} 个节点`, rationale, t, t);
+      decisionId, taskId, tl(contentLang(db), '任务分解为 {n} 个节点', { n: nodes.length }), rationale, t, t);
     insertEdge(db, decisionId, constitutionId, 'derived_from', t);
 
     audit(db, {

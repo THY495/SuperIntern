@@ -34,6 +34,7 @@ import { appendStateOf, appendPending } from '../agent/project-append.mjs';
 import { sweepLiveness, UNKNOWN_GRACE_MS, REPEAT_THRESHOLD } from './liveness.mjs';
 import { makeRuntimeHealth } from './health.mjs';
 import { raiseAdvanceFailed } from './handback.mjs';
+import { tl, contentLang } from '../i18n/index.mjs';
 
 /** 上次退出之后出现其中任一审计动作 → 任务可以接着跑。question_* 挂在问题上，其余挂在任务上。 */
 export const RESUME_ACTIONS = ['question_answered', 'question_defaulted', 'message_received', 'message_released', 'limit_set',
@@ -224,7 +225,8 @@ export function assessTask(db, task, { at = now(), isLive = () => null, hasWorks
   return assessPhase(db, taskId, 'run', { at, alive, retryKinds: ['provider_error', 'crashed'],
     // 上一轮因为修正被挡着而退出、现在已经不挡了：放行时如果没有触发动作（待比对到点自己放行、
     // 冲突事项被撤回），不在这里认它，这个任务就再也没人拉 —— 正是停等账本抓的那一族。
-    continueIf: (kind, p) => (kind === 'stalled' && String(p.why ?? '').startsWith('到达 maxCycles'))
+    // 编排器的 why 按内容语言写（orchestrator.mjs 的「到达 maxCycles={n}」）：中英两种开头都认
+    continueIf: (kind, p) => (kind === 'stalled' && /^(到达|Reached) maxCycles/.test(String(p.why ?? '')))
       || kind === 'awaiting_check' || kind === 'awaiting_verdict' });
 }
 
@@ -260,7 +262,7 @@ export function daemonStatus(home, { at = Date.now() } = {}) {
  * 轮询循环：每 intervalMs 扫一次超时链，再把该拉的拉起来。返回 { tick, stop }。
  * 通知与打印都交给 onEvent，守护进程本身不知道通道。
  */
-export function startDaemon(db, { home, launcher, intervalMs = 15_000, iterations = null, onEvent = () => {}, alive = pidAlive, clock = now, notifyOpts = null, liveness = null, runtime = makeRuntimeHealth() }) {
+export function startDaemon(db, { home, launcher, intervalMs = 15_000, iterations = null, onEvent = () => {}, alive = pidAlive, clock = now, notifyOpts = null, liveness = null, runtime = makeRuntimeHealth({ lang: () => contentLang(db) }) }) {
   // 容器运行时的状态：不在的时候不拉要用沙箱的那几步（run、项目推进里的变基验收 / 项目级验收），
   // 不烧退避表的重试次数；起草、规划照常。状态变化各记一条审计，看板与活动流据此说话。
   let runtimeWasOk = true;
@@ -348,20 +350,20 @@ export function startDaemon(db, { home, launcher, intervalMs = 15_000, iteration
         const due = catalogCheckDue(db, { every: catalogCheckEvery, at, keysInUse: notifyOpts.catalogKeys ?? reg.keysInUse });
         if (due.due) {
           try {
-            const r = await checkCatalog({ catalog: notifyOpts.catalog ?? reg.catalog, vendors: notifyOpts.vendors ?? reg.vendors, env, fetchFn, at });
-            recordCatalogCheck(db, r, { by: 'daemon' });
+            const r = await checkCatalog({ catalog: notifyOpts.catalog ?? reg.catalog, vendors: notifyOpts.vendors ?? reg.vendors, env, fetchFn, at, lang: contentLang(db) });
+            recordCatalogCheck(db, r, { by: 'daemon', lang: contentLang(db) });
             let sent = 0;
             if (r.warnings > 0) {
               const lead = firstAdmin(db);
               let channels = lead ? channelsForUsers(db, [lead]) : [];
               if (!channels.length) channels = channelsFromEnv(env, extraCmd);
               if (channels.length) {
-                const receipts = await notify(db, { taskId: null, kind: 'catalog', title: `[SuperIntern] 模型目录有 ${r.warnings} 项要看一眼`, text: renderCatalogCheck(r, { onlyProblems: true }), ref: 'catalog', channels, fetchFn });
+                const receipts = await notify(db, { taskId: null, kind: 'catalog', title: `[SuperIntern] ${tl(contentLang(db), '模型目录有 {n} 项要看一眼', { n: r.warnings })}`, text: renderCatalogCheck(r, { onlyProblems: true, lang: contentLang(db) }), ref: 'catalog', channels, fetchFn });
                 sent = receipts.filter((x) => x.ok).length;
               }
             }
             onEvent({ type: 'catalog', why: due.why, warnings: r.warnings, fetchErrors: r.fetchErrors.length, sent });
-          } catch (e) { onEvent({ type: 'notify_failed', error: `目录检查：${e.message}` }); }
+          } catch (e) { onEvent({ type: 'notify_failed', error: tl(contentLang(db), '目录检查：{msg}', { msg: e.message }) }); }
         }
       }
       const rt = runtime ? await runtime.fresh() : { ok: true };
@@ -375,8 +377,9 @@ export function startDaemon(db, { home, launcher, intervalMs = 15_000, iteration
           const lead = firstAdmin(db);
           let channels = lead ? channelsForUsers(db, [lead]) : [];
           if (!channels.length) channels = channelsFromEnv(env, extraCmd);
-          if (channels.length) await notify(db, { taskId: null, kind: 'runtime', title: `[SuperIntern] 沙箱用不了：${rt.cli ?? 'Docker'} 没在运行`,
-            text: `要改代码、跑测试的步骤已暂停（不算失败、不耗重试次数）。在服务器上把 ${rt.cli ?? 'Docker'} 启动起来，系统会自己接着跑。
+          const L = contentLang(db);
+          if (channels.length) await notify(db, { taskId: null, kind: 'runtime', title: `[SuperIntern] ${tl(L, '沙箱用不了：{cli} 没在运行', { cli: rt.cli ?? 'Docker' })}`,
+            text: `${tl(L, '要改代码、跑测试的步骤已暂停（不算失败、不耗重试次数）。在服务器上把 {cli} 启动起来，系统会自己接着跑。', { cli: rt.cli ?? 'Docker' })}
 
 ${rt.why ?? ''}`, ref: 'runtime', channels, fetchFn }).catch(() => {});
         }

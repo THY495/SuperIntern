@@ -8,6 +8,7 @@
 // 段落顺序是**成本约束**不是逻辑分组：四家都是前缀缓存，
 // 改动点之后全部失效，所以稳定段必须连续且在最前，易变段一律靠后。
 
+import { withOutputLang, contentLang } from '../i18n/index.mjs';
 import { newId, now, audit } from '../db/db.mjs';
 import { pendingMessages } from '../core/inbox.mjs';
 import { CACHE_FLOORS } from '../llm/canonical.mjs';
@@ -311,7 +312,7 @@ ${resume.answer
 
   return {
     assemblyId,
-    system: seg1,
+    system: withOutputLang(seg1, contentLang(db)),
     cacheStable,
     messages: [{ role: 'user', content: blocks }],
     meta: { items, tokenEstimate, stableTokens, constitutionVersion: c.version, cacheNote,

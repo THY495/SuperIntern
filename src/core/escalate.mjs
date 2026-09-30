@@ -16,6 +16,7 @@
 import { now, audit } from '../db/db.mjs';
 import { limitOf, priorRuntimeMs } from './limits.mjs';
 import { taskSpendMicroUsd } from './ledger.mjs';
+import { tl, contentLang, N_ } from '../i18n/index.mjs';
 
 export const TIER_ORDER = ['light', 'standard', 'heavy'];
 export const ESCALATE_AFTER_RETRIES = 2;
@@ -36,7 +37,8 @@ export function escalationFor(db, { taskId, node, binding, catalog, ctx = {}, at
   const base = node.model_tier;
   const idx = TIER_ORDER.indexOf(base);
   if ((node.retry_count ?? 0) < ESCALATE_AFTER_RETRIES) return { tier: base, escalated: false };
-  if (idx < 0 || idx === TIER_ORDER.length - 1) return { tier: base, escalated: false, why: 'heavy 已是最高档' };
+  const L = contentLang(db);   // 触顶时 human 进提问正文与活动：按内容语言写
+  if (idx < 0 || idx === TIER_ORDER.length - 1) return { tier: base, escalated: false, why: tl(L, 'heavy 已是最高档') };
   const target = TIER_ORDER[idx + 1];
 
   // 花费闸门
@@ -47,9 +49,9 @@ export function escalationFor(db, { taskId, node, binding, catalog, ctx = {}, at
   const spent = taskSpendMicroUsd(db, taskId);
   if (budget - spent < estimateMicro) {
     return { tier: base, escalated: false, blocked: true, breach: {
-      key: 'limit.budget_micro_usd', label: '任务花费', actual: spent + estimateMicro, limit: budget,
-      human: `升档前预算闸门：节点「${node.title}」已失败 ${node.retry_count} 次，升到 ${target} 档重试预计再花 `
-        + `$${(estimateMicro / 1e6).toFixed(4)}，而剩余预算只有 $${((budget - spent) / 1e6).toFixed(4)}。不升档、不重试，先问人。` } };
+      key: 'limit.budget_micro_usd', label: N_('任务花费'), actual: spent + estimateMicro, limit: budget,
+      human: tl(L, '升档前预算闸门：节点「{title}」已失败 {n} 次，升到 {target} 档重试预计再花 ${estimate}，而剩余预算只有 ${left}。不升档、不重试，先问人。',
+        { title: node.title, n: node.retry_count, target, estimate: (estimateMicro / 1e6).toFixed(4), left: ((budget - spent) / 1e6).toFixed(4) }) } };
   }
   // 挂钟闸门：上一次尝试从 started_at 到最近一次失败审计的时长
   const lastFail = db.one(`SELECT ts FROM audit_log WHERE target_id=? AND action IN ('node_stalled','node_crashed')
@@ -61,9 +63,9 @@ export function escalationFor(db, { taskId, node, binding, catalog, ctx = {}, at
     const need = Math.round(lastMs * 1.5);
     if (runtimeLimit - used < need) {
       return { tier: base, escalated: false, blocked: true, breach: {
-        key: 'limit.runtime_ms', label: '累计运行时长', actual: used + need, limit: runtimeLimit,
-        human: `升档前时长闸门：节点「${node.title}」上次尝试跑了 ${(lastMs / 60000).toFixed(1)} 分钟，升到 ${target} 档预计 `
-          + `${(need / 60000).toFixed(1)} 分钟，而剩余时长只有 ${((runtimeLimit - used) / 60000).toFixed(1)} 分钟。不升档，先问人。` } };
+        key: 'limit.runtime_ms', label: N_('累计运行时长'), actual: used + need, limit: runtimeLimit,
+        human: tl(L, '升档前时长闸门：节点「{title}」上次尝试跑了 {last} 分钟，升到 {target} 档预计 {need} 分钟，而剩余时长只有 {left} 分钟。不升档，先问人。',
+          { title: node.title, last: (lastMs / 60000).toFixed(1), target, need: (need / 60000).toFixed(1), left: ((runtimeLimit - used) / 60000).toFixed(1) }) } };
     }
   }
   return { tier: target, escalated: true, from: base, estimateMicro, remainingMicro: budget - spent };

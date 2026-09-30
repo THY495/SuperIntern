@@ -16,6 +16,7 @@
 
 import { newId, now, audit } from '../db/db.mjs';
 import { stripTransferHint } from './routing.mjs';
+import { tl, contentLang, I18nError } from '../i18n/index.mjs';
 
 /**
  * 哪些已答的事项算"决定"。
@@ -31,6 +32,11 @@ import { stripTransferHint } from './routing.mjs';
 export const DECIDING_TYPES = ['spec_choice', 'structural'];
 
 export const SOURCE_NAMES = { question: '答复', contract: '契约', revision: '计划变更', goal: '项目目标' };
+/** 给人看的来源标签按内容语言写：中文〔答复〕，英文 [answer]（看板静态说明按这个写）。 */
+const sourceTags = (lang) => ({ question: tl(lang, '〔答复〕'), contract: tl(lang, '〔契约〕'), revision: tl(lang, '〔计划变更〕'), goal: tl(lang, '〔项目目标〕') });
+export const sourceTagOf = (lang, kind) => (Object.hasOwn(SOURCE_NAMES, kind) ? sourceTags(lang)[kind] : `〔${kind}〕`);
+/** 看板用：去掉括号的来源名（中文与 SOURCE_NAMES 相同）。 */
+export const sourceNamesOf = (lang) => Object.fromEntries(Object.entries(sourceTags(lang)).map(([k, v]) => [k, v.replace(/^[〔[]|[〕\]]$/g, '')]));
 
 const parse = (s, d = []) => { try { const v = JSON.parse(s ?? ''); return v ?? d; } catch { return d; } };
 const head = (s, n) => { const t = String(s ?? '').replace(/\s+/g, ' ').trim(); return t.length > n ? `${t.slice(0, n - 1)}…` : t; };
@@ -75,7 +81,7 @@ export function record(db, { projectId = null, taskId = null, subject, statement
             decided_by,decided_at,status,supersedes,reservation,recorded_at) VALUES (?,?,?,?,?,?,?,?,?,?,'active',?,?,?)`,
   id, projectId, taskId, String(subject).trim(), String(statement).trim(), JSON.stringify(sc),
   sourceKind, sourceId, decidedBy, decidedAt ?? at, supersedes, reservation ? 1 : 0, at);
-  if (supersedes) voidOne(db, { id: supersedes, by: decidedBy, reason: `被 ${id} 取代`, at, supersededBy: id });
+  if (supersedes) voidOne(db, { id: supersedes, by: decidedBy, reason: tl(contentLang(db), '被 {id} 取代', { id }), at, supersededBy: id });
   audit(db, { actorKind: decidedBy ? 'user' : 'system', actorId: decidedBy, action: 'decision_registered',
     targetType: 'project', targetId: projectId ?? taskId, payload: { decisionId: id, sourceKind, sourceId, subject: head(subject, 120), taskId, supersedes, reservation: !!reservation } });
   return id;
@@ -84,7 +90,7 @@ export function record(db, { projectId = null, taskId = null, subject, statement
 /** 作废一条。`supersededBy` 只进审计与 void_reason —— 取代关系记在新那条的 supersedes 上，一处真相。 */
 export function voidOne(db, { id, by = null, reason = '', at = now(), supersededBy = null }) {
   const row = db.one(`SELECT id, status, subject, project_id FROM decision_registry WHERE id=?`, id);
-  if (!row) throw new Error(`决定不存在：${id}`);
+  if (!row) throw new I18nError('决定不存在：{id}', { id });
   if (row.status === 'void') return { changed: false };
   db.run(`UPDATE decision_registry SET status='void', void_reason=?, voided_at=?, voided_by=? WHERE id=?`,
     String(reason ?? ''), at, by, id);
@@ -275,7 +281,7 @@ export function recordReservation(db, { projectId = null, taskId = null, subject
   if (!body) return null;
   return record(db, {
     projectId, taskId, reservation: true,
-    subject: head(String(subject ?? '批准时的保留意见').trim(), 120),
+    subject: head(String(subject ?? tl(contentLang(db), '批准时的保留意见')).trim(), 120),
     statement: head(body, 600),
     scope: scopeHints(`${subject}\n${body}`),
     sourceKind, sourceId, decidedBy: by, at,
@@ -307,34 +313,41 @@ export function recordFromQuestion(db, { question, finalBody, by = null, at = no
  */
 export function recordFromContract(db, { taskId, spec, constitutionId = null, userId = null, at = now() }) {
   const projectId = projectOf(db, taskId);
+  const L = contentLang(db);
   const title = String(spec?.title ?? '').trim();
+  const pre = title ? tl(L, '{title}｜', { title }) : '';
   const ids = [];
   const common = { projectId, taskId, sourceKind: 'contract', sourceId: constitutionId, decidedBy: userId, at };
   for (const r of Array.isArray(spec?.rules) ? spec.rules : []) {
     if (!String(r?.rule ?? '').trim()) continue;
     // `approved`：追问器草案里人批过的约束 —— 它本身就是契约原文，没有另外的出处，也不是规划器的假设。
-    const src = r.approved ? '〔批准过的草案约束〕' : String(r.quote ?? '').trim() ? `〔规格〕出处：“${head(r.quote, 200)}”` : `〔规划器假设〕${head(r.assumption, 200)}`;
-    ids.push(record(db, { ...common, subject: `${title ? `${title}｜` : ''}行为规则`, statement: `${String(r.rule).trim()}（${src}）`,
+    const src = r.approved ? tl(L, '〔批准过的草案约束〕') : String(r.quote ?? '').trim() ? tl(L, '〔规格〕出处：“{quote}”', { quote: head(r.quote, 200) }) : tl(L, '〔规划器假设〕{assumption}', { assumption: head(r.assumption, 200) });
+    ids.push(record(db, { ...common, subject: tl(L, '{pre}行为规则', { pre }), statement: `${String(r.rule).trim()}${tl(L, '（{src}）', { src })}`,
       scope: scopeHints(`${r.rule}\n${r.quote ?? r.assumption ?? ''}\n${spec?.scope ?? ''}`) }));
   }
-  if (String(spec?.scope ?? '').trim() && spec.scope !== '未限定') {
-    ids.push(record(db, { ...common, subject: `${title ? `${title}｜` : ''}改动范围`, statement: String(spec.scope).trim() }));
+  // "未限定"是缺省占位（按内容语言写，两种都认）：不当成一条范围约定
+  if (String(spec?.scope ?? '').trim() && ![tl('zh', '未限定'), tl('en', '未限定')].includes(spec.scope)) {
+    ids.push(record(db, { ...common, subject: tl(L, '{pre}改动范围', { pre }), statement: String(spec.scope).trim() }));
   }
   const vc = typeof spec?.verify_command === 'string' ? spec.verify_command.trim() : Array.isArray(spec?.verify_command) ? spec.verify_command.join(' ') : '';
-  if (vc) ids.push(record(db, { ...common, subject: `${title ? `${title}｜` : ''}验收命令`, statement: vc, scope: scopeHints(vc) }));
+  if (vc) ids.push(record(db, { ...common, subject: tl(L, '{pre}验收命令', { pre }), statement: vc, scope: scopeHints(vc) }));
   return ids;
 }
 
 /** ③ 批准过的计划变更。人写的那条消息是决定本身；宪法补丁改了什么单独说一句。 */
 const FIELD_NAMES = { goal: '目标', scope: '范围', definition_of_done: '完成定义', constraints: '约束' };
+// 英文字段名单列（不进目录：'目标' 这类短词在看板词表里另有译法，合并时会撞）
+const FIELD_NAMES_EN = { goal: 'goal', scope: 'scope', definition_of_done: 'definition of done', constraints: 'constraints' };
+const fieldName = (L, f) => (L === 'en' ? FIELD_NAMES_EN : FIELD_NAMES)[f] ?? f;
 export function recordFromRevision(db, { taskId, revisionId, messageId = null, instruction = '', patchFields = [], patch = null, userId = null, at = now() }) {
   // 字段名翻成人话，并写明是**本任务契约**的那一份 —— 项目也有"完成定义"，不说清楚会被当成改了项目的。
+  const L = contentLang(db);
   const fields = patchFields ?? [];
-  const changed = fields.length ? `（改了本任务契约的${fields.map((f) => FIELD_NAMES[f] ?? f).join('、')}）` : '';
+  const changed = fields.length ? tl(L, '（改了本任务契约的{fields}）', { fields: fields.map((f) => fieldName(L, f)).join(tl(L, '、')) }) : '';
   const projectId = projectOf(db, taskId);
   const id = record(db, {
     projectId, taskId,
-    subject: head(`计划变更 ${revisionId}`, 120),
+    subject: head(tl(L, '计划变更 {id}', { id: revisionId }), 120),
     statement: `${head(instruction, 600)}${changed}`,
     scope: scopeHints(instruction),
     sourceKind: 'revision', sourceId: messageId ?? revisionId, decidedBy: userId, at,
@@ -347,9 +360,9 @@ export function recordFromRevision(db, { taskId, revisionId, messageId = null, i
   for (const f of fields) {
     const v = patch?.[f];
     if (v === undefined || v === null) continue;
-    const text = Array.isArray(v) ? v.map((x) => String(x)).join('；') : String(v);
+    const text = Array.isArray(v) ? v.map((x) => String(x)).join(tl(L, '；')) : String(v);
     if (!text.trim()) continue;
-    record(db, { projectId, taskId, subject: head(`本任务契约的${FIELD_NAMES[f] ?? f}`, 120),
+    record(db, { projectId, taskId, subject: head(tl(L, '本任务契约的{field}', { field: fieldName(L, f) }), 120),
       statement: head(text, 600), scope: scopeHints(text),
       sourceKind: 'revision', sourceId: messageId ?? revisionId, decidedBy: userId, at });
   }
@@ -360,8 +373,9 @@ export function recordFromRevision(db, { taskId, revisionId, messageId = null, i
 export function recordGoalChange(db, { projectId, goal, doneDefinition, userId = null, at = now() }) {
   const prev = db.one(`SELECT id FROM decision_registry WHERE project_id=? AND source_kind='goal' AND status='active'
                        ORDER BY decided_at DESC, rowid DESC LIMIT 1`, projectId)?.id ?? null;
-  return record(db, { projectId, taskId: null, subject: '项目目标与完成定义',
-    statement: `目标：${head(goal, 400)}\n完成定义：${head(doneDefinition, 400)}`,
+  const L = contentLang(db);
+  return record(db, { projectId, taskId: null, subject: tl(L, '项目目标与完成定义'),
+    statement: tl(L, '目标：{goal}\n完成定义：{done}', { goal: head(goal, 400), done: head(doneDefinition, 400) }),
     // 范围显式留空：目标是**项目级通则**，对每个任务都生效。让它自动抽出几个路径，
     // 反而会被执行器那份按范围过滤的清单挡掉（完成定义里随口提到 docs/API.md 就够了）。
     scope: [], sourceKind: 'goal', sourceId: projectId, decidedBy: userId, supersedes: prev, at });

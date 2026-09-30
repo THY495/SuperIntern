@@ -15,6 +15,7 @@
 
 import { newId, now, audit } from '../db/db.mjs';
 import { validateRules, leadOf, advanceRoute, QUORUM_ALL, DECISION_TYPES } from './routing.mjs';
+import { tl, contentLang, I18nError } from '../i18n/index.mjs';
 
 const OPEN_PROJECT = `('proposed','active','stalled')`;
 const ENDED_TASK = `('done','aborted')`;
@@ -24,12 +25,14 @@ export function normScope(scope) {
   if (scope?.project) return { kind: 'project', project: String(scope.project) };
   if (scope?.soloTasks) return { kind: 'solo' };
   if (scope?.all) return { kind: 'all' };
-  throw new Error('交接范围无效：应为某个项目、不属于项目的任务或全部');
+  throw new I18nError('交接范围无效：应为某个项目、不属于项目的任务或全部');
 }
+// 范围的说法按内容语言写（它进交接清单、报错与通知正文）
 export const scopeText = (db, scope) => {
   const s = normScope(scope);
-  if (s.kind === 'project') return `项目「${db.one(`SELECT title FROM projects WHERE id=?`, s.project)?.title ?? s.project}」`;
-  return s.kind === 'solo' ? '不属于项目的任务' : '全部';
+  const L = contentLang(db);
+  if (s.kind === 'project') return tl(L, '项目「{title}」', { title: db.one(`SELECT title FROM projects WHERE id=?`, s.project)?.title ?? s.project });
+  return s.kind === 'solo' ? tl(L, '不属于项目的任务') : tl(L, '全部');
 };
 
 const userRow = (db, id) => db.one(`SELECT id, display_name, role, disabled_at FROM users WHERE id=?`, id);
@@ -62,29 +65,30 @@ export function responsibilitiesOf(db, userId, scope = { all: true }) {
   return { projects, soloTasks, routing, bindings, duty, questions, count };
 }
 
-/** 一句话清点（报错与界面共用）。 */
-export function responsibilitiesText(r) {
+/** 一句话清点（报错与界面共用）。lang：内容语言（调用方传 contentLang(db)）。 */
+export function responsibilitiesText(r, lang = 'zh') {
   const parts = [];
-  if (r.projects.length) parts.push(`负责 ${r.projects.length} 个进行中的项目`);
-  if (r.soloTasks.length) parts.push(`负责 ${r.soloTasks.length} 个不属于项目的任务`);
-  if (r.routing.length) parts.push(`是 ${r.routing.length} 行决策路由的接收人`);
-  if (r.duty.length) parts.push(`在 ${r.duty.length} 张值班表中`);
-  if (r.questions.length) parts.push(`有 ${r.questions.length} 条相关待决事项`);
-  if (r.bindings.length && !r.routing.length) parts.push(`绑定了 ${r.bindings.length} 个模板占位符`);
-  return parts.join('、');
+  if (r.projects.length) parts.push(tl(lang, '负责 {n} 个进行中的项目', { n: r.projects.length }));
+  if (r.soloTasks.length) parts.push(tl(lang, '负责 {n} 个不属于项目的任务', { n: r.soloTasks.length }));
+  if (r.routing.length) parts.push(tl(lang, '是 {n} 行决策路由的接收人', { n: r.routing.length }));
+  if (r.duty.length) parts.push(tl(lang, '在 {n} 张值班表中', { n: r.duty.length }));
+  if (r.questions.length) parts.push(tl(lang, '有 {n} 条相关待决事项', { n: r.questions.length }));
+  if (r.bindings.length && !r.routing.length) parts.push(tl(lang, '绑定了 {n} 个模板占位符', { n: r.bindings.length }));
+  return parts.join(tl(lang, '、'));
 }
 
 // 真做一遍（调用方开事务）。返回逐项清单。
 function apply(db, { fromUserId, toUserId, scope, note = null, byUserId, thenDisable = false, allowQuorumDrop = false, requestId = null, at = now() }) {
   const s = normScope(scope);
   const from = userRow(db, fromUserId), to = userRow(db, toUserId);
-  if (!from) throw new Error(`成员不存在：${fromUserId}`);
-  if (!to) throw new Error(`成员不存在：${toUserId}`);
-  if (from.id === to.id) throw new Error('交出方与接手人不能是同一人');
-  if (to.disabled_at) throw new Error(`${to.display_name} 已停用，不能接手`);
-  if (to.role === 'observer') throw new Error(`${to.display_name} 是旁观者，不能接手；请先将其角色改为成员`);
-  if (s.kind === 'project' && !db.one(`SELECT id FROM projects WHERE id=?`, s.project)) throw new Error(`项目不存在：${s.project}`);
-  if (thenDisable && s.kind !== 'all') throw new Error('选择「交接后停用」时，范围必须为「全部」');
+  if (!from) throw new I18nError('成员不存在：{id}', { id: fromUserId });
+  if (!to) throw new I18nError('成员不存在：{id}', { id: toUserId });
+  if (from.id === to.id) throw new I18nError('交出方与接手人不能是同一人');
+  if (to.disabled_at) throw new I18nError('{name} 已停用，不能接手', { name: to.display_name });
+  if (to.role === 'observer') throw new I18nError('{name} 是旁观者，不能接手；请先将其角色改为成员', { name: to.display_name });
+  if (s.kind === 'project' && !db.one(`SELECT id FROM projects WHERE id=?`, s.project)) throw new I18nError('项目不存在：{id}', { id: s.project });
+  if (thenDisable && s.kind !== 'all') throw new I18nError('选择「交接后停用」时，范围必须为「全部」');
+  const L = contentLang(db);
 
   const resp = responsibilitiesOf(db, from.id, scope);
   const ch = { from: { id: from.id, name: from.display_name }, to: { id: to.id, name: to.display_name }, scope: s, scopeText: scopeText(db, scope), note: note ? String(note).slice(0, 2000) : null,
@@ -122,7 +126,11 @@ function apply(db, { fromUserId, toUserId, scope, note = null, byUserId, thenDis
     const rules = db.all(`SELECT * FROM routing_rules WHERE project_id=? ORDER BY decision_type, scope, position`, key).map((r) => ({ ...r, recipients: JSON.parse(r.recipients || '[]') }));
     if (!rules.length) continue;
     const errs = validateRules(db, key, rules);
-    if (errs.length) throw new Error(`交接后${key ? `项目「${db.one(`SELECT title FROM projects WHERE id=?`, key)?.title ?? key}」的` : '默认'}决策路由无法通过校验，请先调整决策路由：\n${errs.map((x) => `  - ${x.msg}`).join('\n')}`);
+    if (errs.length) {
+      const list = errs.map((x) => `  - ${x.msg}`).join('\n');
+      throw key ? new I18nError('交接后项目「{title}」的决策路由无法通过校验，请先调整决策路由：\n{list}', { title: db.one(`SELECT title FROM projects WHERE id=?`, key)?.title ?? key, list })
+        : new I18nError('交接后默认决策路由无法通过校验，请先调整决策路由：\n{list}', { list });
+    }
   }
 
   // ③ 值班表
@@ -134,7 +142,7 @@ function apply(db, { fromUserId, toUserId, scope, note = null, byUserId, thenDis
 
   // ④ 还开着的事项
   for (const q of resp.questions) {
-    const brief = { id: q.id, taskId: q.task_id, taskTitle: q.task_title, label: DECISION_TYPES[q.decision_type]?.label ?? q.decision_type ?? '事项', text: oneLine(q.text) };
+    const brief = { id: q.id, taskId: q.task_id, taskTitle: q.task_title, label: DECISION_TYPES[q.decision_type]?.label ?? q.decision_type ?? tl(L, '事项'), text: oneLine(q.text) };
     if (!q.to.includes(from.id)) {            // 只是知会
       const inf = swap(q.inf, from.id, to.id).filter((u) => !q.to.includes(u));
       db.run(`UPDATE questions SET informed=? WHERE id=?`, JSON.stringify(inf), q.id);
@@ -152,7 +160,7 @@ function apply(db, { fromUserId, toUserId, scope, note = null, byUserId, thenDis
         db.run(`UPDATE questions SET addressed_to=?, route=?, route_due_at=NULL WHERE id=?`, JSON.stringify(toWhom), route ? JSON.stringify(route) : q.route, q.id);
       }
       db.run(`UPDATE questions SET notified_at=NULL WHERE id=?`, q.id);
-      audit(db, { actorKind: 'user', actorId: byUserId, action: 'conflict_escalated', targetType: 'question', targetId: q.id, payload: { why: '冲突方交接', party: from.id, to: toWhom } });
+      audit(db, { actorKind: 'user', actorId: byUserId, action: 'conflict_escalated', targetType: 'question', targetId: q.id, payload: { why: tl(L, '冲突方交接'), party: from.id, to: toWhom } });
       ch.escalated.push({ ...brief, to: toWhom }); continue;
     }
     const nextTo = swap(q.to, from.id, to.id);
@@ -174,14 +182,14 @@ function apply(db, { fromUserId, toUserId, scope, note = null, byUserId, thenDis
     if (dropped) ch.quorumDrops.push({ ...brief, ...dropped });
     ch.transferred.push({ ...brief, merged: nextTo.length < q.to.length });
   }
-  if (ch.quorumDrops.length) ch.warnings.push(`${ch.quorumDrops.length} 条事项的接手人已是接收人，合并后接收人数少于法定人数；执行后这些事项的法定人数将降为实际人数`);
-  if (ch.kept.length) ch.warnings.push(`${ch.kept.length} 条事项 ${from.display_name} 已答复、仍在等待其他人，不作变更`);
+  if (ch.quorumDrops.length) ch.warnings.push(tl(L, '{n} 条事项的接手人已是接收人，合并后接收人数少于法定人数；执行后这些事项的法定人数将降为实际人数', { n: ch.quorumDrops.length }));
+  if (ch.kept.length) ch.warnings.push(tl(L, '{n} 条事项 {name} 已答复、仍在等待其他人，不作变更', { n: ch.kept.length, name: from.display_name }));
 
   // ⑤ 停用
   if (thenDisable) {
     const left = responsibilitiesOf(db, from.id, { all: true });
     const blocking = left.count - left.questions.filter((q) => ch.kept.some((k) => k.id === q.id)).length;
-    if (blocking > 0) throw new Error(`交接后 ${from.display_name} 仍有未结职责（${responsibilitiesText(left)}），未执行停用`);
+    if (blocking > 0) throw new I18nError('交接后 {name} 仍有未结职责（{what}），未执行停用', { name: from.display_name, what: responsibilitiesText(left, L) });
     ch.tokensRevoked = doDisable(db, { user: from, at });
     ch.disabled = true;
   }
@@ -197,9 +205,10 @@ function doDisable(db, { user, at }) {
   return Number(n);
 }
 
-const requireLeadRole = (db, byUserId, what) => {
+// denied：拒绝时抛的报错（按动作各写一句，英文才翻得通）
+const requireLeadRole = (db, byUserId, denied) => {
   const by = userRow(db, byUserId);
-  if (!by || by.disabled_at || by.role !== 'lead') throw new Error(`只有管理员能${what}`);
+  if (!by || by.disabled_at || by.role !== 'lead') throw denied();
   return by;
 };
 
@@ -211,38 +220,41 @@ export function canDecideHandover(db, { byUserId, scope }) {
   const s = normScope(scope);
   return s.kind === 'project' && db.one(`SELECT owner_id FROM projects WHERE id=?`, s.project)?.owner_id === by.id;
 }
-const deciderText = (scope) => (normScope(scope).kind === 'project' ? '该项目的负责人或管理员' : '管理员');
+const deciderText = (scope, lang = 'zh') => (normScope(scope).kind === 'project' ? tl(lang, '该项目的负责人或管理员') : tl(lang, '管理员'));
 /** 给界面：这条申请谁能批，带上负责人的名字。 */
 export function approverText(db, scope) {
   const s = normScope(scope);
-  if (s.kind !== 'project') return '管理员';
+  const L = contentLang(db);
+  if (s.kind !== 'project') return tl(L, '管理员');
   const o = db.one(`SELECT u.display_name AS n FROM projects p JOIN users u ON u.id=p.owner_id WHERE p.id=?`, s.project);
-  return o ? `该项目的负责人（${o.n}）或管理员` : '管理员';
+  return o ? tl(L, '该项目的负责人（{name}）或管理员', { name: o.n }) : tl(L, '管理员');
 }
 
 /** 预览：真做一遍再回滚。任何人都能看自己的；看别人的要有该范围的执行权。 */
 export function previewHandover(db, opts) {
   const by = userRow(db, opts.byUserId);
-  if (!by || by.disabled_at) throw new Error('成员不存在或已停用');
+  if (!by || by.disabled_at) throw new I18nError('成员不存在或已停用');
   const can = canDecideHandover(db, { byUserId: by.id, scope: opts.scope });
-  if (!can && by.id !== opts.fromUserId) throw new Error('只能预览自己的交接');
+  if (!can && by.id !== opts.fromUserId) throw new I18nError('只能预览自己的交接');
   let out = null;
   try {
     db.tx(() => { out = apply(db, { ...opts, allowQuorumDrop: true }); throw DRY; }, { immediate: true });
   } catch (e) { if (e !== DRY) throw e; }
   if (out.quorumDrops.length) out.needsQuorumConfirm = true;
   out.needsApproval = !can;
-  out.approver = deciderText(opts.scope);
+  out.approver = deciderText(opts.scope, contentLang(db));
   return out;
 }
 
 /** 执行（管理员，或项目范围内该项目的负责人）。法定人数会降而没带 allowQuorumDrop → 拒，让人先看预览。 */
 export function executeHandover(db, opts) {
-  if (!canDecideHandover(db, { byUserId: opts.byUserId, scope: opts.scope })) throw new Error(`只有${deciderText(opts.scope)}能直接执行此交接；你可以提交交接申请`);
+  if (!canDecideHandover(db, { byUserId: opts.byUserId, scope: opts.scope })) {
+    throw normScope(opts.scope).kind === 'project' ? new I18nError('只有该项目的负责人或管理员能直接执行此交接；你可以提交交接申请') : new I18nError('只有管理员能直接执行此交接；你可以提交交接申请');
+  }
   return db.tx(() => {
     const ch = apply(db, opts);
-    if (ch.needsQuorumConfirm) throw new Error(`${ch.quorumDrops.length} 条事项的法定人数将因接收人合并而降低（${ch.quorumDrops.map((x) => `${x.id}：${x.from}→${x.to}`).join('、')}）。如确认，请勾选「允许降低法定人数」后重新执行`);
-    if (ch.empty) throw new Error(`${ch.from.name} 在${ch.scopeText}范围内没有需要交接的内容`);
+    if (ch.needsQuorumConfirm) throw new I18nError('{n} 条事项的法定人数将因接收人合并而降低（{list}）。如确认，请勾选「允许降低法定人数」后重新执行', { n: ch.quorumDrops.length, list: ch.quorumDrops.map((x) => `${x.id}：${x.from}→${x.to}`).join('、') });
+    if (ch.empty) throw new I18nError('{name} 在{scope}范围内没有需要交接的内容', { name: ch.from.name, scope: ch.scopeText });
     audit(db, { actorKind: 'user', actorId: opts.byUserId, action: 'handover_executed', targetType: 'user', targetId: opts.fromUserId, payload: slim(ch, opts.requestId ?? null) });
     return ch;
   }, { immediate: true });
@@ -253,10 +265,10 @@ const slim = (ch, requestId) => ({ requestId, from: ch.from.id, to: ch.to.id, sc
 
 // ── 成员发起的申请 ────────────────────────────────────────────────────────
 export function requestHandover(db, { fromUserId, toUserId, scope, note = null, thenDisable = false, byUserId, at = now() }) {
-  if (byUserId !== fromUserId) throw new Error('只能申请交接自己的职责');
+  if (byUserId !== fromUserId) throw new I18nError('只能申请交接自己的职责');
   const pv = previewHandover(db, { fromUserId, toUserId, scope, note, thenDisable, byUserId });   // 走一遍校验；接手人不合适 / 路由校验不过在这里就报
-  if (pv.empty) throw new Error(`你在${pv.scopeText}范围内没有需要交接的内容`);
-  if (db.one(`SELECT id FROM handover_requests WHERE from_user=? AND status='open'`, fromUserId)) throw new Error('你已有一条待批准的交接申请，请先撤回后再提交');
+  if (pv.empty) throw new I18nError('你在{scope}范围内没有需要交接的内容', { scope: pv.scopeText });
+  if (db.one(`SELECT id FROM handover_requests WHERE from_user=? AND status='open'`, fromUserId)) throw new I18nError('你已有一条待批准的交接申请，请先撤回后再提交');
   const id = newId('hr');
   db.tx(() => {
     db.run(`INSERT INTO handover_requests (id,from_user,to_user,scope,note,then_disable,status,requested_by,requested_at) VALUES (?,?,?,?,?,?,'open',?,?)`,
@@ -275,16 +287,21 @@ export function listHandoverRequests(db, { status = 'open' } = {}) {
 
 /** 批准（= 立刻执行）/ 驳回：项目范围 = 该项目负责人或管理员，其余范围 = 管理员；撤回：申请人自己。 */
 export function decideHandoverRequest(db, { requestId, decision, byUserId, note = null, allowQuorumDrop = false, at = now() }) {
-  if (!['approve', 'reject', 'withdraw'].includes(decision)) throw new Error(`decision 无效：${decision}（应为 approve / reject / withdraw）`);
+  if (!['approve', 'reject', 'withdraw'].includes(decision)) throw new I18nError('decision 无效：{decision}（应为 approve / reject / withdraw）', { decision });
   return db.tx(() => {
     const r = db.one(`SELECT * FROM handover_requests WHERE id=?`, requestId);
-    if (!r) throw new Error(`交接申请不存在：${requestId}`);
-    if (r.status !== 'open') throw new Error(`该交接申请已${{ approved: '批准', rejected: '驳回', withdrawn: '撤回' }[r.status]}`);
-    if (decision === 'withdraw') { if (byUserId !== r.from_user) throw new Error('只有申请人能撤回'); } else if (!canDecideHandover(db, { byUserId, scope: JSON.parse(r.scope) })) throw new Error(`只有${deciderText(JSON.parse(r.scope))}能批准或驳回此交接申请`);
+    if (!r) throw new I18nError('交接申请不存在：{id}', { id: requestId });
+    if (r.status !== 'open') {
+      throw ({ approved: () => new I18nError('该交接申请已批准'), rejected: () => new I18nError('该交接申请已驳回'), withdrawn: () => new I18nError('该交接申请已撤回') }[r.status]
+        ?? (() => new Error(`该交接申请已${{ approved: '批准', rejected: '驳回', withdrawn: '撤回' }[r.status]}`)))();
+    }
+    if (decision === 'withdraw') { if (byUserId !== r.from_user) throw new I18nError('只有申请人能撤回'); } else if (!canDecideHandover(db, { byUserId, scope: JSON.parse(r.scope) })) {
+      throw normScope(JSON.parse(r.scope)).kind === 'project' ? new I18nError('只有该项目的负责人或管理员能批准或驳回此交接申请') : new I18nError('只有管理员能批准或驳回此交接申请');
+    }
     let ch = null;
     if (decision === 'approve') {
       ch = apply(db, { fromUserId: r.from_user, toUserId: r.to_user, scope: JSON.parse(r.scope), note: r.note, thenDisable: !!r.then_disable, byUserId, allowQuorumDrop, requestId, at });
-      if (ch.needsQuorumConfirm) throw new Error(`${ch.quorumDrops.length} 条事项的法定人数将因接收人合并而降低。如确认，请勾选「允许降低法定人数」后重新批准`);
+      if (ch.needsQuorumConfirm) throw new I18nError('{n} 条事项的法定人数将因接收人合并而降低。如确认，请勾选「允许降低法定人数」后重新批准', { n: ch.quorumDrops.length });
       audit(db, { actorKind: 'user', actorId: byUserId, action: 'handover_executed', targetType: 'user', targetId: r.from_user, payload: slim(ch, requestId) });
     }
     const status = { approve: 'approved', reject: 'rejected', withdraw: 'withdrawn' }[decision];
@@ -297,16 +314,16 @@ export function decideHandoverRequest(db, { requestId, decision, byUserId, note 
 // ── 停用 / 恢复 ───────────────────────────────────────────────────────────
 /** 名下没有未了结的责任才停用；有就报出清单，让人先交接（handover --all --disable 一步做完）。 */
 export function disableUser(db, { userId, byUserId, at = now() }) {
-  requireLeadRole(db, byUserId, '停用成员');
+  requireLeadRole(db, byUserId, () => new I18nError('只有管理员能停用成员'));
   return db.tx(() => {
     const u = userRow(db, userId);
-    if (!u) throw new Error(`成员不存在：${userId}`);
-    if (u.disabled_at) throw new Error(`${u.display_name} 已停用`);
-    if (u.role === 'lead' && !db.one(`SELECT id FROM users WHERE role='lead' AND disabled_at IS NULL AND id<>?`, userId)) throw new Error('不能停用最后一位管理员');
+    if (!u) throw new I18nError('成员不存在：{id}', { id: userId });
+    if (u.disabled_at) throw new I18nError('{name} 已停用', { name: u.display_name });
+    if (u.role === 'lead' && !db.one(`SELECT id FROM users WHERE role='lead' AND disabled_at IS NULL AND id<>?`, userId)) throw new I18nError('不能停用最后一位管理员');
     const left = responsibilitiesOf(db, userId, { all: true });
     const mine = left.questions.filter((q) => !db.one(`SELECT 1 FROM answers WHERE question_id=? AND user_id=? AND stance='answer'`, q.id, userId));
     if (left.count - (left.questions.length - mine.length) > 0) {
-      const e = new Error(`${u.display_name} 仍有未结职责：${responsibilitiesText({ ...left, questions: mine })}。请先交接（范围选「全部」，并勾选「交接后停用」）`);
+      const e = new I18nError('{name} 仍有未结职责：{what}。请先交接（范围选「全部」，并勾选「交接后停用」）', { name: u.display_name, what: responsibilitiesText({ ...left, questions: mine }, contentLang(db)) });
       e.needsHandover = true; throw e;
     }
     const n = doDisable(db, { user: u, at });
@@ -317,10 +334,10 @@ export function disableUser(db, { userId, byUserId, at = now() }) {
 
 /** 恢复：只清停用标记。令牌在停用时已全部吊销，要另外重发。 */
 export function enableUser(db, { userId, byUserId }) {
-  requireLeadRole(db, byUserId, '启用成员');
+  requireLeadRole(db, byUserId, () => new I18nError('只有管理员能启用成员'));
   const u = userRow(db, userId);
-  if (!u) throw new Error(`成员不存在：${userId}`);
-  if (!u.disabled_at) throw new Error(`${u.display_name} 未停用，无需启用`);
+  if (!u) throw new I18nError('成员不存在：{id}', { id: userId });
+  if (!u.disabled_at) throw new I18nError('{name} 未停用，无需启用', { name: u.display_name });
   db.tx(() => {
     db.run(`UPDATE users SET disabled_at=NULL WHERE id=?`, userId);
     audit(db, { actorKind: 'user', actorId: byUserId, action: 'user_enabled', targetType: 'user', targetId: userId, payload: {} });

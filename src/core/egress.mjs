@@ -27,6 +27,8 @@ import { join, resolve } from 'node:path';
 import { now, newId, audit, insertEdge } from '../db/db.mjs';
 import { setProjectParam, getProjectParam } from './params.mjs';
 import { getSetting } from './settings.mjs';
+import { markLike, markOf } from '../i18n/marks.mjs';
+import { tl, contentLang, I18nError } from '../i18n/index.mjs';
 
 export const PROXY_IMAGE = 'mitmproxy/mitmproxy:latest';
 export const PROXY_PORT = 8080;
@@ -70,44 +72,46 @@ export const sourceOf = (db, id) => shapeSource(db.one(`SELECT * FROM egress_sou
  * 只收具体域名或 `*.后缀`（后缀至少两段）；不收 IP、localhost、内网后缀 —— 那会让沙箱借代理打进宿主所在的内网。
  * @returns 错误原因，或 null
  */
-export function hostProblem(raw) {
+export function hostProblem(raw, lang = 'zh') {
   const h = String(raw ?? '').trim().toLowerCase();
-  if (!h) return '域名是空的';
-  if (/[/:?#@\s]/.test(h)) return `「${h}」不是一个域名：只写域名本身，不要带 https://、端口或路径`;
-  if (/^\d{1,3}(\.\d{1,3}){3}$/.test(h) || h.includes('[')) return `「${h}」是 IP 地址：只允许域名`;
+  if (!h) return tl(lang, '域名是空的');
+  if (/[/:?#@\s]/.test(h)) return tl(lang, '「{h}」不是一个域名：只写域名本身，不要带 https://、端口或路径', { h });
+  if (/^\d{1,3}(\.\d{1,3}){3}$/.test(h) || h.includes('[')) return tl(lang, '「{h}」是 IP 地址：只允许域名', { h });
   const base = h.startsWith('*.') ? h.slice(2) : h;
-  if (base.includes('*')) return `「${h}」：通配只能写在最前面，形如 *.example.com`;
+  if (base.includes('*')) return tl(lang, '「{h}」：通配只能写在最前面，形如 *.example.com', { h });
   const labels = base.split('.');
-  if (labels.some((l) => !/^[a-z0-9]([a-z0-9-]*[a-z0-9])?$/.test(l))) return `「${h}」不是合法的域名`;
-  if (labels.length < 2) return `「${h}」只有一段：要写完整域名，例如 docs.example.com`;
-  if (['localhost', 'local', 'internal', 'lan', 'home', 'intranet', 'corp'].includes(labels.at(-1)) || base === 'localhost') return `「${h}」是本机或内网地址：不允许经代理访问`;
-  if (h.startsWith('*.') && labels.length < 2) return `「${h}」：通配的后缀至少要两段（*.example.com 可以，*.com 不行）`;
+  if (labels.some((l) => !/^[a-z0-9]([a-z0-9-]*[a-z0-9])?$/.test(l))) return tl(lang, '「{h}」不是合法的域名', { h });
+  if (labels.length < 2) return tl(lang, '「{h}」只有一段：要写完整域名，例如 docs.example.com', { h });
+  if (['localhost', 'local', 'internal', 'lan', 'home', 'intranet', 'corp'].includes(labels.at(-1)) || base === 'localhost') return tl(lang, '「{h}」是本机或内网地址：不允许经代理访问', { h });
+  if (h.startsWith('*.') && labels.length < 2) return tl(lang, '「{h}」：通配的后缀至少要两段（*.example.com 可以，*.com 不行）', { h });
   return null;
 }
 /** 工具配置：只收环境变量，名字不能和沙箱自己的出网 / 证书 / 身份配置撞车。 */
 const RESERVED_ENV = /^(HTTPS?_PROXY|https?_proxy|NO_PROXY|no_proxy|NODE_USE_ENV_PROXY|HOME|PATH|SSL_CERT_FILE|NODE_EXTRA_CA_CERTS|GIT_SSL_CAINFO|CURL_CA_BUNDLE|REQUESTS_CA_BUNDLE|PIP_CERT|GIT_(AUTHOR|COMMITTER)_\w+)$/;
-export function toolEnvProblems(env) {
+export function toolEnvProblems(env, lang = 'zh') {
   const errs = [];
   for (const [k, v] of Object.entries(env ?? {})) {
-    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(k)) errs.push(`「${k}」不是合法的环境变量名`);
-    else if (RESERVED_ENV.test(k)) errs.push(`「${k}」是沙箱自己的出网 / 证书 / 身份配置，不能在这里改`);
-    if (typeof v !== 'string' || !v.trim()) errs.push(`「${k}」的值是空的`);
+    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(k)) errs.push(tl(lang, '「{k}」不是合法的环境变量名', { k }));
+    else if (RESERVED_ENV.test(k)) errs.push(tl(lang, '「{k}」是沙箱自己的出网 / 证书 / 身份配置，不能在这里改', { k }));
+    if (typeof v !== 'string' || !v.trim()) errs.push(tl(lang, '「{k}」的值是空的', { k }));
   }
   return errs;
 }
 const requireAdmin = (db, userId) => {
   const u = db.one(`SELECT role, disabled_at FROM users WHERE id=?`, userId);
-  if (!u || u.disabled_at || u.role !== 'lead') throw new Error('只有管理员能改联网目录：往目录里加一个源，等于给所有项目多开一个可选的出口');
+  if (!u || u.disabled_at || u.role !== 'lead') throw new I18nError('只有管理员能改联网目录：往目录里加一个源，等于给所有项目多开一个可选的出口');
 };
 
 export function addSource(db, { name, kind = 'package', hosts, readOnly = null, toolEnv = {}, note = '', userId, at = now() }) {
   requireAdmin(db, userId);
-  if (!String(name ?? '').trim()) throw new Error('要给这个源起个名字（例如「清华 PyPI 镜像」）');
-  if (!SOURCE_KINDS[kind]) throw new Error(`类型只能是 ${Object.keys(SOURCE_KINDS).join(' / ')}`);
+  if (!String(name ?? '').trim()) throw new I18nError('要给这个源起个名字（例如「清华 PyPI 镜像」）');
+  if (!SOURCE_KINDS[kind]) throw new I18nError('类型只能是 {kinds}', { kinds: Object.keys(SOURCE_KINDS).join(' / ') });
   const list = [...new Set((Array.isArray(hosts) ? hosts : String(hosts ?? '').split(/[\s,，;；]+/)).map((h) => String(h).trim().toLowerCase()).filter(Boolean))];
-  if (!list.length) throw new Error('至少要有一个域名');
-  const errs = [...list.map(hostProblem).filter(Boolean), ...toolEnvProblems(toolEnv)];
-  if (errs.length) throw new Error(errs.join('；'));
+  if (!list.length) throw new I18nError('至少要有一个域名');
+  // 可能一次好几条：没法套一个模板，按部署的内容语言拼好（中文部署照旧是中文原文）
+  const L = contentLang(db);
+  const errs = [...list.map((h) => hostProblem(h, L)).filter(Boolean), ...toolEnvProblems(toolEnv, L)];
+  if (errs.length) throw new Error(errs.join(tl(L, '；')));
   const ro = readOnly === null ? kind === 'info' : !!readOnly;   // 信息源默认只读
   const id = newId('es');
   db.run(`INSERT INTO egress_sources (id,name,kind,hosts,read_only,tool_env,note,builtin,created_by,created_at) VALUES (?,?,?,?,?,?,?,0,?,?)`,
@@ -128,8 +132,8 @@ export function sourceUsage(db, id) {
 export function removeSource(db, { id, userId, at = now() }) {
   requireAdmin(db, userId);
   const s = sourceOf(db, id);
-  if (!s) throw new Error(`联网目录里没有这个源：${id}`);
-  if (s.builtin) throw new Error('内置的源不能删；不想用就在项目联网里不勾它');
+  if (!s) throw new I18nError('联网目录里没有这个源：{id}', { id });
+  if (s.builtin) throw new I18nError('内置的源不能删；不想用就在项目联网里不勾它');
   const usedBy = sourceUsage(db, id);
   db.run(`UPDATE egress_sources SET removed_at=? WHERE id=?`, at, id);
   audit(db, { actorKind: 'user', actorId: userId, action: 'egress_source_removed', targetType: 'egress_source', targetId: id,
@@ -148,18 +152,18 @@ export function projectEgressOf(db, projectId) {
 export function applyEgressDefaults(db, { projectId, userId }) {
   const want = (getSetting(db, 'deploy.egress_defaults') ?? []).filter((x) => sourceOf(db, x));
   if (!want.length) return null;
-  return setProjectEgress(db, { projectId, sources: want, userId, authorized: true, why: '新项目默认放行（管理员在「设置 → 联网目录」里设的）' });
+  return setProjectEgress(db, { projectId, sources: want, userId, authorized: true, why: tl(contentLang(db), '新项目默认放行（管理员在「设置 → 联网目录」里设的）') });
 }
 export function setProjectEgress(db, { projectId, sources, userId, why = null, authorized = false, at = now() }) {
   const p = db.one(`SELECT id, owner_id FROM projects WHERE id=?`, projectId);
-  if (!p) throw new Error(`没有这个项目：${projectId}`);
+  if (!p) throw new I18nError('没有这个项目：{id}', { id: projectId });
   if (userId && !authorized && p.owner_id !== userId) {
     const role = db.one(`SELECT role FROM users WHERE id=?`, userId)?.role;
-    if (role !== 'lead') throw new Error('只有项目负责人能改项目联网');
+    if (role !== 'lead') throw new I18nError('只有项目负责人能改项目联网');
   }
   const want = [...new Set(sources ?? [])];
   const bad = want.filter((x) => !sourceOf(db, x));
-  if (bad.length) throw new Error(`联网目录里没有：${bad.join('、')}`);
+  if (bad.length) throw new I18nError('联网目录里没有：{ids}', { ids: bad.join('、') });
   const before = projectEgressOf(db, projectId);
   setProjectParam(db, { projectId, key: PROJECT_EGRESS_KEY, value: want, by: { kind: 'user', id: userId ?? null }, governance: 'constitutional' });
   audit(db, { actorKind: 'user', actorId: userId, action: 'project_egress_set', targetType: 'project', targetId: projectId,
@@ -184,11 +188,11 @@ export function egressGroupsOf(db, taskId) {
  */
 export function setEgressGroups(db, { taskId, groups, userId, why = null }) {
   const bad = groups.filter((g) => !sourceOf(db, g));
-  if (bad.length) throw new Error(`联网目录里没有：${bad.join(' / ')}（可选：${egressSources(db).map((s) => s.id).join(' / ')}）`);
+  if (bad.length) throw new I18nError('联网目录里没有：{ids}（可选：{all}）', { ids: bad.join(' / '), all: egressSources(db).map((s) => s.id).join(' / ') });
   if (userId) requireAuthorized(db, { taskId, decisionType: 'egress', userId });   // 出网放行是决策类型之一：查路由表
   const pid = db.one(`SELECT project_id FROM tasks WHERE id=?`, taskId)?.project_id ?? null;
   if (pid) {
-    const r = setProjectEgress(db, { projectId: pid, sources: groups, userId, authorized: true, why: why ?? `经任务 ${taskId} 放行` });
+    const r = setProjectEgress(db, { projectId: pid, sources: groups, userId, authorized: true, why: why ?? tl(contentLang(db), '经任务 {id} 放行', { id: taskId }) });
     audit(db, { actorKind: 'user', actorId: userId, action: 'egress_allowlist_set', targetType: 'task', targetId: taskId,
       payload: { groups, hosts: allowlistOf(db, groups), projectId: pid } });
     return r;
@@ -224,7 +228,7 @@ export const hostsOf = (groups) => groups.flatMap(
  * 原来 agent 不知道哪里能去，只能撞墙了才知道；现在事先告诉它。
  */
 // 这几个源要沙箱里有对应的工具才用得上；现有的两种沙箱（Node / Node + Python）都没有 —— 放行了也白放。
-export const SOURCE_NEEDS_TOOL = { crates: 'cargo（Rust）', goproxy: 'go' };
+export const SOURCE_NEEDS_TOOL = { crates: 'cargo (Rust)', goproxy: 'go' };
 
 /**
  * 沙箱环境说明。原来 agent 不知道沙箱长什么样：哪里能写、有哪些工具、
@@ -659,7 +663,7 @@ export function raiseEgressQuestion(db, { taskId, nodeId = null, group, why, aud
   let source = sourceOf(db, want);
   let host = null;
   if (!source) {
-    if (hostProblem(want)) throw new Error(`「${want}」既不是联网目录里的源，也不是合法的域名（目录里有：${egressSources(db).map((s) => s.id).join(' / ')}）`);
+    if (hostProblem(want)) throw new I18nError('「{want}」既不是联网目录里的源，也不是合法的域名（目录里有：{all}）', { want, all: egressSources(db).map((s) => s.id).join(' / ') });
     host = want.toLowerCase();
     source = sourceForHost(db, host);          // 这个域其实已经在某个源里了：就按那个源问
   }
@@ -672,29 +676,34 @@ export function raiseEgressQuestion(db, { taskId, nodeId = null, group, why, aud
   const newHost = host && !source ? host : (uncovered[0] ?? null);   // (B) 选项要加进目录的那个域
   const other = Object.keys(denied).filter((h) => !hit.includes(h));
 
+  const L = contentLang(db);
+  const sep = tl(L, '、');
+  const counts = (hs) => hs.map((h) => `${h}×${denied[h]}`).join(sep);
   const evidence = !Object.keys(denied).length
-    ? '⚠️ 审计轨里**没有被拦记录**。本任务若完全断网，这是正常的 —— 请求根本到不了代理。'
+    ? tl(L, '⚠️ 审计轨里**没有被拦记录**。本任务若完全断网，这是正常的 —— 请求根本到不了代理。')
     : source && hit.length
-      ? `✅ 与被拦记录对得上：${hit.map((h) => `${h}×${denied[h]}`).join('、')}`
-        + (other.length ? `\n⚠️ 还有不属于它的被拦域：${other.map((h) => `${h}×${denied[h]}`).join('、')}` : '')
+      ? tl(L, '✅ 与被拦记录对得上：{hosts}', { hosts: counts(hit) })
+        + (other.length ? `\n${tl(L, '⚠️ 还有不属于它的被拦域：{hosts}', { hosts: counts(other) })}` : '')
       : source
         // 最该被人看见的那种：它要的和它实际撞的墙不是一回事 —— 先弄清为什么再放行
-        ? `⚠️ **对不上**：它请求「${source.name}」，但被拦的是 ${Object.keys(denied).map((h) => `${h}×${denied[h]}`).join('、')}　←　放行它不会让这些通，先弄清为什么`
-        : `被拦记录：${Object.keys(denied).map((h) => `${h}×${denied[h]}`).join('、')}`;
+        ? tl(L, '⚠️ **对不上**：它请求「{name}」，但被拦的是 {hosts}　←　放行它不会让这些通，先弄清为什么', { name: source.name, hosts: counts(Object.keys(denied)) })
+        : tl(L, '被拦记录：{hosts}', { hosts: counts(Object.keys(denied)) });
   const pid = db.one(`SELECT project_id FROM tasks WHERE id=?`, taskId)?.project_id ?? null;
-  const scopeWord = pid ? '本项目的联网设置（项目下所有任务都能用）' : '本任务的放行名单';
+  const scopeWord = pid ? tl(L, '本项目的联网设置（项目下所有任务都能用）') : tl(L, '本任务的放行名单');
   const opts = [
-    source ? `(A) 放行「${source.name}」（${source.hosts.join('、')}${source.readOnly ? '，只读' : ''}）—— 加进${scopeWord}` : null,
-    newHost ? `(B) 把 ${newHost} 加进联网目录（作为只读的信息源）并放行 —— 只有管理员能选：它扩大的是整个部署可选的出口` : null,
-    '(C) 不放行 —— 让它改用离线方式完成',
+    source ? (source.readOnly
+      ? tl(L, '(A) 放行「{name}」（{hosts}，只读）—— 加进{scope}', { name: source.name, hosts: source.hosts.join(sep), scope: scopeWord })
+      : tl(L, '(A) 放行「{name}」（{hosts}）—— 加进{scope}', { name: source.name, hosts: source.hosts.join(sep), scope: scopeWord })) : null,
+    newHost ? tl(L, '(B) 把 {host} 加进联网目录（作为只读的信息源）并放行 —— 只有管理员能选：它扩大的是整个部署可选的出口', { host: newHost }) : null,
+    tl(L, '(C) 不放行 —— 让它改用离线方式完成'),
   ].filter(Boolean);
-  const text = `【请求联网】${source ? `请求放行「${source.name}」` : `请求访问 ${host}（不在联网目录里）`}\n\n`
-    + `agent 给的理由：${why}\n\n`
-    + `放行意味着沙箱里的代码可以连上这些地址，并向它们发送数据。\n`
-    + `当前已放行：${current.length ? current.map((x) => sourceOf(db, x)?.name ?? x).join('、') : '（无，完全断网）'}\n\n`
-    + `${evidence}\n\n请选一条（回复字母即可，选定后立即生效）：\n${opts.join('\n')}`
+  const text = `${markOf(L, 'egress')}${source ? tl(L, '请求放行「{name}」', { name: source.name }) : tl(L, '请求访问 {host}（不在联网目录里）', { host })}\n\n`
+    + `${tl(L, 'agent 给的理由：{why}', { why })}\n\n`
+    + `${tl(L, '放行意味着沙箱里的代码可以连上这些地址，并向它们发送数据。')}\n`
+    + `${tl(L, '当前已放行：{list}', { list: current.length ? current.map((x) => sourceOf(db, x)?.name ?? x).join(sep) : tl(L, '（无，完全断网）') })}\n\n`
+    + `${evidence}\n\n${tl(L, '请选一条（回复字母即可，选定后立即生效）：')}\n${opts.join('\n')}`
     // 只有 (B)(C) 时读者要对照别的事项才明白 A 去哪了 —— 字母是固定含义，这里直说为什么没有
-    + (source ? '' : `\n（${host} 不在联网目录里，所以没有「直接放行」这一项；不是管理员的话，要放行请找管理员）`);
+    + (source ? '' : `\n${tl(L, '（{host} 不在联网目录里，所以没有「直接放行」这一项；不是管理员的话，要放行请找管理员）', { host })}`);
 
   const origin = db.one(`SELECT id FROM params WHERE task_id=? AND key=? AND superseded_at IS NULL
                          ORDER BY recorded_at DESC, rowid DESC LIMIT 1`, taskId, EGRESS_PARAM)?.id
@@ -726,15 +735,16 @@ RESOLUTION_HOOKS.egress = (db, { question, finalBody, by, at }) => {
   if (!req) return null;                                  // 老的放行事项（v20 之前）：照旧只记答复
   const choice = egressChoiceOf(finalBody);
   const cur = egressGroupsOf(db, question.task_id);
+  const L = contentLang(db);
   if (choice === 'A' && req.group) {
-    setEgressGroups(db, { taskId: question.task_id, groups: [...new Set([...cur, req.group])], userId: by, why: `事项 ${question.id} 选 (A)` });
+    setEgressGroups(db, { taskId: question.task_id, groups: [...new Set([...cur, req.group])], userId: by, why: tl(L, '事项 {id} 选 (A)', { id: question.id }) });
     return { applied: 'allow', source: req.group };
   }
   if (choice === 'B' && req.host) {
     // 抛错会让整次答复回滚、答复人看到原因 —— 比"答了但什么都没发生"好
     const s = sourceForHost(db, req.host) ?? addSource(db, { name: req.host, kind: 'info', hosts: [req.host], readOnly: true,
-      note: `由事项 ${question.id} 加入（agent 请求时说：${String(req.why ?? '').slice(0, 80)}）`, userId: by, at });
-    setEgressGroups(db, { taskId: question.task_id, groups: [...new Set([...cur, s.id])], userId: by, why: `事项 ${question.id} 选 (B)` });
+      note: tl(L, '由事项 {id} 加入（agent 请求时说：{why}）', { id: question.id, why: String(req.why ?? '').slice(0, 80) }), userId: by, at });
+    setEgressGroups(db, { taskId: question.task_id, groups: [...new Set([...cur, s.id])], userId: by, why: tl(L, '事项 {id} 选 (B)', { id: question.id }) });
     return { applied: 'add_and_allow', source: s.id };
   }
   audit(db, { actorKind: 'user', actorId: by, action: 'egress_declined', targetType: 'task', targetId: question.task_id,
@@ -744,13 +754,15 @@ RESOLUTION_HOOKS.egress = (db, { question, finalBody, by, at }) => {
 
 /** 某任务当前开着的、请求某个生态的问题。给 `egress --allow` 用来一并解答。 */
 export function openEgressQuestions(db, { taskId, group = null }) {
+  const EG = markLike('q.text', 'egress'), EGL = markLike('q.text', 'egressLegacy');
   // 按审计里记下的请求认（v20 起正文改了措辞；认正文字样迟早又对不上）。老事项的正文前缀也照认。
   const asked = new Map(db.all(`SELECT payload FROM audit_log WHERE action='egress_requested' AND target_id=?`, taskId)
     .map((r) => { try { const p = JSON.parse(r.payload); return [p.questionId, p.group]; } catch { return [null, null]; } }));
   return db.all(`SELECT q.id, q.text FROM questions q
                  WHERE q.task_id=? AND q.status IN ('open','escalated') AND q.level_source='hard_rule'
-                   AND (q.text LIKE '【请求联网】%' OR q.text LIKE '【请求放行出口白名单】%')`, taskId)
-    .filter((q) => !group || asked.get(q.id) === group || q.text.includes(`生态 \`${group}\``));
+                   AND (${EG.sql} OR ${EGL.sql})`, taskId, ...EG.params, ...EGL.params)
+    // 正文里的"生态 `x`"两种语言都认（英文正文写 ecosystem `x`，见 i18n 目录）
+    .filter((q) => !group || asked.get(q.id) === group || q.text.includes(`生态 \`${group}\``) || q.text.includes(`ecosystem \`${group}\``));
 }
 
 /**
@@ -786,7 +798,7 @@ export function ingestEgressAudit(db, { taskId, auditFile, from = 0 }) {
     for (const d of denied) byHost[d.host] = (byHost[d.host] ?? 0) + 1;
     audit(db, { actorKind: 'system', action: 'egress_denied', targetType: 'task', targetId: taskId,
       payload: { hosts: byHost, total: denied.length, auditFile,
-        hint: '反复出现的域 = 白名单漏了哪个生态的候选' } });
+        hint: tl(contentLang(db), '反复出现的域 = 白名单漏了哪个生态的候选') } });
   }
   if (injected.length) {
     const byRule = {};

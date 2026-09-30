@@ -31,6 +31,8 @@
 //     结论回写原事项：赢的那条 message 挂 answers 边到原事项，输的答复标 dissent。
 //   - agent 只保留一件事：冲突事项正文附对称影响简报。目前是模板（两边原文等深并列），不调模型。
 
+import { hasMark, markOf } from '../i18n/marks.mjs';
+import { tl, contentLang, userLang, I18nError } from '../i18n/index.mjs';
 import { newId, now, audit, insertEdge, authenticate } from '../db/db.mjs';
 import { routeQuestion, advanceRoute, leadOf, requesterOf } from './routing.mjs';
 import { recordFromQuestion } from './decisions.mjs';
@@ -68,22 +70,23 @@ export const writtenOf = (db, questionId) => answersOf(db, questionId).filter((a
  * @throws 令牌无效 / 问题不存在 / 问题已关闭 / 无权
  */
 export function recordAnswer(db, { questionId, body, stance = 'answer', agreesWith = null, plaintextToken, at = now() }) {
-  if (!STANCES[stance]) throw new Error(`立场无效：${stance}（只能是 ${Object.keys(STANCES).join(' / ')}）`);
-  if (stance === 'answer' && !body?.trim()) throw new Error('答复内容不能为空');
+  if (!STANCES[stance]) throw new I18nError('立场无效：{stance}（只能是 {list}）', { stance, list: Object.keys(STANCES).join(' / ') });
+  if (stance === 'answer' && !body?.trim()) throw new I18nError('答复内容不能为空');
 
   // ① 认证。**先认证再看问题**：认证失败不该泄露"这个问题存不存在"。
   const auth = authenticate(db, plaintextToken);
   if (!auth) {
-    throw new Error('令牌无效或已吊销');
+    throw new I18nError('令牌无效或已吊销');
   }
   const user = db.one(`SELECT id, role FROM users WHERE id=?`, auth.user_id);
-  if (user.role === 'observer') throw new Error('旁观者不能答复事项；可在该事项下留言，留言会附在事项上并进入负责人的摘要，但不计入决策');
+  if (user.role === 'observer') throw new I18nError('旁观者不能答复事项；可在该事项下留言，留言会附在事项上并进入负责人的摘要，但不计入决策');
 
   const q = db.one(`SELECT * FROM questions WHERE id=?`, questionId);
-  if (!q) throw new Error(`事项不存在：${questionId}`);
+  if (!q) throw new I18nError('事项不存在：{id}', { id: questionId });
+  const L = contentLang(db);
   // 签收的答案空间是封闭的，入口就要收紧。原来不以"接受"开头的一律算打回、原文当理由 ——
   // 照着正文的"(A) 接受"答一个 A，就成了以"A"为理由打回，任务据此重新规划。
-  if (q.decision_type === 'signoff' && stance === 'answer') body = signoffAnswer(body);
+  if (q.decision_type === 'signoff' && stance === 'answer') body = signoffAnswer(body, L);
   const lead = leadOf(db, q.task_id);
   const isLead = auth.user_id === lead;
   const addressed = JSON.parse(q.addressed_to || '[]');
@@ -96,18 +99,22 @@ export function recordAnswer(db, { questionId, body, stance = 'answer', agreesWi
   // 已决事项（block 路径）再收到介入者的答复：先答生效，迟到的是**意见**不是指令 —— 留痕（dissent / 附议）、通知负责人
   // 与生效答复的作者，不改结论。负责人要改结论走修正流程，所以负责人仍走下面的报错。
   if (!open && q.status === 'answered' && policy === 'block' && isRecipient && !isLead) {
-    if (stance === 'abstain') throw new Error(`事项 ${questionId} 已有结论，不必再弃权`);
+    if (stance === 'abstain') throw new I18nError('事项 {id} 已有结论，不必再弃权', { id: questionId });
     return recordLateAnswer(db, { q, auth, body, stance, at, lead });
   }
   if (!open && !supersede) {
-    throw new Error(`事项 ${questionId} 状态为 ${q.status}，不接受答复。`
-      + (q.status === 'answered' ? '该事项已有结论；如需更改，请走修正流程提交计划变更。' : ''));
+    throw q.status === 'answered'
+      ? new I18nError('事项 {id} 状态为 {status}，不接受答复。该事项已有结论；如需更改，请走修正流程提交计划变更。', { id: questionId, status: q.status })
+      : new I18nError('事项 {id} 状态为 {status}，不接受答复。', { id: questionId, status: q.status });
   }
   if (q.status === 'escalated' && q.decision_type !== 'conflict' && db.one(`SELECT id FROM questions WHERE origin_question_id=? AND status IN ('open','escalated')`, q.id) && !isLead) {
-    throw new Error(`事项 ${questionId} 正在冲突处理中，请等待冲突事项的结论`);
+    throw new I18nError('事项 {id} 正在冲突处理中，请等待冲突事项的结论', { id: questionId });
   }
   if (!isLead && !isRecipient) {
-    throw new Error(`无权答复：你不是该事项的接收人（接收人：${addressed.map((id) => db.one(`SELECT display_name FROM users WHERE id=?`, id)?.display_name ?? id).join('、') || '无'}）。可请接收人或负责人将事项转交给你`);
+    const names = addressed.map((id) => db.one(`SELECT display_name FROM users WHERE id=?`, id)?.display_name ?? id).join('、');
+    throw names
+      ? new I18nError('无权答复：你不是该事项的接收人（接收人：{names}）。可请接收人或负责人将事项转交给你', { names })
+      : new I18nError('无权答复：你不是该事项的接收人（接收人：无）。可请接收人或负责人将事项转交给你');
   }
 
   // 弃权：不是一条立场，是"把我从收件人里去掉"。单独走一条路。
@@ -119,11 +126,11 @@ export function recordAnswer(db, { questionId, body, stance = 'answer', agreesWi
     const written = writtenOf(db, q.id).filter((a) => a.user_id !== auth.user_id);
     if (agreesWith) {
       target = written.find((a) => a.id === agreesWith || a.id.endsWith(agreesWith));
-      if (!target) throw new Error(`附议的目标 ${agreesWith} 不在这条事项的答复里`);
+      if (!target) throw new I18nError('附议的目标 {target} 不在这条事项的答复里', { target: agreesWith });
     } else if (written.length === 1) target = written[0];
-    else if (!written.length) throw new Error('这条事项还没有别人的答复可附议 —— 请写下你自己的意见');
-    else throw new Error(`这条事项有 ${written.length} 条答复（${written.map((a) => `${nameOf(db, a.user_id)}：${a.id}`).join('、')}），附议要指明是哪一条`);
-    body = `附议 ${nameOf(db, target.user_id)} 的答复：${String(target.body).trim()}`;
+    else if (!written.length) throw new I18nError('这条事项还没有别人的答复可附议 —— 请写下你自己的意见');
+    else throw new I18nError('这条事项有 {n} 条答复（{list}），附议要指明是哪一条', { n: written.length, list: written.map((a) => `${nameOf(db, a.user_id)}：${a.id}`).join('、') });
+    body = tl(L, '附议 {name} 的答复：{body}', { name: nameOf(db, target.user_id), body: String(target.body).trim() });
   }
   // 按类型的收件前检查（抛错 = 拒收，什么都不记）：答复本身做不到的事，当场说清楚该去哪儿做
   if (stance === 'answer' && ANSWER_GUARDS[q.decision_type]) ANSWER_GUARDS[q.decision_type](db, { question: q, body, userId: auth.user_id });
@@ -189,21 +196,23 @@ export function recordAnswer(db, { questionId, body, stance = 'answer', agreesWi
 /**
  * 签收答复归一：选项字母（A / (A) / B：理由）换成正文；打回必须带理由；C（先查看经过）不是结论；
  * 认不出方向的自由文字**拒收**，不再默认当打回。归一之后的正文只有两种形状：「接受…」「打回：<理由>」。
+ * 内容语言是英文时（0.2.0）写成「Accept…」「Reject: <理由>」；输入两种语言都认（"send back" 与看板英文按钮同名，也算打回）。
  */
-export function signoffAnswer(raw) {
+export function signoffAnswer(raw, lang = 'zh') {
   const s = String(raw ?? '').trim();
-  const NEED = '签收只收两种答复：「接受」，或「打回：<理由>」（理由会作为修正指令，任务据此重新规划）';
+  const en = lang === 'en';
+  const reject = (why) => (en ? `Reject: ${why}` : `打回：${why}`);
   const opt = /^[（(]?\s*([ABCabc])\s*[)）]?(?=$|[\s：:，,。.、])[\s：:，,。.、]*([\s\S]*)$/.exec(s);
   if (opt) {
     const k = opt[1].toUpperCase(), rest = opt[2].trim();
-    if (k === 'A') return rest ? `接受，${rest}` : '接受';
-    if (k === 'B') { if (!rest) throw new Error('打回必须写理由：回「B：<理由>」或「打回：<理由>」'); return `打回：${rest}`; }
-    throw new Error(`(C) 是"先查看经过"，不是结论。看完再答：${NEED}`);
+    if (k === 'A') return rest ? (en ? `Accept, ${rest}` : `接受，${rest}`) : (en ? 'Accept' : '接受');
+    if (k === 'B') { if (!rest) throw new I18nError('打回必须写理由：回「B：<理由>」或「打回：<理由>」'); return reject(rest); }
+    throw new I18nError('(C) 是"先查看经过"，不是结论。看完再答：签收只收两种答复：「接受」，或「打回：<理由>」（理由会作为修正指令，任务据此重新规划）');
   }
   if (/^(接受|accept)/i.test(s)) return s;
-  const rj = /^(打回|reject(?:ed)?)[\s：:，,。]*([\s\S]*)$/i.exec(s);
-  if (rj) { if (!rj[2].trim()) throw new Error('打回必须写理由：回「打回：<理由>」'); return `打回：${rj[2].trim()}`; }
-  throw new Error(NEED);
+  const rj = /^(打回|reject(?:ed)?|send\s+back)[\s：:，,。]*([\s\S]*)$/i.exec(s);
+  if (rj) { if (!rj[2].trim()) throw new I18nError('打回必须写理由：回「打回：<理由>」'); return reject(rj[2].trim()); }
+  throw new I18nError('签收只收两种答复：「接受」，或「打回：<理由>」（理由会作为修正指令，任务据此重新规划）');
 }
 
 /** 签收的答案空间是封闭的：接受 / 打回。口径与 RESOLUTION_HOOKS.signoff 一致（入口已经 signoffAnswer 归一过）。 */
@@ -224,7 +233,7 @@ const signoffSide = (b) => (/^(接受|accept)/i.test(String(b ?? '').trim()) ? '
  */
 function positionsOf(q, written, db = null) {
   const key = q.decision_type === 'signoff' ? (a) => signoffSide(a.body)
-    : String(q.text ?? '').startsWith(CHOICES_MARK) ? (a) => choicesSide(a.body)
+    : hasMark(q.text, 'choices') ? (a) => choicesSide(a.body)
     : db && q.decision_type === 'contract_approval' && isRevisionQuestion(db, q.id) ? (a) => revisionSide(a.body)
     : (a) => norm(a.body);
   const m = new Map();
@@ -236,10 +245,10 @@ function positionsOf(q, written, db = null) {
   return [...m.values()];
 }
 /** 同一立场里多条答复时的最终正文：签收打回把各人的理由合起来，别丢话；其余取第一条。 */
-function finalBodyOf(q, side) {
+function finalBodyOf(q, side, lang = 'zh') {
   if (q.decision_type !== 'signoff' || side.length < 2 || signoffSide(side[0].body) !== 'reject') return side[0].body;
-  const reasons = [...new Set(side.map((a) => String(a.body).replace(/^打回[：:]\s*/, '').trim()))];
-  return `打回：${reasons.join('；')}`;
+  const reasons = [...new Set(side.map((a) => String(a.body).replace(/^(打回|reject(?:ed)?|send\s+back)[：:]?\s*/i, '').trim()))];
+  return lang === 'en' ? `Reject: ${reasons.join('; ')}` : `打回：${reasons.join('；')}`;
 }
 
 /** 这条是配了会签的方案批准吗：方案批准类、状态机认得、路由里某一段不止一人且要多于一人表态。 */
@@ -288,18 +297,25 @@ function cosign(db, { q, written, at }) {
   const has = (v) => sides.some((s) => s.v === v);
   if (has('abandon') && sides.some((s) => s.v !== 'abandon')) return null;   // 有人要放弃、有人不：真分歧，走冲突
   if (has('reached') && sides.some((s) => s.v !== 'reached')) return null;   // 有人说"已经达成、这些都不要"、有人不：同上
+  const L = contentLang(db);
+  const en = L === 'en';
+  const list = (xs) => xs.join(en ? ', ' : '、');
   let body;
   if (sides.every((s) => s.v === 'approve')) {
-    const resv = sides.map((s) => { const r = reservationOf(s.a.body); return r ? `${who(s.a)}：${r}` : null; }).filter(Boolean);
-    body = resv.length ? `A\n保留：${resv.join('；')}` : 'A';
+    const resv = sides.map((s) => { const r = reservationOf(s.a.body); return r ? `${who(s.a)}${en ? ': ' : '：'}${r}` : null; }).filter(Boolean);
+    // 英文写 Reservation:（approval.mjs 的 RESERVATION_RE 两种都认）
+    body = resv.length ? `A\n${tl(L, '保留：{list}', { list: resv.join(en ? '; ' : '；') })}` : 'A';
   } else if (sides.every((s) => s.v === 'abandon')) {
     body = 'C';
   } else if (sides.every((s) => s.v === 'reached')) {
     body = 'E';
   } else {
     // 有人要改：批准的那几位这一版等于白批 —— 下一版会再送他们看（会签批的是同一版）
-    body = `会签：${sides.filter((s) => s.v === 'feedback').map((s) => `${who(s.a)}要改`).join('、')}${has('approve') ? `（${sides.filter((s) => s.v === 'approve').map((s) => who(s.a)).join('、')}批准了这一版）` : ''}\n`
-      + sides.filter((s) => s.v === 'feedback').map((s) => `${who(s.a)}：${String(s.a.body).trim()}`).join('\n');
+    const wants = list(sides.filter((s) => s.v === 'feedback').map((s) => tl(L, '{name}要改', { name: who(s.a) })));
+    body = (has('approve')
+      ? tl(L, '会签：{wants}（{approvers}批准了这一版）', { wants, approvers: list(sides.filter((s) => s.v === 'approve').map((s) => who(s.a))) })
+      : tl(L, '会签：{wants}', { wants })) + '\n'
+      + sides.filter((s) => s.v === 'feedback').map((s) => `${who(s.a)}${en ? ': ' : '：'}${String(s.a.body).trim()}`).join('\n');
   }
   const last = written.at(-1);
   const src = db.one(`SELECT token_id FROM messages WHERE id=?`, last.message_id);
@@ -308,7 +324,8 @@ function cosign(db, { q, written, at }) {
           VALUES (?,?,?,?,'answer','explicit','normal','explicit','user-authenticated',?,?)`, mid, q.task_id, last.user_id, body, src?.token_id ?? null, at);
   for (const a of written) insertEdge(db, mid, a.message_id, 'derived_from', at);
   audit(db, { actorKind: 'system', action: 'cosign_merged', targetType: 'question', targetId: q.id,
-    payload: { messageId: mid, sides: sides.map((s) => ({ userId: s.a.user_id, verdict: s.v })), human: `会签：${sides.map((s) => `${who(s.a)}${{ approve: '批准', feedback: '要改', abandon: '放弃', reached: '已经达成' }[s.v]}`).join('，')}` } });
+    payload: { messageId: mid, sides: sides.map((s) => ({ userId: s.a.user_id, verdict: s.v })), human: tl(L, '会签：{list}', { list: sides.map((s) => { const name = who(s.a);
+      return { approve: tl(L, '{name}批准', { name }), feedback: tl(L, '{name}要改', { name }), abandon: tl(L, '{name}放弃', { name }), reached: tl(L, '{name}已经达成', { name }) }[s.v]; }).join(en ? ', ' : '，') }) } });
   return { messageId: mid, finalBody: body, by: last.user_id };
 }
 
@@ -363,7 +380,7 @@ function settleBlock(db, { q, at, base, answerId = null }) {
   if (groups.length === 1) {
     const side = groups[0];
     const win = side[0];
-    return resolve(db, { q, messageId: win.message_id, finalBody: finalBodyOf(q, side), by: win.user_id, at, base,
+    return resolve(db, { q, messageId: win.message_id, finalBody: finalBodyOf(q, side, contentLang(db)), by: win.user_id, at, base,
       how: q.decision_type === 'conflict' ? 'parties_agreed' : 'quorum' });
   }
   if (q.decision_type === 'conflict') {
@@ -371,7 +388,7 @@ function settleBlock(db, { q, at, base, answerId = null }) {
     for (const a of all.filter((x) => x.stance === 'answer')) db.run(`UPDATE answers SET stance='dissent', updated_at=? WHERE id=?`, at, a.id);
     const adv = advanceRoute(db, { questionId: q.id, at });
     audit(db, { actorKind: 'system', action: 'conflict_escalated', targetType: 'question', targetId: q.id,
-      payload: { why: written.length ? '双方阶段仍不一致' : '双方都撤回了立场，没有可采的答复', to: adv?.answerers ?? null,
+      payload: { why: written.length ? tl(contentLang(db), '双方阶段仍不一致') : tl(contentLang(db), '双方都撤回了立场，没有可采的答复'), to: adv?.answerers ?? null,
         stances: all.map((a) => ({ userId: a.user_id, stance: a.stance, body: a.body.slice(0, 300) })) } });
     return { ...base, resolved: false, escalated: true, to: adv?.answerers ?? [], stillOpen: openCount(db, q.task_id) };
   }
@@ -388,11 +405,15 @@ function settleBlock(db, { q, at, base, answerId = null }) {
  * 冲突事项里"这不归我"其实是**撤回自己的立场**，记 withdrawn，随即重新结算。
  */
 function recordAbstain(db, { q, auth, body, at, lead, addressed }) {
-  if (!addressed.includes(auth.user_id)) throw new Error('你不在这条事项的接收人里，无需弃权');
+  if (!addressed.includes(auth.user_id)) throw new I18nError('你不在这条事项的接收人里，无需弃权');
   const isConflict = q.decision_type === 'conflict';
   const mid = newId('m'), aid = newId('a');
   const note = String(body ?? '').trim();
-  const text = isConflict ? `撤回：不再坚持自己的立场${note ? `（${note}）` : ''}` : `弃权：这条不归我${note ? `（${note}）` : ''}`;
+  const L = contentLang(db);
+  // 英文的撤回也要以 Withdraw 开头：isWithdraw 按开头认
+  const text = isConflict
+    ? (note ? tl(L, '撤回：不再坚持自己的立场（{note}）', { note }) : tl(L, '撤回：不再坚持自己的立场'))
+    : (note ? tl(L, '弃权：这条不归我（{note}）', { note }) : tl(L, '弃权：这条不归我'));
   return db.tx(() => {
     db.run(`INSERT INTO messages (id,task_id,sender_id,body,kind,kind_source,urgency,urgency_source,trust_label,token_id,received_at)
             VALUES (?,?,?,?,'answer','explicit','normal','explicit','user-authenticated',?,?)`, mid, q.task_id, auth.user_id, text, auth.token_id, at);
@@ -427,7 +448,7 @@ function recordAbstain(db, { q, auth, body, at, lead, addressed }) {
       const adv = advanceRoute(db, { questionId: q.id, at });
       if (adv?.answerers?.length) {
         audit(db, { actorKind: 'system', action: 'question_rerouted', targetType: 'question', targetId: q.id,
-          payload: { why: '收件人全部弃权', to: adv.answerers } });
+          payload: { why: tl(L, '收件人全部弃权'), to: adv.answerers } });
         return { ...base, resolved: false, reassigned: adv.answerers, stillOpen: openCount(db, q.task_id) };
       }
       if (lead && lead !== auth.user_id) {
@@ -435,11 +456,11 @@ function recordAbstain(db, { q, auth, body, at, lead, addressed }) {
         db.run(`UPDATE questions SET addressed_to=?, route=? WHERE id=?`, JSON.stringify([lead]),
           JSON.stringify({ ...(route ?? { stage: 0, chains: [] }), rows: [row] }), q.id);
         audit(db, { actorKind: 'system', action: 'question_rerouted', targetType: 'question', targetId: q.id,
-          payload: { why: '收件人全部弃权，且路由没有下一顺位', to: [lead] } });
+          payload: { why: tl(L, '收件人全部弃权，且路由没有下一顺位'), to: [lead] } });
         return { ...base, resolved: false, reassigned: [lead], stillOpen: openCount(db, q.task_id) };
       }
       audit(db, { actorKind: 'system', action: 'question_unassigned', targetType: 'question', targetId: q.id,
-        payload: { why: '收件人全部弃权，且没有下一顺位、负责人也弃权了' } });
+        payload: { why: tl(L, '收件人全部弃权，且没有下一顺位、负责人也弃权了') } });
       return { ...base, resolved: false, unassigned: true, stillOpen: openCount(db, q.task_id) };
     }
     return settleBlock(db, { q, at, base, answerId: aid });
@@ -451,7 +472,7 @@ const openCount = (db, taskId) => db.one(`SELECT count(*) AS n FROM questions WH
 /** 已决事项上迟到的答复（"先答生效，迟到的异议留痕"）：与结论不同 → dissent；相同 → 附议（comment）。不挂 answers 边、不动状态。 */
 function recordLateAnswer(db, { q, auth, body, stance: action = 'answer', at, lead }) {
   const effective = db.one(`SELECT m.body, m.sender_id FROM messages m JOIN edges e ON e.from_id=m.id AND e.to_id=? AND e.relation='answers' AND e.superseded_at IS NULL ORDER BY e.id DESC LIMIT 1`, q.id);
-  if (action === 'agree') body = `附议已生效的结论`;
+  if (action === 'agree') body = tl(contentLang(db), '附议已生效的结论');
   // 附议迟到的必然是附议；写了字的仍按老规矩：与结论一字不差算附议，否则是异议（只影响标签）。
   const differs = action !== 'agree' && (!effective || norm(effective.body) !== norm(body));
   const stance = differs ? 'dissent' : 'comment';
@@ -463,7 +484,9 @@ function recordLateAnswer(db, { q, auth, body, stance: action = 'answer', at, le
     const notify = [...new Set([lead, effective?.sender_id].filter((u) => u && u !== auth.user_id))];
     audit(db, { actorKind: 'user', actorId: auth.user_id, action: differs ? 'late_dissent_noted' : 'late_agreement_noted', targetType: 'question', targetId: q.id,
       payload: { answerId: aid, messageId: mid, decisionType: q.decision_type, effective: effective?.body?.slice(0, 300) ?? null, body: body.slice(0, 300), notify } });
-    const note = differs ? '该事项已有结论。你的不同意见已记录，并已通知负责人与答复人；如需更改结论，请由负责人走修正流程' : '该事项已有结论，且与你的答复一致，已记为附议';
+    // 回给答复人本人看的一句话：用他的界面语言
+    const UL = userLang(db, auth.user_id);
+    const note = differs ? tl(UL, '该事项已有结论。你的不同意见已记录，并已通知负责人与答复人；如需更改结论，请由负责人走修正流程') : tl(UL, '该事项已有结论，且与你的答复一致，已记为附议');
     return { messageId: mid, answerId: aid, questionId: q.id, nodeId: q.node_id, userId: auth.user_id, decisionType: q.decision_type,
       resolved: false, late: true, stance, finalBody: effective?.body ?? null, note, stillOpen: openCount(db, q.task_id) };
   });
@@ -475,6 +498,8 @@ function recordLateAnswer(db, { q, auth, body, stance: action = 'answer', at, le
  */
 function conflictImpact(db, q) {
   const lines = [];
+  const L = contentLang(db);
+  const en = L === 'en';
   const task = db.one(`SELECT id, status FROM tasks WHERE id=?`, q.task_id);
   if (q.node_id) {
     const n = db.one(`SELECT id, title, risk_tier, status FROM nodes WHERE id=?`, q.node_id);
@@ -486,18 +511,18 @@ function conflictImpact(db, q) {
         seen.add(r.id); down.push(r); queue.push(r.id);
       }
     }
-    const tier = (t) => (t ? `风险 ${t}` : '');
-    if (n) lines.push(`- 卡住的步骤：「${n.title}」（${[n.status, tier(n.risk_tier)].filter(Boolean).join('，')}）—— 有结论前不会继续`);
+    const tier = (t) => (t ? tl(L, '风险 {tier}', { tier: t }) : '');
+    if (n) lines.push(tl(L, '- 卡住的步骤：「{title}」（{state}）—— 有结论前不会继续', { title: n.title, state: [n.status, tier(n.risk_tier)].filter(Boolean).join(en ? ', ' : '，') }));
     lines.push(down.length
-      ? `- 等它的下游步骤 ${down.length} 个：${down.map((d) => `「${d.title}」${d.risk_tier ? `（${tier(d.risk_tier)}）` : ''}`).join('、')} —— 都不会开始`
-      : '- 没有下游步骤等它');
+      ? tl(L, '- 等它的下游步骤 {n} 个：{list} —— 都不会开始', { n: down.length, list: down.map((d) => (en ? `"${d.title}"${d.risk_tier ? ` (${tier(d.risk_tier)})` : ''}` : `「${d.title}」${d.risk_tier ? `（${tier(d.risk_tier)}）` : ''}`)).join(en ? ', ' : '、') })
+      : tl(L, '- 没有下游步骤等它'));
   } else {
-    lines.push('- 这条事项不挂在某个步骤上：整个任务等结论');
+    lines.push(tl(L, '- 这条事项不挂在某个步骤上：整个任务等结论'));
   }
   // 调用时任务还没被置 waiting（raiseConflict 在正文之后才改状态），这里写的是冲突生效后的状态。
-  if (task) lines.push(task.status === 'done' ? `- 任务已完成（${task.id}），冲突只影响完成后的事项`
-    : ['running', 'waiting'].includes(task.status) ? `- 任务 ${task.id} 挂起等结论` : `- 任务 ${task.id} 处于 ${task.status}`);
-  if (q.decision_type === 'signoff') lines.push('- 签收未定：任务不能交付');
+  if (task) lines.push(task.status === 'done' ? tl(L, '- 任务已完成（{id}），冲突只影响完成后的事项', { id: task.id })
+    : ['running', 'waiting'].includes(task.status) ? tl(L, '- 任务 {id} 挂起等结论', { id: task.id }) : tl(L, '- 任务 {id} 处于 {status}', { id: task.id, status: task.status }));
+  if (q.decision_type === 'signoff') lines.push(tl(L, '- 签收未定：任务不能交付'));
   return lines.join('\n');
 }
 
@@ -551,17 +576,20 @@ function raiseConflict(db, { q, answers, at }) {
   const parties = [...new Set(answers.map((a) => a.user_id))];
   const names = Object.fromEntries(db.all(`SELECT id, display_name FROM users`).map((u) => [u.id, u.display_name]));
   const backers = answersOf(db, q.id).filter((a) => a.stance === 'agree');
+  const L = contentLang(db);
+  const en = L === 'en';
   const sides = answers.map((a, i) => {
     const mine = backers.filter((b) => b.agrees_with === a.id).map((b) => names[b.user_id] ?? b.user_id);
-    return `（${String.fromCharCode(65 + i)}）${names[a.user_id] ?? a.user_id}：${a.body.trim()}${mine.length ? `\n　　（${mine.join('、')} 附议这一条）` : ''}`;
+    const who = names[a.user_id] ?? a.user_id, letter = String.fromCharCode(65 + i);
+    return `${en ? `(${letter}) ${who}: ` : `（${letter}）${who}：`}${a.body.trim()}${mine.length ? `\n${tl(L, '　　（{names} 附议这一条）', { names: mine.join(en ? ', ' : '、') })}` : ''}`;
   }).join('\n');
-  const text = `【冲突】同一事项收到不一致的答复，各方答复均未生效。\n\n原事项（${q.id}）：\n${String(q.text).trim().split('\n').map((l) => `> ${l}`).join('\n')}\n\n各方答复：\n${sides}\n\n`
-    + `在有结论之前：\n${conflictImpact(db, q)}\n以上为各方答复原文，系统不作裁决。\n\n`
-    + `请冲突双方在此表态，三选一：\n`
-    + `- **附议**对方那一条（点这条事项下的「附议」）—— 以对方为准，当场达成结论；\n`
-    + `- **撤回**自己的立场（点「撤回」）—— 效果和附议一样（以对方为准），挑一个点就行；\n`
-    + `- **重申**自己的立场（写下答复）—— 双方都重申即仍不一致，转负责人裁定。\n`
-    + `超时未达成一致也会转负责人裁定。`;
+  const text = `${markOf(L, 'conflict')}${tl(L, '同一事项收到不一致的答复，各方答复均未生效。\n\n原事项（{id}）：', { id: q.id })}\n${String(q.text).trim().split('\n').map((l) => `> ${l}`).join('\n')}\n\n${tl(L, '各方答复：')}\n${sides}\n\n`
+    + `${tl(L, '在有结论之前：')}\n${conflictImpact(db, q)}\n${tl(L, '以上为各方答复原文，系统不作裁决。')}\n\n`
+    + tl(L, `请冲突双方在此表态，三选一：
+- **附议**对方那一条（点这条事项下的「附议」）—— 以对方为准，当场达成结论；
+- **撤回**自己的立场（点「撤回」）—— 效果和附议一样（以对方为准），挑一个点就行；
+- **重申**自己的立场（写下答复）—— 双方都重申即仍不一致，转负责人裁定。
+超时未达成一致也会转负责人裁定。`);
   db.run(`INSERT INTO questions (id,task_id,node_id,level,level_source,text,default_action,asked_at,timeout_at,status,origin_question_id)
           VALUES (?,?,?,3,'hard_rule',?,NULL,?,NULL,'open',?)`, id, q.task_id, q.node_id, text, at, q.id);
   insertEdge(db, id, q.id, 'derived_from', at);
@@ -581,7 +609,7 @@ function raiseConflict(db, { q, answers, at }) {
  */
 export function commentOnQuestion(db, { questionId, messageId, userId, body, at = now() }) {
   const q = db.one(`SELECT id, status, task_id FROM questions WHERE id=?`, questionId);
-  if (!q) throw new Error(`事项不存在：${questionId}`);
+  if (!q) throw new I18nError('事项不存在：{id}', { id: questionId });
   const id = newId('a');
   db.run(`INSERT INTO answers (id,question_id,user_id,message_id,body,stance,created_at) VALUES (?,?,?,?,?,'comment',?)`, id, questionId, userId, messageId, body, at);
   const decided = !['open', 'escalated'].includes(q.status);

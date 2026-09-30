@@ -5,7 +5,7 @@
 一个在你自己的机器或服务器上长期运行的自主编码 agent。你交给它一个想法，它先问清细节，再拆步骤，在容器沙箱里写代码、跑验收，最后交给你签收。**你只需要做四件事：回答它的问题、做取舍、提变更、叫停。** 多人使用时，按一张「决策路由表」决定每类事由谁来拍板。
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-![version](https://img.shields.io/badge/version-0.1.0-orange)
+![version](https://img.shields.io/badge/version-0.2.0-orange)
 ![node](https://img.shields.io/badge/node-%E2%89%A5%2022.13-green)
 ![deps](https://img.shields.io/badge/npm%20dependencies-0-brightgreen)
 
@@ -50,6 +50,7 @@
 - **多厂商模型**：内置 DeepSeek、Anthropic、OpenAI、Gemini、OpenRouter，也可以加任何 OpenAI 兼容的服务商。模型分 light / standard / heavy 三档，每档用哪个模型可以随时换，还能定期检查模型目录（单价、上下文窗口）有没有变化。
 - **可复盘**：所有状态都在一个 SQLite 库里，每个动作都记审计。进程随时可以挂掉，重启后接着干。`replay` 只凭审计记录就能复盘一个任务。
 - **通知**：ntfy、飞书、钉钉、企业微信，或者任意一条命令，按人发送，也可以定时推送待办摘要。
+- **中英双语**：看板与命令行支持中文和英文。每人在看板右上角选自己的界面语言；管理员在「设置 → 成员」里定团队的内容语言（事项正文、汇报、AI 写给人的文字）。答复用哪种语言写都能读懂。
 - **零 npm 依赖**：只用 Node 内置模块（包括 `node:sqlite`）。看板是一个不需要构建的单页。
 
 ## 快速开始
@@ -63,7 +64,7 @@
 | Docker（在运行） | Windows 用 Docker Desktop，保持默认的 Linux 容器模式（如果切到过 Windows 容器，在托盘图标右键选 Switch to Linux containers）；Linux 用 docker-ce。**没有容器运行时，任务不会开跑**（不会退回宿主机裸跑） |
 | 至少一家模型厂商的 API key | [DeepSeek](https://platform.deepseek.com/) / [Anthropic](https://console.anthropic.com/) / [OpenAI](https://platform.openai.com/) / [Gemini](https://aistudio.google.com/) / [OpenRouter](https://openrouter.ai/)，或任何 OpenAI 兼容的服务商 |
 
-下载：在 [Releases](../../releases) 里下载 `superintern-v0.1.0-windows.zip` 或 `superintern-v0.1.0-linux.tar.gz` 并解压，或者直接 `git clone` 本仓库。不需要 `npm install`。
+下载：在 [Releases](../../releases) 里下载 `superintern-v0.2.0-windows.zip` 或 `superintern-v0.2.0-linux.tar.gz` 并解压，或者直接 `git clone` 本仓库。不需要 `npm install`。
 
 > 所有命令都在解压出来的目录里执行：运行时的状态（库、令牌、日志、工作区）放在这个目录下的 `.superintern/` 里。
 

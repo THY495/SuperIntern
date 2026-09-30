@@ -5,11 +5,11 @@
 SuperIntern is a self-hosted autonomous coding agent that runs for long periods on your own machine or server. You hand it an idea. It asks about anything that is unclear, breaks the work into steps, writes code in a container sandbox and runs the acceptance checks. Then it brings the result to you for sign-off. **You only do four things: answer its questions, make trade-offs, request changes and stop it.** When several people work together, a *decision routing table* decides who gets the final say on each kind of decision.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-![version](https://img.shields.io/badge/version-0.1.0-orange)
+![version](https://img.shields.io/badge/version-0.2.0-orange)
 ![node](https://img.shields.io/badge/node-%E2%89%A5%2022.13-green)
 ![deps](https://img.shields.io/badge/npm%20dependencies-0-brightgreen)
 
-> The web UI is currently **Chinese only**. The CLI help and most messages are in Chinese as well. The setup scripts are bilingual.
+> The web UI and the CLI are available in **English and Chinese**. Each person picks their own interface language (top right of the board). An admin sets the team's *content language* under Settings → Members: the language of open items, reports and everything the AI writes for people. Documentation other than this README is in Chinese.
 
 ---
 
@@ -57,6 +57,7 @@ See [docs/known-limits.md](docs/known-limits.md) (Chinese) for known gaps.
 - **Multiple model vendors.** DeepSeek, Anthropic, OpenAI, Gemini and OpenRouter are built in, and you can add any OpenAI-compatible endpoint. Three tiers (light / standard / heavy) can each be bound to any model. A catalog check detects price and context-window drift.
 - **Auditable.** All state lives in one SQLite database, and every action is audited. The process can die at any time and resume. `replay` reconstructs a task from the audit log alone.
 - **Notifications.** ntfy, Feishu, DingTalk, WeCom or any shell command, sent per person, plus periodic to-do digests.
+- **English and Chinese.** Interface language per person; content language (items, reports, what the AI writes for people) per team. Answers are understood in either language.
 - **Zero npm dependencies.** It uses only Node built-ins, including `node:sqlite`. The web UI is a single page with no build step.
 
 ## Quick start
@@ -70,7 +71,7 @@ See [docs/known-limits.md](docs/known-limits.md) (Chinese) for known gaps.
 | Docker (running) | Docker Desktop on Windows, in its default Linux-containers mode (if you switched to Windows containers, right-click the tray icon → Switch to Linux containers); docker-ce on Linux. **Without a container runtime, tasks will not run.** SuperIntern never falls back to running code on the host |
 | An API key for at least one model vendor | [DeepSeek](https://platform.deepseek.com/) / [Anthropic](https://console.anthropic.com/) / [OpenAI](https://platform.openai.com/) / [Gemini](https://aistudio.google.com/) / [OpenRouter](https://openrouter.ai/), or any OpenAI-compatible endpoint |
 
-**Download:** get `superintern-v0.1.0-windows.zip` or `superintern-v0.1.0-linux.tar.gz` from [Releases](../../releases) and extract it, or `git clone` this repo. No `npm install` needed.
+**Download:** get `superintern-v0.2.0-windows.zip` or `superintern-v0.2.0-linux.tar.gz` from [Releases](../../releases) and extract it, or `git clone` this repo. No `npm install` needed.
 
 > Run every command from the extracted directory. Runtime state (database, tokens, logs, workspaces) lives in `.superintern/` inside it.
 

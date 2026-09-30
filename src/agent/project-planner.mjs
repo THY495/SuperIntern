@@ -10,6 +10,8 @@
 // 批准前规划器**不提问**（问题要挂任务，而任务在提案之后才有）：拿不准的写进 notes，人在反馈里说。
 // 这是目前的形状；要提问就得把载体任务提前建出来，等实际出现"不问就写不出契约"的案例再加。
 
+import { withOutputLang, contentLang, tl, I18nError } from '../i18n/index.mjs';
+import { markOf } from '../i18n/marks.mjs';
 import { applyEgressDefaults } from '../core/egress.mjs';
 import { routeQuestion, specPrefixes } from '../core/routing.mjs';
 import { execFileSync } from 'node:child_process';
@@ -19,7 +21,7 @@ import { newId, now, audit } from '../db/db.mjs';
 import { toolCallsOf, textOf, truncatedEmpty, TruncatedEmptyError } from '../llm/canonical.mjs';
 import { answerOf } from './elicitor.mjs';
 import { reservationOf, readApproval, confirmBeforeRevising, feedbackOf, REACHED_LABELS } from './approval.mjs';
-import { initProjectRepo, createProjectTasks, validateProjectSpec, renderRules, renderDeps, scopeOverlaps, renderScopeOverlaps, renderScopePaths, SCOPE_PATHS_NOTE, PROJECT_TASK_RUNTIME_MS } from '../core/project.mjs';
+import { initProjectRepo, createProjectTasks, validateProjectSpec, renderRules, renderDeps, scopeOverlaps, renderScopeOverlaps, renderScopePaths, SCOPE_PATHS_NOTE, scopePathsNote, PROJECT_TASK_RUNTIME_MS } from '../core/project.mjs';
 import { planAppend, appendStateOf, appendPending, startQueuedAppend } from './project-append.mjs';
 import { decisionsSection, recordReservation } from '../core/decisions.mjs';
 import { maxOpenOf, DEFAULT_MAX_OPEN } from '../core/project-settings.mjs';
@@ -120,18 +122,39 @@ const SYSTEM = `你是一个长期运行的自主 agent 的"项目规划器"。�
 - 只调用 propose_project，不要输出别的文字。人对上一版的反馈会以"人的反馈"出现，按反馈出下一版。`;
 
 /** 从规划文本建 proposed 项目：克隆仓库、开分支、建载体任务（order 0）。不调模型。 */
+/**
+ * 没给标题时从目标原文取一句当标题：跳过空行与 Markdown 标题符号，去掉"目标：""Goal:"这类标签前缀，
+ * 只剩标签的行（用户照模板贴的"目标：\n做一个……"）不算，接着看下一行。
+ * （例：目标原样贴进来、第一行是"目标："时，项目曾被命名为"目标："。）
+ */
+// 太长时：第一句放得下就用第一句；否则截到 80 字以内 —— 英文在词边界截，不把单词切成两半
+function clipTitle(line) {
+  if (line.length <= 80) return line;
+  const first = line.match(/^(.+?)(?:[。！？!?]|\.(?=\s))/)?.[1]?.trim();
+  if (first && first.length >= 8 && first.length <= 80) return first;
+  const cut = line.slice(0, 80), sp = cut.lastIndexOf(' ');
+  return `${(sp >= 40 ? cut.slice(0, sp) : cut).replace(/[\s,，、;；:：]+$/, '')}…`;
+}
+export function titleFromText(text) {
+  for (const raw of String(text ?? '').split('\n')) {
+    const line = raw.replace(/^\s*#+\s*/, '').replace(/^\s*(项目目标|目标|标题|goal|title)\s*[:：]\s*/i, '').trim();
+    if (line && !/^(项目目标|目标|标题|goal|title)$/i.test(line)) return clipTitle(line);
+  }
+  return '未命名项目';
+}
+
 export function startProjectFromBrief(db, { userId, brief, source = null, home, base = null, title = null, empty = false }) {
   const text = String(brief ?? '').trim();
-  if (!text) throw new Error('规划文本为空');
+  if (!text) throw new I18nError('规划文本为空');
   const projectId = newId('pj');
   const { repo, branch, baseRef } = initProjectRepo({ home, projectId, source, base, empty });
   const t = now();
-  const ttl = title?.trim() || text.split('\n')[0].trim().slice(0, 80);
+  const ttl = title?.trim() || titleFromText(text);
   const carrierId = newId('t');
   db.run(`INSERT INTO projects (id,owner_id,title,brief,repo,branch,base_ref,source,status,draft_version,created_at) VALUES (?,?,?,?,?,?,?,?,'proposed',0,?)`,
     projectId, userId, ttl, text, repo, branch, baseRef, (source ? String(source) : null), t);
   db.run(`INSERT INTO tasks (id,owner_id,title,status,created_at,project_id,project_order) VALUES (?,?,?,'planning',?,?,0)`,
-    carrierId, userId, `项目规划：${ttl}`, t, projectId);
+    carrierId, userId, tl(contentLang(db), '项目规划：{title}', { title: ttl }), t, projectId);
   audit(db, { actorKind: 'user', actorId: userId, action: 'project_created', targetType: 'project', targetId: projectId,
     payload: { title: ttl, repo, branch, baseRef, source: (source ? String(source) : null), proposed: true, carrier: carrierId, briefBytes: text.length } });
   applyEgressDefaults(db, { projectId, userId });   // 管理员勾过的默认放行源
@@ -159,29 +182,31 @@ function repoGlance(repo) {
  * 人正是在这一页上批准依赖关系，而"并列的两个任务会不会同时做"直接影响他怎么看那张图。
  * 所以它必须跟着同时开着的上限走：上限 > 1 时还写"同一时间只执行一个"，就是把错的那句给了负责人。
  */
-export const schedLine = (maxOpen) => (maxOpen > 1
-  ? `同时最多开着 ${maxOpen} 个任务：平时一次只做一个，只有开着的任务全都在等人（等你答题、等你签收）时，系统才会让独立的下一个先跑起来。`
-  : '同一时间只执行一个任务。');
-export function renderProposal(spec, version, notes, { maxOpen = DEFAULT_MAX_OPEN } = {}) {
-  const L = [`【项目契约草案 v${version}】`, `项目：${spec.title}`, ''];
+export const schedLine = (maxOpen, lang = 'zh') => (maxOpen > 1
+  ? tl(lang, '同时最多开着 {n} 个任务：平时一次只做一个，只有开着的任务全都在等人（等你答题、等你签收）时，系统才会让独立的下一个先跑起来。', { n: maxOpen })
+  : tl(lang, '同一时间只执行一个任务。'));
+/** `lang`：内容语言（调用方传 contentLang(db)；默认中文）。 */
+export function renderProposal(spec, version, notes, { maxOpen = DEFAULT_MAX_OPEN, lang = 'zh' } = {}) {
+  const lg = lang;
+  const L = [markOf(lg, 'projectDraft', { version }), tl(lg, '项目：{v}', { v: spec.title }), ''];
   spec.tasks.forEach((t, i) => {
-    L.push(`${i + 1}. ${t.title}`, `   依赖：${renderDeps(t, i + 1, 1)}`, `   目标：${t.goal}`, `   范围：${t.scope}`, `   可动路径（判据）：${renderScopePaths(t.scope_paths)}`, `   完成定义：${t.definition_of_done}`);
-    if (t.rules?.length) L.push(`   规则：${renderRules(t.rules).map((r) => `\n     - ${r}`).join('')}`);
-    if (t.constraints?.length) L.push(`   约束：${t.constraints.map((c) => `\n     - ${c}`).join('')}`);
-    L.push(`   验收命令：${t.verify_command}${i > 0 ? '（开工时系统会再累加当时已合并的全部任务的验收命令）' : ''}`, '');
+    L.push(`${i + 1}. ${t.title}`, tl(lg, '   依赖：{v}', { v: renderDeps(t, i + 1, 1, lg) }), tl(lg, '   目标：{v}', { v: t.goal }), tl(lg, '   范围：{v}', { v: t.scope }), tl(lg, '   可动路径（判据）：{v}', { v: renderScopePaths(t.scope_paths, lg) }), tl(lg, '   完成定义：{v}', { v: t.definition_of_done }));
+    if (t.rules?.length) L.push(tl(lg, '   规则：{v}', { v: renderRules(t.rules, lg).map((r) => `\n     - ${r}`).join('') }));
+    if (t.constraints?.length) L.push(tl(lg, '   约束：{v}', { v: t.constraints.map((c) => `\n     - ${c}`).join('') }));
+    L.push(tl(lg, '   验收命令：{v}{extra}', { v: t.verify_command, extra: i > 0 ? tl(lg, '（开工时系统会再累加当时已合并的全部任务的验收命令）') : '' }), '');
   });
-  L.push(SCOPE_PATHS_NOTE, '');
+  L.push(scopePathsNote(lg), '');
   // 假设单列：这一节是人批准前唯一该逐条核的地方 —— 引了规格原文的规则错不到哪去，臆造的都在这。
-  const assumptions = spec.tasks.flatMap((t, i) => (t.rules ?? []).filter((r) => !String(r.quote ?? '').trim()).map((r) => `T${i + 1} · ${r.rule}（${r.assumption}）`));
+  const assumptions = spec.tasks.flatMap((t, i) => (t.rules ?? []).filter((r) => !String(r.quote ?? '').trim()).map((r) => tl(lg, 'T{n} · {rule}（{why}）', { n: i + 1, rule: r.rule, why: r.assumption })));
   if (spec.tasks.some((t) => t.rules?.length)) {
-    L.push(assumptions.length ? `⚠ 规划器假设（规格没写、规划器定的，共 ${assumptions.length} 条；批准即认可，不同意就在反馈里改）：${assumptions.map((a) => `\n  - ${a}`).join('')}` : '规划器假设：无（每条规则都引了规格原文）', '');
+    L.push(assumptions.length ? tl(lg, '⚠ 规划器假设（规格没写、规划器定的，共 {n} 条；批准即认可，不同意就在反馈里改）：{list}', { n: assumptions.length, list: assumptions.map((a) => `\n  - ${a}`).join('') }) : tl(lg, '规划器假设：无（每条规则都引了规格原文）'), '');
   }
   // 范围重叠预警。只在上限 > 1（真会同时开着）时给 —— 串行下这条提示是噪声。
-  const overlaps = maxOpen > 1 ? renderScopeOverlaps(scopeOverlaps(spec)) : null;
+  const overlaps = maxOpen > 1 ? renderScopeOverlaps(scopeOverlaps(spec), lg) : null;
   if (overlaps) L.push(overlaps, '');
-  if (notes) L.push(`规划器说明：${notes}`, '');
-  L.push(`每个任务的硬上限：累计运行时长 ${Math.round(PROJECT_TASK_RUNTIME_MS / 3600000)} h（其余按默认）；批准后可用 cli limit <taskId> 改。`, '');
-  L.push(`批准后会自动逐个规划、执行：一个任务要等它依赖的任务都签收并合并后才开工；每个任务做完你签收一次。${schedLine(maxOpen)}依赖关系不对，直接在反馈里说（例如"3 不依赖 2"）。请回复：`, '(A) 批准 —— 回 "A" 或 "批准"', '(B) 要改 —— 直接写要改什么，会出下一版', '(C) 放弃 —— 回 "C" 或 "放弃"', '(D) 批准，但留一句保留意见 —— **它不挡任何东西**：这一批照样全部生效，效果与 (A) 一模一样。它只把你那句话留在项目的约定清单上、标成〔保留意见〕，让下一个碰这一处的人看得到。要**挡住**其中某一条，只能 (B) 说清哪一条不要、让它重出一版。写法：先回 A，**另起一行**写「保留：…」。');
+  if (notes) L.push(tl(lg, '规划器说明：{v}', { v: notes }), '');
+  L.push(tl(lg, '每个任务的硬上限：累计运行时长 {h} h（其余按默认）；批准后可用 cli limit <taskId> 改。', { h: Math.round(PROJECT_TASK_RUNTIME_MS / 3600000) }), '');
+  L.push(tl(lg, '批准后会自动逐个规划、执行：一个任务要等它依赖的任务都签收并合并后才开工；每个任务做完你签收一次。{sched}依赖关系不对，直接在反馈里说（例如"3 不依赖 2"）。请回复：', { sched: schedLine(maxOpen, lg) }), tl(lg, '(A) 批准 —— 回 "A" 或 "批准"'), tl(lg, '(B) 要改 —— 直接写要改什么，会出下一版'), tl(lg, '(C) 放弃 —— 回 "C" 或 "放弃"'), tl(lg, '(D) 批准，但留一句保留意见 —— **它不挡任何东西**：这一批照样全部生效，效果与 (A) 一模一样。它只把你那句话留在项目的约定清单上、标成〔保留意见〕，让下一个碰这一处的人看得到。要**挡住**其中某一条，只能 (B) 说清哪一条不要、让它重出一版。写法：先回 A，**另起一行**写「保留：…」。'));
   return L.join('\n');
 }
 
@@ -190,11 +215,12 @@ export function renderProposal(spec, version, notes, { maxOpen = DEFAULT_MAX_OPE
  */
 export async function planProject(db, { client, projectId, tier = 'heavy', maxAttempts = 3 }) {
   const p = db.one(`SELECT * FROM projects WHERE id=?`, projectId);
-  if (!p) throw new Error(`没有这个项目：${projectId}`);
+  if (!p) throw new I18nError('没有这个项目：{id}', { id: projectId });
+  const L = contentLang(db);
   const appending = p.status !== 'proposed' && appendPending(appendStateOf(db, projectId));   // 给在跑的项目追加尾部任务，同一个入口、同一对起止审计
   if (p.status !== 'proposed' && !appending) return { kind: 'noop', why: `项目 ${p.status}` };
   const carrier = carrierTask(db, projectId);
-  if (!carrier) throw new Error('这个项目不是从规划开始的（没有载体任务），用 project new --file');
+  if (!carrier) throw new I18nError('这个项目不是从规划开始的（没有载体任务），用 project new --file');
 
   const startedAt = now();
   audit(db, { actorKind: 'agent', actorId: 'project_planner', action: 'project_planner_started', targetType: 'project', targetId: projectId,
@@ -219,16 +245,16 @@ export async function planProject(db, { client, projectId, tier = 'heavy', maxAt
     let feedback = null;
     if (p.draft_question) {
       const q = db.one(`SELECT status FROM questions WHERE id=?`, p.draft_question);
-      if (q && ['open', 'escalated'].includes(q.status)) return exit('noop', { why: '草案等人批' });
+      if (q && ['open', 'escalated'].includes(q.status)) return exit('noop', { why: tl(L, '草案等人批') });
       const a = answerOf(db, p.draft_question);
-      if (!a) return exit('noop', { why: '草案等人批，但找不到答复' });
+      if (!a) return exit('noop', { why: tl(L, '草案等人批，但找不到答复') });
       const verdict = readApproval(db, { taskId: carrier.id, questionId: p.draft_question, body: a.body, userId: a.sender_id, version: p.draft_version });
       if (verdict === 'approve') {
         db.run(`UPDATE projects SET status='active' WHERE id=?`, projectId);
         db.run(`UPDATE tasks SET status='done' WHERE id=?`, carrier.id);
         // 批准时带的保留意见记进约定清单
         const resv = reservationOf(a.body);
-        if (resv) recordReservation(db, { projectId, subject: `批准项目契约草案 v${p.draft_version} 时的保留意见`, text: resv, sourceKind: 'contract', sourceId: p.draft_question, by: a.sender_id });
+        if (resv) recordReservation(db, { projectId, subject: tl(L, '批准项目契约草案 v{version} 时的保留意见', { version: p.draft_version }), text: resv, sourceKind: 'contract', sourceId: p.draft_question, by: a.sender_id });
         audit(db, { actorKind: 'user', actorId: a.sender_id, action: 'project_approved', targetType: 'project', targetId: projectId,
           payload: { version: p.draft_version, questionId: p.draft_question, answer: String(a.body).slice(0, 200), reservation: resv ? resv.slice(0, 200) : null } });
         return exit('approved', { version: p.draft_version });
@@ -262,7 +288,7 @@ export async function planProject(db, { client, projectId, tier = 'heavy', maxAt
       const prev = { title: p.title, tasks: prevTasks.map((t) => ({ ...t, constraints: JSON.parse(t.constraints || '[]'), verify_command: t.verify ? JSON.parse(t.verify).join(' ') : '' })) };
       // 上一版 = 人当时看到的原文（批准事项正文）；拿不到才用库里重建的
       const hist = roundHistory(db, { carrierId: carrier.id });
-      parts.push(`## 上一版草案（v${p.draft_version}，人看到的原文）\n${hist.prevText ?? renderProposal(prev, p.draft_version, p.draft_notes)}`);
+      parts.push(`## 上一版草案（v${p.draft_version}，人看到的原文）\n${hist.prevText ?? renderProposal(prev, p.draft_version, p.draft_notes, { lang: L })}`);
       const h = renderRoundHistory(hist);
       if (h) parts.push(h);
     }
@@ -270,7 +296,7 @@ export async function planProject(db, { client, projectId, tier = 'heavy', maxAt
     const messages = [{ role: 'user', content: [{ type: 'text', text: parts.join('\n\n') }] }];
 
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-      const resp = await client.complete({ tier, system: SYSTEM, messages, tools: [PROPOSE_PROJECT], maxTokens: MAX_TOKENS, effort: 'high' });
+      const resp = await client.complete({ tier, system: withOutputLang(SYSTEM, contentLang(db)), messages, tools: [PROPOSE_PROJECT], maxTokens: MAX_TOKENS, effort: 'high' });
       if (truncatedEmpty(resp)) throw new TruncatedEmptyError('项目规划器', MAX_TOKENS);
       const call = toolCallsOf(resp).find((c) => c.name === 'propose_project');
       const errs = [];
@@ -289,7 +315,7 @@ export async function planProject(db, { client, projectId, tier = 'heavy', maxAt
       }
       audit(db, { actorKind: 'agent', actorId: 'project_planner', action: 'project_plan_attempt', targetType: 'project', targetId: projectId,
         payload: { attempt, rejections: errs, say: textOf(resp).slice(0, 600) || null, stopReason: resp.stopReason } });
-      if (attempt === maxAttempts) throw new Error(`项目规划器 ${maxAttempts} 次都没给出合规契约：${errs.join('；')}`);
+      if (attempt === maxAttempts) throw new I18nError('项目规划器 {n} 次都没给出合规契约：{errs}', { n: maxAttempts, errs: errs.join('；') });
       messages.push({ role: 'assistant', content: resp.content });
       if (call) messages.push({ role: 'tool_results', results: [{ callId: call.id, name: call.name, isError: true, content: `被拒：\n- ${errs.join('\n- ')}` }] });
       else messages.push({ role: 'user', content: [{ type: 'text', text: errs[0] }] });
@@ -306,9 +332,10 @@ function recordProposal(db, { project, carrier, spec, notes, prevSpec = null }) 
   const t = now();
   const version = project.draft_version + 1;
   const qid = newId('q');
-  let text = renderProposal(spec, version, notes, { maxOpen: maxOpenOf(db, project.id) });
+  const L = contentLang(db);
+  let text = renderProposal(spec, version, notes, { maxOpen: maxOpenOf(db, project.id), lang: L });
   // 和上一版逐字比对：少了的任务 / 约束 / 规则写在标题行下面
-  if (prevSpec) { const i = text.indexOf('\n'); text = `${text.slice(0, i + 1)}${renderSpecDiff(diffSpecs(prevSpec, spec), { prevVersion: project.draft_version })}${text.slice(i + 1)}`; }
+  if (prevSpec) { const i = text.indexOf('\n'); text = `${text.slice(0, i + 1)}${renderSpecDiff(diffSpecs(prevSpec, spec), { prevVersion: project.draft_version, lang: L })}${text.slice(i + 1)}`; }
   const old = db.all(`SELECT id FROM tasks WHERE project_id=? AND project_order>0`, project.id).map((r) => r.id);
   if (old.length) {
     db.run(`UPDATE tasks SET status='aborted', project_id=NULL, project_order=NULL WHERE project_id=? AND project_order>0`, project.id);

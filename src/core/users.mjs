@@ -9,6 +9,7 @@ import { notify, channelsFromEnv } from './notify.mjs';
 import { responsibilitiesOf, responsibilitiesText } from './handover.mjs';
 import { DECISION_TYPES } from './routing.mjs';
 import { projectsToDeliver } from './delivery-due.mjs';
+import { tl, contentLang, I18nError, CATALOGS } from '../i18n/index.mjs';
 
 export const ROLES = ['lead', 'member', 'observer'];
 /** user_channels.channel 的 CHECK 值 → notify.mjs 的通道种类。 */
@@ -17,9 +18,9 @@ const KIND_CHANNEL = { ntfy: 'ntfy', feishu: 'lark', lark: 'lark', dingtalk: 'di
 
 export function addUser(db, { name, role, tags = [], byUserId }) {
   const display = String(name ?? '').trim();
-  if (!display) throw new Error('名称不能为空');
-  if (!['member', 'observer'].includes(role)) throw new Error('角色只能是成员（member）或旁观者（observer）；管理员角色请在添加后由管理员授予');
-  if (db.one(`SELECT id FROM users WHERE display_name=?`, display)) throw new Error(`名称 ${display} 已被使用`);
+  if (!display) throw new I18nError('名称不能为空');
+  if (!['member', 'observer'].includes(role)) throw new I18nError('角色只能是成员（member）或旁观者（observer）；管理员角色请在添加后由管理员授予');
+  if (db.one(`SELECT id FROM users WHERE display_name=?`, display)) throw new I18nError('名称 {name} 已被使用', { name: display });
   const id = newId('u');
   const tokenId = newId('tk');
   const plaintext = randomBytes(24).toString('base64url');
@@ -58,11 +59,13 @@ export function usersView(db) {
       tokens: u.tokens, tokenIssuedAt: tk?.issued_at ?? null,
       channels: db.all(`SELECT channel, target FROM user_channels WHERE user_id=? AND enabled=1 ORDER BY priority, channel`, u.id).map((c) => ({ kind: KIND_LABEL[c.channel] ?? c.channel, host: channelHost(c.target) })),
       responsibilities: { projects: resp.projects.length, soloTasks: resp.soloTasks.length, routingRows: resp.routing.length, routingKeys: new Set(resp.routing.map((r) => r.project_id)).size,
-        duty: resp.duty.length, questions: resp.questions.length, count: resp.count, text: responsibilitiesText(resp) } };
+        duty: resp.duty.length, questions: resp.questions.length, count: resp.count, text: responsibilitiesText(resp, contentLang(db)) } };
   });
 }
 
-const mustUser = (db, userId) => db.one(`SELECT id, display_name, role, disabled_at FROM users WHERE id=?`, userId) ?? (() => { throw new Error(`成员不存在：${userId}`); })();
+const mustUser = (db, userId) => db.one(`SELECT id, display_name, role, disabled_at FROM users WHERE id=?`, userId) ?? (() => { throw new I18nError('成员不存在：{id}', { id: userId }); })();
+// 决策类型名（DECISION_TYPES 的 label 是中文原文）按语言取；目录里没有就原样
+const labelIn = (lang, s) => CATALOGS[lang]?.[s] ?? s;
 
 /**
  * 改角色（调用方保证操作者是管理员）。角色是部署级的，与负责哪些项目 / 任务无关：
@@ -70,16 +73,18 @@ const mustUser = (db, userId) => db.one(`SELECT id, display_name, role, disabled
  * （旁观者不会被解析成接收人，也不能当负责人 —— 点名他的路由行会变成没人接）。
  */
 export function setUserRole(db, { userId, role, byUserId }) {
-  if (!ROLES.includes(role)) throw new Error(`角色无效：${role}（应为 ${ROLES.join(' / ')}）`);
+  if (!ROLES.includes(role)) throw new I18nError('角色无效：{role}（应为 {roles}）', { role, roles: ROLES.join(' / ') });
   return db.tx(() => {
     const u = mustUser(db, userId);
-    if (u.disabled_at) throw new Error(`${u.display_name} 已停用，请先启用再修改角色`);
+    if (u.disabled_at) throw new I18nError('{name} 已停用，请先启用再修改角色', { name: u.display_name });
     if (u.role === role) return { userId, role, changed: false };
     const resp = responsibilitiesOf(db, userId, { all: true });
-    if (u.role === 'lead' && !db.one(`SELECT id FROM users WHERE role='lead' AND disabled_at IS NULL AND id<>?`, userId)) throw new Error('不能更改最后一位管理员的角色');
+    if (u.role === 'lead' && !db.one(`SELECT id FROM users WHERE role='lead' AND disabled_at IS NULL AND id<>?`, userId)) throw new I18nError('不能更改最后一位管理员的角色');
     if (role === 'observer' && resp.count) {
-      const rows = resp.routing.map((r) => `${r.project_id ? `项目「${db.one(`SELECT title FROM projects WHERE id=?`, r.project_id)?.title ?? r.project_id}」` : '默认决策路由'} / ${DECISION_TYPES[r.decision_type]?.label ?? r.decision_type} / ${r.scope} 顺位 ${r.position}`);
-      throw new Error(`旁观者不能作为接收人，而 ${u.display_name} ${responsibilitiesText(resp)}${rows.length ? `（${rows.slice(0, 6).join('；')}${rows.length > 6 ? ' …' : ''}）` : ''}。请先交接，或先调整决策路由`);
+      const L = contentLang(db);
+      const rows = resp.routing.map((r) => `${r.project_id ? tl(L, '项目「{title}」', { title: db.one(`SELECT title FROM projects WHERE id=?`, r.project_id)?.title ?? r.project_id }) : tl(L, '默认决策路由')} / ${labelIn(L, DECISION_TYPES[r.decision_type]?.label ?? r.decision_type)} / ${tl(L, '{scope} 顺位 {position}', { scope: r.scope, position: r.position })}`);
+      throw new I18nError('旁观者不能作为接收人，而 {name} {what}{rows}。请先交接，或先调整决策路由', { name: u.display_name, what: responsibilitiesText(resp, L),
+        rows: rows.length ? tl(L, '（{list}{more}）', { list: rows.slice(0, 6).join(tl(L, '；')), more: rows.length > 6 ? ' …' : '' }) : '' });
     }
     db.run(`UPDATE users SET role=? WHERE id=?`, role, userId);
     audit(db, { actorKind: 'user', actorId: byUserId, action: 'user_role_set', targetType: 'user', targetId: userId, payload: { from: u.role, to: role } });
@@ -89,11 +94,11 @@ export function setUserRole(db, { userId, role, byUserId }) {
 
 export function renameUser(db, { userId, name, byUserId }) {
   const display = String(name ?? '').trim();
-  if (!display) throw new Error('名称不能为空');
+  if (!display) throw new I18nError('名称不能为空');
   return db.tx(() => {
     const u = mustUser(db, userId);
     if (u.display_name === display) return { userId, name: display, changed: false };
-    if (db.one(`SELECT id FROM users WHERE display_name=? AND id<>?`, display, userId)) throw new Error(`名称 ${display} 已被使用`);
+    if (db.one(`SELECT id FROM users WHERE display_name=? AND id<>?`, display, userId)) throw new I18nError('名称 {name} 已被使用', { name: display });
     db.run(`UPDATE users SET display_name=? WHERE id=?`, display, userId);
     audit(db, { actorKind: 'user', actorId: byUserId, action: 'user_renamed', targetType: 'user', targetId: userId, payload: { from: u.display_name, to: display } });
     return { userId, name: display, changed: true };
@@ -107,7 +112,7 @@ export function reissueToken(db, { userId, byUserId }) {
   const t = now();
   return db.tx(() => {
     const u = mustUser(db, userId);
-    if (u.disabled_at) throw new Error(`${u.display_name} 已停用，请先启用再重新生成令牌`);
+    if (u.disabled_at) throw new I18nError('{name} 已停用，请先启用再重新生成令牌', { name: u.display_name });
     const revoked = Number(db.run(`UPDATE tokens SET revoked_at=? WHERE user_id=? AND revoked_at IS NULL`, t, userId).changes);
     db.run(`INSERT INTO tokens (id,user_id,token_hash,issued_by,issued_at) VALUES (?,?,?,?,?)`, tokenId, userId, sha256(plaintext), byUserId, t);
     audit(db, { actorKind: 'user', actorId: byUserId, action: 'token_reissued', targetType: 'user', targetId: userId, payload: { tokenId, revoked } });
@@ -117,18 +122,18 @@ export function reissueToken(db, { userId, byUserId }) {
 
 export function removeUserChannel(db, { userId, kind, byUserId }) {
   const ch = KIND_CHANNEL[kind];
-  if (!ch) throw new Error(`通知通道无效：${kind}（应为 ntfy / feishu / dingtalk / wecom）`);
+  if (!ch) throw new I18nError('通知通道无效：{kind}（应为 ntfy / feishu / dingtalk / wecom）', { kind });
   mustUser(db, userId);
   return db.tx(() => {
     const n = Number(db.run(`DELETE FROM user_channels WHERE user_id=? AND channel=?`, userId, ch).changes);
-    if (!n) throw new Error(`该成员未配置 ${kind} 通知通道`);
+    if (!n) throw new I18nError('该成员未配置 {kind} 通知通道', { kind });
     audit(db, { actorKind: 'user', actorId: byUserId, action: 'user_channel_removed', targetType: 'user', targetId: userId, payload: { channel: ch } });
     return { removed: n };
   });
 }
 
 export function setUserTags(db, { userId, tags, byUserId }) {
-  if (!db.one(`SELECT id FROM users WHERE id=?`, userId)) throw new Error(`成员不存在：${userId}`);
+  if (!db.one(`SELECT id FROM users WHERE id=?`, userId)) throw new I18nError('成员不存在：{id}', { id: userId });
   db.run(`UPDATE users SET domain_tags=? WHERE id=?`, JSON.stringify([].concat(tags).map(String).filter(Boolean)), userId);
   audit(db, { actorKind: 'user', actorId: byUserId, action: 'user_tags_set', targetType: 'user', targetId: userId, payload: { tags } });
 }
@@ -136,9 +141,9 @@ export function setUserTags(db, { userId, tags, byUserId }) {
 /** 挂一条通道。同种通道覆盖（一人一种一条）。URL 里可能带密钥：审计只记种类。 */
 export function setUserChannel(db, { userId, kind, target, byUserId }) {
   const ch = KIND_CHANNEL[kind];
-  if (!ch) throw new Error(`通知通道无效：${kind}（应为 ntfy / feishu / dingtalk / wecom）`);
-  if (!db.one(`SELECT id FROM users WHERE id=?`, userId)) throw new Error(`成员不存在：${userId}`);
-  if (!String(target ?? '').trim()) throw new Error('通道地址不能为空');
+  if (!ch) throw new I18nError('通知通道无效：{kind}（应为 ntfy / feishu / dingtalk / wecom）', { kind });
+  if (!db.one(`SELECT id FROM users WHERE id=?`, userId)) throw new I18nError('成员不存在：{id}', { id: userId });
+  if (!String(target ?? '').trim()) throw new I18nError('通道地址不能为空');
   db.tx(() => {
     db.run(`DELETE FROM user_channels WHERE user_id=? AND channel=?`, userId, ch);
     db.run(`INSERT INTO user_channels (id,user_id,channel,target,priority,enabled) VALUES (?,?,?,?,100,1)`, newId('ch'), userId, ch, String(target).trim());
@@ -173,12 +178,13 @@ export async function notifyPendingDeliveries(db, { env = process.env, extraCmd 
   const due = projectsToDeliver(db).filter((p) => !db.one(`SELECT 1 FROM audit_log WHERE action='delivery_notified' AND target_id=? AND ts >= ?`, p.projectId, p.mergedMax))
     .map((p) => ({ id: p.projectId, title: p.title, owner_id: p.ownerId, again: p.again }));
   const sent = [];
+  const L = contentLang(db);
   for (const p of due) {
     const channels = [...channelsForUsers(db, [p.owner_id]), ...channelsFromEnv(env, extraCmd)];
     let receipts = [];
     if (channels.length) {
-      receipts = await notify(db, { taskId: null, kind: 'delivery', title: `[SuperIntern] 项目已达成，等你交付：${String(p.title).slice(0, 40)}`,
-        text: `项目「${p.title}」已确认达成，所有任务都已合进项目分支（还只在这套系统里）。\n到看板的项目页点「交付项目」，才会推到你们的代码仓库 —— 只能你亲自点，推出去收不回。`, ref: `deliver:${p.id}`, channels, fetchFn, ...(spawn ? { spawn } : {}) });
+      receipts = await notify(db, { taskId: null, kind: 'delivery', title: `[SuperIntern] ${tl(L, '项目已达成，等你交付：{title}', { title: String(p.title).slice(0, 40) })}`,
+        text: tl(L, '项目「{title}」已确认达成，所有任务都已合进项目分支（还只在这套系统里）。\n到看板的项目页点「交付项目」，才会推到你们的代码仓库 —— 只能你亲自点，推出去收不回。', { title: p.title }), ref: `deliver:${p.id}`, channels, fetchFn, ...(spawn ? { spawn } : {}) });
       sent.push({ projectId: p.id, to: [p.owner_id], receipts });
     }
     audit(db, { actorKind: 'system', action: 'delivery_notified', targetType: 'project', targetId: p.id, payload: { to: p.owner_id, channels: channels.map((c) => c.kind) } });
@@ -189,12 +195,13 @@ export async function notifyPendingDeliveries(db, { env = process.env, extraCmd 
 export async function notifyPendingQuestions(db, { env = process.env, extraCmd = null, fetchFn = globalThis.fetch, spawn } = {}) {
   const due = db.all(`SELECT q.*, t.title FROM questions q JOIN tasks t ON t.id=q.task_id WHERE q.status IN ('open','escalated') AND q.notified_at IS NULL ORDER BY q.asked_at LIMIT 50`);
   const sent = [];
+  const L = contentLang(db);
   for (const q of due) {
     const to = [...JSON.parse(q.addressed_to || '[]'), ...JSON.parse(q.informed || '[]')];
     const channels = [...channelsForUsers(db, to), ...channelsFromEnv(env, extraCmd)];
     const lvl = ['', 'Ⅰ', 'Ⅱ', 'Ⅲ'][q.level] ?? q.level;
-    const title = `[SuperIntern] ${q.decision_type === 'conflict' ? '冲突事项' : q.decision_type === 'signoff' ? '等你签收' : `${lvl} 级问题在等你`}：${String(q.title).slice(0, 40)}`;
-    const text = `${String(q.text).slice(0, 400)}\n\n回答：node src/cli.mjs answer ${q.id} "..."（任务 ${q.task_id}）`;
+    const title = `[SuperIntern] ${tl(L, '{what}：{title}', { what: q.decision_type === 'conflict' ? tl(L, '冲突事项') : q.decision_type === 'signoff' ? tl(L, '等你签收') : tl(L, '{lvl} 级问题在等你', { lvl }), title: String(q.title).slice(0, 40) })}`;
+    const text = `${String(q.text).slice(0, 400)}\n\n${tl(L, '回答：node src/cli.mjs answer {id} "..."（任务 {taskId}）', { id: q.id, taskId: q.task_id })}`;
     if (channels.length) {
       const receipts = await notify(db, { taskId: q.task_id, kind: 'question', title, text, ref: q.id, channels, fetchFn, ...(spawn ? { spawn } : {}) });
       sent.push({ questionId: q.id, to, receipts });

@@ -9,6 +9,8 @@
 // 不是四条代码路径共用一个名字，是同一条路径——把 while 换成进程重启，
 // 行为一模一样。挂起后进程退出、复工时重新进来，靠的正是后者。
 
+import { hasMark } from '../i18n/marks.mjs';
+import { tl, contentLang, I18nError, N_ } from '../i18n/index.mjs';
 import { raiseSignoffQuestion } from './deliver.mjs';
 import { join, resolve } from 'node:path';
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
@@ -19,7 +21,7 @@ import { raiseChoiceReviews, CHOICES_MARK } from './choices.mjs';
 
 /** 这条开着的事项挡不挡执行（见 run 里 pending 那一行）。停等 / 空转的标记与 liveness.mjs 一致（不 import，免得成环）。 */
 export const blocksExecution = (q) => q.decision_type !== 'signoff'
-  && !['【停等】', '【空转】', CHOICES_MARK].some((m) => String(q.text ?? '').startsWith(m));
+  && !['stall', 'loop', 'choices'].some((m) => hasMark(q.text, m));
 import { audit, now, newId } from '../db/db.mjs';
 import { tierEntry } from '../llm/canonical.mjs';
 import { readyNodes } from '../context/assemble.mjs';
@@ -50,13 +52,26 @@ export const getParam = (db, taskId, key) => db.one(
 const AGAIN = Symbol('again');
 export const PREVIEW_NODE_KEY = 'preview.auto_node';
 export const PREVIEW_NODE = {
-  title: `写页面截图说明（${PREVIEW_FILE}）`,
+  // 显示在看板步骤图上：插入节点时按内容语言翻（键是这句中文原文，与 PREVIEW_FILE 同值，写成字面量才登记得上）
+  title: N_('写页面截图说明（si-preview.json）'),
   spec: `仓库里有界面（前端），但根目录还没有 ${PREVIEW_FILE}，签收的人因此看不到做出来的页面。按沙箱说明写一份 ${PREVIEW_FILE}：`
     + `start（起后端、起前端的命令，每条一个后台进程，监听 127.0.0.1）、url（前端地址）、ready（后端一个能返回 200 的地址）、`
     + `seed（可选：服务起来后放几条样例数据的命令，每条可写成字符串数组，例如用 curl 调新建接口 —— 空列表证明不了功能）、pages（要截的页，至多 6 页）。`
     + `只改 ${PREVIEW_FILE}（需要样例数据脚本时可以新加一个）；不要自己起浏览器截图，不要提交图片 —— 截图由系统按这份文件做，放到签收页上。`,
   acceptance: `仓库根目录有 ${PREVIEW_FILE}：合法 JSON，start 非空、url 是 http://127.0.0.1:端口、pages 非空；`
     + `在沙箱里按 start 实际起一遍服务，url 与 ready 里每个地址都返回 2xx（交接记录里贴出这几次请求的结果）。`,
+};
+
+// 页面接了后端（写了 ready 或不止一条 start）却没写 seed：截图里的列表是空的，证明不了功能
+// （例：前后端联调之后，签收页的截图曾是空列表）。同样每个任务只补一次。
+export const PREVIEW_SEED_NODE_KEY = 'preview.seed_node';
+export const PREVIEW_SEED_NODE = {
+  title: N_('给页面截图补样例数据（si-preview.json 的 seed）'),
+  spec: `${PREVIEW_FILE} 里的页面接了后端，但没写 seed：系统截图时库是空的，签收的人只看得到空列表。`
+    + `补一条或几条 seed（至多 3 条，每条一个进程、不经 shell）：服务起来之后往里放几条有代表性的样例数据 ——`
+    + `例如写一个样例数据脚本（通过后端的新建接口写入，或直接写库），或用 curl 调新建接口。样例要覆盖页面上主要的几种状态。`
+    + `只改 ${PREVIEW_FILE} 与新加的样例数据脚本；不要自己截图、不要提交图片或数据库文件。`,
+  acceptance: `${PREVIEW_FILE} 的 seed 非空；在沙箱里按 start 起服务、跑一遍 seed 后，列表接口返回的数据不为空（交接记录里贴出这次请求的结果）。`,
 };
 
 /** 节点状态直方图。编排器判"接下来该干什么"只需要这一个东西。 */
@@ -92,6 +107,7 @@ export async function orchestrate(db, {
   report = false, llmVerify = false,
 }) {
   const pid = process.pid;
+  const L = contentLang(db);   // 审计里给人看的 why、验收附注、系统补的节点标题按内容语言写
   audit(db, { actorKind: 'system', action: 'orchestrator_started', targetType: 'task', targetId: taskId,
     payload: { pid, maxCycles, argv: process.argv.slice(1).join(' ') } });
 
@@ -104,7 +120,7 @@ export async function orchestrate(db, {
   if (!exec?.isolated) {
     audit(db, { actorKind: 'system', action: 'sandbox_skipped', targetType: 'task', targetId: taskId,
       payload: { pid, executor: exec?.constructor?.name ?? String(exec),
-        why: '执行器未声明隔离 —— 命令直接跑在宿主机上' } });
+        why: tl(L, '执行器未声明隔离 —— 命令直接跑在宿主机上') } });
   }
 
   // ── 崩溃恢复 ──────────────────────────────────────────────────────────
@@ -127,7 +143,7 @@ export async function orchestrate(db, {
     db.run(`UPDATE nodes SET status='pending' WHERE id=?`, n.id);
     const reclaims = db.one(`SELECT count(*) AS n FROM audit_log WHERE action='node_reclaimed' AND target_id=?`, n.id).n + 1;
     audit(db, { actorKind: 'system', action: 'node_reclaimed', targetType: 'node', targetId: n.id,
-      payload: { pid, why: '启动时发现节点停在 running —— 上一个进程死在它手里', reclaims } });
+      payload: { pid, why: tl(L, '启动时发现节点停在 running —— 上一个进程死在它手里'), reclaims } });
     onEvent({ type: 'reclaimed', nodeId: n.id, reclaims });
   }
 
@@ -176,9 +192,10 @@ export async function orchestrate(db, {
       audit(db, { actorKind: 'system', action: 'limit_breached', targetType: 'task', targetId: taskId,
         payload: { pid, nodeId, ...breach, on_hit: 'hard_fail' } });
       await reportOn('limit_breached', nodeId);
+      const tlN = tl;   // breach.label 是 limits.mjs 里用 N_ 登记过的原文：按变量查
       return finish('limit_hard_failed', { breach, nodeId, completed,
-        why: `${breach.label}是硬边界：撞顶 = 容器被 OOM / pids-limit 掐死，`
-          + `属任务自身失控或泄漏，提高上限不是解法。已记审计，硬失败。` });
+        why: tl(L, '{label}是硬边界：撞顶 = 容器被 OOM / pids-limit 掐死，属任务自身失控或泄漏，提高上限不是解法。已记审计，硬失败。',
+          { label: tlN(L, breach.label) }) });
     }
     // 出网连续被拒撞顶：把当前**持久化**的被拒目标集合摘要挂进审计载荷与问题正文
     // （该维度 advice 让人去看"连续撞的是哪些域"，摘要就是落在这里的证据）。
@@ -189,7 +206,7 @@ export async function orchestrate(db, {
         Object.entries(egressDenialStateOf(db, taskId).hosts).sort((a, b) => b[1] - a[1]));
       breach = { ...breach, deniedHosts,
         human: Object.keys(deniedHosts).length
-          ? breach.human + '｜被拒目标：' + Object.entries(deniedHosts).map(([h, n]) => h + '×' + n).join('、')
+          ? breach.human + tl(L, '｜被拒目标：{hosts}', { hosts: Object.entries(deniedHosts).map(([h, n]) => h + '×' + n).join(tl(L, '、')) })
           : breach.human };
     }
     const q = raiseLimitQuestion(db, { taskId, nodeId, breach });
@@ -242,7 +259,7 @@ export async function orchestrate(db, {
       let cur = null; try { cur = readFileSync(marker, 'utf8'); } catch { /* 没跑过 */ }
       if (cur !== fp) {
         onEvent({ type: 'env_setup_start', commands: argvs.length });
-        const r = await runSetupCommands(exec, workspace, argvs);
+        const r = await runSetupCommands(exec, workspace, argvs, L);
         audit(db, { actorKind: 'system', action: r.ok ? 'env_setup_done' : 'env_setup_failed', targetType: 'task', targetId: taskId,
           payload: { pid, source: setupSource, results: r.results.map((x) => ({ cmd: x.argv.join(' '), code: x.code, timedOut: x.timedOut, tail: x.tail.slice(-600) })) } });
         if (r.ok) { try { writeFileSync(marker, fp); } catch { /* 写不进去就下次再跑一遍 */ } }
@@ -259,16 +276,16 @@ export async function orchestrate(db, {
     // 所以 cron 起一个 run 就等于"30 分钟后有人来看了一眼"。扫完再读状态，免得读到扫之前的。
     sweepTimeouts(db, { taskId, onEvent });
     const task = db.one(`SELECT * FROM tasks WHERE id=?`, taskId);
-    if (!task) throw new Error(`没有这个任务：${taskId}`);
-    // 不挡执行的事项不算"在等人"（否则会死锁）：签收（任务又被改时，收尾会按新提交撤掉旧的、重新请签）、
+    if (!task) throw new I18nError('没有这个任务：{id}', { id: taskId });
+    // 不挡执行的事项不算"在等人"（否则会死锁，见下）：签收（任务又被改时，收尾会按新提交撤掉旧的、重新请签）、
     // 「AI 替你定了几件事」（写明了不挡签收、不挡合并）、停等 / 空转报警（本来就是说它没动）。
-    // 若把它们算进去，它们一开着，改完的任务就收不了尾，而签收按钮又因任务不是 done 被禁用 —— 两边互等，页面上没有出路。
+    // 原来它们一开着，改完的任务就收不了尾，而签收按钮又因任务不是 done 被禁用 —— 两边互等，页面上没有出路。
     const pending = openQuestions(db, taskId).filter(blocksExecution);
     const counts = census(db, taskId);
     onEvent({ type: 'cycle', cycle, status: task.status, counts, openQuestions: pending.length });
 
-    // 已完成的任务**仍然接受修正**：人说"哦对了，再加一样"是最自然的事，修正流程没说
-    // 修正到 done 为止。这一行若排在 ⓪′ 之前 —— `say` 把修正写进库、`run` 看到
+    // 已完成的任务**仍然接受修正**：人说"哦对了，再加一样"是最自然的事，修正流水线
+    // 没有"到 done 为止"这一说。原来这一行排在 ⓪′ 之前 —— `say` 把修正写进库、`run` 看到
     // done 直接退出，那条消息永远不被消费，没有任何报错。修正落库之后任务会被
     // applyRevision 重新置 running，节点跑完再走一遍 finalize（任务级验收重跑）。
     const reopen = pendingMessages(db, taskId).some((m) => m.kind === 'correction' || m.kind === 'instruction');
@@ -277,15 +294,15 @@ export async function orchestrate(db, {
     }
     // 人在看板上按了暂停 / 中止（控制杆）：状态就是指令，编排器每轮开头读到就退出。
     // 暂停不是挂起（suspended 由人设、waiting 由问题设），恢复也不是答题 —— 是人再按一次。
-    if (task.status === 'suspended') return finish('paused', { cycles: cycle - 1, completed, why: '任务被人暂停；恢复：cli 或看板 resume' });
-    if (task.status === 'aborted') return finish('aborted_by_user', { cycles: cycle - 1, completed, why: '任务被人中止' });
+    if (task.status === 'suspended') return finish('paused', { cycles: cycle - 1, completed, why: tl(L, '任务被人暂停；恢复：cli 或看板 resume') });
+    if (task.status === 'aborted') return finish('aborted_by_user', { cycles: cycle - 1, completed, why: tl(L, '任务被人中止') });
 
     // ⓪ 硬上限体检。**排在挑节点之前**：闸门的意义是不让下一份钱
     //    花出去，放在花完之后检查那叫记账，不叫闸门。
     const breach = checkLimits(db, taskId, limitsCtx());
     if (breach) return breachOut(breach);
 
-    // ⓪′ 人发来的修正/新指令（修正流水线）。**必须在挑节点之前处理。**
+    // ⓪′ 人发来的修正/新指令（五步流水线）。**必须在挑节点之前处理。**
     //
     // 为什么不放它过去让执行器自己看着办：那等于让执行器**自行改变任务目标**，
     // 而目标属宪法层，执行层无权动。装配层因此也明写了
@@ -293,7 +310,7 @@ export async function orchestrate(db, {
     //
     // `context` 类不在此列：补充上下文不改变要做什么，进收件箱段给执行器读就行。
     //
-    // 流水线的"在途工作处理"一步在串行模型里**是空的**：这里排在挑节点
+    // 流水线第 3 步（在途工作处理）在当前的串行模型里**是空的**：这里排在挑节点
     // 之前，所以流水线跑起来时不可能有节点在途。如实记着，不假装实现了 ——
     // 一旦有并发执行器它就必须真的做。
     const pendingRev = pendingRevision(db, taskId);
@@ -362,10 +379,10 @@ export async function orchestrate(db, {
       if (verdict.length) {
         const qids = [...new Set(verdict.flatMap((h) => h.questionIds))];
         return finish('awaiting_verdict', { cycles: cycle - 1, completed, messageIds: verdict.map((h) => h.message.id), questionIds: qids,
-          why: '有一条修正撞上了仍然有效的旧决定，等那条冲突事项有结论再执行' });
+          why: tl(L, '有一条修正撞上了仍然有效的旧决定，等那条冲突事项有结论再执行') });
       }
       return finish('awaiting_check', { cycles: cycle - 1, completed, messageIds: held.map((h) => h.message.id),
-        until: Math.max(...held.map((h) => h.until ?? 0)), why: '刚到的修正还在对照已有决定，比对完就接着跑' });
+        until: Math.max(...held.map((h) => h.until ?? 0)), why: tl(L, '刚到的修正还在对照已有决定，比对完就接着跑') });
     }
 
     // ① 有人没回答 → 停。最简形态是：一个分支挂起，整个任务停下。
@@ -394,10 +411,10 @@ export async function orchestrate(db, {
       if (terminal === total && (counts.done ?? 0) > 0) { const fin = await finalize(); if (fin !== AGAIN) return fin; continue; }
       if (terminal === total) {
         return finish('stalled', { cycles: cycle - 1, completed, counts,
-          why: '所有节点都被作废了 —— 修正把这个任务改没了，需要人重新给方向' });
+          why: tl(L, '所有节点都被作废了 —— 修正把这个任务改没了，需要人重新给方向') });
       }
       return finish('stalled', { cycles: cycle - 1, completed, counts,
-        why: '没有就绪节点，但也不是全部完成 —— 依赖成环或有节点停在非终态' });
+        why: tl(L, '没有就绪节点，但也不是全部完成 —— 依赖成环或有节点停在非终态') });
     }
 
     const node = ready[0];
@@ -456,15 +473,16 @@ export async function orchestrate(db, {
           const spent = taskSpendMicroUsd(db, taskId)
             + (client.ledger ?? []).reduce((s, e) => s + e.microUsd, 0);
           const budget = limitOf(db, taskId, 'limit.budget_micro_usd');
-          if (spent >= budget) return `limit.budget_micro_usd（${spent} ≥ ${budget}）`;
+          if (spent >= budget) return tl(L, 'limit.budget_micro_usd（{spent} ≥ {budget}）', { spent, budget });
           const runtime = priorRuntimeMs(db, taskId) + (now() - startedAt);
           const cap = limitOf(db, taskId, 'limit.runtime_ms');
-          if (runtime >= cap) return `limit.runtime_ms（${runtime} ≥ ${cap}）`;
+          if (runtime >= cap) return tl(L, 'limit.runtime_ms（{runtime} ≥ {cap}）', { runtime, cap });
           // 上下文体量。读**上一轮实际发出去的**提示词体量，因为下一轮只会更大 ——
           // 发之前拿不到确切数，用上一轮当下界是保守且够用的。
           const ctxTokens = Math.max(peakContextTokens, contextPeak(client));
           const ctx = contextCapOf(db, taskId, { contextWindow: client.catalog?.[client.binding?.[tier]]?.contextWindow ?? null });
-          if (ctxTokens >= ctx.cap) return `limit.context_tokens（上一轮 ${ctxTokens} ≥ ${ctx.cap}${ctx.source === 'model' ? `，按所绑模型窗口 ${ctx.window} 的 75% 封顶` : ''}）`;
+          if (ctxTokens >= ctx.cap) return tl(L, 'limit.context_tokens（上一轮 {tokens} ≥ {cap}{window}）', { tokens: ctxTokens, cap: ctx.cap,
+            window: ctx.source === 'model' ? tl(L, '，按所绑模型窗口 {window} 的 75% 封顶', { window: ctx.window }) : '' });
           return null;
         },
       });
@@ -515,7 +533,7 @@ export async function orchestrate(db, {
       const ctxMsgs = pendingMessages(db, taskId).filter((m) => m.kind === 'context');
       if (ctxMsgs.length) {
         consumeMessages(db, { taskId, ids: ctxMsgs.map((m) => m.id),
-          why: `已随节点 ${node.id} 的上下文读入并落进交接记录` });
+          why: tl(L, '已随节点 {id} 的上下文读入并落进交接记录', { id: node.id }) });
       }
       await reportOn('node_done', node.id);   // 汇报触发之一：里程碑完成
       completed.push({ nodeId: node.id, title: node.title, handoffId: r.handoffId });
@@ -527,7 +545,7 @@ export async function orchestrate(db, {
       // 掐停本身不是结论，"停下来并告诉人"才是（绝不静默死掉）。
       const b = checkLimits(db, taskId, limitsCtx())
         ?? { key: 'limit.budget_micro_usd', label: '任务花费', limit: limitOf(db, taskId, 'limit.budget_micro_usd'),
-          actual: taskSpendMicroUsd(db, taskId), human: `轮级闸门掐停：${r.stopped}` };
+          actual: taskSpendMicroUsd(db, taskId), human: tl(L, '轮级闸门掐停：{stopped}', { stopped: r.stopped }) };
       return breachOut(b, node.id);
     }
     if (r.kind === 'question') {
@@ -561,9 +579,8 @@ export async function orchestrate(db, {
       return breachOut({
         key: 'limit.context_tokens', label: '单轮上下文体量',
         limit: ctx.cap, actual: seen,
-        human: `厂商报 context_exceeded：上下文撞的是**模型窗口**，不是本系统的上限`
-          + `（本系统上限 ${ctx.cap}，实测已到 ${seen}）`
-          + (ctx.window ? ` —— 目录里记的窗口 ${ctx.window} 与厂商实际不符，去核对 MODEL_CATALOG` : ` —— 所绑模型没有核实过的 contextWindow，上限退回了常数；给 MODEL_CATALOG 填上经核实的窗口`),
+        human: tl(L, '厂商报 context_exceeded：上下文撞的是**模型窗口**，不是本系统的上限（本系统上限 {cap}，实测已到 {seen}）', { cap: ctx.cap, seen })
+          + (ctx.window ? tl(L, ' —— 目录里记的窗口 {window} 与厂商实际不符，去核对 MODEL_CATALOG', { window: ctx.window }) : tl(L, ' —— 所绑模型没有核实过的 contextWindow，上限退回了常数；给 MODEL_CATALOG 填上经核实的窗口')),
       }, node.id);
     }
 
@@ -580,10 +597,12 @@ export async function orchestrate(db, {
     const after = checkLimits(db, taskId, limitsCtx());
     if (after) return breachOut(after, node.id);
   }
-  return finish('stalled', { cycles: maxCycles, completed, why: `到达 maxCycles=${maxCycles}` });
+  // ⚠️ 守护进程按这句的开头认"到点下班"（daemon.mjs 的 continueIf）：中英两种开头它都认
+  return finish('stalled', { cycles: maxCycles, completed, why: tl(L, '到达 maxCycles={n}', { n: maxCycles }) });
 
   // ── 任务级验收 ──────────────────────────────────────────────────────────
   async function finalize() {
+    const tlN = tl;   // 系统补的节点标题：常量里是用 N_ 登记过的原文，按变量查
     const raw = verify ? getParam(db, taskId, 'task.verify_command') : null;
     let verification = null;
     // 项目层的回归义务（project.mjs）：`task.verify_extra` 是前面任务的验收命令清单，全部要过。
@@ -617,7 +636,7 @@ export async function orchestrate(db, {
       const rest = pre.filter((p) => !isBuildOutput(p));
       if (rest.length) {
         return verifyFailed({ argv: commands[0], code: null, timedOut: false, mutated: [], dirtyBefore: rest,
-          tail: `[系统] 验收前工作区里就有没提交的改动：${rest.join(' ')} —— 验收只认已提交的版本，这些改动要么提交、要么撤掉` });
+          tail: tl(L, '[系统] 验收前工作区里就有没提交的改动：{paths} —— 验收只认已提交的版本，这些改动要么提交、要么撤掉', { paths: rest.join(' ') }) });
       }
     }
     for (const [ci, argv] of commands.entries()) {
@@ -644,9 +663,9 @@ export async function orchestrate(db, {
         tail: (out.stdout + out.stderr).trim().split('\n').slice(-40).join('\n') };
       if (rebuilt.length) {
         verification.rebuilt = rebuilt;
-        verification.tail += `\n[系统] 验收重新生成了已提交进仓库的构建产物：${rebuilt.join(' ')} —— 已还原成提交时的样子；构建产物不该进仓库（应写进 .gitignore 并从跟踪里摘掉）`;
+        verification.tail += `\n${tl(L, '[系统] 验收重新生成了已提交进仓库的构建产物：{paths} —— 已还原成提交时的样子；构建产物不该进仓库（应写进 .gitignore 并从跟踪里摘掉）', { paths: rebuilt.join(' ') })}`;
       }
-      if (mutated.length) verification.tail += `\n[系统] 验收命令改动了工作区：${mutated.join(' ')} —— 验收不许留下改动（已撤掉这些改动）`;
+      if (mutated.length) verification.tail += `\n${tl(L, '[系统] 验收命令改动了工作区：{paths} —— 验收不许留下改动（已撤掉这些改动）', { paths: mutated.join(' ') })}`;
       onEvent({ type: 'verified', verification });
       if (out.code !== 0 || out.timedOut || mutated.length) return verifyFailed(verification);
     }
@@ -656,9 +675,19 @@ export async function orchestrate(db, {
     if (exec?.isolated && workspace && !readPreviewSpec(workspace) && hasUi(workspace) && !getParam(db, taskId, PREVIEW_NODE_KEY)) {
       const nid = newId('n');
       db.run(`INSERT INTO nodes (id,task_id,title,spec,acceptance,status,risk_tier,model_tier,created_at) VALUES (?,?,?,?,?,'pending','low','standard',?)`,
-        nid, taskId, PREVIEW_NODE.title, PREVIEW_NODE.spec, PREVIEW_NODE.acceptance, now());
+        nid, taskId, tlN(L, PREVIEW_NODE.title), PREVIEW_NODE.spec, PREVIEW_NODE.acceptance, now());
       setParam(db, { taskId, key: PREVIEW_NODE_KEY, value: nid, by: { kind: 'agent', id: 'orchestrator' }, governance: 'execution' });
       audit(db, { actorKind: 'system', action: 'preview_node_added', targetType: 'task', targetId: taskId, payload: { pid, nodeId: nid } });
+      onEvent({ type: 'preview_node_added', nodeId: nid });
+      return AGAIN;
+    }
+    const pv = exec?.isolated && workspace ? readPreviewSpec(workspace, L) : null;
+    if (pv?.spec && !pv.spec.seed.length && (pv.spec.ready.length > 1 || pv.spec.start.length > 1) && !getParam(db, taskId, PREVIEW_SEED_NODE_KEY)) {
+      const nid = newId('n');
+      db.run(`INSERT INTO nodes (id,task_id,title,spec,acceptance,status,risk_tier,model_tier,created_at) VALUES (?,?,?,?,?,'pending','low','standard',?)`,
+        nid, taskId, tlN(L, PREVIEW_SEED_NODE.title), PREVIEW_SEED_NODE.spec, PREVIEW_SEED_NODE.acceptance, now());
+      setParam(db, { taskId, key: PREVIEW_SEED_NODE_KEY, value: nid, by: { kind: 'agent', id: 'orchestrator' }, governance: 'execution' });
+      audit(db, { actorKind: 'system', action: 'preview_seed_node_added', targetType: 'task', targetId: taskId, payload: { pid, nodeId: nid } });
       onEvent({ type: 'preview_node_added', nodeId: nid });
       return AGAIN;
     }
@@ -672,10 +701,10 @@ export async function orchestrate(db, {
     // 看运行效果：仓库里有 si-preview.json，就在同一个沙箱里起服务、截图，挂到签收页上。
     // 只在真沙箱里做（测试的本地执行器不起服务）；截不出来不拦签收，原因照实记下。
     if (exec?.isolated && workspace) {
-      const read = readPreviewSpec(workspace);
+      const read = readPreviewSpec(workspace, L);
       if (read) {
         const outDir = join(resolve(workspace, '..', '..'), 'previews', taskId, String(ws?.head ?? 'nohead').slice(0, 12));
-        const r = read.error ? { ok: false, shots: [], why: read.error } : await capturePreview(exec, workspace, read.spec, { outDir });
+        const r = read.error ? { ok: false, shots: [], why: read.error } : await capturePreview(exec, workspace, read.spec, { outDir, lang: L });
         audit(db, { actorKind: 'system', action: r.ok ? 'preview_captured' : 'preview_failed', targetType: 'task', targetId: taskId,
           payload: { head: ws?.head ?? null, dir: outDir, shots: r.shots, why: r.why ?? null, warnings: r.warnings ?? [], restored: r.restored ?? [], log: r.log ? String(r.log).slice(-1500) : null } });
         onEvent({ type: 'preview', ok: r.ok, shots: r.shots.length, why: r.why ?? null });

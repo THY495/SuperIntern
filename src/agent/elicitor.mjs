@@ -12,7 +12,9 @@
 // 以及人对草案的回复被机械判为"批准 / 放弃 / 要改"。判"批准"不经模型：正则、短句、全匹配 ——
 // "好，但是把 X 改成 Y" 不算批准，算反馈。签字这件事不交给分类器。
 
-import { routeQuestion, scopePathProblems, normScopePaths, renderScopePaths, SCOPE_PATHS_NOTE, specPrefixes } from '../core/routing.mjs';
+import { withOutputLang, contentLang, tl, I18nError } from '../i18n/index.mjs';
+import { markOf } from '../i18n/marks.mjs';
+import { routeQuestion, scopePathProblems, normScopePaths, renderScopePaths, SCOPE_PATHS_NOTE, scopePathsNote, specPrefixes } from '../core/routing.mjs';
 import { newId, now, audit } from '../db/db.mjs';
 import { toolCallsOf, textOf, truncatedEmpty, TruncatedEmptyError } from '../llm/canonical.mjs';
 import { priorAnswers } from './planner.mjs';
@@ -109,26 +111,27 @@ export function verifyCommandProblems(raw) {
   return errs;
 }
 
-/** 草案渲染成人看的正文（也是 Ⅲ 级批准问题的正文）。 */
-export function renderDraft(c, version, notes) {
+/** 草案渲染成人看的正文（也是 Ⅲ 级批准问题的正文）。`lang`：内容语言（调用方传 contentLang(db)；默认中文）。 */
+export function renderDraft(c, version, notes, lang = 'zh') {
+  const L = lang;
   const cons = Array.isArray(c.constraints) ? c.constraints : [];
   return [
-    `【宪法块草案 v${version}】`,
-    `标题：${c.title}`,
-    `目标：${c.goal}`,
-    `范围：${c.scope}`,
-    `可动路径（判据）：${renderScopePaths(c.scope_paths)}`,
-    SCOPE_PATHS_NOTE,
-    `完成定义：${c.definition_of_done}`,
-    `约束：${cons.length ? '\n' + cons.map((x) => `  - ${x}`).join('\n') : '（无）'}`,
-    `验收命令：${c.verify_command ? c.verify_command : '（没给 —— 见说明）'}`,
-    notes ? `\n草案说明：${notes}` : '',
+    markOf(L, 'taskDraft', { version }),
+    tl(L, '标题：{v}', { v: c.title }),
+    tl(L, '目标：{v}', { v: c.goal }),
+    tl(L, '范围：{v}', { v: c.scope }),
+    tl(L, '可动路径（判据）：{v}', { v: renderScopePaths(c.scope_paths, L) }),
+    scopePathsNote(L),
+    tl(L, '完成定义：{v}', { v: c.definition_of_done }),
+    tl(L, '约束：{v}', { v: cons.length ? '\n' + cons.map((x) => `  - ${x}`).join('\n') : tl(L, '（无）') }),
+    tl(L, '验收命令：{v}', { v: c.verify_command ? c.verify_command : tl(L, '（没给 —— 见说明）') }),
+    notes ? '\n' + tl(L, '草案说明：{v}', { v: notes }) : '',
     '',
-    '批准后会自动规划并开跑。请回复：',
-    '(A) 批准 —— 回 "A" 或 "批准"',
-    '(B) 要改 —— 直接写要改什么，会出下一版',
-    '(C) 放弃 —— 回 "C" 或 "放弃"',
-    '(D) 批准，但留一句保留意见 —— **它不挡任何东西**：这一批照样全部生效，效果与 (A) 一模一样。它只把你那句话留在项目的约定清单上、标成〔保留意见〕，让下一个碰这一处的人看得到。要**挡住**其中某一条，只能 (B) 说清哪一条不要、让它重出一版。写法：先回 A，**另起一行**写「保留：…」。',
+    tl(L, '批准后会自动规划并开跑。请回复：'),
+    tl(L, '(A) 批准 —— 回 "A" 或 "批准"'),
+    tl(L, '(B) 要改 —— 直接写要改什么，会出下一版'),
+    tl(L, '(C) 放弃 —— 回 "C" 或 "放弃"'),
+    tl(L, '(D) 批准，但留一句保留意见 —— **它不挡任何东西**：这一批照样全部生效，效果与 (A) 一模一样。它只把你那句话留在项目的约定清单上、标成〔保留意见〕，让下一个碰这一处的人看得到。要**挡住**其中某一条，只能 (B) 说清哪一条不要、让它重出一版。写法：先回 A，**另起一行**写「保留：…」。'),
   ].filter((l) => l !== null).join('\n');
 }
 
@@ -138,7 +141,7 @@ export function renderDraft(c, version, notes) {
  */
 export function startFromIdea(db, { userId, idea, title = null, source = null, projectId = null, order = null }) {
   const text = String(idea ?? '').trim();
-  if (!text) throw new Error('想法不能为空');
+  if (!text) throw new I18nError('想法不能为空');
   const taskId = newId('t');
   const t = now();
   const by = { kind: 'user', id: userId };
@@ -169,9 +172,10 @@ export const answerOf = (db, questionId) => db.one(
  */
 export async function draft(db, { client, taskId, tier = 'heavy', maxAttempts = 3 }) {
   const task = db.one(`SELECT * FROM tasks WHERE id=?`, taskId);
-  if (!task) throw new Error(`没有这个任务：${taskId}`);
+  if (!task) throw new I18nError('没有这个任务：{id}', { id: taskId });
   const idea = getParam(db, taskId, 'draft.idea');
-  if (!idea) throw new Error('这个任务不是从想法开始的（没有 draft.idea），不需要追问');
+  if (!idea) throw new I18nError('这个任务不是从想法开始的（没有 draft.idea），不需要追问');
+  const L = contentLang(db);
   const stage = getParam(db, taskId, 'draft.stage');
   if (stage === 'approved') return { kind: 'noop', why: '草案已批准，下一步是规划' };
   if (['done', 'aborted'].includes(task.status)) return { kind: 'noop', why: `任务 ${task.status}` };
@@ -196,7 +200,7 @@ export async function draft(db, { client, taskId, tier = 'heavy', maxAttempts = 
     if (stage === 'proposed') {
       const qid = getParam(db, taskId, 'draft.approval_question');
       const a = qid ? answerOf(db, qid) : null;
-      if (!a) return exit('noop', { why: '草案等人批，但找不到答复' });
+      if (!a) return exit('noop', { why: tl(L, '草案等人批，但找不到答复') });
       const verdict = readApproval(db, { taskId, questionId: qid, body: a.body, userId: a.sender_id, version: current?.version ?? null });
       if (verdict === 'approve') {
         setParam(db, { taskId, key: 'draft.stage', value: 'approved', by: { kind: 'user', id: a.sender_id }, governance: 'constitutional' });
@@ -217,7 +221,7 @@ export async function draft(db, { client, taskId, tier = 'heavy', maxAttempts = 
           } catch (e) { audit(db, { actorKind: 'system', actorId: 'elicitor', action: 'contract_register_failed', targetType: 'task', targetId: taskId, payload: { error: e.message } }); }
         }
         const resv = reservationOf(a.body);
-        if (resv) recordReservation(db, { taskId, subject: `批准草案 v${current?.version ?? '?'} 时的保留意见`, text: resv, sourceKind: 'contract', sourceId: current?.id ?? null, by: a.sender_id });
+        if (resv) recordReservation(db, { taskId, subject: tl(L, '批准草案 v{version} 时的保留意见', { version: current?.version ?? '?' }), text: resv, sourceKind: 'contract', sourceId: current?.id ?? null, by: a.sender_id });
         audit(db, { actorKind: 'user', actorId: a.sender_id, action: 'draft_approved', targetType: 'task', targetId: taskId,
           payload: { constitution: current?.id ?? null, version: current?.version ?? null, questionId: qid, answer: String(a.body).slice(0, 200), reservation: resv ? resv.slice(0, 200) : null } });
         return exit('approved', { constitution: current, version: current?.version ?? null });
@@ -255,7 +259,7 @@ export async function draft(db, { client, taskId, tier = 'heavy', maxAttempts = 
     if (current) {
       parts.push(`## 上一版草案（v${current.version}）\n${renderDraft({ ...current, title: getParam(db, taskId, 'draft.title') ?? task.title,
         constraints: JSON.parse(current.constraints || '[]'), verify_command: getParam(db, taskId, 'draft.verify_command') ?? '' },
-      current.version, getParam(db, taskId, 'draft.notes'))}`);
+      current.version, getParam(db, taskId, 'draft.notes'), L)}`);
     }
     // 这一条线上人说过的每一句：只给最新一条，前面定下的要求会在下一版里悄悄没了
     { const h = renderRoundHistory(roundHistory(db, { carrierId: taskId })); if (h) parts.push(h); }
@@ -263,7 +267,7 @@ export async function draft(db, { client, taskId, tier = 'heavy', maxAttempts = 
     const messages = [{ role: 'user', content: [{ type: 'text', text: parts.join('\n\n') }] }];
 
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-      const resp = await client.complete({ tier, system: SYSTEM, messages, tools: [ASK_USER, PROPOSE], maxTokens: MAX_TOKENS, effort: 'high' });
+      const resp = await client.complete({ tier, system: withOutputLang(SYSTEM, contentLang(db)), messages, tools: [ASK_USER, PROPOSE], maxTokens: MAX_TOKENS, effort: 'high' });
       if (truncatedEmpty(resp)) throw new TruncatedEmptyError('追问器', MAX_TOKENS);
       const calls = toolCallsOf(resp);
       const ask = calls.find((c) => c.name === 'ask_user');
@@ -297,7 +301,7 @@ export async function draft(db, { client, taskId, tier = 'heavy', maxAttempts = 
 
       audit(db, { actorKind: 'agent', actorId: 'elicitor', action: 'draft_attempt', targetType: 'task', targetId: taskId,
         payload: { attempt, rejections: errs, say: textOf(resp).slice(0, 600) || null, stopReason: resp.stopReason } });
-      if (attempt === maxAttempts) throw new Error(`追问器 ${maxAttempts} 次都没给出合法动作：${errs.join('；')}`);
+      if (attempt === maxAttempts) throw new I18nError('追问器 {n} 次都没给出合法动作：{errs}', { n: maxAttempts, errs: errs.join('；') });
       messages.push({ role: 'assistant', content: resp.content });
       const bad = prop ?? ask;
       if (bad) messages.push({ role: 'tool_results', results: [{ callId: bad.id, name: bad.name, isError: true, content: `被拒：\n- ${errs.join('\n- ')}` }] });
@@ -314,13 +318,14 @@ export async function draft(db, { client, taskId, tier = 'heavy', maxAttempts = 
 function recordQuestions(db, { taskId, qs, tier }) {
   const t = now();
   const ttl = timeoutFor(db, taskId, 2);
+  const L = contentLang(db);
   const ids = [];
   db.tx(() => {
     for (const q of qs) {
       const id = newId('q');
       db.run(`INSERT INTO questions (id,task_id,node_id,level,level_source,text,default_action,asked_at,timeout_at,status)
               VALUES (?,?,NULL,2,'classifier',?,?,?,?,'open')`,
-        id, taskId, `${q.text.trim()}${q.why ? `\n\n（为什么问：${String(q.why).trim()}）` : ''}`, q.default_action.trim(), t, ttl ? t + ttl : null);
+        id, taskId, `${q.text.trim()}${q.why ? `\n\n${tl(L, '（为什么问：{why}）', { why: String(q.why).trim() })}` : ''}`, q.default_action.trim(), t, ttl ? t + ttl : null);
       routeQuestion(db, { questionId: id, decisionType: 'spec_choice', typeSource: 'hard_rule', at: t });   // 追问器只问规格
       audit(db, { actorKind: 'agent', actorId: 'elicitor', action: 'question_raised', targetType: 'task', targetId: taskId,
         payload: { questionId: id, level: 2, tier, text: q.text.slice(0, 200), defaultAction: q.default_action.slice(0, 200) } });
@@ -340,7 +345,7 @@ function recordProposal(db, { taskId, c, current }) {
   const by = { kind: 'agent', id: 'elicitor' };
   const constraints = c.constraints.map((x) => String(x));
   const verify = String(c.verify_command ?? '').trim();
-  const text = renderDraft({ ...c, constraints, verify_command: verify }, version, c.notes);
+  const text = renderDraft({ ...c, constraints, verify_command: verify }, version, c.notes, contentLang(db));
   db.tx(() => {
     if (current) db.run(`UPDATE constitutions SET superseded_at=?, valid_to=? WHERE id=?`, t, t, current.id);
     db.run(`INSERT INTO constitutions (id,task_id,version,goal,scope,scope_paths,definition_of_done,constraints,valid_from,recorded_at)

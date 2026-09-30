@@ -14,6 +14,7 @@
 // 散文；它挂了（厂商故障、预算触顶）就退回模板 —— 汇报永远能产生，
 // 尤其是"钱花光了"那一条，它必须在钱花光之后仍能说出口。
 
+import { withOutputLang, contentLang, tl } from '../i18n/index.mjs';
 import { existsSync } from 'node:fs';
 import { runToolLoop } from '../llm/client.mjs';
 import { newId, now, audit, insertEdge } from '../db/db.mjs';
@@ -26,8 +27,9 @@ const head = (s, n = 160) => String(s ?? '').replace(/\s+/g, ' ').slice(0, n);
 // 曾出现过：T2 卡在重试上限、T3 还没开工，汇报摘要却说"已完成 T2 与 T3 两块工作并沉淀为现行约定"——
 // 输入里只有一行节点计数的 JSON 和一串"仍然有效的约定"（两个任务的契约批准时登记的），模型把"约定已登记"读成了"做完了"；
 // 读汇报的人据此判断"其实已经做完，是计数在空转"。所以任务状态由代码写成一行放在最前，摘要里的"完成"再机械核对一遍。
-const TASK_STATE = { planning: '未开工 / 规划中', running: '进行中', waiting: '等人处理', suspended: '暂停', done: '已做完（未合并）', aborted: '已中止' };
-const stateOf = (t) => (t.merged_at ? '已合并' : TASK_STATE[t.status] ?? t.status);
+// 按内容语言取（0.2.0）：lang 默认中文
+const TASK_STATE = (lang = 'zh') => ({ planning: tl(lang, '未开工 / 规划中'), running: tl(lang, '进行中'), waiting: tl(lang, '等人处理'), suspended: tl(lang, '暂停'), done: tl(lang, '已做完（未合并）'), aborted: tl(lang, '已中止') });
+const stateOf = (t, lang = 'zh') => (t.merged_at ? tl(lang, '已合并') : TASK_STATE(lang)[t.status] ?? t.status);
 const isFinished = (t) => !!t.merged_at || t.status === 'done';
 /** 任务在摘要里可能被怎么称呼：项目里的编号 #n、标题开头的 Tn、完整标题。 */
 const labelsOf = (t) => [t.project_order ? `#${t.project_order}` : null, /^(T\d+)\b/.exec(t.title ?? '')?.[1] ?? null, t.title || null].filter(Boolean);
@@ -37,8 +39,10 @@ const labelsOf = (t) => [t.project_order ? `#${t.project_order}` : null, /^(T\d+
  * 只看同一句里既点了这个任务的名、又说了"完成"，且"完成"前面不是"未 / 没 / 尚未 / 还没"。
  */
 export function falseDoneClaims(summary, standing) {
-  const sentences = String(summary ?? '').split(/[。；;！!，,\n]/);
-  const claims = (s) => /(?<![未没尚])完成/.test(s.replace(/(尚未|还没有?|没有|未能)完成/g, ''));
+  // 英文摘要按句号也断开（"T2 is done. T3 is next."）；否定说法（not / isn't / yet to be）先剥掉再看
+  const sentences = String(summary ?? '').split(/[。；;！!，,\n]|\.\s/);
+  const claims = (s) => /(?<![未没尚])完成/.test(s.replace(/(尚未|还没有?|没有|未能)完成/g, ''))
+    || /\b(completed|finished|is done|are done|has been done)\b/i.test(s.replace(/\b(not|n't|never|yet to be|isn't|aren't|hasn't|haven't)\b[^.]{0,16}\b(completed|finished|done)\b/gi, ''));
   return standing.filter((t) => !isFinished(t) && sentences.some((s) => claims(s) && labelsOf(t).some((l) => s.includes(l))));
 }
 
@@ -98,15 +102,16 @@ export function gatherSince(db, taskId, sinceTs) {
 
   // 持久化纪律审计：这段窗口里 done 的节点，真相源里能不能重建它？
   const gaps = [];
+  const lang = contentLang(db);
   for (const n of nodesDone) {
     const h = n.handoffId ? db.one(`SELECT id, narrative_ref FROM handoffs WHERE id=?`, n.handoffId) : null;
-    if (!h) { gaps.push(`节点 ${n.id}（${n.title}）记为 done，但库里没有它的交接记录 —— 只凭真相源重建不出这一步`); continue; }
+    if (!h) { gaps.push(tl(lang, '节点 {id}（{title}）记为 done，但库里没有它的交接记录 —— 只凭真相源重建不出这一步', { id: n.id, title: String(n.title) })); continue; }
     if (!h.narrative_ref || !existsSync(h.narrative_ref)) {
-      gaps.push(`节点 ${n.id}（${n.title}）的叙事文件不在：${h.narrative_ref ?? '（空）'} —— 上下文考古断线`);
+      gaps.push(tl(lang, '节点 {id}（{title}）的叙事文件不在：{ref} —— 上下文考古断线', { id: n.id, title: String(n.title), ref: h.narrative_ref ?? tl(lang, '（空）') }));
     }
   }
   for (const d of decisions) {
-    if (!String(d.rationale ?? '').trim()) gaps.push(`决策 ${d.id}（${head(d.summary, 40)}）没有理由 —— 只有结论的决策不可复盘`);
+    if (!String(d.rationale ?? '').trim()) gaps.push(tl(lang, '决策 {id}（{summary}）没有理由 —— 只有结论的决策不可复盘', { id: d.id, summary: head(d.summary, 40) }));
   }
 
   // 现状 ≠ 历史：返工之后，窗口里同一个主题会有新旧两条假设并存，
@@ -156,79 +161,80 @@ export function gatherSince(db, taskId, sinceTs) {
 export const CLASSIFIER_MARK = '[分类器判定]';
 
 /** 该行前缀标注；没有就是空串（人显式给的消息，渲染结果与从前逐字相同）。 */
-export function classifierTag(m) {
+export function classifierTag(m, lang = 'zh') {
   const which = [];
-  if (m.kind_source === 'classifier') which.push('类别');
-  if (m.urgency_source === 'classifier') which.push('紧急度');
-  return which.length ? `${CLASSIFIER_MARK}（${which.join('+')}） ` : '';
+  if (m.kind_source === 'classifier') which.push(tl(lang, '类别'));
+  if (m.urgency_source === 'classifier') which.push(tl(lang, '紧急度'));
+  // 与 CLASSIFIER_MARK 同一个标（中文逐字相同），按内容语言写
+  return which.length ? tl(lang, '[分类器判定]（{which}） ', { which: which.join('+') }) : '';
 }
 
 /**
  * 事实的确定性渲染 —— 给模型看的输入，也是模板回退时给人看的正文。
  * **分两段：现状在前、历史在后**。返工之后新旧口径混排，看的人判断不出"到底改成什么样了"。
  */
-export function renderFacts(f) {
+export function renderFacts(f, lang = 'zh') {
   const L = [];
-  L.push(`## 现状（此刻的口径。下面"历史"一节是过程，两者不要混着读）`);
+  L.push(tl(lang, '## 现状（此刻的口径。下面"历史"一节是过程，两者不要混着读）'));
   if ((f.standing ?? []).length) {
-    L.push(`任务状态（做没做完只以这一行为准）：${f.standing.map((t) => `${t.project_order ? `#${t.project_order}` : ''}「${head(t.title, 40)}」`
-      + `${t.id === f.task?.id ? '（本任务）' : ''}${stateOf(t)}`).join('；')}`);
+    L.push(tl(lang, '任务状态（做没做完只以这一行为准）：{list}', { list: f.standing.map((t) => tl(lang, '{order}「{title}」{self}{state}', {
+      order: t.project_order ? `#${t.project_order}` : '', title: head(t.title, 40),
+      self: t.id === f.task?.id ? tl(lang, '（本任务）') : '', state: stateOf(t, lang) }).trim()).join(tl(lang, '；')) }));
   }
-  L.push(`节点 ${JSON.stringify(f.counts)}｜本窗口花费 ${fmtUsd(f.spend.since)}，累计 ${fmtUsd(f.spend.total)}`
-    + `｜宪法 v${f.constitution?.version ?? '?'}${f.constitutionChanged ? '（**本窗口内升版**）' : ''}`);
+  L.push(tl(lang, '节点 {counts}｜本窗口花费 {since}，累计 {total}｜宪法 v{version}{changed}', { counts: JSON.stringify(f.counts), since: fmtUsd(f.spend.since), total: fmtUsd(f.spend.total),
+    version: f.constitution?.version ?? '?', changed: f.constitutionChanged ? tl(lang, '（**本窗口内升版**）') : '' }));
   const now_ = f.assumptionsNow ?? [];
   if (now_.length) {
     const dup = new Set(now_.map((a) => a.subject_key).filter((k, i, xs) => xs.indexOf(k) !== i));
-    L.push(`### 现行假设（此刻仍然有效的，按主题）`);
+    L.push(tl(lang, '### 现行假设（此刻仍然有效的，按主题）'));
     for (const a of now_) {
-      L.push(`- [${a.status}${a.must_disclose ? '，强制披露' : ''}] ${a.subject_key}：${head(a.statement, 100)}`
-        + `（对着 ${a.verified_against ?? '—'} 查证）`);
+      L.push(`- [${a.status}${a.must_disclose ? tl(lang, '，强制披露') : ''}] `
+        + tl(lang, '{subject}：{statement}（对着 {against} 查证）', { subject: String(a.subject_key), statement: head(a.statement, 100), against: a.verified_against ?? '—' }));
     }
-    if (dup.size) L.push(`⚠ 同一主题有多条并存：${[...dup].join('、')} —— 这个口径还没收敛，签收前先看清楚按哪条为准`);
+    if (dup.size) L.push(tl(lang, '⚠ 同一主题有多条并存：{list} —— 这个口径还没收敛，签收前先看清楚按哪条为准', { list: [...dup].join(tl(lang, '、')) }));
   }
   // 本任务范围内仍然有效的、人拍过板的约定。列在这里是为了**防规划器漏引**：
   // 契约里该写进去而没写的，签收人在这儿还能看见，对不上就打回。
   if ((f.registry ?? []).length) {
-    L.push(`### 本任务范围内仍然有效的约定（人拍过板的，共 ${f.registry.length} 条）`);
+    L.push(tl(lang, '### 本任务范围内仍然有效的约定（人拍过板的，共 {n} 条）', { n: f.registry.length }));
     for (const d of f.registry) L.push(`- 〔${DEC_SOURCE[d.source_kind] ?? d.source_kind}〕${d.subject}：${head(d.statement, 120)}`);
-    L.push(`产物与其中任何一条对不上，就是该打回的事；要改其中一条，走计划变更。`
-      + `约定是人批准过的**要求**，不代表已经做到 —— 做没做完只看上面的任务状态。`);
+    L.push(tl(lang, '产物与其中任何一条对不上，就是该打回的事；要改其中一条，走计划变更。约定是人批准过的**要求**，不代表已经做到 —— 做没做完只看上面的任务状态。'));
   }
-  L.push(`## 历史（自上次汇报以来发生的过程；下面这些**不代表现状**）`);
+  L.push(tl(lang, '## 历史（自上次汇报以来发生的过程；下面这些**不代表现状**）'));
   if (f.nodesDone.length) {
-    L.push(`### 本窗口完成的节点`);
-    for (const n of f.nodesDone) L.push(`- ${n.title}（${n.id}）产物：${n.artifacts.join(', ') || '（无）'}`);
+    L.push(tl(lang, '### 本窗口完成的节点'));
+    for (const n of f.nodesDone) L.push(`- ${tl(lang, '{title}（{id}）产物：{artifacts}', { title: String(n.title), id: n.id, artifacts: n.artifacts.join(', ') || tl(lang, '（无）') })}`);
   }
   if (f.nodeTrouble.length) {
-    L.push(`### 节点异常`);
+    L.push(tl(lang, '### 节点异常'));
     for (const t of f.nodeTrouble) L.push(`- [${t.action}] ${t.title ?? t.id}：${t.why}`);
   }
   if (f.messages.length) {
-    L.push(`### 人发来的`);
-    for (const m of f.messages) L.push(`- ${classifierTag(m)}（${m.kind}）${head(m.body, 140)}`);
+    L.push(tl(lang, '### 人发来的'));
+    for (const m of f.messages) L.push(`- ${classifierTag(m, lang)}${tl(lang, '（{kind}）', { kind: String(m.kind) })}${head(m.body, 140)}`);
   }
   if (f.revisions.length) {
-    L.push(`### 计划修正`);
-    for (const r of f.revisions) L.push(`- ${r.id} ${r.status}${r.gate ? `｜门：${head(r.gate, 80)}` : '｜门未触发，自动生效'}`);
+    L.push(tl(lang, '### 计划修正'));
+    for (const r of f.revisions) L.push(`- ${r.id} ${r.status}${r.gate ? tl(lang, '｜门：{gate}', { gate: head(r.gate, 80) }) : tl(lang, '｜门未触发，自动生效')}`);
   }
   if (f.questions.length) {
-    L.push(`### 问题`);
-    for (const q of f.questions) L.push(`- Ⅲ${'Ⅰ'.repeat(0)}${q.level} 级（${q.level_source}）${q.status}：${head(q.text, 120)}`);
+    L.push(tl(lang, '### 问题'));
+    for (const q of f.questions) L.push(`- ${tl(lang, 'Ⅲ{level} 级（{source}）{status}：{text}', { level: String(q.level), source: String(q.level_source), status: String(q.status), text: head(q.text, 120) })}`);
   }
   if (f.breaches.length) {
-    L.push(`### 触顶`);
+    L.push(tl(lang, '### 触顶'));
     for (const b of f.breaches) L.push(`- ${b.key}（${b.onHit}）：${b.human}`);
   }
   if (f.decisions.length) {
-    L.push(`### 本窗口的决策（全部）`);
+    L.push(tl(lang, '### 本窗口的决策（全部）'));
     for (const d of f.decisions) L.push(`- [${d.actor_kind}/${d.layer}] ${head(d.summary, 100)}`);
   }
   if (f.assumptions.length) {
     // 已被取代的照列 —— 但要标出来。上面"现行假设"才是此刻的口径。
-    L.push(`### 本窗口的假设变动（全部，含已被取代的）`);
+    L.push(tl(lang, '### 本窗口的假设变动（全部，含已被取代的）'));
     for (const a of f.assumptions) {
-      L.push(`- [${a.status}${a.must_disclose ? '，强制披露' : ''}${f.supersededIn?.has(a.id) ? '，**已被取代，不是现状**' : ''}]`
-        + ` ${a.subject_key}：${head(a.statement, 100)}（对着 ${a.verified_against ?? '—'} 查证）`);
+      L.push(`- [${a.status}${a.must_disclose ? tl(lang, '，强制披露') : ''}${f.supersededIn?.has(a.id) ? tl(lang, '，**已被取代，不是现状**') : ''}]`
+        + ` ${tl(lang, '{subject}：{statement}（对着 {against} 查证）', { subject: String(a.subject_key), statement: head(a.statement, 100), against: a.verified_against ?? '—' })}`);
     }
   }
   return L.join('\n');
@@ -238,26 +244,26 @@ export function renderFacts(f) {
  * **不可省的那一节**，由代码生成，不经模型。
  * 自作主张 = 强制披露的假设 + agent 在执行层做的决策。
  */
-export function renderSelfDecided(f) {
-  const L = [`## 自作主张的决定与假设（代码生成，不由模型取舍）`];
+export function renderSelfDecided(f, lang = 'zh') {
+  const L = [tl(lang, '## 自作主张的决定与假设（代码生成，不由模型取舍）')];
   const { assumptions, decisions } = f.selfDecided;
   const timeouts = f.timeouts ?? [];
-  if (!assumptions.length && !decisions.length && !timeouts.length) { L.push('（本窗口没有）'); return L.join('\n'); }
+  if (!assumptions.length && !decisions.length && !timeouts.length) { L.push(tl(lang, '（本窗口没有）')); return L.join('\n'); }
   // 超时走默认：没有人答，系统按 agent 登记的默认动作放行了 —— 这是最该让人看见的一种"自作主张"
   for (const t of timeouts) {
-    if (t.action === 'question_defaulted') L.push(`- **超时走默认**（${t.level === 1 ? 'Ⅰ' : 'Ⅱ'} 级，无人答复）｜${t.text}\n  执行了：${head(t.defaultAction ?? '', 160)}`);
-    else if (t.action === 'question_escalated') L.push(`- 超时升级（Ⅱ 级，第一段无人答复，再等一段后退默认）｜${t.text}`);
-    else L.push(`- 超时后仍挂起（升级后无人答，且没有默认可退）｜${t.text}`);
+    if (t.action === 'question_defaulted') L.push(tl(lang, '- **超时走默认**（{level} 级，无人答复）｜{text}\n  执行了：{action}', { level: t.level === 1 ? 'Ⅰ' : 'Ⅱ', text: String(t.text), action: head(t.defaultAction ?? '', 160) }));
+    else if (t.action === 'question_escalated') L.push(tl(lang, '- 超时升级（Ⅱ 级，第一段无人答复，再等一段后退默认）｜{text}', { text: String(t.text) }));
+    else L.push(tl(lang, '- 超时后仍挂起（升级后无人答，且没有默认可退）｜{text}', { text: String(t.text) }));
   }
   for (const a of assumptions) {
-    const tag = a.verified_against === 'settled_by_me' ? '**替人做了个决定**'
-      : a.verified_against === 'own_artifact' ? '循环论证（对着自己的产物验）'
-        : '凭据不具体';
-    L.push(`- ${tag}｜${a.subject_key}：${head(a.statement, 160)}`
-      + `${a.verification ? `\n  凭据：${head(a.verification, 120)}` : ''}`);
+    const tag = a.verified_against === 'settled_by_me' ? tl(lang, '**替人做了个决定**')
+      : a.verified_against === 'own_artifact' ? tl(lang, '循环论证（对着自己的产物验）')
+        : tl(lang, '凭据不具体');
+    L.push(tl(lang, '- {tag}｜{subject}：{statement}', { tag, subject: String(a.subject_key), statement: head(a.statement, 160) })
+      + `${a.verification ? `\n  ${tl(lang, '凭据：{v}', { v: head(a.verification, 120) })}` : ''}`);
   }
   for (const d of decisions) {
-    L.push(`- 决策｜${head(d.summary, 100)}\n  理由：${head(d.rationale, 160)}`);
+    L.push(tl(lang, '- 决策｜{summary}\n  理由：{rationale}', { summary: head(d.summary, 100), rationale: head(d.rationale, 160) }));
   }
   return L.join('\n');
 }
@@ -305,8 +311,9 @@ export async function makeReport(db, { taskId, trigger, triggerRef = null, clien
   const taskCreated = db.one(`SELECT created_at FROM tasks WHERE id=?`, taskId)?.created_at ?? 0;
   const sinceTs = (trigger === 'task_done' || trigger === 'verify_failed') ? taskCreated : (prev?.created_at ?? taskCreated);
   const f = gatherSince(db, taskId, sinceTs);
-  const facts = renderFacts(f);
-  const selfDecided = renderSelfDecided(f);
+  const lang = contentLang(db);
+  const facts = renderFacts(f, lang);
+  const selfDecided = renderSelfDecided(f, lang);
 
   let prose = null, generatedBy = 'template';
   const gaps = [...f.gaps];
@@ -314,41 +321,41 @@ export async function makeReport(db, { taskId, trigger, triggerRef = null, clien
     try {
       let out = null;
       await runToolLoop(client, {
-        tier, system: SYSTEM, tools: [SUBMIT_REPORT], maxTokens: 2000,
+        tier, system: withOutputLang(SYSTEM, contentLang(db)), tools: [SUBMIT_REPORT], maxTokens: 2000,
         messages: [{ role: 'user', content: [{ type: 'text',
           text: `触发：${trigger}${triggerRef ? `（${triggerRef}）` : ''}\n\n${facts}\n\n现在调用 submit_report。` }] }],
       }, {
         submit_report: async (args) => { out = args; return '已收到。不要再调用任何工具。'; },
       }, { maxIterations: 2, shouldStop: () => out !== null });
       if (out?.summary?.trim()) { prose = out; generatedBy = 'llm'; }
-      else gaps.push('汇报生成器没有产出摘要，已退回模板');
+      else gaps.push(tl(lang, '汇报生成器没有产出摘要，已退回模板'));
     } catch (e) {
       // 厂商挂了 / 预算被闸门掐 —— 汇报仍然要产生。这不是吞异常：原因写进 gaps。
-      gaps.push(`汇报生成器调用失败（${head(e.message, 100)}），已退回模板`);
+      gaps.push(tl(lang, '汇报生成器调用失败（{error}），已退回模板', { error: head(e.message, 100) }));
     }
   }
 
   let summary = prose?.summary?.trim()
-    ?? `[${trigger}] 节点 ${JSON.stringify(f.counts)}，本窗口花费 ${fmtUsd(f.spend.since)}`
-      + `${f.nodesDone.length ? `，完成 ${f.nodesDone.map((n) => n.title).join('、')}` : ''}`;
+    ?? tl(lang, '[{trigger}] 节点 {counts}，本窗口花费 {since}', { trigger: String(trigger), counts: JSON.stringify(f.counts), since: fmtUsd(f.spend.since) })
+      + `${f.nodesDone.length ? tl(lang, '，完成 {list}', { list: f.nodesDone.map((n) => n.title).join(tl(lang, '、')) }) : ''}`;
   // 摘要在没做完的任务旁边说了"完成"：前面补一句此刻的状态，**只陈述、不判对错**。
   // 不写"下面说它'完成'不对"：那样容易误报 ——「完成了 T2 的验收脚本（2 个节点里的第 1 个）」
   // 与「T2 完成了」字面上分不开。补状态总是对的；替模型判"说错了"则不一定。
   const unfinished = prose ? falseDoneClaims(summary, f.standing) : [];
   if (unfinished.length) {
     const said = (t) => labelsOf(t).find((l) => summary.includes(l)) ?? labelsOf(t)[0];   // 用摘要里的叫法，人对得上
-    summary = `〔此刻：${unfinished.map((t) => `${said(t)}${stateOf(t)}`).join('、')}〕${summary}`;
-    gaps.push(`摘要在 ${unfinished.map(said).join('、')} 旁边提到"完成"，而它此刻${unfinished.map((t) => `「${stateOf(t)}」`).join('、')} —— 已在摘要前补上状态`);
+    summary = `${tl(lang, '〔此刻：{list}〕', { list: unfinished.map((t) => tl(lang, '{name}{state}', { name: said(t), state: stateOf(t, lang) })).join(tl(lang, '、')) })}${summary}`;
+    gaps.push(tl(lang, '摘要在 {names} 旁边提到"完成"，而它此刻{states} —— 已在摘要前补上状态', { names: unfinished.map(said).join(tl(lang, '、')), states: unfinished.map((t) => tl(lang, '「{state}」', { state: stateOf(t, lang) })).join(tl(lang, '、')) }));
   }
   const body = [
-    `# 汇报 · ${trigger}${triggerRef ? ` · ${triggerRef}` : ''}`,
+    `# ${tl(lang, '汇报')} · ${trigger}${triggerRef ? ` · ${triggerRef}` : ''}`,
     `**${summary}**`,
-    prose ? [prose.current_state?.trim() ? `## 此刻的口径\n${prose.current_state}` : '',
-      `## 下一步\n${prose.next_steps}`, `## 不确定点\n${prose.uncertainties}`].filter(Boolean).join('\n\n')
-      : `## 下一步 / 不确定点\n（模板汇报，未经模型生成）`,
+    prose ? [prose.current_state?.trim() ? `## ${tl(lang, '此刻的口径')}\n${prose.current_state}` : '',
+      `## ${tl(lang, '下一步')}\n${prose.next_steps}`, `## ${tl(lang, '不确定点')}\n${prose.uncertainties}`].filter(Boolean).join('\n\n')
+      : `## ${tl(lang, '下一步 / 不确定点')}\n${tl(lang, '（模板汇报，未经模型生成）')}`,
     selfDecided,
-    `## 自上次汇报以来（真相源 diff）\n${facts}`,
-    gaps.length ? `## ⚠️ 持久化纪律审计\n${gaps.map((g) => `- ${g}`).join('\n')}` : '',
+    `## ${tl(lang, '自上次汇报以来（真相源 diff）')}\n${facts}`,
+    gaps.length ? `## ${tl(lang, '⚠️ 持久化纪律审计')}\n${gaps.map((g) => `- ${g}`).join('\n')}` : '',
   ].filter(Boolean).join('\n\n');
 
   const id = newId('rp');

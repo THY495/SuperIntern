@@ -13,6 +13,7 @@ import { execFileSync } from 'node:child_process';
 import { existsSync, mkdirSync, rmSync, readFileSync, writeFileSync } from 'node:fs';
 import { resolve, join } from 'node:path';
 import { audit, newId } from '../db/db.mjs';
+import { I18nError } from '../i18n/index.mjs';
 
 const gitRaw = (cwd, ...args) =>
   execFileSync('git', args, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
@@ -241,8 +242,8 @@ export function ensureWorkspace(db, { taskId, source, dir, force = false, ref = 
   }
 
   const src = resolve(source);
-  if (ws === src) throw new Error('工作区不能是源仓库本身——agent 会改到系统自己正在加载的代码');
-  if (!existsSync(join(src, '.git'))) throw new Error(`源不是 git 仓库：${src}`);
+  if (ws === src) throw new I18nError('工作区不能是源仓库本身——agent 会改到系统自己正在加载的代码');
+  if (!existsSync(join(src, '.git'))) throw new I18nError('源不是 git 仓库：{path}', { path: src });
 
   if (existsSync(ws)) {
     if (!force) {

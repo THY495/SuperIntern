@@ -44,6 +44,7 @@
  * 故 canonical 取"聚合"形状，由 OpenAI adapter 负责扇出。
  */
 
+import { N_ } from '../i18n/index.mjs';
 import { ConfigError } from '../core/errors.mjs';   // 无依赖的叶子模块；tierEntry 用它报"绑定 / 目录配错了"
 
 export const TIERS = ['light', 'standard', 'heavy'];
@@ -152,7 +153,7 @@ export const MODEL_CATALOG = {
     // 实测 400 "This model does not support the effort parameter."
     efforts: [],
     pricing: { input: 1.00, output: 5.00, cacheRead: 0.10, cacheWrite: 1.25 },
-    notes: ['2025-10 发布，暂无后继的轻量模型；不支持 effort 参数，无法通过提高推理强度升档'],
+    notes: [N_('2025-10 发布，暂无后继的轻量模型；不支持 effort 参数，无法通过提高推理强度升档')],
   },
   'anthropic/claude-sonnet-5': {
     vendor: 'anthropic', model: 'claude-sonnet-5',
@@ -161,12 +162,12 @@ export const MODEL_CATALOG = {
   'anthropic/claude-opus-5': {
     vendor: 'anthropic', model: 'claude-opus-5',
     pricing: { input: 5.00, output: 25.00, cacheRead: 0.50, cacheWrite: 6.25 },
-    notes: ['启用 thinking 时约 1/8 的响应为 stop_reason=tool_use 但不含 tool_use 块；系统按空工具调用自动重试'],
+    notes: [N_('启用 thinking 时约 1/8 的响应为 stop_reason=tool_use 但不含 tool_use 块；系统按空工具调用自动重试')],
   },
   'anthropic/claude-fable-5': {
     vendor: 'anthropic', model: 'claude-fable-5',
     pricing: { input: 10.00, output: 50.00, cacheRead: 1.00, cacheWrite: 12.50 },
-    notes: ['定位高于 opus-5；默认未分配到任何档位'],
+    notes: [N_('定位高于 opus-5；默认未分配到任何档位')],
   },
   // ── OpenAI（gpt-5.6 三档族：Sol 旗舰 / Terra 均衡 / Luna 高性价比）─────────
   'openai/gpt-5.6-luna': {
@@ -193,17 +194,17 @@ export const MODEL_CATALOG = {
   'deepseek/deepseek-flash': {
     vendor: 'deepseek', model: 'deepseek-flash', contextWindow: 1_000_000,
     pricing: { input: 0.30, output: 1.20, cacheRead: 0.006, cacheWrite: 0 },
-    notes: ['DeepSeek-V4.1-Flash；所列为峰时单价，谷时减半', '输出与输入单价比为 4:1'],
+    notes: [N_('DeepSeek-V4.1-Flash；所列为峰时单价，谷时减半'), N_('输出与输入单价比为 4:1')],
   },
   'deepseek/deepseek-v4-flash': {
     vendor: 'deepseek', model: 'deepseek-v4-flash', contextWindow: 1_000_000,
     pricing: { input: 0.30, output: 1.20, cacheRead: 0.006, cacheWrite: 0 },
-    notes: ['已退役（2026-09）：请求由 DeepSeek-V4.1-Flash 响应并按其单价计费；新配置请使用 deepseek/deepseek-flash'],
+    notes: [N_('已退役（2026-09）：请求由 DeepSeek-V4.1-Flash 响应并按其单价计费；新配置请使用 deepseek/deepseek-flash')],
   },
   'deepseek/deepseek-v4-pro': {
     vendor: 'deepseek', model: 'deepseek-v4-pro', contextWindow: 1_000_000,
     pricing: { input: 1.32, output: 3.96, cacheRead: 0.044, cacheWrite: 0 },
-    notes: ['DeepSeek-V4-Pro-0813；所列为峰时单价，谷时减半；2026-09-14 后继续提供 API'],
+    notes: [N_('DeepSeek-V4-Pro-0813；所列为峰时单价，谷时减半；2026-09-14 后继续提供 API')],
   },
   // ── Gemini ───────────────────────────────────────────────────────────────
   'gemini/gemini-3.5-flash-lite': {
@@ -213,12 +214,12 @@ export const MODEL_CATALOG = {
   'gemini/gemini-3.6-flash': {
     vendor: 'gemini', model: 'gemini-3.6-flash',
     pricing: { input: 1.50, output: 7.50, cacheRead: 0.15, cacheWrite: 0.0833 },
-    notes: ['Gemini 3.x 的多轮工具调用必须原样回传 thought_signature，否则返回 HTTP 400'],
+    notes: [N_('Gemini 3.x 的多轮工具调用必须原样回传 thought_signature，否则返回 HTTP 400')],
   },
   'gemini/gemini-3.1-pro-preview': {
     vendor: 'gemini', model: 'gemini-3.1-pro-preview',
     pricing: { input: 2.00, output: 12.00, cacheRead: 0.20, cacheWrite: 0.375 },
-    notes: ['preview 模型，可能下线（gemini-3-pro-preview 已返回 404）', 'thinking 占用 maxOutputTokens；额度不足时返回 MALFORMED_FUNCTION_CALL 而非 MAX_TOKENS'],
+    notes: [N_('preview 模型，可能下线（gemini-3-pro-preview 已返回 404）'), N_('thinking 占用 maxOutputTokens；额度不足时返回 MALFORMED_FUNCTION_CALL 而非 MAX_TOKENS')],
   },
   // ── 网关（示例项，展示"用户添加模型"这条路径长什么样）─────────────────────
   // 这两条不是推荐配置，是**两种合法选择各一个样本**：钉死上游 vs 用默认路由。
@@ -230,21 +231,21 @@ export const MODEL_CATALOG = {
     vendor: 'openrouter', model: 'moonshotai/kimi-k3',
     providerPrefs: { only: ['moonshotai'] },
     pricing: { input: 3.00, output: 15.00, cacheRead: 0.30, cacheWrite: 0 },   // 兜底；记账走网关回报
-    notes: ['输出单价约为直连 DeepSeek-pro 的 17 倍；推理 token 计入输出 token，需预留足够的 maxTokens'],
+    notes: [N_('输出单价约为直连 DeepSeek-pro 的 17 倍；推理 token 计入输出 token，需预留足够的 maxTokens')],
   },
   'openrouter/claude-opus-5@anthropic': {
     vendor: 'openrouter', model: 'anthropic/claude-opus-5',
     providerPrefs: { only: ['anthropic'] },     // 钉死厂商官方：与直连同一上游
     pricing: { input: 5.00, output: 25.00, cacheRead: 0.50, cacheWrite: 6.25 },  // 仅作回报缺失时的兜底
-    notes: ['固定上游为 Anthropic，行为与直连一致，多经过一层网关；计费与余额在网关侧'],
+    notes: [N_('固定上游为 Anthropic，行为与直连一致，多经过一层网关；计费与余额在网关侧')],
   },
   'openrouter/claude-opus-5': {
     vendor: 'openrouter', model: 'anthropic/claude-opus-5',
     // 不填 providerPrefs = 用网关默认路由。代价（上游身份/量化/上下文上限浮动）
     // 由界面披露，不由代码禁止——这是用户的选择，不是我们的规矩。
     pricing: { input: 5.00, output: 25.00, cacheRead: 0.50, cacheWrite: 6.25 },
-    notes: ['默认路由：实测由 Amazon Bedrock / Azure / Google Vertex 等 7 个上游之一响应',
-      '上游与直连不同，直连不可用时可作为备用通路'],
+    notes: [N_('默认路由：实测由 Amazon Bedrock / Azure / Google Vertex 等 7 个上游之一响应'),
+      N_('上游与直连不同，直连不可用时可作为备用通路')],
   },
 };
 

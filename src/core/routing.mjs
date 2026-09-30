@@ -14,6 +14,8 @@
 // 负责人 = 项目的 owner_id / 独立任务的 owner_id：纯资源级身份，与部署级角色（users.role：lead = 管理员）无关（两者解耦）。
 // 只要求是未停用的非旁观者。默认表 '' 下各任务各有各的负责人，表本身没有"负责人"，校验时用占位。
 
+import { N_, tl, contentLang, I18nError, CATALOGS, translateError } from '../i18n/index.mjs';
+import { indexOfMark, markOf } from '../i18n/marks.mjs';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
@@ -30,26 +32,29 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
  */
 export const DECISION_TYPES = {
   // label 给界面；desc 给人看（只说是什么事，不说系统怎么产生）；from 给开发者。
-  spec_choice:       { label: '规格取舍',   level3: false, noDefault: false, desc: '执行中发现规格未写明，需要人工选定一种做法', from: '执行器 / 规划器 / 追问器的提问，判为规格类' },
-  structural:        { label: '结构矛盾',   level3: true,  noDefault: true,  desc: '规格、方案或依赖之间存在矛盾，需要人工修改后才能继续', from: '提问判为结构类：模型自报 kind=structural，或正文命中硬规则（与规格原文矛盾、依赖不成立、契约规则冲突）' },
-  contract_approval: { label: '方案批准',   level3: true,  noDefault: true,  desc: '批准任务方案、项目方案或计划变更', from: '追问器草案 / 项目规划器整批契约 / 修正提案的确认门' },
-  signoff:           { label: '签收',       level3: false, noDefault: true,  desc: '任务完成后验收：接受或打回', from: '任务 done 后的签收' },
-  budget:            { label: '上限追加',   level3: false, noDefault: true,  desc: '花费或次数达到上限，决定是否追加', from: '硬上限触顶（on_hit=gate）' },
-  egress:            { label: '联网放行',   level3: false, noDefault: true,  desc: '沙箱请求访问某类软件源，决定是否放行', from: '沙箱请求放行某个生态' },
-  delivery:          { label: '交付',       level3: false, noDefault: false, desc: '将产物推送到远端仓库并创建 PR', from: 'push / 开 PR（授权，不生成事项）' },
-  conflict:          { label: '意见不一致', level3: true,  noDefault: true,  desc: '多人答复不一致时，由谁裁定', from: '冲突检测：同一问题的答复不一致' },
-  // 这些不走"结构矛盾"（必须含负责人）—— 否则每条停等报警都至少发两个人。分出来，负责人可以只派给管代码的那一位。
-  ops:               { label: '系统卡住',   level3: false, noDefault: true,  desc: '系统卡住了（合并出错、工作区里有来路不明的改动、改计划没成、长时间没动静），要有人看一眼、决定怎么办', from: '交回给人的几种卡住（handback）/ 停等报警（liveness）' },
+  spec_choice:       { label: N_('规格取舍'),   level3: false, noDefault: false, desc: N_('执行中发现规格未写明，需要人工选定一种做法'), from: '执行器 / 规划器 / 追问器的提问，判为规格类' },
+  structural:        { label: N_('结构矛盾'),   level3: true,  noDefault: true,  desc: N_('规格、方案或依赖之间存在矛盾，需要人工修改后才能继续'), from: '提问判为结构类：模型自报 kind=structural，或正文命中硬规则（与规格原文矛盾、依赖不成立、契约规则冲突）' },
+  contract_approval: { label: N_('方案批准'),   level3: true,  noDefault: true,  desc: N_('批准任务方案、项目方案或计划变更'), from: '追问器草案 / 项目规划器整批契约 / 修正提案的确认门' },
+  signoff:           { label: N_('签收'),       level3: false, noDefault: true,  desc: N_('任务完成后验收：接受或打回'), from: '任务 done 后的签收' },
+  budget:            { label: N_('上限追加'),   level3: false, noDefault: true,  desc: N_('花费或次数达到上限，决定是否追加'), from: '硬上限触顶（on_hit=gate）' },
+  egress:            { label: N_('联网放行'),   level3: false, noDefault: true,  desc: N_('沙箱请求访问某类软件源，决定是否放行'), from: '沙箱请求放行某个生态' },
+  delivery:          { label: N_('交付'),       level3: false, noDefault: false, desc: N_('将产物推送到远端仓库并创建 PR'), from: 'push / 开 PR（授权，不生成事项）' },
+  conflict:          { label: N_('意见不一致'), level3: true,  noDefault: true,  desc: N_('多人答复不一致时，由谁裁定'), from: '冲突检测：同一问题的答复不一致' },
+  // 原来这些都走"结构矛盾"（必须含负责人）—— 每条停等报警都要发两个人。分出来，负责人可以只派给管代码的那一位。
+  ops:               { label: N_('系统卡住'),   level3: false, noDefault: true,  desc: N_('系统卡住了（合并出错、工作区里有来路不明的改动、改计划没成、长时间没动静），要有人看一眼、决定怎么办'), from: '交回给人的几种卡住（handback）/ 停等报警（liveness）' },
 };
-/** 已存的路由表里缺某一类时借哪一类的行（旧版本存的表没有"运维"）：谁管结构矛盾，谁就先管运维。 */
+/** 已存的路由表里缺某一类时借哪一类的行（加"系统卡住"这一类之前存的表都没有它）：谁管结构矛盾，谁就先管运维。 */
 const TYPE_FALLBACK = { ops: 'structural' };
+/** 决策类型在某种语言下的名字（label 由 N_ 登记，目录里有译文）；不认识的类型原样返回。 */
+const typeLabel = (lang, t) => { const l = DECISION_TYPES[t]?.label; return l ? (lang && lang !== 'zh' ? CATALOGS[lang]?.[l] ?? l : l) : t; };
 
 /**
  * 类型只升不降的兜底（"自报 + 单向升级"）：模型自报 structural 一律采信；没报或报了 spec 但正文命中
  * 结构矛盾的硬规则表述，也按 structural 走（type_source=hard_rule）。不做降级，不调分类器。
- * 正则覆盖面以后还要回头看：这里只认三类明确表述，宁可漏判（漏判 = 按规格取舍路由，仍会问人）。
+ * 正则覆盖面有意收窄：这里只认三类明确表述，宁可漏判（漏判 = 按规格取舍路由，仍会问人）。
  */
-export const STRUCTURAL_RULE = /规格原文.{0,8}(矛盾|冲突)|与.{0,16}(规格|〔规格〕).{0,8}(矛盾|冲突)|依赖不成立|契约规则.{0,12}(矛盾|冲突)|(规格|契约|方案).{0,6}自相矛盾/;
+// 英文正文（内容语言 en 时模型用英文提问）同一套三类表述。
+export const STRUCTURAL_RULE = /规格原文.{0,8}(矛盾|冲突)|与.{0,16}(规格|〔规格〕).{0,8}(矛盾|冲突)|依赖不成立|契约规则.{0,12}(矛盾|冲突)|(规格|契约|方案).{0,6}自相矛盾|\b(contradicts?|conflicts? with|inconsistent with)\b.{0,16}\b(spec|specification|contract)\b|\b(spec|specification|contract|plan)\b.{0,12}\b(contradicts itself|self-contradictory)\b|\bdependency\b.{0,12}\b(does not|doesn't) hold\b/i;
 export function decisionTypeOfQuestion({ kind = null, text = '' } = {}) {
   if (kind === 'structural') return { decisionType: 'structural', typeSource: 'self' };
   if (STRUCTURAL_RULE.test(String(text ?? ''))) return { decisionType: 'structural', typeSource: 'hard_rule' };
@@ -70,7 +75,7 @@ export function loadTemplates() {
 /** '30m' / '8h' / '1d' / '1bd'（工作日：跳过周六日；不做节假日）→ 到期时刻。 */
 export function dueAfter(at, after) {
   const m = /^(\d+)(m|h|d|bd)$/.exec(String(after ?? '').trim());
-  if (!m) throw new Error(`超时无效：${after}（应为 30m / 8h / 1d / 1bd 格式）`);
+  if (!m) throw new I18nError('超时无效：{after}（应为 30m / 8h / 1d / 1bd 格式）', { after: `${after}` });
   const n = Number(m[1]);
   if (m[2] === 'm') return at + n * 60_000;
   if (m[2] === 'h') return at + n * 3600_000;
@@ -186,18 +191,19 @@ export const normScopePaths = (paths) => [...new Set((Array.isArray(paths) ? pat
  * 机器根本拦不住」。这是对的，而"机器按这一份撤销越界改动"这类措辞反倒在暗示它拦得住。
  * 粒度差这一层没打算做（做了就是又一个跑在散文上的启发式），那就必须明说。
  */
-export const SCOPE_PATHS_NOTE = '「可动路径」是机器唯一认的判据，它只判**能不能动这个文件**：没列上的文件被改了会原样撤销。'
-  + '上面那段「范围」里更细的要求（"只加一条 script、不改已有的"这种）**机器管不了**，只能靠实现方读、靠你签收时看。';
+/** 按内容语言写（0.2.0）：拼进草案正文的地方传 contentLang(db)。SCOPE_PATHS_NOTE 是中文那份，别处还在引用。 */
+export const scopePathsNote = (lang = 'zh') => tl(lang, '「可动路径」是机器唯一认的判据，它只判**能不能动这个文件**：没列上的文件被改了会原样撤销。上面那段「范围」里更细的要求（"只加一条 script、不改已有的"这种）**机器管不了**，只能靠实现方读、靠你签收时看。');
+export const SCOPE_PATHS_NOTE = scopePathsNote('zh');
 
 /**
  * 批准页上那一行。**必须露出来** —— 人批准的是机器按这一份判越界，
  * 而不是上面那段散文；判据不给人看，等于让人批一个他没见过的东西。
  */
-export function renderScopePaths(paths) {
+export function renderScopePaths(paths, lang = 'zh') {
   const list = normScopePaths(paths);
-  if (!list.length) return '（这份契约没给路径，判据回落到从上面那段话里抽 —— 精度差，容易漏也容易多）';
-  if (list.includes('*')) return '整个仓库（* —— 等于不设范围，越界校验不生效）';
-  return list.join('、');
+  if (!list.length) return tl(lang, '（这份契约没给路径，判据回落到从上面那段话里抽 —— 精度差，容易漏也容易多）');
+  if (list.includes('*')) return tl(lang, '整个仓库（* —— 等于不设范围，越界校验不生效）');
+  return list.join(lang === 'en' ? ', ' : '、');
 }
 
 /**
@@ -291,7 +297,8 @@ export function profileOf(db, key) {
  * 空收件人只配 hang / default；`next` 必须有下一行且有时限；on_duty 出现时日历非空；`parties` 只在冲突类型；
  * 占位符必须已绑定；范围前缀必须是仓库里存在的目录（给了 repoDirs 才查）。
  */
-export function validateRules(db, key, rules, { repoDirs = null } = {}) {
+export function validateRules(db, key, rules, { repoDirs = null, lang = 'zh' } = {}) {
+  // lang：报错写给谁看（看板传请求人的界面语言）；默认中文，与原来逐字相同
   const errs = [];
   // 项目表：负责人必须是未停用的非旁观者（与角色是不是管理员无关）。默认表没有单一负责人：`user:lead` 用占位参与校验，
   // 实际解析按任务的 owner（routeQuestion 传 lead）。
@@ -299,60 +306,67 @@ export function validateRules(db, key, rules, { repoDirs = null } = {}) {
   if (key) {
     lead = leadOfKey(db, key);
     const leadRow = lead ? db.one(`SELECT display_name, role, disabled_at FROM users WHERE id=?`, lead) : null;
-    if (!leadRow) errs.push({ row: null, msg: `负责人无效：${lead ?? '未设置'}` });
-    else if (leadRow.disabled_at || leadRow.role === 'observer') errs.push({ row: null, msg: `负责人无效：${leadRow.display_name} ${leadRow.disabled_at ? '已停用' : '是旁观者'}` });
+    if (!leadRow) errs.push({ row: null, msg: tl(lang, '负责人无效：{who}', { who: lead ?? tl(lang, '未设置') }) });
+    else if (leadRow.disabled_at || leadRow.role === 'observer') errs.push({ row: null, msg: leadRow.disabled_at ? tl(lang, '负责人无效：{name} 已停用', { name: leadRow.display_name }) : tl(lang, '负责人无效：{name} 是旁观者', { name: leadRow.display_name }) });
   }
   const byType = {};
   rules.forEach((r, i) => {
-    const at = (msg) => errs.push({ row: i, msg: `第 ${i + 1} 行（${DECISION_TYPES[r.decision_type]?.label ?? r.decision_type} / ${r.scope}）：${msg}` });
-    if (!DECISION_TYPES[r.decision_type]) return at(`决策类型无效：${r.decision_type}`);
-    if (typeof r.scope !== 'string' || !r.scope) return at('范围必须是 * 或目录前缀');
-    if (r.scope !== '*' && (r.scope.startsWith('/') || r.scope.includes('..'))) at('范围必须是仓库内的相对路径');
-    if (repoDirs && r.scope !== '*' && !repoDirs.includes(r.scope.replace(/\/+$/, ''))) at(`目录 ${r.scope} 在仓库中不存在`);
-    if (!Array.isArray(r.recipients)) return at('接收人必须是列表');
-    if (!(r.quorum === QUORUM_ALL || /^[1-9]\d*$/.test(String(r.quorum)))) at(`法定人数无效：${r.quorum}（应为正整数或 all）`);
-    if (!CONFLICT_POLICIES.includes(r.conflict_policy)) at(`「冲突时」无效：${r.conflict_policy}（应为 block 或 latest）`);
-    if (!TIMEOUT_ACTIONS.includes(r.timeout_action)) at(`超时动作无效：${r.timeout_action}（应为 hang / next / default）`);
-    if (r.timeout_action === 'hang' && r.timeout_after) at('超时动作为「持续等待」（hang）时不能填写超时');
-    if (r.timeout_action !== 'hang' && !isValidAfter(r.timeout_after)) at(`超时动作为 ${r.timeout_action} 时必须填写超时（30m / 8h / 1d / 1bd）`);
+    const at = (msg) => errs.push({ row: i, msg: tl(lang, '第 {n} 行（{label} / {scope}）：{msg}', { n: i + 1, label: `${typeLabel(lang, r.decision_type)}`, scope: `${r.scope}`, msg }) });
+    if (!DECISION_TYPES[r.decision_type]) return at(tl(lang, '决策类型无效：{type}', { type: `${r.decision_type}` }));
+    if (typeof r.scope !== 'string' || !r.scope) return at(tl(lang, '范围必须是 * 或目录前缀'));
+    if (r.scope !== '*' && (r.scope.startsWith('/') || r.scope.includes('..'))) at(tl(lang, '范围必须是仓库内的相对路径'));
+    if (repoDirs && r.scope !== '*' && !repoDirs.includes(r.scope.replace(/\/+$/, ''))) at(tl(lang, '目录 {dir} 在仓库中不存在', { dir: r.scope }));
+    if (!Array.isArray(r.recipients)) return at(tl(lang, '接收人必须是列表'));
+    if (!(r.quorum === QUORUM_ALL || /^[1-9]\d*$/.test(String(r.quorum)))) at(tl(lang, '法定人数无效：{quorum}（应为正整数或 all）', { quorum: `${r.quorum}` }));
+    if (!CONFLICT_POLICIES.includes(r.conflict_policy)) at(tl(lang, '「冲突时」无效：{policy}（应为 block 或 latest）', { policy: `${r.conflict_policy}` }));
+    if (!TIMEOUT_ACTIONS.includes(r.timeout_action)) at(tl(lang, '超时动作无效：{action}（应为 hang / next / default）', { action: `${r.timeout_action}` }));
+    if (r.timeout_action === 'hang' && r.timeout_after) at(tl(lang, '超时动作为「持续等待」（hang）时不能填写超时'));
+    if (r.timeout_action !== 'hang' && !isValidAfter(r.timeout_after)) at(tl(lang, '超时动作为 {action} 时必须填写超时（30m / 8h / 1d / 1bd）', { action: `${r.timeout_action}` }));
     if (r.timeout_action === 'default' && (DECISION_TYPES[r.decision_type].level3 || DECISION_TYPES[r.decision_type].noDefault)) {
-      at(`${DECISION_TYPES[r.decision_type].label}不支持「按默认处理」（default）；请改为「转下一顺位」（next）或「持续等待」（hang）`);
+      at(tl(lang, '{label}不支持「按默认处理」（default）；请改为「转下一顺位」（next）或「持续等待」（hang）', { label: typeLabel(lang, r.decision_type) }));
     }
     for (const s of r.recipients) {
       const bare = String(s).replace(/^inform:/, '');
-      if (/^user:\$/.test(bare)) at(`占位符 ${bare} 尚未指定成员`);
-      else if (!/^(user:[\w-]+|group:[\w*-]+|on_duty|parties|requester)$/.test(bare)) at(`接收人写法无效：${s}`);
-      if (bare === 'requester' && r.decision_type === 'conflict') at('需求提出人不能用于「意见不一致」类型');
-      if (bare === 'parties' && r.decision_type !== 'conflict') at('parties 只能用于「意见不一致」类型');
+      if (/^user:\$/.test(bare)) at(tl(lang, '占位符 {name} 尚未指定成员', { name: bare }));
+      else if (!/^(user:[\w-]+|group:[\w*-]+|on_duty|parties|requester)$/.test(bare)) at(tl(lang, '接收人写法无效：{value}', { value: `${s}` }));
+      if (bare === 'requester' && r.decision_type === 'conflict') at(tl(lang, '需求提出人不能用于「意见不一致」类型'));
+      if (bare === 'parties' && r.decision_type !== 'conflict') at(tl(lang, 'parties 只能用于「意见不一致」类型'));
     }
     (byType[r.decision_type] ??= []).push({ r, i });
     // 解析后的人数与负责人
     let resolved;
     // 需求提出人按任务解析；表上校验时按"有一个人"算（与冲突双方同理）。
     const hasRq = r.recipients.some((x) => String(x).replace(/^inform:/, '') === 'requester');
-    try { resolved = resolveRecipients(db, key, r.recipients, { parties: bare(r) ? ['__p1', '__p2'] : [], requester: hasRq ? ['__rq'] : [], lead }); } catch (e) { return at(e.message); }
+    try { resolved = resolveRecipients(db, key, r.recipients, { parties: bare(r) ? ['__p1', '__p2'] : [], requester: hasRq ? ['__rq'] : [], lead }); } catch (e) { return at(translateError(e, lang)); }
     const answerers = resolved.answerers;
-    if (!answerers.length && r.timeout_action === 'next') at('接收人为空时，超时动作只能是「持续等待」（hang）或「按默认处理」（default）');
-    if (answerers.length && r.quorum !== QUORUM_ALL && Number(r.quorum) > answerers.length) at(`法定人数 ${r.quorum} 大于接收人实际人数 ${answerers.length}`);
+    if (!answerers.length && r.timeout_action === 'next') at(tl(lang, '接收人为空时，超时动作只能是「持续等待」（hang）或「按默认处理」（default）'));
+    if (answerers.length && r.quorum !== QUORUM_ALL && Number(r.quorum) > answerers.length) at(tl(lang, '法定人数 {quorum} 大于接收人实际人数 {n}', { quorum: `${r.quorum}`, n: answerers.length }));
     // 默认表：负责人是占位，`group:*`（所有成员）必然含任何任务的负责人。
     const hasLead = answerers.includes(lead) || (!key && r.recipients.includes('group:*'));
     if (DECISION_TYPES[r.decision_type].level3 && !r.recipients.includes('parties') && lead && !hasLead) {
-      at(key ? '该类型的接收人必须包含负责人' : '该类型的接收人必须包含负责人（默认决策路由由多个任务共用，请使用「负责人」而不是某位成员）');
+      // 说清为什么（例：负责人想把结构矛盾只派给某位成员，被拦下却不知道原因，还以为"系统卡住"也不行）
+      const why = { structural: tl(lang, '这类事往往要改项目的约定'), contract_approval: tl(lang, '批准方案就是定下项目的约定'), conflict: tl(lang, '意见不一致最后要有人拍板') }[r.decision_type];
+      const label = typeLabel(lang, r.decision_type);
+      at((why ? tl(lang, '「{label}」的接收人必须包含负责人：{why}，负责人得参与。在这一行的接收人里加上「负责人」再保存（可以和别人一起收）', { label, why })
+        : tl(lang, '「{label}」的接收人必须包含负责人。在这一行的接收人里加上「负责人」再保存（可以和别人一起收）', { label }))
+        + (r.decision_type === 'structural' ? tl(lang, '。「系统卡住」那一行不受此限，可以只填一个人') : '')
+        + (key ? '' : tl(lang, '。默认决策路由由多个任务共用，请使用「负责人」而不是某位成员')));
     }
-    if (r.recipients.some((s) => s.replace(/^inform:/, '') === 'on_duty') && !dutyCalendarOf(db, key)?.users?.length) at('使用了 on_duty，但值班表为空');
+    if (r.recipients.some((s) => s.replace(/^inform:/, '') === 'on_duty') && !dutyCalendarOf(db, key)?.users?.length) at(tl(lang, '使用了 on_duty，但值班表为空'));
   });
   for (const t of Object.keys(DECISION_TYPES)) {
     const rows = byType[t] ?? [];
-    if (!rows.some(({ r }) => r.scope === '*')) errs.push({ row: null, msg: `${DECISION_TYPES[t].label}：至少需要一行范围为 * 的规则` });
+    const label = typeLabel(lang, t);
+    if (!rows.some(({ r }) => r.scope === '*')) errs.push({ row: null, msg: tl(lang, '{label}：至少需要一行范围为 * 的规则', { label }) });
     // 同一 (类型, 范围) 链：position 连续、next 有下一行、Ⅲ 级类型最后一行只能 hang
     const chains = {};
     for (const x of rows) (chains[x.r.scope] ??= []).push(x);
     for (const [scope, xs] of Object.entries(chains)) {
       xs.sort((a, b) => a.r.position - b.r.position);
       xs.forEach((x, k) => {
-        if (x.r.position !== k) errs.push({ row: x.i, msg: `第 ${x.i + 1} 行：${DECISION_TYPES[t].label} / ${scope} 的顺位必须从 0 起连续编号` });
-        if (x.r.timeout_action === 'next' && k === xs.length - 1) errs.push({ row: x.i, msg: `第 ${x.i + 1} 行：超时动作为「转下一顺位」（next），但没有下一顺位` });
-        if (DECISION_TYPES[t].level3 && k === xs.length - 1 && x.r.timeout_action !== 'hang') errs.push({ row: x.i, msg: `第 ${x.i + 1} 行：${DECISION_TYPES[t].label}的最后一个顺位只能「持续等待」（hang）` });
+        if (x.r.position !== k) errs.push({ row: x.i, msg: tl(lang, '第 {n} 行：{label} / {scope} 的顺位必须从 0 起连续编号', { n: x.i + 1, label, scope }) });
+        if (x.r.timeout_action === 'next' && k === xs.length - 1) errs.push({ row: x.i, msg: tl(lang, '第 {n} 行：超时动作为「转下一顺位」（next），但没有下一顺位', { n: x.i + 1 }) });
+        if (DECISION_TYPES[t].level3 && k === xs.length - 1 && x.r.timeout_action !== 'hang') errs.push({ row: x.i, msg: tl(lang, '第 {n} 行：{label}的最后一个顺位只能「持续等待」（hang）', { n: x.i + 1, label }) });
       });
     }
   }
@@ -361,14 +375,15 @@ export function validateRules(db, key, rules, { repoDirs = null } = {}) {
 const bare = (r) => r.recipients.some((s) => String(s).replace(/^inform:/, '') === 'parties');
 
 /** 覆盖式保存：整张项目表换成 rules（校验不过就不动）。记审计。 */
-export function saveRules(db, { key, rules, template = null, bindings = {}, userId, repoDirs = null }) {
+export function saveRules(db, { key, rules, template = null, bindings = {}, userId, repoDirs = null, lang = 'zh' }) {
   rules = rules.map((r) => ({ ...r, scope: normScope(r.scope) }));
   // 交上来的表缺新加的类型（旧页面 / 旧脚本）：与 rulesOf 同一条规则借行补齐，而不是整张表报错
   for (const [t, from] of Object.entries(TYPE_FALLBACK)) {
     if (!rules.some((r) => r.decision_type === t)) rules = [...rules, ...rules.filter((r) => r.decision_type === from).map((r) => ({ ...r, decision_type: t }))];
   }
-  const errs = validateRules(db, key, rules, { repoDirs });
-  if (errs.length) { const e = new Error(`决策路由未保存，校验未通过：\n${errs.map((x) => `  - ${x.msg}`).join('\n')}`); e.errors = errs; throw e; }
+  const errs = validateRules(db, key, rules, { repoDirs, lang });
+  // 逐条的原因已按 lang 写好；外壳这一句由服务端按看的人的界面语言翻
+  if (errs.length) { const e = new I18nError('决策路由未保存，校验未通过：\n{list}', { list: errs.map((x) => `  - ${x.msg}`).join('\n') }); e.errors = errs; throw e; }
   const t = now();
   return db.tx(() => {
     db.run(`DELETE FROM routing_rules WHERE project_id=?`, key);
@@ -384,13 +399,13 @@ export function saveRules(db, { key, rules, template = null, bindings = {}, user
 }
 
 /** 选模板 = 把行复制进项目的表。占位符（user:$pm）由 bindings 绑到用户 id。 */
-export function applyTemplate(db, { key, name, bindings = {}, userId, repoDirs = null }) {
+export function applyTemplate(db, { key, name, bindings = {}, userId, repoDirs = null, lang = 'zh' }) {
   const tpl = loadTemplates()[name];
-  if (!tpl) throw new Error(`模板不存在：${name}（可选：${Object.keys(loadTemplates()).join(' / ')}）`);
+  if (!tpl) throw new I18nError('模板不存在：{name}（可选：{list}）', { name: `${name}`, list: Object.keys(loadTemplates()).join(' / ') });
   const missing = Object.keys(tpl.placeholders ?? {}).filter((p) => !bindings[p]);
-  if (missing.length) throw new Error(`模板「${tpl.label}」需要先指定：${missing.map((p) => `${p}（${tpl.placeholders[p]}）`).join('、')}`);
+  if (missing.length) throw new I18nError('模板「{label}」需要先指定：{list}', { label: tpl.label, list: missing.map((p) => `${p}（${tpl.placeholders[p]}）`).join('、') });
   const rules = tpl.rows.map((r) => ({ ...r, recipients: r.recipients.map((s) => s.replace(/^(inform:)?user:\$(\w+)$/, (_, inf, p) => `${inf ?? ''}user:${bindings[p]}`)) }));
-  saveRules(db, { key, rules, template: name, bindings, userId, repoDirs });
+  saveRules(db, { key, rules, template: name, bindings, userId, repoDirs, lang });
   return rules;
 }
 
@@ -417,8 +432,8 @@ export function dutyCalendarOf(db, key) {
   return r ? { ...r, users: JSON.parse(r.users || '[]') } : null;
 }
 export function setDutyCalendar(db, { key, users, startAt, periodDays = 7, userId }) {
-  if (!Array.isArray(users) || !users.length) throw new Error('值班表不能为空');
-  for (const u of users) if (!db.one(`SELECT id FROM users WHERE id=?`, u)) throw new Error(`值班表中的成员不存在：${u}`);
+  if (!Array.isArray(users) || !users.length) throw new I18nError('值班表不能为空');
+  for (const u of users) if (!db.one(`SELECT id FROM users WHERE id=?`, u)) throw new I18nError('值班表中的成员不存在：{id}', { id: `${u}` });
   const t = now();
   db.run(`INSERT INTO duty_calendar (project_id,users,start_at,period_days,updated_at) VALUES (?,?,?,?,?)
           ON CONFLICT(project_id) DO UPDATE SET users=excluded.users, start_at=excluded.start_at, period_days=excluded.period_days, updated_at=excluded.updated_at`,
@@ -464,7 +479,7 @@ export function resolveRecipients(db, key, resolvers, { parties = [], requester 
     if (s === 'on_duty') { const u = onDutyAt(dutyCalendarOf(db, key), at); return u && db.one(`SELECT id FROM users WHERE id=? AND disabled_at IS NULL`, u) ? [u] : []; }
     if (s === 'parties') return parties;
     if (s === 'requester') return requester;
-    throw new Error(`接收人写法无效：${s}`);
+    throw new I18nError('接收人写法无效：{value}', { value: `${s}` });
   };
   for (const s of resolvers) {
     if (s.startsWith('inform:')) one(s.slice(7)).forEach((u) => informed.add(u));
@@ -500,9 +515,9 @@ export function matchChains(rules, { decisionType, prefixes = [] }) {
  * rows 是当前 stage 各链的行。
  */
 export function routeQuestion(db, { questionId, decisionType, typeSource, prefixes = null, parties = [], at = now(), stage = 0 }) {
-  if (!DECISION_TYPES[decisionType]) throw new Error(`决策类型无效：${decisionType}`);
+  if (!DECISION_TYPES[decisionType]) throw new I18nError('决策类型无效：{type}', { type: `${decisionType}` });
   const q = db.one(`SELECT task_id, level FROM questions WHERE id=?`, questionId);
-  if (!q) throw new Error(`事项不存在：${questionId}`);
+  if (!q) throw new I18nError('事项不存在：{id}', { id: questionId });
   const key = routingKeyOf(db, q.task_id);
   const lead = leadOf(db, q.task_id);
   const rules = rulesOf(db, key);
@@ -551,17 +566,17 @@ export const TRANSFER_HINT_MARK = '　　·　不该你答？';
  * 答复登记成决定时范围是从正文里抽路径的，不剥的话一个 Python 项目的约定范围里会冒出 `src/cli.mjs`，
  * 复盘时规划器还会专门把它列成"无法确认的来由"。那一行是给人看的出路，不是事项内容。
  */
-export const stripTransferHint = (text) => { const s = String(text ?? ''); const i = s.indexOf(TRANSFER_HINT_MARK); return i < 0 ? s : s.slice(0, i).trimEnd(); };
-const transferHintFor = (questionId) => `
+export const stripTransferHint = (text) => { const s = String(text ?? ''); const i = indexOfMark(s, 'transferHint'); return i < 0 ? s : s.slice(0, i).trimEnd(); };
+// 按内容语言写（0.2.0）：标记走 marks.mjs（读的一侧两种都认），按钮名与看板一致（英文 Hand over / Not mine）
+const transferHintFor = (questionId, lang = 'zh') => `
 
-${TRANSFER_HINT_MARK}转给知道的人：node src/cli.mjs question transfer ${questionId} --to user:<成员id>`
-  + `（看板上这条事项右边有「转交」按钮）。转交之后你不再是接收人，但**这条仍然要有人答** —— 与「不归我」不是一回事。`;
+${markOf(lang, 'transferHint')}${tl(lang, '转给知道的人：node src/cli.mjs question transfer {id} --to user:<成员id>（看板上这条事项右边有「转交」按钮）。转交之后你不再是接收人，但**这条仍然要有人答** —— 与「不归我」不是一回事。', { id: questionId })}`;
 function appendTransferHint(db, questionId, decisionType) {
   // 交付不生成事项；冲突事项的答案空间是封闭的三选一（附议 / 弃权 / 重申），转交只会把裁定甩来甩去。
   if (decisionType === 'conflict' || decisionType === 'delivery') return;
   const row = db.one(`SELECT text FROM questions WHERE id=?`, questionId);
-  if (!row || String(row.text ?? '').includes(TRANSFER_HINT_MARK)) return;
-  db.run(`UPDATE questions SET text=? WHERE id=?`, `${row.text}${transferHintFor(questionId)}`, questionId);
+  if (!row || indexOfMark(row.text, 'transferHint') >= 0) return;
+  db.run(`UPDATE questions SET text=? WHERE id=?`, `${row.text}${transferHintFor(questionId, contentLang(db))}`, questionId);
 }
 
 /** 转下一行（超时 next）或转交后重算。返回新的解析结果；没有下一行 → null（保持挂起）。 */
@@ -584,19 +599,19 @@ export function advanceRoute(db, { questionId, at = now() }) {
  *     负责人可以降（他本来就能一人定）。
  * 转交后 route_due_at 按各行时限从此刻重算，而不是清零 —— 转交不该让 next / default 兜底失效。
  */
-export function transferQuestion(db, { questionId, to, byUserId, at = now() }) {
+export function transferQuestion(db, { questionId, to, byUserId, reason = null, at = now() }) {
   const q = db.one(`SELECT * FROM questions WHERE id=?`, questionId);
-  if (!q) throw new Error(`事项不存在：${questionId}`);
-  if (!['open', 'escalated'].includes(q.status)) throw new Error(`事项 ${questionId} 状态为 ${q.status}，无法转交`);
+  if (!q) throw new I18nError('事项不存在：{id}', { id: questionId });
+  if (!['open', 'escalated'].includes(q.status)) throw new I18nError('事项 {id} 状态为 {status}，无法转交', { id: questionId, status: q.status });
   const key = routingKeyOf(db, q.task_id);
   const lead = leadOf(db, q.task_id);
   const cur = JSON.parse(q.addressed_to || '[]');
   const byLead = byUserId === lead;
-  if (!byLead && !cur.includes(byUserId)) throw new Error('只有该事项的接收人或负责人能转交');
+  if (!byLead && !cur.includes(byUserId)) throw new I18nError('只有该事项的接收人或负责人能转交');
   const res = resolveRecipients(db, key, to, { at, lead });
-  if (!res.answerers.length) throw new Error('转交对象中没有可答复的成员');
+  if (!res.answerers.length) throw new I18nError('转交对象中没有可答复的成员');
   if (DECISION_TYPES[q.decision_type]?.level3 && q.decision_type !== 'conflict' && !res.answerers.includes(lead)) {
-    throw new Error(`${DECISION_TYPES[q.decision_type].label}事项转交后，接收人仍须包含负责人`);
+    throw new I18nError('{label}事项转交后，接收人仍须包含负责人', { label: DECISION_TYPES[q.decision_type].label });
   }
   // 上限事项的出路是"去任务页调上限"：转给改不了上限的人等于给他一条死路（他找不到入口，
   // 只能转回）。谁能改上限查路由表「预算上限」那一行，与 setLimit 同一个口径。
@@ -604,7 +619,10 @@ export function transferQuestion(db, { questionId, to, byUserId, at = now() }) {
     const cannot = res.answerers.filter((u) => !authorize(db, { taskId: q.task_id, decisionType: 'budget', userId: u, at }).ok);
     if (cannot.length) {
       const nm = (id) => db.one(`SELECT display_name FROM users WHERE id=?`, id)?.display_name ?? id;
-      throw new Error(`上限事项只能转给能改上限的人：${cannot.map(nm).join('、')} 改不了上限（路由表「${DECISION_TYPES.budget.label}」那一行里没有${cannot.length > 1 ? '他们' : '这个人'}）。能改上限的人列在设置页决策路由的「上限追加」那一行。可以请懂行的人帮着判断，但调上限、回这条事项还得那一行里的人来`);
+      // 「上限追加」写死在原文里（与 DECISION_TYPES.budget.label 同一个词），英文目录照译
+      throw cannot.length > 1
+        ? new I18nError('上限事项只能转给能改上限的人：{names} 改不了上限（路由表「上限追加」那一行里没有他们）。能改上限的人列在设置页决策路由的「上限追加」那一行。可以请懂行的人帮着判断，但调上限、回这条事项还得那一行里的人来', { names: cannot.map(nm).join('、') })
+        : new I18nError('上限事项只能转给能改上限的人：{names} 改不了上限（路由表「上限追加」那一行里没有这个人）。能改上限的人列在设置页决策路由的「上限追加」那一行。可以请懂行的人帮着判断，但调上限、回这条事项还得那一行里的人来', { names: cannot.map(nm).join('、') });
     }
   }
   const informed = JSON.parse(q.informed || '[]').filter((u) => !res.answerers.includes(u));
@@ -615,7 +633,7 @@ export function transferQuestion(db, { questionId, to, byUserId, at = now() }) {
     for (const r of route.rows) {
       const need = r.quorum === QUORUM_ALL ? null : Number(r.quorum);
       if (need !== null && need > res.answerers.length) {
-        if (!byLead) throw new Error(`该事项的法定人数为 ${need}，转交后接收人只有 ${res.answerers.length} 人；请转交给至少 ${need} 人，或由负责人转交`);
+        if (!byLead) throw new I18nError('该事项的法定人数为 {need}，转交后接收人只有 {n} 人；请转交给至少 {need} 人，或由负责人转交', { need, n: res.answerers.length });
         r.quorum = String(res.answerers.length);
         r.quorum_lowered_by = byUserId;
       }
@@ -629,7 +647,8 @@ export function transferQuestion(db, { questionId, to, byUserId, at = now() }) {
   }
   db.run(`UPDATE questions SET addressed_to=?, informed=?, route=?, route_due_at=? WHERE id=?`, JSON.stringify(res.answerers), JSON.stringify(informed), route ? JSON.stringify(route) : q.route, due, questionId);
   audit(db, { actorKind: 'user', actorId: byUserId, action: 'question_transferred', targetType: 'question', targetId: questionId,
-    payload: { from: cur, to: res.answerers, resolvers: to, dueAt: due } });
+    // 转交附一句理由（否则被转交的人不知道为什么转给自己）。可留空。
+    payload: { from: cur, to: res.answerers, resolvers: to, dueAt: due, reason: String(reason ?? '').trim().slice(0, 500) || null } });
   return { from: cur, to: res.answerers, dueAt: due };
 }
 
@@ -651,11 +670,21 @@ export function authorize(db, { taskId, decisionType, userId, prefixes = null, a
   for (const { chain } of chains) for (const r of chain) resolveRecipients(db, key, r.recipients, { requester: requesterOf(db, taskId), at, lead }).answerers.forEach((x) => rec.add(x));
   const ok = rec.has(userId);
   const nameOf = (id) => db.one(`SELECT display_name FROM users WHERE id=?`, id)?.display_name ?? id;
-  return { ok, why: ok ? 'routed' : `${DECISION_TYPES[decisionType]?.label ?? decisionType}的接收人不包含你（接收人：${[...rec].map(nameOf).join('、') || '无'}）`, recipients: [...rec] };
+  const label = DECISION_TYPES[decisionType]?.label ?? decisionType, names = [...rec].map(nameOf).join('、');
+  // label / names 给 requireAuthorized 拼可翻的报错用
+  return { ok, why: ok ? 'routed' : `${label}的接收人不包含你（接收人：${names || '无'}）`, recipients: [...rec], ...(ok ? {} : { label, names }) };
 }
 export function requireAuthorized(db, o) {
   const a = authorize(db, o);
-  if (!a.ok) throw new Error(`无权操作：${a.why}。可请接收人或负责人转交，或请负责人调整决策路由`);
+  if (!a.ok) {
+    // 报错按看的人的界面语言翻（I18nError）：几种原因各写一整句，不把中文原因当参数塞进去
+    if (a.why === '成员不存在') throw new I18nError('无权操作：成员不存在。可请接收人或负责人转交，或请负责人调整决策路由');
+    if (a.why === '该成员已停用') throw new I18nError('无权操作：该成员已停用。可请接收人或负责人转交，或请负责人调整决策路由');
+    if (a.why === '旁观者没有决策权限') throw new I18nError('无权操作：旁观者没有决策权限。可请接收人或负责人转交，或请负责人调整决策路由');
+    throw a.names
+      ? new I18nError('无权操作：{label}的接收人不包含你（接收人：{names}）。可请接收人或负责人转交，或请负责人调整决策路由', { label: `${a.label}`, names: a.names })
+      : new I18nError('无权操作：{label}的接收人不包含你（接收人：无）。可请接收人或负责人转交，或请负责人调整决策路由', { label: `${a.label}` });
+  }
   return a;
 }
 
@@ -674,16 +703,16 @@ export function knobsOf(db, key) {
   return { interveners: [...inter], ownership, ownershipQuorum, lead };
 }
 /** 改旋钮 = 改表：决策类型归属写 `*` 行 position 0 的收件人；介入者名单只能删（从所有行里去掉 user:<id>），加人要落到某个类型。 */
-export function setKnobs(db, { key, ownership = null, removeInterveners = [], userId, repoDirs = null }) {
+export function setKnobs(db, { key, ownership = null, removeInterveners = [], userId, repoDirs = null, lang = 'zh' }) {
   const rules = rulesOf(db, key).map((r) => ({ ...r }));
   if (ownership) for (const [t, recips] of Object.entries(ownership)) {
     const row = rules.find((r) => r.decision_type === t && r.scope === '*' && r.position === 0);
-    if (!row) throw new Error(`${DECISION_TYPES[t]?.label ?? t}缺少范围为 * 的规则`);
+    if (!row) throw new I18nError('{label}缺少范围为 * 的规则', { label: `${DECISION_TYPES[t]?.label ?? t}` });
     row.recipients = recips;
   }
   for (const u of removeInterveners) for (const r of rules) r.recipients = r.recipients.filter((s) => s !== `user:${u}` && s !== `inform:user:${u}`);
   const prof = profileOf(db, key);
-  saveRules(db, { key, rules: rules.map(({ id, project_id, template, created_at, ...r }) => r), template: prof.template, bindings: JSON.parse(prof.bindings || '{}'), userId, repoDirs });
+  saveRules(db, { key, rules: rules.map(({ id, project_id, template, created_at, ...r }) => r), template: prof.template, bindings: JSON.parse(prof.bindings || '{}'), userId, repoDirs, lang });
   return knobsOf(db, key);
 }
 

@@ -16,13 +16,16 @@
 import { newId, now, audit, insertEdge } from '../db/db.mjs';
 import { routeQuestion } from './routing.mjs';
 import { getParam, setParam } from './params.mjs';
+import { tl, contentLang } from '../i18n/index.mjs';
+import { markOf } from '../i18n/marks.mjs';
 
 export const HANDBACK_KEY = 'task.handback';
 export const VERIFY_FAILED_MARK = '【验收没过】';
 export const DIRTY_MARK = '【合并卡住】';
 
 const BY = { kind: 'agent', id: 'handback' };
-const HOW_TO_ABORT = '不要这个任务了：到任务页点「中止」。这一步不可逆，答复里写"中止"不算数，得你自己去点。';
+const HOW_TO_ABORT = (L) => tl(L, '不要这个任务了：到任务页点「中止」。这一步不可逆，答复里写"中止"不算数，得你自己去点。');
+const NO_AI = (L) => tl(L, '（这条是系统按规则直接生成的，没有经过 AI。）');
 
 /** 这个任务上还开着的交回事项（同一种只挂一条）。 */
 export function openHandback(db, taskId, kind = null) {
@@ -52,34 +55,35 @@ const tailOf = (s, n = 20) => String(s ?? '').trim().split('\n').slice(-n).join(
 
 /** 任务级验收没过。 */
 export function raiseVerifyFailed(db, { taskId, verification: v, at = now() }) {
+  const L = contentLang(db);
   const task = db.one(`SELECT title FROM tasks WHERE id=?`, taskId);
-  const cmd = Array.isArray(v?.argv) ? v.argv.join(' ') : '（没有命令）';
-  const code = v?.code === null || v?.code === undefined ? '（没跑起来）' : v.code;
-  const detail = `验收命令：${cmd}\n退出码：${code}${v?.timedOut ? '（超时）' : ''}\n输出尾部：\n${tailOf(v?.tail) || '（空）'}`;
-  const text = `${VERIFY_FAILED_MARK}任务「${task?.title ?? taskId}」的步骤都做完了，但任务的验收没过，所以没有进入签收。\n\n`
+  const cmd = Array.isArray(v?.argv) ? v.argv.join(' ') : tl(L, '（没有命令）');
+  const code = v?.code === null || v?.code === undefined ? tl(L, '（没跑起来）') : v.code;
+  const detail = tl(L, '验收命令：{cmd}\n退出码：{code}{timeout}\n输出尾部：\n{tail}',
+    { cmd, code, timeout: v?.timedOut ? tl(L, '（超时）') : '', tail: tailOf(v?.tail) || tl(L, '（空）') });
+  const text = `${markOf(L, 'verifyFailed')}${tl(L, '任务「{title}」的步骤都做完了，但任务的验收没过，所以没有进入签收。', { title: task?.title ?? taskId })}\n\n`
     + `${detail}\n\n`
-    + `（这条是系统按规则直接生成的，没有经过 AI。）\n\n`
-    + `怎么答：\n`
-    + `· 想先看看再决定：到任务页看「改动」（这个任务改了哪些代码）和「日志」（验收的完整输出），看完再回来答。\n`
-    + `· 让 AI 接着修：直接在下面写一句你的判断或要求（比如"是测试写错了"、"先把构建修好"），只写"接着修"也行。`
-    + `你写的话会连同上面的失败输出一起交给 AI，它重新规划、改完再验收。\n`
-    + `· ${HOW_TO_ABORT}`;
+    + `${NO_AI(L)}\n\n`
+    + `${tl(L, '怎么答：')}\n`
+    + `· ${tl(L, '想先看看再决定：到任务页看「改动」（这个任务改了哪些代码）和「日志」（验收的完整输出），看完再回来答。')}\n`
+    + `· ${tl(L, '让 AI 接着修：直接在下面写一句你的判断或要求（比如"是测试写错了"、"先把构建修好"），只写"接着修"也行。你写的话会连同上面的失败输出一起交给 AI，它重新规划、改完再验收。')}\n`
+    + `· ${HOW_TO_ABORT(L)}`;
   return raise(db, { taskId, kind: 'verify_failed', text, detail, at });
 }
 
 /** 签收之后、合并之前，工作区里还有没提交的改动（且不全是构建产物）。 */
 export function raiseDirtyWorkspace(db, { taskId, files, at = now() }) {
+  const L = contentLang(db);
   const task = db.one(`SELECT title FROM tasks WHERE id=?`, taskId);
-  const list = files.slice(0, 30).join('\n') + (files.length > 30 ? `\n……共 ${files.length} 处` : '');
-  const detail = `签收之后工作区里还有没提交的改动（不在签收过的那一版里）：\n${list}`;
-  const text = `${DIRTY_MARK}任务「${task?.title ?? taskId}」已经签收，但它的工作区里还有没提交的改动，系统不替你决定要不要它们，所以先没合并。\n\n`
+  const list = files.slice(0, 30).join('\n') + (files.length > 30 ? `\n${tl(L, '……共 {n} 处', { n: files.length })}` : '');
+  const detail = `${tl(L, '签收之后工作区里还有没提交的改动（不在签收过的那一版里）：')}\n${list}`;
+  const text = `${markOf(L, 'mergeBlocked')}${tl(L, '任务「{title}」已经签收，但它的工作区里还有没提交的改动，系统不替你决定要不要它们，所以先没合并。', { title: task?.title ?? taskId })}\n\n`
     + `${detail}\n\n`
-    + `（这条是系统按规则直接生成的，没有经过 AI。）\n\n`
-    + `怎么答：\n`
-    + `· 让 AI 处理：直接写一句（比如"都不要"、"把 README 的改动提交上"），只写"让 AI 处理"也行；`
-    + `拿不准某个文件是什么，就写"先看看这几个文件是什么，数据文件别删"。\n`
-    + `　AI 会照你的话处理。只丢掉的话，签过的那一版一个字不变、不用重新签收；提交了新内容，才会重新请你签收。\n`
-    + `· ${HOW_TO_ABORT}`;
+    + `${NO_AI(L)}\n\n`
+    + `${tl(L, '怎么答：')}\n`
+    + `· ${tl(L, '让 AI 处理：直接写一句（比如"都不要"、"把 README 的改动提交上"），只写"让 AI 处理"也行；拿不准某个文件是什么，就写"先看看这几个文件是什么，数据文件别删"。')}\n`
+    + `　${tl(L, 'AI 会照你的话处理。只丢掉的话，签过的那一版一个字不变、不用重新签收；提交了新内容，才会重新请你签收。')}\n`
+    + `· ${HOW_TO_ABORT(L)}`;
   return raise(db, { taskId, kind: 'dirty_workspace', text, detail, at });
 }
 
@@ -92,37 +96,45 @@ export const ADVANCE_FAILED_MARK = '【合并出错】';
 export function raiseAdvanceFailed(db, { projectId, taskId = null, error, attempts, at = now() }) {
   const host = taskId ?? db.one(`SELECT id FROM tasks WHERE project_id=? ORDER BY COALESCE(project_order,0) LIMIT 1`, projectId)?.id;
   if (!host) return { questionId: null };
+  const L = contentLang(db);
   const p = db.one(`SELECT title FROM projects WHERE id=?`, projectId);
   const task = taskId ? db.one(`SELECT title FROM tasks WHERE id=?`, taskId) : null;
-  const detail = `最近一次的错误：${String(error ?? '').slice(0, 600)}`;
-  const text = `${ADVANCE_FAILED_MARK}项目「${p?.title ?? projectId}」${task ? `在合并任务「${task.title}」时` : '在往前推进时'}反复出错，已经自动重试了 ${attempts} 次。\n\n`
+  const detail = tl(L, '最近一次的错误：{error}', { error: String(error ?? '').slice(0, 600) });
+  const text = `${markOf(L, 'advanceFailed')}${tl(L, '项目「{project}」{when}反复出错，已经自动重试了 {n} 次。', {
+    project: p?.title ?? projectId, when: task ? tl(L, '在合并任务「{task}」时', { task: task.title }) : tl(L, '在往前推进时'), n: attempts })}\n\n`
     + `${detail}\n\n`
-    + `这多半是系统或服务器上的问题，不是谁的疏忽，AI 也修不了。系统会隔一段时间自己再试，但不再指望它自己好。（这条是系统按规则直接生成的，没有经过 AI。）\n\n`
-    + `怎么答：\n`
-    + `· 你不是管理员：点「转交」把这条交给管理员，上面的错误原文就是给管理员看的。\n`
-    + `· 原因已经排除了（比如管理员说磁盘清出来了）：回一句"再试"。系统收到立刻重试；还不行的话，会接着隔一段时间自己试，又失败几次后再问一次。\n`
-    + `· ${HOW_TO_ABORT}`;
+    + `${tl(L, '这多半是系统或服务器上的问题，不是谁的疏忽，AI 也修不了。系统会隔一段时间自己再试，但不再指望它自己好。')}${NO_AI(L)}\n\n`
+    + `${tl(L, '怎么答：')}\n`
+    + `· ${tl(L, '你不是管理员：点「转交」把这条交给管理员，上面的错误原文就是给管理员看的。')}\n`
+    + `· ${tl(L, '原因已经排除了（比如管理员说磁盘清出来了）：回一句"再试"。系统收到立刻重试；还不行的话，会接着隔一段时间自己试，又失败几次后再问一次。')}\n`
+    + `· ${HOW_TO_ABORT(L)}`;
   return raise(db, { taskId: host, kind: 'advance_failed', text, detail, at });
 }
 
 export const REPLAN_FAILED_MARK = '【改计划没成】';
+// 改计划没成时人回"算了"= 撤回那条修正、照原计划做（中英都认）
+const DROP_RE = /^(算了|不改了|不用了|never ?mind|forget it|drop it|leave it)/i;
 
 /**
  * 人发来的修正 / 新指令，重规划器几次都没产出合规的新计划（原来：只退出、那条消息原样挂着、30 分钟后停等报警；
  * 人回 A 只会让它拿同一条话再失败一次）。答复 = 换个说法：原来那条作废，换成人这次写的；回"算了" = 原来那条作废、照原计划做。
  */
 export function raiseReplanFailed(db, { taskId, messageId, why, at = now() }) {
+  const L = contentLang(db);
   const task = db.one(`SELECT title FROM tasks WHERE id=?`, taskId);
   const m = messageId ? db.one(`SELECT body, sender_id FROM messages WHERE id=?`, messageId) : null;
   const who = m?.sender_id ? db.one(`SELECT display_name FROM users WHERE id=?`, m.sender_id)?.display_name : null;
-  const detail = `原来那条话${who ? `（${who} 发的）` : ''}：\n${String(m?.body ?? '（找不到原文）').slice(0, 1500)}\n\n没改成的原因：${String(why ?? '（没有记下）').slice(0, 600)}`;
-  const text = `${REPLAN_FAILED_MARK}发给任务「${task?.title ?? taskId}」的一条修正，AI 试了几次都没能改成一份合规的新计划，任务停在这里。\n\n`
+  const detail = tl(L, '原来那条话{who}：\n{body}\n\n没改成的原因：{why}', {
+    who: who ? tl(L, '（{name} 发的）', { name: who }) : '',
+    body: String(m?.body ?? tl(L, '（找不到原文）')).slice(0, 1500),
+    why: String(why ?? tl(L, '（没有记下）')).slice(0, 600) });
+  const text = `${markOf(L, 'replanFailed')}${tl(L, '发给任务「{title}」的一条修正，AI 试了几次都没能改成一份合规的新计划，任务停在这里。', { title: task?.title ?? taskId })}\n\n`
     + `${detail}\n\n`
-    + `（这条是系统按规则直接生成的，没有经过 AI。）\n\n`
-    + `怎么答：\n`
-    + `· 换个说法再给它一次：直接在下面写，最好说清楚要改什么、哪些不动。原来那条作废，换成你这次写的。\n`
-    + `· 不改了：回"算了"。原来那条作废，任务照原来的计划接着做。\n`
-    + `· ${HOW_TO_ABORT}`;
+    + `${NO_AI(L)}\n\n`
+    + `${tl(L, '怎么答：')}\n`
+    + `· ${tl(L, '换个说法再给它一次：直接在下面写，最好说清楚要改什么、哪些不动。原来那条作废，换成你这次写的。')}\n`
+    + `· ${tl(L, '不改了：回"算了"。原来那条作废，任务照原来的计划接着做。')}\n`
+    + `· ${HOW_TO_ABORT(L)}`;
   return raise(db, { taskId, kind: 'replan_failed', text, detail, at, extra: { messageId } });
 }
 
@@ -133,11 +145,12 @@ export function handbackHook(db, { question, finalBody, by, messageId, at }) {
   const taskId = question.task_id;
   const h = getParam(db, taskId, HANDBACK_KEY);
   if (!h || h.questionId !== question.id) return null;
+  const L = contentLang(db);
   const body = String(finalBody ?? '').trim();
   setParam(db, { taskId, key: HANDBACK_KEY, value: null, by: BY, governance: 'execution' });
   if (/^(中止|放弃|不要了|abort)/i.test(body)) {
     audit(db, { actorKind: 'user', actorId: by, action: 'handback_answer_abort', targetType: 'task', targetId: taskId,
-      payload: { questionId: question.id, kind: h.kind, why: '答复要求中止，这一步不可逆，留给人在任务页做' } });
+      payload: { questionId: question.id, kind: h.kind, why: tl(L, '答复要求中止，这一步不可逆，留给人在任务页做') } });
     return { handled: false, abort: true };
   }
   if (h.kind === 'advance_failed') {
@@ -150,18 +163,18 @@ export function handbackHook(db, { question, finalBody, by, messageId, at }) {
     // 原来那条不再处理：标成已消费（不删 —— 审计与出处边都还指着它）。
     db.run(`UPDATE messages SET consumed_at=? WHERE id=? AND consumed_at IS NULL`, at, h.messageId);
     audit(db, { actorKind: 'user', actorId: by, action: 'messages_consumed', targetType: 'task', targetId: taskId,
-      payload: { messageIds: [h.messageId], why: `改计划没成，人${/^(算了|不改了|不用了)/.test(body) ? '撤回了这条' : '换了个说法'}（事项 ${question.id}）` } });
-    if (/^(算了|不改了|不用了)/.test(body)) {
+      payload: { messageIds: [h.messageId], why: tl(L, '改计划没成，人{what}（事项 {id}）', { what: DROP_RE.test(body) ? tl(L, '撤回了这条') : tl(L, '换了个说法'), id: question.id }) } });
+    if (DROP_RE.test(body)) {
       // 没有新消息 —— 记一条 task_resumed 当触发动作，守护进程才会把任务拉起来照原计划做。
       audit(db, { actorKind: 'user', actorId: by, action: 'task_resumed', targetType: 'task', targetId: taskId,
         payload: { via: 'handback:replan_failed', dropped: h.messageId } });
       return { handled: true, dropped: true, kind: h.kind };
     }
   }
-  const mark = { dirty_workspace: DIRTY_MARK, replan_failed: REPLAN_FAILED_MARK }[h.kind] ?? VERIFY_FAILED_MARK;
+  const mark = markOf(L, { dirty_workspace: 'mergeBlocked', replan_failed: 'replanFailed' }[h.kind] ?? 'verifyFailed');
   const tok = messageId ? db.one(`SELECT token_id FROM messages WHERE id=?`, messageId)?.token_id ?? null : null;
   const mid = newId('m');
-  const reason = `${mark}${body || '（没有补充）'}\n\n—— 系统附（不由模型生成）——\n${h.detail ?? ''}`;
+  const reason = `${mark}${body || tl(L, '（没有补充）')}\n\n${tl(L, '—— 系统附（不由模型生成）——')}\n${h.detail ?? ''}`;
   db.run(`INSERT INTO messages (id,task_id,sender_id,body,kind,kind_source,urgency,urgency_source,trust_label,token_id,received_at)
           VALUES (?,?,?,?,'correction','explicit','urgent','explicit','user-authenticated',?,?)`, mid, taskId, by, reason, tok, at);
   if (messageId) insertEdge(db, mid, messageId, 'derived_from', at);

@@ -7,6 +7,7 @@ import { PROVIDERS } from './providers.mjs';
 import { costMicroUsd, EMPTY_USAGE, addUsage, tierEntry, clampEffort, TIER_BINDING, MODEL_CATALOG, VENDORS } from './canonical.mjs';
 import { headersFor } from './registry.mjs';
 import { ProviderError, ConfigError, isInfraError } from '../core/errors.mjs';
+import { I18nError } from '../i18n/index.mjs';
 
 // ── 厂商侧重试 ──────────────────────────────────────────────────────────────
 // 曾出现过：anthropic/claude-opus-5 中途开始回 403，异常直接炸穿到 CLI。
@@ -184,8 +185,7 @@ export class LlmClient {
     const reported = resp.reportedMicroUsd;
     const useReported = r.billing === 'reported' && reported != null;
     if (r.billing === 'reported' && reported == null && !r.pricing) {
-      throw new Error(`${r.key}：服务商声明按回报计费，但本次响应无 usage.cost，` +
-        `且目录项没有兜底单价 —— 拒绝按 0 入账（预算闸门会因此失效）`);
+      throw new I18nError('{key}：服务商声明按回报计费，但本次响应无 usage.cost，且目录项没有兜底单价 —— 拒绝按 0 入账（预算闸门会因此失效）', { key: r.key });
     }
     this.ledger.push({
       model: r.key, vendor: r.vendorId, tier,

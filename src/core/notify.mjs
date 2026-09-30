@@ -13,6 +13,7 @@
 
 import { spawnSync } from 'node:child_process';
 import { audit } from '../db/db.mjs';
+import { tl, I18nError } from '../i18n/index.mjs';
 
 export const CHANNEL_ENV = {
   ntfy: 'NTFY_URL',              // 例：https://ntfy.sh/<topic>
@@ -61,7 +62,7 @@ export function buildRequest(channel, { title, text }) {
       return { url: channel.target, init: { method: 'POST', headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ msgtype: 'text', text: { content: body } }) } };
     default:
-      throw new Error(`不认识的通道：${channel.kind}`);
+      throw new I18nError('不认识的通道：{kind}', { kind: channel.kind });
   }
 }
 
@@ -103,39 +104,42 @@ export async function notify(db, { taskId, kind, title, text, ref = null, channe
   return receipts;
 }
 
-/** 退出原因 → 一条通知。只覆盖"需要人做点什么"的那几种；complete 也推，好让人知道可以签收了。 */
-export function outcomeNotice(r, taskId) {
+/** 退出原因 → 一条通知。只覆盖"需要人做点什么"的那几种；complete 也推，好让人知道可以签收了。
+ *  `lang`：部署级广播，调用方传 contentLang(db)（0.2.0）。 */
+export function outcomeNotice(r, taskId, lang = 'zh') {
+  const L = lang;
   const k = r.kind;
   if (k === 'suspended') {
     const q = r.questions?.[0];
-    return { title: `[SuperIntern] 第 ${q?.level ?? '?'} 级问题在等你`, ref: q?.id ?? null,
-      text: `${String(q?.text ?? '').slice(0, 400)}\n\n回答：node src/cli.mjs answer ${q?.id} "..."（任务 ${taskId}）` };
+    return { title: `[SuperIntern] ${tl(L, '第 {level} 级问题在等你', { level: q?.level ?? '?' })}`, ref: q?.id ?? null,
+      text: `${String(q?.text ?? '').slice(0, 400)}\n\n${tl(L, '回答：{cmd}（任务 {taskId}）', { cmd: `node src/cli.mjs answer ${q?.id} "..."`, taskId })}` };
   }
-  if (k === 'limit_breached') return { title: `[SuperIntern] 硬上限触顶，任务冻结`, ref: r.questionId ?? null,
-    text: `${r.breach?.human ?? ''}\n加额：node src/cli.mjs limit ${taskId} --${String(r.breach?.key ?? '').replace('limit.', '')} <新值>` };
-  if (k === 'limit_hard_failed') return { title: `[SuperIntern] 硬边界触顶（不支持加额）`, ref: null, text: `${r.breach?.human ?? ''}\n${r.why ?? ''}` };
-  if (k === 'provider_error' && r.error?.config) return { title: `[SuperIntern] 模型配置有问题，任务停了`, ref: null,
-    text: `${String(r.error.message ?? '').slice(0, 300)}\n没有发出请求，节点不计重试。改绑：node src/cli.mjs bind set ${r.error.tier ?? '<tier>'}=<服务商/模型>，或看板"设置 → 模型分配"` };
+  if (k === 'limit_breached') return { title: `[SuperIntern] ${tl(L, '硬上限触顶，任务冻结')}`, ref: r.questionId ?? null,
+    text: `${r.breach?.human ?? ''}\n${tl(L, '加额：{cmd} <新值>', { cmd: `node src/cli.mjs limit ${taskId} --${String(r.breach?.key ?? '').replace('limit.', '')}` })}` };
+  if (k === 'limit_hard_failed') return { title: `[SuperIntern] ${tl(L, '硬边界触顶（不支持加额）')}`, ref: null, text: `${r.breach?.human ?? ''}\n${r.why ?? ''}` };
+  if (k === 'provider_error' && r.error?.config) return { title: `[SuperIntern] ${tl(L, '模型配置有问题，任务停了')}`, ref: null,
+    text: `${String(r.error.message ?? '').slice(0, 300)}\n${tl(L, '没有发出请求，节点不计重试。改绑：node src/cli.mjs bind set {tier}=<服务商/模型>，或看板"设置 → 模型分配"', { tier: r.error.tier ?? '<tier>' })}` };
   if (k === 'provider_error') {
     // 可重试的（429 / 5xx / 网络，客户端已经重试到耗尽）守护进程会退避再拉，人不一定要动；不可重试的（401 / 403）才是"要人来"。
     // 建议的是 bind set（进库）而不是 run --bind：一次性覆盖不进库，守护进程下次拉起用的还是库里的绑定，会撞同一个错。
     const e = r.error ?? {};
-    const head = `${e.vendor}/${e.model}${e.status ? ` HTTP ${e.status}` : '（网络）'}：${String(e.message ?? '').slice(0, 200)}`;
-    const rebind = `node src/cli.mjs bind set ${e.tier ?? '<tier>'}=<服务商/模型>，或看板"设置 → 模型分配"（下个步骤起生效）`;
+    const head = `${e.vendor}/${e.model}${e.status ? ` HTTP ${e.status}` : tl(L, '（网络）')}${L === 'en' ? ': ' : '：'}${String(e.message ?? '').slice(0, 200)}`;
+    const rebind = tl(L, 'node src/cli.mjs bind set {tier}=<服务商/模型>，或看板"设置 → 模型分配"（下个步骤起生效）', { tier: e.tier ?? '<tier>' });
     return e.retryable
-      ? { title: `[SuperIntern] 厂商暂时不可用，任务停了`, ref: null,
-        text: `${head}\n节点不计重试。开着守护进程的话它会隔一阵自动再拉；一直不好就换一家：${rebind}` }
-      : { title: `[SuperIntern] 厂商拒绝了请求，需换绑或检查 key`, ref: null,
-        text: `${head}\n节点不计重试；守护进程不会自己重试这种错，改绑或换 key 后它会立刻再拉。检查这家的 key / 权限（看板"设置 → 服务商"的"检查"），或换一家：${rebind}` };
+      ? { title: `[SuperIntern] ${tl(L, '厂商暂时不可用，任务停了')}`, ref: null,
+        text: `${head}\n${tl(L, '节点不计重试。开着守护进程的话它会隔一阵自动再拉；一直不好就换一家：{rebind}', { rebind })}` }
+      : { title: `[SuperIntern] ${tl(L, '厂商拒绝了请求，需换绑或检查 key')}`, ref: null,
+        text: `${head}\n${tl(L, '节点不计重试；守护进程不会自己重试这种错，改绑或换 key 后它会立刻再拉。检查这家的 key / 权限（看板"设置 → 服务商"的"检查"），或换一家：{rebind}', { rebind })}` };
   }
-  if (k === 'revision_pending') return { title: `[SuperIntern] 修正方案要你批准`, ref: null,
-    text: `${String(r.gate ?? '').slice(0, 300)}\n看：node src/cli.mjs revision ${taskId}` };
-  if (k === 'verify_failed') return { title: `[SuperIntern] 任务级验收没过`, ref: null,
+  if (k === 'revision_pending') return { title: `[SuperIntern] ${tl(L, '修正方案要你批准')}`, ref: null,
+    text: `${String(r.gate ?? '').slice(0, 300)}\n${tl(L, '看：{cmd}', { cmd: `node src/cli.mjs revision ${taskId}` })}` };
+  if (k === 'verify_failed') return { title: `[SuperIntern] ${tl(L, '任务级验收没过')}`, ref: null,
     text: `${r.verification?.argv?.join(' ')} exit=${r.verification?.code}\n${String(r.verification?.tail ?? '').split('\n').slice(-5).join('\n')}` };
   // 已经 done 的任务再 run 一次也会以 complete 收尾，但那不是"刚做完"—— 没有工作区快照就不推
   if (k === 'complete' && !r.workspace) return null;
-  if (k === 'complete') return { title: `[SuperIntern] 任务完成，等签收`, ref: null,
-    text: `${r.completed?.length ?? 0} 个节点，产物在 ${r.workspace?.branch} @ ${r.workspace?.head?.slice(0, 8)}\n签收：node src/cli.mjs signoff ${taskId} --accept | --reject "..."\n交付：node src/cli.mjs deliver ${taskId} --remote <url> [--pr]` };
+  if (k === 'complete') return { title: `[SuperIntern] ${tl(L, '任务完成，等签收')}`, ref: null,
+    text: tl(L, '{n} 个节点，产物在 {branch} @ {head}\n签收：node src/cli.mjs signoff {taskId} --accept | --reject "..."\n交付：node src/cli.mjs deliver {taskId} --remote <url> [--pr]',
+      { n: r.completed?.length ?? 0, branch: `${r.workspace?.branch}`, head: `${r.workspace?.head?.slice(0, 8)}`, taskId }) };
   return null;
 }
 

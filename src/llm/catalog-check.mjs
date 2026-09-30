@@ -15,6 +15,7 @@ import { PROVIDERS } from './providers.mjs';
 import { headersFor, listEndpointModels, ADAPTER_DEFAULTS } from './registry.mjs';
 import { audit, now } from '../db/db.mjs';
 import { dueAfter, isValidAfter } from '../core/routing.mjs';
+import { I18nError, tl, N_ } from '../i18n/index.mjs';
 
 /** 归一化模型名用于跨表匹配：去掉日期后缀与 ./- 差异 */
 export const normId = (s) => String(s).replace(/-?20\d{6}$/, '').replace(/[.-]/g, '').toLowerCase();
@@ -59,14 +60,15 @@ export async function probeModel(entry, { vendors = VENDORS, env = process.env, 
     if (res.ok) return 'ok';
     const j = await res.json().catch(() => ({}));
     return `HTTP ${res.status}: ${String(j.error?.message ?? '').slice(0, 90)}`;
-  } catch (e) { return `请求失败：${e.message}`; }
+  } catch (e) { return `ERR: ${e.message}`; }
 }
 
 /**
  * 全目录检查。返回 { checkedAt, probe, keys, entries: [{ key, model, vendor, findings: [{ level, msg }] }], warnings, fetchErrors }。
  * level：OK / SKIP / INFO / WARN / FAIL；warnings 只数 WARN + FAIL。`only`：只查某个 vendor。
  */
-export async function checkCatalog({ catalog = MODEL_CATALOG, vendors = VENDORS, env = process.env, fetchFn = globalThis.fetch, probe = false, only = null, at = now() } = {}) {
+// 发现写进审计、给所有人看：按部署的内容语言写（调用方传 contentLang(db)）
+export async function checkCatalog({ catalog = MODEL_CATALOG, vendors = VENDORS, env = process.env, fetchFn = globalThis.fetch, probe = false, only = null, at = now(), lang = 'zh' } = {}) {
   const fetchErrors = [];
   const vendorIds = [...new Set(Object.values(catalog).map((e) => e.vendor))].filter((v) => !only || v === only);
   const lists = Object.fromEntries(await Promise.all(vendorIds.map(async (v) => {
@@ -76,67 +78,70 @@ export async function checkCatalog({ catalog = MODEL_CATALOG, vendors = VENDORS,
     return [v, r];
   })));
   const or = await openRouterTable({ fetchFn });
-  if (or.error) fetchErrors.push(`OpenRouter 定价表：${or.error}`);
+  if (or.error) fetchErrors.push(tl(lang, 'OpenRouter 定价表：{error}', { error: or.error }));
   const entries = [];
   let warnings = 0;
   for (const [key, entry] of Object.entries(catalog)) {
     if (only && entry.vendor !== only) continue;
     const findings = [];
-    const say = (level, msg) => { if (level === 'WARN' || level === 'FAIL') warnings++; findings.push({ level, msg }); };
+    const say = (level, tpl, params) => { const msg = tl(lang, tpl, params); if (level === 'WARN' || level === 'FAIL') warnings++; findings.push({ level, msg }); };
     const v = vendors[entry.vendor];
     if (v?.gateway) {
-      say('SKIP', '网关服务商：按回报计费，不做模型级单价漂移检查');
-      say(entry.providerPrefs ? 'OK' : 'SKIP', entry.providerPrefs ? `已钉上游偏好 ${JSON.stringify(entry.providerPrefs)}` : '未钉上游：走网关默认路由（上游身份 / 量化 / 上下文上限随调用浮动，属用户选择）');
+      say('SKIP', N_('网关服务商：按回报计费，不做模型级单价漂移检查'));
+      if (entry.providerPrefs) say('OK', N_('已钉上游偏好 {prefs}'), { prefs: JSON.stringify(entry.providerPrefs) });
+      else say('SKIP', N_('未钉上游：走网关默认路由（上游身份 / 量化 / 上下文上限随调用浮动，属用户选择）'));
       entries.push({ key, model: entry.model, vendor: entry.vendor, findings });
       continue;
     }
     // A. 存在性
     const list = lists[entry.vendor];
-    if (!list?.ids) say('SKIP', list?.noKey ? `${entry.vendor} 无 key，跳过 /models 存在性检查` : `${entry.vendor} /models 没拉到，跳过存在性检查`);
-    else if (list.ids.includes(entry.model)) say('OK', '在厂商 /models 列表中');
-    else say('WARN', `**不在** ${entry.vendor} 的 /models 列表中 —— 可能是废弃别名或已下线（旧名有时仍能调通、由别的模型代答）`);
+    if (!list?.ids) say('SKIP', list?.noKey ? N_('{vendor} 无 key，跳过 /models 存在性检查') : N_('{vendor} /models 没拉到，跳过存在性检查'), { vendor: entry.vendor });
+    else if (list.ids.includes(entry.model)) say('OK', N_('在厂商 /models 列表中'));
+    else say('WARN', N_('**不在** {vendor} 的 /models 列表中 —— 可能是废弃别名或已下线（旧名有时仍能调通、由别的模型代答）'), { vendor: entry.vendor });
     // B. 可调用性
     if (probe) {
       const r = await probeModel(entry, { vendors, env, fetchFn });
-      if (r === 'ok') say('OK', '最小请求可调通');
-      else if (r === 'no-key') say('SKIP', '无 key，跳过实调');
-      else say('FAIL', `实调失败 —— ${r}`);
+      if (r === 'ok') say('OK', N_('最小请求可调通'));
+      else if (r === 'no-key') say('SKIP', N_('无 key，跳过实调'));
+      else say('FAIL', N_('实调失败 —— {r}'), { r });
     }
     // D. 窗口（厂商 API 给的优先）
     const vendorLimit = list?.limits?.get(entry.model) ?? null;
     const orRow = or.table?.get(normId(entry.model)) ?? null;
     const refWindow = vendorLimit ?? orRow?.context ?? null;
+    const refName = vendorLimit ? tl(lang, '厂商 API') : 'OpenRouter';
     if (entry.contextWindow && refWindow && Math.abs(entry.contextWindow - refWindow) / refWindow > 0.05) {
-      say('WARN', `窗口不一致：目录 ${entry.contextWindow} vs ${vendorLimit ? '厂商 API' : 'OpenRouter'} ${refWindow}`);
-    } else if (entry.contextWindow && refWindow) say('OK', `窗口 ${entry.contextWindow} 与${vendorLimit ? '厂商 API' : ' OpenRouter'}一致`);
-    else if (!entry.contextWindow && refWindow) say('INFO', `目录未填 contextWindow；${vendorLimit ? '厂商 API' : 'OpenRouter'} 称 ${refWindow}（核实厂商文档后再填，limits.context_tokens 会按它封顶）`);
+      say('WARN', N_('窗口不一致：目录 {mine} vs {ref} {theirs}'), { mine: entry.contextWindow, ref: refName, theirs: refWindow });
+    } else if (entry.contextWindow && refWindow) say('OK', N_('窗口 {mine} 与 {ref} 一致'), { mine: entry.contextWindow, ref: refName });
+    else if (!entry.contextWindow && refWindow) say('INFO', N_('目录未填 contextWindow；{ref} 称 {theirs}（核实厂商文档后再填，limits.context_tokens 会按它封顶）'), { ref: refName, theirs: refWindow });
     // C. 单价
-    if (!orRow) { say('SKIP', 'OpenRouter 无此模型，单价无法比对'); entries.push({ key, model: entry.model, vendor: entry.vendor, findings }); continue; }
+    if (!orRow) { say('SKIP', N_('OpenRouter 无此模型，单价无法比对')); entries.push({ key, model: entry.model, vendor: entry.vendor, findings }); continue; }
     const ratios = [], diffs = [];
     for (const f of ['input', 'output', 'cacheRead', 'cacheWrite']) {
       const mine = entry.pricing?.[f], theirs = orRow[f];
       if (mine == null || theirs == null) continue;
       if (Math.abs(mine - theirs) / Math.max(theirs, 1e-9) > 0.02) {
         ratios.push(mine / theirs);
-        diffs.push(`与网关挂牌价不一致 ${f}: 目录 $${mine} vs OpenRouter $${theirs.toFixed(4)}（${(mine / theirs).toFixed(2)}×）`);
+        diffs.push([N_('与网关挂牌价不一致 {field}: 目录 ${mine} vs OpenRouter ${theirs}（{ratio}×）'), { field: f, mine, theirs: theirs.toFixed(4), ratio: (mine / theirs).toFixed(2) }]);
       }
     }
     // 各项差值完全一致 = 两边报的不是同一个价格档（实测：OpenRouter 给 luna / terra 挂的是批量档价）。
     // 那不是目录过期，降为 INFO 不计入告警；只有比值不一致（某一项单独变了）才是漂移的指纹。
     const fingerprint = ratios.length >= 2 && Math.max(...ratios) - Math.min(...ratios) < 0.01;
-    for (const m of diffs) say(fingerprint ? 'INFO' : 'WARN', m);
-    if (fingerprint) say('SKIP', `↑ 上面 ${ratios.length} 项差值完全一致（${ratios[0].toFixed(2)}×）—— 这是"两边报的不是同一个价格档"的指纹，不是目录过期。先去厂商官网核，别急着改目录`);
-    if (orRow.expires) say('WARN', `厂商已标注下线日期：${orRow.expires}`);
+    for (const [tpl, p] of diffs) say(fingerprint ? 'INFO' : 'WARN', tpl, p);
+    if (fingerprint) say('SKIP', N_('↑ 上面 {n} 项差值完全一致（{ratio}×）—— 这是"两边报的不是同一个价格档"的指纹，不是目录过期。先去厂商官网核，别急着改目录'), { n: ratios.length, ratio: ratios[0].toFixed(2) });
+    if (orRow.expires) say('WARN', N_('厂商已标注下线日期：{date}'), { date: orRow.expires });
     const declaredEfforts = (entry.efforts ?? ['low', 'medium', 'high']).length > 0;
-    if (declaredEfforts !== orRow.efforts) say('WARN', `推理强度支持声明不一致：目录=${declaredEfforts ? '支持' : '不支持'}，OpenRouter=${orRow.efforts ? '支持' : '不支持'}`);
+    const yn = (b) => (b ? tl(lang, '支持') : tl(lang, '不支持'));
+    if (declaredEfforts !== orRow.efforts) say('WARN', N_('推理强度支持声明不一致：目录={mine}，OpenRouter={theirs}'), { mine: yn(declaredEfforts), theirs: yn(orRow.efforts) });
     entries.push({ key, model: entry.model, vendor: entry.vendor, findings });
   }
   return { checkedAt: at, probe, keys: entries.map((e) => e.key), entries, warnings, fetchErrors };
 }
 
 /** 纯文本报告。`onlyProblems`：只列有 WARN / FAIL 的模型（通知与摘要用）。 */
-export function renderCatalogCheck(r, { onlyProblems = false } = {}) {
-  const L = [`模型目录漂移检查 —— ${r.entries.length} 条${r.probe ? '（含实调）' : ''}`];
+export function renderCatalogCheck(r, { onlyProblems = false, lang = 'zh' } = {}) {
+  const L = [r.probe ? tl(lang, '模型目录漂移检查 —— {n} 条（含实调）', { n: r.entries.length }) : tl(lang, '模型目录漂移检查 —— {n} 条', { n: r.entries.length })];
   for (const e of r.fetchErrors) L.push(`  [WARN] ${e}`);
   for (const e of r.entries) {
     const bad = e.findings.filter((f) => f.level === 'WARN' || f.level === 'FAIL');
@@ -144,15 +149,15 @@ export function renderCatalogCheck(r, { onlyProblems = false } = {}) {
     L.push(`\n${e.key}  (${e.model})`);
     for (const f of (onlyProblems ? e.findings.filter((x) => x.level !== 'OK') : e.findings)) L.push(`  [${f.level}] ${f.msg}`);
   }
-  L.push(`\n${r.warnings === 0 ? '目录无漂移。' : `${r.warnings} 项需要人看一眼。目录只由人改：看板"设置 → 模型列表"或 node src/cli.mjs catalog set。`}`);
+  L.push(`\n${r.warnings === 0 ? tl(lang, '目录无漂移。') : tl(lang, '{n} 项需要人看一眼。目录只由人改：看板"设置 → 模型列表"或 node src/cli.mjs catalog set。', { n: r.warnings })}`);
   return L.join('\n');
 }
 
 /** 落审计：catalog_checked。正文不存全文，只存有问题的行（封顶 60 行）。 */
-export function recordCatalogCheck(db, r, { by = 'daemon', actorKind = 'system' } = {}) {
+export function recordCatalogCheck(db, r, { by = 'daemon', actorKind = 'system', lang = 'zh' } = {}) {
   const lines = [];
   for (const e of r.entries) for (const f of e.findings) if (f.level === 'WARN' || f.level === 'FAIL') lines.push(`${e.key}：${f.msg}`);
-  for (const e of r.fetchErrors) lines.push(`拉取失败：${e}`);   // 排最后：摘要只截前几行，真发现要在前面
+  for (const e of r.fetchErrors) lines.push(tl(lang, '拉取失败：{e}', { e }));   // 排最后：摘要只截前几行，真发现要在前面
   audit(db, { actorKind, actorId: by, action: 'catalog_checked', targetType: 'catalog', targetId: 'model_catalog',
     payload: { checkedAt: r.checkedAt, probe: r.probe, keys: r.keys, warnings: r.warnings, fetchErrors: r.fetchErrors.length, lines: lines.slice(0, 60) } });
 }
@@ -162,7 +167,7 @@ export function lastCatalogCheck(db) {
 }
 /** 该不该查：没查过；或过了间隔；或绑定里出现了上次没查过的键。 */
 export function catalogCheckDue(db, { every, at = now(), keysInUse = [] }) {
-  if (!isValidAfter(every)) throw new Error(`检查间隔写法不对：${every}（可用 30m / 8h / 1d / 1bd）`);
+  if (!isValidAfter(every)) throw new I18nError('检查间隔写法不对：{every}（可用 30m / 8h / 1d / 1bd）', { every });
   const last = lastCatalogCheck(db);
   if (!last) return { due: true, why: 'never' };
   if (keysInUse.some((k) => !(last.keys ?? []).includes(k))) return { due: true, why: 'new_key' };

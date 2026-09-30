@@ -2,14 +2,15 @@
 // 审计只记变量名（endpoint 页的 key_set），值永远不出这个函数。
 
 import { readFileSync, writeFileSync, existsSync, chmodSync } from 'node:fs';
+import { I18nError } from '../i18n/index.mjs';
 
 const NAME_RE = /^[A-Z][A-Z0-9_]{0,63}$/;
 
 /** 写或改一个变量。value 为空字符串 = 清空（保留行，值为空）。返回 { name, existed, present }。 */
 export function setEnvVar(path, name, value, { env = process.env } = {}) {
-  if (!NAME_RE.test(name)) throw new Error('变量名要是大写字母 / 数字 / 下划线');
+  if (!NAME_RE.test(name)) throw new I18nError('变量名要是大写字母 / 数字 / 下划线');
   const v = String(value ?? '');
-  if (/[\r\n]/.test(v)) throw new Error('值不能含换行');
+  if (/[\r\n]/.test(v)) throw new I18nError('值不能含换行');
   const text = existsSync(path) ? readFileSync(path, 'utf8') : '';
   const lines = text.split(/\r?\n/);
   let existed = false;

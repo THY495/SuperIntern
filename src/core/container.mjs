@@ -31,6 +31,7 @@ import { LIMITS, limitOf } from './limits.mjs';
 import { audit } from '../db/db.mjs';
 import { HardLimitError } from './errors.mjs';
 import { sandboxFlavorOf } from './project-settings.mjs';
+import { I18nError } from '../i18n/index.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 
@@ -70,9 +71,8 @@ export function detectRuntime(candidates = ['docker', 'podman']) {
       tried.push(`${cli}: ${String(e.stderr || e.message).trim().split('\n')[0].slice(0, 160)}`);
     }
   }
-  throw new Error(`没有可用的容器运行时，沙箱起不来：\n  ${tried.join('\n  ')}\n`
-    + `装上 Docker Desktop 或 Podman 并确认 daemon 在跑。**不要**改用 LocalExecutor 绕过 ——`
-    + `那是在宿主机上裸跑 agent 生成的代码。`);
+  throw new I18nError('没有可用的容器运行时，沙箱起不来：\n  {tried}\n装上 Docker Desktop 或 Podman 并确认 daemon 在跑。**不要**改用 LocalExecutor 绕过 ——那是在宿主机上裸跑 agent 生成的代码。',
+    { tried: tried.join('\n  ') });
 }
 
 export class ContainerExecutor extends HostFileOps {
@@ -120,8 +120,8 @@ export class ContainerExecutor extends HostFileOps {
       return execFileSync(this.cli, args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
     } catch (e) {
       if (allowFail) return null;
-      throw new Error(`${this.cli} ${args.slice(0, 2).join(' ')} 失败：`
-        + String(e.stderr || e.message).trim().split('\n').slice(0, 3).join(' / '));
+      throw new I18nError('{cmd} 失败：{detail}',
+        { cmd: `${this.cli} ${args.slice(0, 2).join(' ')}`, detail: String(e.stderr || e.message).trim().split('\n').slice(0, 3).join(' / ') });
     }
   }
 

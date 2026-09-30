@@ -20,14 +20,16 @@ import { createTaskFromSpec, projectTasks, chainGraph } from './project.mjs';
 import { maxOpenOf } from './project-settings.mjs';
 import { recordMessage } from './inbox.mjs';
 import { getParam } from './params.mjs';
+import { tl, contentLang, I18nError } from '../i18n/index.mjs';
 
 const ENDED = ['done', 'aborted'];
 const ABORTABLE = ['planning', 'running', 'waiting', 'suspended'];
 
-const mustTask = (db, taskId) => db.one(`SELECT * FROM tasks WHERE id=?`, taskId) ?? (() => { throw new Error(`任务不存在：${taskId}`); })();
-const mustProject = (db, projectId) => db.one(`SELECT * FROM projects WHERE id=?`, projectId) ?? (() => { throw new Error(`项目不存在：${projectId}`); })();
-const requireTaskLead = (db, taskId, userId, what) => { if (leadOf(db, taskId) !== userId) throw new Error(`只有该任务的负责人能${what}`); };
-const requireOwner = (p, userId, what) => { if (p.owner_id !== userId) throw new Error(`只有该项目的负责人能${what}`); };
+const mustTask = (db, taskId) => db.one(`SELECT * FROM tasks WHERE id=?`, taskId) ?? (() => { throw new I18nError('任务不存在：{taskId}', { taskId }); })();
+const mustProject = (db, projectId) => db.one(`SELECT * FROM projects WHERE id=?`, projectId) ?? (() => { throw new I18nError('项目不存在：{id}', { id: projectId }); })();
+// denied：拒绝时抛的报错（按动作各写一句，英文才翻得通）
+const requireTaskLead = (db, taskId, userId, denied) => { if (leadOf(db, taskId) !== userId) throw denied(); };
+const requireOwner = (p, userId, denied) => { if (p.owner_id !== userId) throw denied(); };
 
 /** 项目里已中止、还没合并的任务（按编号）。项目按依赖图推进，"当前任务"不唯一；停滞的出口针对的是这些任务。 */
 const abortedOf = (db, projectId) => projectTasks(db, projectId).filter((t) => !t.merged_at && t.status === 'aborted');
@@ -40,15 +42,15 @@ const abortedOf = (db, projectId) => projectTasks(db, projectId).filter((t) => !
 export function reopenTask(db, { taskId, userId, at = now() }) {
   return db.tx(() => {
     const t = mustTask(db, taskId);
-    requireTaskLead(db, taskId, userId, '恢复任务');
-    if (t.status !== 'aborted') throw new Error(`任务状态为 ${t.status}，只有已中止的任务能恢复`);
-    if (t.archived_at) throw new Error('任务已归档，请先取消归档');
+    requireTaskLead(db, taskId, userId, () => new I18nError('只有该任务的负责人能恢复任务'));
+    if (t.status !== 'aborted') throw new I18nError('任务状态为 {status}，只有已中止的任务能恢复', { status: t.status });
+    if (t.archived_at) throw new I18nError('任务已归档，请先取消归档');
     let project = null;
     if (t.project_id) {
       project = mustProject(db, t.project_id);
-      if (t.project_order === null) throw new Error('该任务已被重做的任务取代，不能恢复');
-      if (project.status === 'aborted') throw new Error('所属项目已中止，任务不能恢复');
-      if (project.status === 'done') throw new Error('所属项目已完成，任务不能恢复');
+      if (t.project_order === null) throw new I18nError('该任务已被重做的任务取代，不能恢复');
+      if (project.status === 'aborted') throw new I18nError('所属项目已中止，任务不能恢复');
+      if (project.status === 'done') throw new I18nError('所属项目已完成，任务不能恢复');
       // 这里不设"开工后项目分支前进过"与"另有任务在进行"就拒（只能重做）的硬约束：那只在任务分支
       // 只能**快进**合并时才必要。合并前会先机械变基 + 重跑全部回归义务，所以**放开**：恢复回来的任务照常排队，轮到它合并时走变基那条路；变基冲突或
       // 重跑不过会当场挂一条结构矛盾事项，那时人再决定改还是重做 —— 比现在就替他决定要诚实。
@@ -57,8 +59,8 @@ export function reopenTask(db, { taskId, userId, at = now() }) {
       const cap = maxOpenOf(db, project.id);
       const open = chainGraph(db, project.id).filter((x) => x.id !== taskId && x.started && !x.merged_at && x.status !== 'aborted');
       if (open.length >= cap) {
-        throw new Error(`项目里同时开着的任务已到上限 ${cap}（${open.map((x) => `#${x.order}`).join('、')}）。`
-          + `等其中一个合并后再恢复，或把上限调高（项目设置 → 预算与上限），或改用「重做」`);
+        throw new I18nError('项目里同时开着的任务已到上限 {cap}（{list}）。等其中一个合并后再恢复，或把上限调高（项目设置 → 预算与上限），或改用「重做」',
+          { cap, list: open.map((x) => `#${x.order}`).join('、') });
       }
     }
     const last = db.one(`SELECT payload FROM audit_log WHERE action='task_aborted' AND target_id=? ORDER BY id DESC LIMIT 1`, taskId);
@@ -87,16 +89,16 @@ export function reopenTask(db, { taskId, userId, at = now() }) {
  */
 export function redoProjectTask(db, { projectId, userId, taskId = null, note = null, plaintextToken = null, at = now() }) {
   const p = mustProject(db, projectId);
-  requireOwner(p, userId, '重做任务');
-  if (!['stalled', 'active'].includes(p.status)) throw new Error(`项目状态为 ${p.status}，不能重做任务`);
+  requireOwner(p, userId, () => new I18nError('只有该项目的负责人能重做任务'));
+  if (!['stalled', 'active'].includes(p.status)) throw new I18nError('项目状态为 {status}，不能重做任务', { status: p.status });
   // 重做哪个：给了 taskId 就是它；没给 = 已中止任务里编号最小的。
   const abortedTasks = abortedOf(db, projectId);
   const cur = taskId ? projectTasks(db, projectId).find((t) => t.id === taskId) ?? null : abortedTasks[0] ?? null;
-  if (!cur) throw new Error(taskId ? '该任务不在这个项目的任务列表里（可能已被重做取代）' : '项目里没有已中止的任务');
-  if (cur.merged_at) throw new Error('该任务已合并，不能重做');
-  if (cur.status !== 'aborted') throw new Error(`任务状态为 ${cur.status}；只有已中止的任务能重做（进行中的请先中止）`);
+  if (!cur) throw taskId ? new I18nError('该任务不在这个项目的任务列表里（可能已被重做取代）') : new I18nError('项目里没有已中止的任务');
+  if (cur.merged_at) throw new I18nError('该任务已合并，不能重做');
+  if (cur.status !== 'aborted') throw new I18nError('任务状态为 {status}；只有已中止的任务能重做（进行中的请先中止）', { status: cur.status });
   const c = db.one(`SELECT * FROM constitutions WHERE task_id=? AND superseded_at IS NULL ORDER BY version DESC LIMIT 1`, cur.id);
-  if (!c) throw new Error('当前任务没有契约，无法重做');
+  if (!c) throw new I18nError('当前任务没有契约，无法重做');
   const verify = getParam(db, cur.id, 'task.verify_command');
   const verifyExtra = getParam(db, cur.id, 'task.verify_extra') ?? [];
   const dependsOn = getParam(db, cur.id, 'task.depends_on');   // 编号不变，边原样带过去；下游指向的也是编号，不用改
@@ -104,7 +106,7 @@ export function redoProjectTask(db, { projectId, userId, taskId = null, note = n
   db.run(`UPDATE tasks SET project_order=NULL WHERE id=?`, cur.id);
   let created;
   try {
-    // scope_paths 必须带过去：漏了它，重做出来的任务越界判据是空的，悄悄退回散文启发式。
+    // scope_paths 必须带过去（后来加的列）：漏了它，重做出来的任务越界判据是空的，悄悄退回散文启发式。
     created = createTaskFromSpec(db, { title: cur.title, goal: c.goal, scope: c.scope, scope_paths: (() => { try { return JSON.parse(c.scope_paths || '[]'); } catch { return []; } })(), definition_of_done: c.definition_of_done,
       constraints: JSON.parse(c.constraints || '[]'), verify_command: Array.isArray(verify) ? verify.join(' ') : undefined },
     { userId: p.owner_id, projectId, order: cur.project_order, verifyExtra, dependsOn: Array.isArray(dependsOn) ? dependsOn : cur.dependsOn, batch: getParam(db, cur.id, 'task.batch') ?? null });
@@ -124,7 +126,7 @@ export function redoProjectTask(db, { projectId, userId, taskId = null, note = n
       const kind = String(d.subject).split('｜').pop();
       const heir = db.one(`SELECT id FROM decision_registry WHERE task_id=? AND source_kind='contract' AND status='active' AND supersedes IS NULL AND subject LIKE ?`, created.taskId, `%${kind}`);
       if (heir) db.run(`UPDATE decision_registry SET supersedes=? WHERE id=?`, d.id, heir.id);
-      voidOne(db, { id: d.id, by: userId ?? null, reason: `任务 #${cur.project_order} 重做，由新任务 ${created.taskId} 的契约接替`, at, supersededBy: heir?.id ?? null });
+      voidOne(db, { id: d.id, by: userId ?? null, reason: tl(contentLang(db), '任务 #{order} 重做，由新任务 {taskId} 的契约接替', { order: cur.project_order, taskId: created.taskId }), at, supersededBy: heir?.id ?? null });
     }
     db.run(`UPDATE projects SET status='active' WHERE id=?`, projectId);
     audit(db, { actorKind: 'user', actorId: userId, action: 'project_task_redone', targetType: 'project', targetId: projectId,
@@ -134,7 +136,8 @@ export function redoProjectTask(db, { projectId, userId, taskId = null, note = n
   if (note?.trim() && plaintextToken) {
     const prevWhy = (() => { try { return JSON.parse(db.one(`SELECT payload FROM audit_log WHERE action='task_aborted' AND target_id=? ORDER BY id DESC LIMIT 1`, cur.id)?.payload || '{}').why ?? null; } catch { return null; } })();
     messageId = recordMessage(db, { taskId: created.taskId, kind: 'context', plaintextToken,
-      body: `本任务是对 ${cur.id} 的重做（上一次已中止${prevWhy ? `，原因：${prevWhy}` : ''}；其半成品未带入）。负责人的说明：${String(note).trim()}` }).messageId ?? null;
+      body: prevWhy ? tl(contentLang(db), '本任务是对 {id} 的重做（上一次已中止，原因：{why}；其半成品未带入）。负责人的说明：{note}', { id: cur.id, why: prevWhy, note: String(note).trim() })
+        : tl(contentLang(db), '本任务是对 {id} 的重做（上一次已中止；其半成品未带入）。负责人的说明：{note}', { id: cur.id, note: String(note).trim() }) }).messageId ?? null;
   }
   return { projectId, order: cur.project_order, oldTaskId: cur.id, newTaskId: created.taskId, messageId };
 }
@@ -147,14 +150,14 @@ export function redoProjectTask(db, { projectId, userId, taskId = null, note = n
 export function abortProject(db, { projectId, userId, why = null, at = now() }) {
   return db.tx(() => {
     const p = mustProject(db, projectId);
-    requireOwner(p, userId, '中止项目');
-    if (!['proposed', 'active', 'stalled'].includes(p.status)) throw new Error(`项目状态为 ${p.status}，无法中止`);
+    requireOwner(p, userId, () => new I18nError('只有该项目的负责人能中止项目'));
+    if (!['proposed', 'active', 'stalled'].includes(p.status)) throw new I18nError('项目状态为 {status}，无法中止', { status: p.status });
     const rows = db.all(`SELECT id, status FROM tasks WHERE project_id=? AND project_order IS NOT NULL`, projectId).filter((t) => ABORTABLE.includes(t.status));
     let withdrawn = 0;
     for (const t of rows) {
       db.run(`UPDATE tasks SET status='aborted' WHERE id=?`, t.id);
       withdrawn += Number(db.run(`UPDATE questions SET status='withdrawn', resolved_at=? WHERE task_id=? AND status IN ('open','escalated')`, at, t.id).changes);
-      audit(db, { actorKind: 'user', actorId: userId, action: 'task_aborted', targetType: 'task', targetId: t.id, payload: { from: t.status, to: 'aborted', why: '所属项目已中止', via: 'project_aborted' } });
+      audit(db, { actorKind: 'user', actorId: userId, action: 'task_aborted', targetType: 'task', targetId: t.id, payload: { from: t.status, to: 'aborted', why: tl(contentLang(db), '所属项目已中止'), via: 'project_aborted' } });
     }
     db.run(`UPDATE projects SET status='aborted' WHERE id=?`, projectId);
     const merged = projectTasks(db, projectId).filter((t) => t.merged_at).length;
@@ -165,10 +168,10 @@ export function abortProject(db, { projectId, userId, why = null, at = now() }) 
 }
 
 // ── 改标题 ───────────────────────────────────────────────────────────────
-const cleanTitle = (s) => { const t = String(s ?? '').replace(/\s+/g, ' ').trim(); if (!t) throw new Error('标题不能为空'); if (t.length > 120) throw new Error('标题不能超过 120 个字符'); return t; };
+const cleanTitle = (s) => { const t = String(s ?? '').replace(/\s+/g, ' ').trim(); if (!t) throw new I18nError('标题不能为空'); if (t.length > 120) throw new I18nError('标题不能超过 120 个字符'); return t; };
 /** 标题只是显示名：契约、分支名、审计里的旧标题都不动。 */
 export function renameTask(db, { taskId, title, userId }) {
-  const t = mustTask(db, taskId); requireTaskLead(db, taskId, userId, '修改任务标题');
+  const t = mustTask(db, taskId); requireTaskLead(db, taskId, userId, () => new I18nError('只有该任务的负责人能修改任务标题'));
   const next = cleanTitle(title);
   if (next === t.title) return { taskId, title: next, changed: false };
   db.tx(() => {
@@ -178,7 +181,7 @@ export function renameTask(db, { taskId, title, userId }) {
   return { taskId, title: next, changed: true };
 }
 export function renameProject(db, { projectId, title, userId }) {
-  const p = mustProject(db, projectId); requireOwner(p, userId, '修改项目标题');
+  const p = mustProject(db, projectId); requireOwner(p, userId, () => new I18nError('只有该项目的负责人能修改项目标题'));
   const next = cleanTitle(title);
   if (next === p.title) return { projectId, title: next, changed: false };
   db.tx(() => {
@@ -190,9 +193,9 @@ export function renameProject(db, { projectId, title, userId }) {
 
 // ── 归档 ─────────────────────────────────────────────────────────────────
 export function setTaskArchived(db, { taskId, archived, userId, at = now() }) {
-  const t = mustTask(db, taskId); requireTaskLead(db, taskId, userId, archived ? '归档任务' : '取消归档');
-  if (t.project_id) throw new Error('项目内的任务不能单独归档；请归档整个项目');
-  if (archived && !ENDED.includes(t.status)) throw new Error(`任务状态为 ${t.status}，只有已结束（已完成 / 已中止）的任务能归档；进行中的请先中止`);
+  const t = mustTask(db, taskId); requireTaskLead(db, taskId, userId, () => (archived ? new I18nError('只有该任务的负责人能归档任务') : new I18nError('只有该任务的负责人能取消归档')));
+  if (t.project_id) throw new I18nError('项目内的任务不能单独归档；请归档整个项目');
+  if (archived && !ENDED.includes(t.status)) throw new I18nError('任务状态为 {status}，只有已结束（已完成 / 已中止）的任务能归档；进行中的请先中止', { status: t.status });
   if (!!t.archived_at === !!archived) return { taskId, archived: !!archived, changed: false };
   db.tx(() => {
     db.run(`UPDATE tasks SET archived_at=? WHERE id=?`, archived ? at : null, taskId);
@@ -201,8 +204,8 @@ export function setTaskArchived(db, { taskId, archived, userId, at = now() }) {
   return { taskId, archived: !!archived, changed: true };
 }
 export function setProjectArchived(db, { projectId, archived, userId, at = now() }) {
-  const p = mustProject(db, projectId); requireOwner(p, userId, archived ? '归档项目' : '取消归档');
-  if (archived && !ENDED.includes(p.status)) throw new Error(`项目状态为 ${p.status}，只有已结束（已完成 / 已中止）的项目能归档；进行中的请先中止`);
+  const p = mustProject(db, projectId); requireOwner(p, userId, () => (archived ? new I18nError('只有该项目的负责人能归档项目') : new I18nError('只有该项目的负责人能取消归档')));
+  if (archived && !ENDED.includes(p.status)) throw new I18nError('项目状态为 {status}，只有已结束（已完成 / 已中止）的项目能归档；进行中的请先中止', { status: p.status });
   if (!!p.archived_at === !!archived) return { projectId, archived: !!archived, changed: false };
   db.tx(() => {
     db.run(`UPDATE projects SET archived_at=? WHERE id=?`, archived ? at : null, projectId);

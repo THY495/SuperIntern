@@ -29,6 +29,7 @@
 // 标 needs_change 退回重做"。提示词不是在防退化，它在**决定模型对"修正"的整体读法**。
 // 那比"讲清楚"重得多，也脆得多：护栏能靠校验器兜底，策略不能。
 
+import { withOutputLang, contentLang, tl } from '../i18n/index.mjs';
 import { runToolLoop } from '../llm/client.mjs';
 import { textOf } from '../llm/canonical.mjs';
 import { newId, now, audit } from '../db/db.mjs';
@@ -470,7 +471,7 @@ ${renderVerdicts(db, verdicts)}
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     let out = null;
     const loop = await runToolLoop(client, {
-      tier, system: systemPrompt(ablatePrompt), messages, tools: [SUBMIT_REVISION, RAISE_QUESTION],
+      tier, system: withOutputLang(systemPrompt(ablatePrompt), contentLang(db)), messages, tools: [SUBMIT_REVISION, RAISE_QUESTION],
       maxTokens: 16000, effort: 'high',
     }, {
       submit_revision: async (args) => {
@@ -501,5 +502,5 @@ ${renderVerdicts(db, verdicts)}
     return { kind: 'failed', why: loop.stopped, say: textOf(loop.resp ?? { content: [] }).slice(0, 600),
       attempts: attempt, rejections };
   }
-  return { kind: 'failed', why: `${maxAttempts} 次尝试都没通过校验`, attempts: maxAttempts, rejections };
+  return { kind: 'failed', why: tl(contentLang(db), '{n} 次尝试都没通过校验', { n: maxAttempts }), attempts: maxAttempts, rejections };   // why 会进【改计划没成】事项正文
 }
