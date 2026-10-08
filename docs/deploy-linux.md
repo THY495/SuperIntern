@@ -20,7 +20,7 @@ Windows 部署见 [deploy.md](deploy.md)。本页讲 Linux 主机和 WSL2 的安
 ```bash
 # 1. 代码放在 Linux 自己的文件系统上
 #    WSL2 下不要放在 /mnt/c、/mnt/d：drvfs 的属主、权限语义和性能都不对
-tar xzf superintern-v0.2.0-linux.tar.gz && cd superintern-v0.2.0
+tar xzf superintern-v0.3.1-linux.tar.gz && cd superintern-v0.3.1
 #    （或者 git clone <本仓库> ~/superintern && cd ~/superintern）
 
 # 2. 检查前置条件、生成 .env（权限 600）、构建沙箱镜像

@@ -5,7 +5,7 @@
 SuperIntern is a self-hosted autonomous coding agent that runs for long periods on your own machine or server. You hand it an idea. It asks about anything that is unclear, breaks the work into steps, writes code in a container sandbox and runs the acceptance checks. Then it brings the result to you for sign-off. **You only do four things: answer its questions, make trade-offs, request changes and stop it.** When several people work together, a *decision routing table* decides who gets the final say on each kind of decision.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-![version](https://img.shields.io/badge/version-0.2.0-orange)
+![version](https://img.shields.io/badge/version-0.3.1-orange)
 ![node](https://img.shields.io/badge/node-%E2%89%A5%2022.13-green)
 ![deps](https://img.shields.io/badge/npm%20dependencies-0-brightgreen)
 
@@ -72,7 +72,7 @@ See [docs/known-limits.md](docs/known-limits.md) (Chinese) for known gaps.
 | Docker (running) | Docker Desktop on Windows, in its default Linux-containers mode (if you switched to Windows containers, right-click the tray icon → Switch to Linux containers); docker-ce on Linux. **Without a container runtime, tasks will not run.** SuperIntern never falls back to running code on the host |
 | An API key for at least one model vendor | [DeepSeek](https://platform.deepseek.com/) / [Anthropic](https://console.anthropic.com/) / [OpenAI](https://platform.openai.com/) / [Gemini](https://aistudio.google.com/) / [OpenRouter](https://openrouter.ai/), or any OpenAI-compatible endpoint |
 
-**Download:** get `superintern-v0.2.0-windows.zip` or `superintern-v0.2.0-linux.tar.gz` from [Releases](../../releases) and extract it, or `git clone` this repo. No `npm install` needed.
+**Download:** get `superintern-v0.3.1-windows.zip` or `superintern-v0.3.1-linux.tar.gz` from [Releases](../../releases) and extract it, or `git clone` this repo. No `npm install` needed.
 
 > Run every command from the extracted directory. Runtime state (database, tokens, logs, workspaces) lives in `.superintern/` inside it.
 
