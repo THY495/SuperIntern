@@ -1,5 +1,23 @@
 # 更新记录 / Changelog
 
+## v0.3.1 — 2026-10-08
+
+**看板 / Board**
+
+- 页面随别人的操作刷新时，不再清掉你正在写的答复、展开的表单和光标位置。/ When the board refreshes because of someone else's action, it no longer wipes the answer you are writing, open forms or your cursor position.
+- 一条事项发给几个人、别人先答了：你没交出去的草稿留在原处，页面写明是谁先答的，并给出去处（负责人可改发修正，其他人可作为补充意见留下）。/ When an item went to several people and someone else answered first, your unsent draft stays where it was; the page says who answered and offers a way forward (the owner can send it as a correction, others can keep it as a comment).
+- 结构矛盾的答复框可以勾选"同时作为计划变更提交"，一次做完原来要答复再另发修正的两步。/ Answers to structural conflicts can be ticked "Also submit as a plan change", doing in one step what used to take an answer plus a separate correction.
+- 合并冲突新增选项：两边在同一位置各自新加的内容（例如各自追加的测试用例）两边都保留。/ A new merge-conflict option keeps what both sides added at the same spot (for example test cases each side appended).
+- 交付：远端地址预填上一次的；没填就确定会提示；远端不是 GitHub 时不再询问 PR；交付后显示"已交付"及推到哪里。/ Delivery: the remote is prefilled with the last one; confirming without one now says so; no PR questions for non-GitHub remotes; after delivery the page shows it was delivered and where.
+- 保存预算闸与上限后，按钮旁留一个"已保存"标记。/ Saving the budget gate or a limit leaves a "Saved" mark next to the button.
+
+**规划与执行 / Planning and execution**
+
+- 规格里写死的命令行用法（参数名），规划时核对负责那个脚本的任务有没有写到。/ Command-line usage fixed in the spec (option names) is checked at planning time against the task that owns that script.
+- 只有改动碰到界面时才截图；不碰界面的任务签收页说明没有截图的原因。/ Page screenshots are taken only when a change touches the UI; other tasks' sign-off pages say why there is none.
+- 并行开发：样例数据只由集成任务补，避免几个同时进行的任务各改一份截图说明。/ Parallel development: only the integration task adds sample data, so tasks running at the same time no longer each edit the screenshot spec.
+- 英文部署里几处会显示给人看的中文（交接被拒的原因、系统补的步骤、并行开发说明）改为英文。/ In English deployments, a few texts shown to people (handoff rejection reasons, steps the system adds, the parallel-development notes) are now in English.
+
 ## v0.3.0 — 2026-10-08
 
 **并行开发（实验功能）/ Parallel development (experimental)**

@@ -630,7 +630,10 @@ function renderProject() {
   const stage = p.status === 'proposed' ? T('方案 v{v}{state}', { v: p.draft_version ?? 1, state: p.draft_question ? T('，待批准') : T('，起草中') }) : T('{m}/{n} 已合并{more}', { m: p.merged, n: p.tasks.length, more: p.awaitingSignoff ? T(' · 有任务待签收') : '' });
   $('#projHead').innerHTML = `<div class="row"><h2 style="font-size:16px;margin:0">${esc(p.title)}</h2> <span class="pill ${p.status === 'active' ? 'running' : p.status === 'proposed' ? 'waiting' : p.status}">${PST_NAME[p.status] ?? p.status}</span> <span class="small mute">${stage}</span><span class="grow"></span>
       ${p.status === 'active' && lead && !daemonOn ? `<button id="btnProjAdvance" title="${T('合并已签收的任务分支并启动下一个任务；无可执行操作时不做变更，不会跳过进行中的任务。自动运行未开启时才需要手动推进')}">${T('推进')}</button>` : ''}
-      ${p.status === 'done' && lead ? `<button id="btnProjDeliver" class="primary">${T('交付项目')}</button>` : ''}
+      ${p.delivered && !p.deliverDue && p.lastDelivery ? `<span class="pill done" title="${esc(p.lastDelivery.remote ?? '')}">${T('已交付')}</span> <span class="small mute">${T('{t}前推到 {remote}', { t: ago(p.lastDelivery.at), remote: esc(p.lastDelivery.remote ?? '—') })}</span>` : ''}
+      ${p.status === 'done' && lead ? (p.delivered && !p.deliverDue
+        ? `<button id="btnProjDeliver" title="${T('合并的内容都已经推出去了。要推到另一个远端、或重推一次时用')}">${T('再交付一次…')}</button>`
+        : `<button id="btnProjDeliver" class="primary">${T('交付项目')}</button>`) : ''}
       ${p.status === 'aborted' && p.merged > 0 && lead ? `<button id="btnProjDeliver" title="${T('项目已中止；已签收并合并的任务仍可交付，PR 中会注明范围')}">${T('交付已合并的 {n} 个任务', { n: p.merged })}</button>` : ''}
       <button id="btnProjSet" class="ghost" title="${lead ? T('本项目的配置：标题与目标、成员与权限、决策路由、预算与上限、自动化，以及中止项目 / 归档 / 交接负责人') : T('查看本项目的配置：标题与目标、成员与权限。只有项目负责人能修改')}">⚙ ${T('项目设置')}</button></div>
     ${(p.abortedTasks ?? []).length && !['aborted', 'done'].includes(p.status) ? `<div class="item flag" style="margin-top:10px"><b>${p.status === 'stalled' ? T('项目已停滞') : T('有已中止的任务')}</b>${T('：')}${p.status === 'stalled' ? T('剩下的任务都在等已中止的任务，项目无法继续。') : T('依赖它的任务不会开工；其他任务照常执行（已中止的任务不占用执行位置）。当剩下的任务都在等已中止的任务时，项目会停滞，等负责人处理。')}${lead ? '' : T('等待项目负责人处理。')}
@@ -678,7 +681,8 @@ function renderProject() {
   // 所以不在设置页、也没有编辑按钮：要改一条，去任务页提变更，系统会生成一条让人拍板的冲突事项。
   // 按需拉：清单可能很长，展开了才请求一次。
   loadDecisions(p.id);
-  if ($('#btnProjAppend')) $('#btnProjAppend').onclick = () => { const brief = $('#projAppendText').value.trim(); if (!brief) return toast(T('内容不能为空'), true); pact('append', { brief }, p.append ? `${p.append.kind === 'review' ? T('已排队：这一轮复盘结束后单独起草') : T('已排队：这一轮添加结束后单独起草')}${p.append.stage === 'proposed' ? T('；也已挂在正等批准的那条事项下，批的人看得到') : ''}` : daemonOn ? T('已提交，正在起草新任务的方案') : T('已提交')); };
+  // 提交前先清空输入框（失败再放回去）：刷新会把重画前输入框里的字放回原处，不清的话交出去的那段还留在框里，像是没交上
+  if ($('#btnProjAppend')) $('#btnProjAppend').onclick = () => { const box = $('#projAppendText'); const brief = box.value.trim(); if (!brief) return toast(T('内容不能为空'), true); box.value = ''; pact('append', { brief }, p.append ? `${p.append.kind === 'review' ? T('已排队：这一轮复盘结束后单独起草') : T('已排队：这一轮添加结束后单独起草')}${p.append.stage === 'proposed' ? T('；也已挂在正等批准的那条事项下，批的人看得到') : ''}` : daemonOn ? T('已提交，正在起草新任务的方案') : T('已提交')).then((ok) => { if (!ok && $('#projAppendText')) { $('#projAppendText').value = brief; $('#projAppend').open = true; } }); };
   document.querySelectorAll('[data-stall-reopen]').forEach((b) => b.onclick = async () => { try { await api(`/api/tasks/${b.dataset.stallReopen}/reopen`, {}); toast(daemonOn ? Tc('task', '已恢复') : T('已恢复；请到任务页点击「运行」')); await loadTasks(); refresh(); } catch (e) { toast(e.message, true); } });
   if ($('#btnProjReview')) $('#btnProjReview').onclick = () => pact('review', {}, T('已开始重新复盘（通常几分钟），结果会进你的收件箱，不用守在这里'));
   document.querySelectorAll('[data-stall-redo]').forEach((b) => b.onclick = () => { const note = prompt(T('重做该任务：已有进度将被放弃（记录保留）。\n可填写一段说明，作为补充信息交给新任务参考，例如上次的问题；方案本身不变（可选）：')); if (note !== null) pact('redo', { taskId: b.dataset.stallRedo, note }, T('已新建任务重做')); });
@@ -716,9 +720,14 @@ function renderProject() {
       }
       if (!confirm(`${lines.join('\n')}\n\n${T('push 出去就收不回来了。继续交付？')}`)) return;
     }
-    const remote = prompt(T('远端仓库 URL（必填）')); if (!remote) return;
-    const base = prompt(T('PR 目标分支（留空 = 仓库默认分支）')) ?? '';
-    const pr = confirm(T('同时创建 PR？'));
+    // 上次推到哪儿就预先填哪儿；点了确定却没填，要说出来（原来什么也不发生，人以为点坏了）
+    const raw = prompt(T('远端仓库 URL（必填）'), p.lastDelivery?.remote ?? '');
+    if (raw === null) return;
+    const remote = raw.trim(); if (!remote) return toast(T('没填远端仓库地址，没有交付'), true);
+    // PR 只有 GitHub 开得了：别的远端（本机文件夹、内网 git 服务）不问，问了也只会得到"开不了"
+    const gh = /github\.com[/:]/i.test(remote);
+    const base = gh ? (prompt(T('PR 目标分支（留空 = 仓库默认分支）')) ?? '') : '';
+    const pr = gh ? confirm(T('同时创建 PR？')) : false;
     try { const r = await api(`/api/projects/${p.id}/deliver`, { remote, pr, base }); toast(r.result.pr ? T('PR：{url}', { url: r.result.pr.url }) : `${T('已推送 {branch}', { branch: r.result.branch })}${r.result.prSkipped ? `${T('；')}${r.result.prSkipped}` : ''}`); } catch (e) { toast(e.message, true); }
   };
 }
@@ -752,8 +761,8 @@ async function loadDecisions(projectId) {
 
 /** 项目层的写操作都走这里：一次请求 + 刷新侧栏、收件箱与当前页。 */
 async function projAct(projectId, action, body, msg) {
-  try { await api(`/api/projects/${projectId}/${action}`, body); toast(msg); await loadTasks(); await renderDigest(); refresh(); if (view === 'projset') renderProjSet(); }
-  catch (e) { toast(e.message, true); }
+  try { await api(`/api/projects/${projectId}/${action}`, body); toast(msg); await loadTasks(); await renderDigest(); refresh(); if (view === 'projset') renderProjSet(); return true; }
+  catch (e) { toast(e.message, true); return false; }
 }
 
 // ── 项目设置（#p/<id>/settings）────────────────────────────────────────
@@ -911,7 +920,7 @@ function renderProjSet() {
     <div class="row" style="margin-top:6px">
       <span class="small mute" style="white-space:nowrap">${T('上限（美元）')}</span>
       <input id="psBudgetUsd" type="number" step="0.01" min="0" placeholder="${T('不填 = 不设闸门')}" value="${b.gate === null ? '' : (b.gate / 1e6).toFixed(2)}" style="width:140px" ${psRo ? 'disabled' : ''}>
-      ${psRo ? '' : `<button id="psBudgetSave" class="primary">${T('保存')}</button><button id="psBudgetClear" class="ghost">${T('撤掉闸门')}</button>`}
+      ${psRo ? '' : `<button id="psBudgetSave" class="primary">${T('保存')}</button>${savedMark('gate')}<button id="psBudgetClear" class="ghost">${T('撤掉闸门')}</button>`}
       <span class="small ${b.over ? 'bad' : 'mute'}">${b.gate === null ? T('当前没有闸门：花多少都不会被拦住') : b.over ? T('已花 {spent}，<b>已撞闸</b>', { spent: usd(b.spent) }) : T('已花 {spent}，还剩 {left}', { spent: usd(b.spent), left: usd(b.remaining) })}</span>
     </div>
     <div class="small mute" style="margin-top:4px">${T('把闸门改得比已花的还低是允许的 —— 那是让项目尽快停下来的办法（正在跑的那个任务在它下一轮体检时停，不会被半路掐断）。')}<br>${T('改闸门只影响之后的判断，不动任何已经做完的事。')}</div>
@@ -932,7 +941,7 @@ function renderProjSet() {
       ${(p.limits ?? []).map((r) => `<tr><td>${esc(T(r.label))}</td><td>${esc(r.valueText)}</td>
         <td class="small ${r.source === 'project' ? '' : 'mute'}">${esc(T((p.layerNames ?? {})[r.source] ?? r.source))}</td>
         <td class="small mute">${esc(r.deployText)}</td>
-        <td>${psRo ? '' : `<button class="small ghost" data-lim="${esc(r.key)}" title="${r.source === 'project' ? T('点开后输入一个新的数值，作为本项目新任务的默认（当前 {value}）', { value: esc(r.valueText) }) : T('点开后输入一个新的数值，作为本项目新任务的默认（现在用的是部署默认 {value}）', { value: esc(r.deployText) })}">${r.source === 'project' ? T('改这个值…') : T('设为本项目默认…')}</button>${r.source === 'project' ? ` <button class="small ghost" data-limclr="${esc(r.key)}" title="${T('删掉本项目的这个设定，回落到部署默认 {value}', { value: esc(r.deployText) })}">${T('清掉（回到 {value}）', { value: esc(r.deployText) })}</button>` : ''}`}</td></tr>`).join('')}
+        <td>${psRo ? '' : `<button class="small ghost" data-lim="${esc(r.key)}" title="${r.source === 'project' ? T('点开后输入一个新的数值，作为本项目新任务的默认（当前 {value}）', { value: esc(r.valueText) }) : T('点开后输入一个新的数值，作为本项目新任务的默认（现在用的是部署默认 {value}）', { value: esc(r.deployText) })}">${r.source === 'project' ? T('改这个值…') : T('设为本项目默认…')}</button>${savedMark(`plim:${r.key}`)}${r.source === 'project' ? ` <button class="small ghost" data-limclr="${esc(r.key)}" title="${T('删掉本项目的这个设定，回落到部署默认 {value}', { value: esc(r.deployText) })}">${T('清掉（回到 {value}）', { value: esc(r.deployText) })}</button>` : ''}`}</td></tr>`).join('')}
     </table>
     <div class="small mute" style="margin-top:6px">${T('三层取值：部署默认（代码里的内置天花板，只能改代码）→ 项目默认（这一表）→ 任务覆盖（任务页）。下层设了就压过上层；清掉一层就回落到上一层。上限永远不会变成"不限"。')}<br>${T('填多少由你定：系统只挡住 0 和负数（0 的意思是"一分钱都不许花"，不是"不限"），<b>填得比部署默认高也照收</b> —— 这一层就是用来给特别费的项目放宽的。')}</div>`;
   if ($('#psParallelOff')) $('#psParallelOff').onclick = () => confirm(T('关掉之后：任务改回"开着的都在等人时才让路"，模块任务也不再被禁止改共享路径。已经开着的任务不受影响。之后不能再打开。确定？')) && pact('parallel', { on: false }, T('已关掉并行开发'));
@@ -941,13 +950,13 @@ function renderProjSet() {
     const v = $('#psBudgetUsd').value.trim();
     if (!v) return toast(T('要撤掉闸门请点「撤掉闸门」；留空不会保存'), true);
     if (!(Number(v) > 0)) return toast(T('预算闸要是正数（0 的意思是一分钱都不许花，那不是"不限"）'), true);
-    pact('budget', { usd: Number(v) }, T('预算闸已保存'));
+    SAVED.set('gate', Date.now()); pact('budget', { usd: Number(v) }, T('预算闸已保存')).then((ok) => { if (!ok) SAVED.delete('gate'); });
   };
   if ($('#psBudgetClear')) $('#psBudgetClear').onclick = () => { if (confirm(T('撤掉「{title}」的预算闸？撤掉后这个项目的花费没有上限，自动化挡位也会掉回「提议」。', { title: p.title }))) pact('budget', { usd: null }, T('预算闸已撤掉')); };
   $('#psBudget').querySelectorAll('[data-lim]').forEach((btn) => btn.onclick = () => {
     const r = (p.limits ?? []).find((x) => x.key === btn.dataset.lim);
     const v = prompt(T('{label}：本项目新任务的默认值\n（部署默认 {deploy}；留空取消）', { label: T(r.label), deploy: r.deployText }), r.project ?? r.deploy);
-    if (v !== null && v.trim()) pact('limit', { key: r.key, value: Number(v) }, T('已保存'));
+    if (v !== null && v.trim()) { SAVED.set(`plim:${r.key}`, Date.now()); pact('limit', { key: r.key, value: Number(v) }, T('已保存')).then((ok) => { if (!ok) SAVED.delete(`plim:${r.key}`); }); }
   });
   $('#psBudget').querySelectorAll('[data-limclr]').forEach((btn) => btn.onclick = () => {
     const r = (p.limits ?? []).find((x) => x.key === btn.dataset.limclr);
@@ -1060,7 +1069,80 @@ async function loadTasks() {
   tasksCache = tasks;
   projects = projs;   // 与任务同一个接口：带"与我有关"标记
 }
+// ── 刷新时保住正在做的事 ────────────────────────────────────────────────
+// 看板随服务端的变化整块重画（别人答了一条、任务换了状态都会触发）。重画会把展开的折叠块收起、把输入框清空、
+// 把焦点丢掉 —— 人正写到一半的答复、刚展开的「添加任务…」就这么没了，下一下点击还会落到挪了位置的别的按钮上。
+// 所以重画前记下：哪些折叠块开着、哪些有 id 的输入框里有字、焦点和光标在哪；重画后照原样放回。
+// 各块自己管状态的（改动对比、截图，见 DV_DETAILS_OPEN）不在这里重复处理。
+const uiKey = (d) => {
+  if (d.dataset.dvopen || d.dataset.pvopen || d.id === 'nodeDiff') return null;
+  if (d.id) return `id:${d.id}`;
+  const box = d.parentElement?.closest('[id]');
+  const sum = d.querySelector(':scope > summary')?.textContent.trim().slice(0, 80);
+  return box && sum ? `${box.id}|${sum}` : null;
+};
+function snapUi() {
+  const open = new Set([...document.querySelectorAll('details[open]')].map(uiKey).filter(Boolean));
+  const vals = new Map([...document.querySelectorAll('textarea[id], input[id]:not([type=checkbox]):not([type=radio]):not([type=hidden])')]
+    .filter((e) => e.value).map((e) => [e.id, e.value]));
+  const checked = new Set([...document.querySelectorAll('input[type=checkbox][data-alsocorr]:checked')].map((e) => e.dataset.alsocorr));
+  const a = document.activeElement;
+  const focus = a && a !== document.body ? (a.id ? `#${a.id}` : a.dataset?.q ? `textarea[data-q="${a.dataset.q}"]` : null) : null;
+  return { at: location.hash, open, vals, checked, focus, sel: focus && typeof a.selectionStart === 'number' ? [a.selectionStart, a.selectionEnd] : null };
+}
+function restoreUi(s) {
+  if (s.at !== location.hash) return;   // 换了页面：上一页的输入不能填进这一页同名的框里（任务 A 写的话不该出现在任务 B）
+  for (const d of document.querySelectorAll('details')) { const k = uiKey(d); if (k && s.open.has(k)) d.open = true; }
+  for (const [id, v] of s.vals) { const e = document.getElementById(id); if (e && !e.value) e.value = v; }
+  for (const qid of s.checked) { const e = document.querySelector(`input[data-alsocorr="${qid}"]`); if (e) e.checked = true; }
+  if (s.focus) { const e = document.querySelector(s.focus); if (e) { e.focus(); if (s.sel) try { e.setSelectionRange(...s.sel); } catch { /* 不是文本框 */ } } }
+}
+// 正在写的答复（按事项记，离开任务页再回来也在）：事项被别人先答掉时，答复框会消失 ——
+// 草稿留在这里，那条事项下面照实说"谁先答了"，并给出这段话还能去哪（见 renderQuestions）。
+const DRAFTS = new Map();
+// 刚保存过的那几处：保存后页面整块重画，提示条两秒就消失 —— 在按钮旁边留一个看得见的"已保存"，两分钟内都在
+const SAVED = new Map();
+const savedMark = (k) => (Date.now() - (SAVED.get(k) ?? 0) < 120_000 ? ` <span class="small" style="color:var(--ok)">✓ ${T('已保存')}</span>` : '');
+/** 事项已经答不了了（别人先答、已到期、已撤回），而你在这条下面有没交出去的草稿：照实说，草稿留着，给出去处。 */
+function lostDraftHtml(q, canAnswer) {
+  const d = DRAFTS.get(q.id);
+  if (!d?.text?.trim() || canAnswer) return '';
+  if (me && q.answers.some((a) => a.userId === me.id)) { DRAFTS.delete(q.id); return ''; }   // 自己的那条已经记上了
+  const firsts = [...new Set(q.answers.filter((a) => a.stance === 'answer' && a.userId && a.userId !== me?.id).map((a) => a.name))];
+  const lead = isLead();
+  return `<div class="item flag" style="margin-top:8px">
+      <div class="small"><b>${T('你正在写的答复没有提交')}</b>${firsts.length ? T('：{who} 先答复了，这条事项已经有了结论（见上面）。你写的草稿还在：', { who: esc(firsts.join(T('、'))) }) : T('：这条事项已经结束了（见上面的状态）。你写的草稿还在：')}</div>
+      <textarea data-lost="${q.id}" rows="2" style="width:100%;margin-top:4px;resize:vertical">${esc(d.text)}</textarea>
+      <div class="row" style="margin-top:4px">${lead
+        ? `<button data-lostcorr="${q.id}" class="primary">${T('改为发一条修正（计划变更）…')}</button>`
+        : `<button data-lostlate="${q.id}" class="primary">${T('作为补充意见留下')}</button>`}<button data-lostdrop="${q.id}">${T('丢弃草稿')}</button></div>
+      <div class="small mute" style="margin-top:4px">${lead
+        ? T('结论定了之后，答复改不了它。要改，就发一条修正：按钮会把草稿填进下面的「发送」框、类别选好「修正」，你看过再发。修正会变成一份计划变更，碰到契约的要按决策路由批准后才生效，先答的人也看得到。')
+        : T('结论不变；这段话会作为你的意见记在这条事项上，负责人和先答的人会收到通知。')}</div></div>`;
+}
+function bindLostDrafts() {
+  const box = $('#questions');
+  box.querySelectorAll('textarea[data-lost]').forEach((i) => i.addEventListener('input', () => DRAFTS.set(i.dataset.lost, { text: i.value })));
+  box.querySelectorAll('[data-lostdrop]').forEach((b) => b.onclick = () => { DRAFTS.delete(b.dataset.lostdrop); renderQuestions(); });
+  box.querySelectorAll('[data-lostlate]').forEach((b) => b.onclick = async () => {
+    const qid = b.dataset.lostlate; const body = DRAFTS.get(qid)?.text?.trim(); if (!body) return toast(T('内容不能为空'), true);
+    const r = await act('answer', { questionId: qid, body }, T('已作为补充意见留下'));
+    if (r) { DRAFTS.delete(qid); renderQuestions(); if (r.result?.late && r.result.note) toast(r.result.note, false, 6000); }
+  });
+  box.querySelectorAll('[data-lostcorr]').forEach((b) => b.onclick = () => {
+    const qid = b.dataset.lostcorr;
+    $('#sayBody').value = DRAFTS.get(qid)?.text ?? ''; $('#sayKind').value = 'correction'; $('#sayAbout').value = qid;
+    DRAFTS.delete(qid); renderQuestions();
+    $('#sayBody').scrollIntoView({ behavior: 'smooth', block: 'center' }); $('#sayBody').focus();
+    toast(T('草稿已填进「发送」框，类别是「修正」；看一眼再点「发送」'), false, 6000);
+  });
+}
+
 async function refresh() {
+  const ui = snapUi();
+  try { await refreshInner(); } finally { restoreUi(ui); }
+}
+async function refreshInner() {
   if (view === 'task' && cur) {
     detail = await api(`/api/tasks/${cur}`);
     renderHeader(); renderConstitution(); renderDag(); renderPreview(); renderTaskDiff(); renderQuestions(); renderRevision(); renderActivity(); renderInbox(); renderReports(); renderLimits();
@@ -1498,6 +1580,7 @@ function quorumText(q) {
 // ── 看运行效果：任务页与收件箱签收共用 ──
 function previewHtml(taskId, pv, { currentHead = null } = {}) {
   if (!pv) return '';
+  if (pv.skipped) return `<div class="small mute">${T('这一轮没改界面（没有动到界面目录里的文件，也没改截图说明），所以没有截图。请看代码改动和自动测试的结果来判断。')}</div>`;
   const when = new Date(pv.at).toLocaleString(LOCALE);
   const stale = currentHead && pv.head && pv.head !== currentHead;
   const head = `<div class="small mute">${pv.head ? T('截于 {when}，对应提交 {commit}。', { when: esc(when), commit: `<span class="mono">${esc(String(pv.head).slice(0, 8))}</span>` }) : T('截于 {when}。', { when: esc(when) })}${T('只看得到页面刚打开的样子，不会替你点按钮、填表单。')}${stale ? ` <b class="bad">${T('这是上一版的截图')}</b>${T('：之后代码又改过，下次验收通过后会重截。')}` : ''}</div>`;
@@ -1576,7 +1659,7 @@ function renderQuestions() {
     return `<div class="item ${forMe ? 'mine' : isOpen ? 'flag' : ''}"><div class="row small mute"><span class="pill ${q.status}"${q.reading ? ` title="${q.reading.final ? T('系统把这条答复读成了「{label}」，并已照此处理', { label: esc(T(q.reading.label)) }) : T('系统把这条答复读成了「{label}」，稍后照此处理', { label: esc(T(q.reading.label)) })}"` : ''}>${q.reading && !isOpen ? T('已答复：{label}', { label: esc(T(q.reading.label)) }) : stName(q.status, q)}</span> ${esc(kind)}${who ? ` · ${who}` : ''} · ${T('{ago}前', { ago: ago(q.asked_at) })}
       ${isOpen ? [wait, routeWait].filter(Boolean).map((x) => `· ${x}`).join(' ') : ''}${q.default_action ? ` · <span title="${q.remainingMs != null ? T('到期仍没有人答复时，系统按这条默认处理，并在下一份报告里标注') : T('这条事项没有设时限，默认动作不会自动执行 —— 只有人答复才会有结论')}">${T('默认：{action}', { action: esc(q.default_action).slice(0, 60) })}${q.remainingMs == null && isOpen ? T('（无时限，不会自动执行）') : ''}</span>` : ''}${forMe ? ` · <b style="color:var(--run)">${T('待你处理')}</b>` : waitingOthers && waitingOthers.length ? ` · ${T('你已答复，待 {names}', { names: esc(waitingOthers.join(T('、'))) })}` : ''}</div>
       <div class="body">${esc(webQText(q.text, q.decision_type, 'task'))}</div>
-      ${q.decision_type === 'signoff' && isOpen ? `<div class="small" style="margin-top:4px">${detail.preview ? `<a href="#previewCard" data-godiff="previewCard">${T('看页面截图 ↓')}</a> · ` : ''}<a href="#diffCard" data-godiff="diffCard">${T('看改动 ↓')}</a> <span class="mute">—— ${detail.preview ? T('下方两张卡片：做出来的页面长什么样，和逐行取自代码的改动') : T('下方「改动」卡片，逐行取自代码')}</span></div>` : ''}
+      ${q.decision_type === 'signoff' && isOpen ? `<div class="small" style="margin-top:4px">${detail.preview && !detail.preview.skipped ? `<a href="#previewCard" data-godiff="previewCard">${T('看页面截图 ↓')}</a> · ` : ''}<a href="#diffCard" data-godiff="diffCard">${T('看改动 ↓')}</a> <span class="mute">—— ${detail.preview && !detail.preview.skipped ? T('下方两张卡片：做出来的页面长什么样，和逐行取自代码的改动') : T('下方「改动」卡片，逐行取自代码')}</span></div>` : ''}
       ${q.briefing ? `<details><summary>${T('当前进展')}</summary><div class="body small">${esc(q.briefing.work_done)}\n\n${T('收到答复后：{plan}', { plan: esc(q.briefing.plan_after_answer) })}</div></details>` : ''}
       ${q.answers.length ? `<div class="small" style="margin-top:4px">${q.answers.map((a) => (['agree', 'abstain', 'withdrawn'].includes(a.stance)
         // 这几种的正文本身就说清了是什么（"附议 X 的答复：…"、"弃权：…"），再加一次标签就成了"弃权：弃权：…"
@@ -1591,10 +1674,18 @@ function renderQuestions() {
         others.length ? `<button data-agree="${q.id}" title="${others.length > 1 ? T('同意上面某一条答复，不用再写一遍。计入需要的人数；够数后就按那条定案。自己敲一遍「同意」不算附议，系统会把它当成你自己的一条答复') : T('同意上面那条答复，不用再写一遍。计入需要的人数；够数后就按那条定案。自己敲一遍「同意」不算附议，系统会把它当成你自己的一条答复')}">${T('附议')}</button>` : ''}${
         forMe ? `<button data-abs="${q.id}" title="${q.decision_type === 'conflict' ? T('撤回自己的立场，以对方为准') : T('这条不归你：把你从接收人里去掉，需要的人数按剩下的人重算')}">${q.decision_type === 'conflict' ? T('撤回') : T('不归我')}</button>` : ''}${
         canTransfer ? `<button data-tr="${q.id}" title="${T('指定另一个人来答；转交后你不再是接收人。与「不归我」的区别：这条仍然要有人答，只是换个人答')}">${T('转交')}</button>` : ''}</div>${
-        q.interpretable ? `<div class="small mute" data-rd="${q.id}" style="white-space:pre-wrap;margin-top:4px">${T('写下答复后，这里会显示系统会怎么理解它。')}</div>` : ''}`
-        : canTransfer ? `<div class="row" style="margin-top:6px"><button data-tr="${q.id}" title="${T('指定另一个人来答；转交后你不再是接收人。与「不归我」的区别：这条仍然要有人答，只是换个人答')}">${T('转交')}</button></div>` : ''}</div>`;
+        q.interpretable ? `<div class="small mute" data-rd="${q.id}" style="white-space:pre-wrap;margin-top:4px">${T('写下答复后，这里会显示系统会怎么理解它。')}</div>` : ''}${
+        // 结构矛盾的出路常常是改契约，而答复本身改不了契约：勾上就把这段话同时作为一条修正提交（一次动作，不用再去下面「发送」）
+        q.decision_type === 'structural' && !detail.task.merged_at ? `<label class="small" style="display:block;margin-top:4px" title="${T('答复本身改不了这个任务的契约（范围、规则、验收标准）。勾上之后，这段答复会同时作为一条「修正」提交：系统据此给出计划变更，触及契约的按路由表批准后生效。只是在现有范围内给出路的话，不用勾。勾上等于答完再到下面「发送」里选「修正」发一遍，只是一次做完。')}"><input type="checkbox" data-alsocorr="${q.id}"> ${T('同时作为计划变更提交（要改范围、规则或验收标准时勾上）')}</label>` : ''}`
+        : canTransfer ? `<div class="row" style="margin-top:6px"><button data-tr="${q.id}" title="${T('指定另一个人来答；转交后你不再是接收人。与「不归我」的区别：这条仍然要有人答，只是换个人答')}">${T('转交')}</button></div>` : ''}${lostDraftHtml(q, canAnswer)}</div>`;
   }).join('') || `<span class="mute small">${T('无')}</span>`;
-  for (const i of document.querySelectorAll('#questions textarea[data-q]')) { if (typed[i.dataset.q]) i.value = typed[i.dataset.q]; if (i.dataset.q === focused) i.focus(); }
+  for (const i of document.querySelectorAll('#questions textarea[data-q]')) {
+    const v = typed[i.dataset.q] || DRAFTS.get(i.dataset.q)?.text;
+    if (v) i.value = v;
+    if (i.dataset.q === focused) i.focus();
+    i.addEventListener('input', () => { if (i.value.trim()) DRAFTS.set(i.dataset.q, { text: i.value }); else DRAFTS.delete(i.dataset.q); });
+  }
+  bindLostDrafts();
   // 方案批准：边写边显示"系统会理解为…"。判读与状态机是同一个函数，所以这里显示什么，提交后就按什么处理。
   for (const i of document.querySelectorAll('#questions textarea[data-interp]')) {
     const show = () => showReading(i.dataset.q, i.value);
@@ -1606,7 +1697,9 @@ function renderQuestions() {
   $('#questions').querySelectorAll('[data-godiff]').forEach((a) => a.onclick = (e) => { e.preventDefault(); $(`#${a.dataset.godiff}`).scrollIntoView({ behavior: 'smooth', block: 'start' }); });
   $('#questions').querySelectorAll('button[data-ans]').forEach((b) => b.onclick = async () => {
     const body = $(`textarea[data-q="${b.dataset.ans}"]`).value.trim(); if (!body) return toast(T('答复不能为空'), true);
-    const r = await act('answer', { questionId: b.dataset.ans, body }, T('已答复'));
+    const alsoCorrection = !!$(`input[data-alsocorr="${b.dataset.ans}"]`)?.checked;
+    const r = await act('answer', { questionId: b.dataset.ans, body, alsoCorrection }, alsoCorrection ? T('已答复，并作为计划变更提交') : T('已答复'));
+    if (r) DRAFTS.delete(b.dataset.ans);
     if (r?.result?.reading) toast(r.result.reading.text, false, 8000);
     else if (r?.result?.conflictId) toast(T('与其他人的答复不一致，请在新生成的冲突事项中协商'), true);
     else if (r?.result?.late) toast(r.result.note, r.result.stance === 'dissent');
@@ -1654,7 +1747,7 @@ function renderRevision() {
 }
 
 // ── 动态 ───────────────────────────────────────────────────────────────
-const ACTION_NAMES = { question_raised: T('提出事项'), question_answered: T('事项已答复'), answer_recorded: T('记录答复'), answer_overridden: T('负责人修改结论'), conflict_raised: T('答复不一致，生成冲突事项'), conflict_resolved: T('冲突已有结论'), question_transferred: T('事项已转交'), question_rerouted: T('事项已改派'), question_defaulted: T('已按默认处理'), node_done: T('步骤完成'), node_failed: T('步骤失败'), task_done: T('任务完成'), task_delivered: T('已交付'), task_signed_off: T('签收'), signoff_requested: T('待签收'), signoff_voided: T('签收作废（产物已变更）'), limit_breached: T('达到上限，暂停并提问'), limit_set: T('修改上限'), egress_requested: T('请求联网'), egress_allowlist_set: T('修改联网许可'), message_received: T('收到消息'), revision_proposed: T('提出计划变更'), revision_applied: T('计划变更已应用'), revision_rejected: T('计划变更已驳回'), task_paused: T('暂停'), task_resumed: Tc('activity', '继续'), task_aborted: T('中止'), orchestrator_started: T('开始运行'), orchestrator_exit: T('本轮结束'), node_escalated: T('升级模型后重试'), dissent_noted: T('对已决事项的异议'), answer_abstained: T('弃权（这条不归我）'), answer_withdrawn: T('撤回自己的立场'), question_unassigned: T('无人认领，等人处理'), contract_rule_overruled: T('任务说明里有一条被判作废'), message_released: T('消息核对完毕，开始处理'), message_held_for_verdict: T('消息暂不执行，等裁定'), decision_check_done: T('核对了已有决定'), decision_conflict_raised: T('和已有决定对不上，挂了冲突事项'), decision_conflict_resolved: T('决定冲突已有结论'), decision_registered: T('记入已定的约定'), decision_voided: T('约定作废'), preview_captured: T('自动测试通过后截了页面图'), preview_failed: T('页面截图没截出来'), preview_node_added: T('系统自动加了一步：写页面截图说明（没有它就截不了图）'), preview_seed_node_added: T('系统自动加了一步：给截图准备样例数据（不然截到的是空列表）'), env_setup_done: T('自动装好了依赖'), env_setup_failed: T('自动装依赖失败'), runtime_down: T('沙箱暂时用不了（Docker 没在运行）'), runtime_up: T('沙箱恢复了'), workspace_created: T('建好了工作区'), task_created: T('建了任务'), user_login: T('登录'), task_verify_failed: T('验收没过'), handback_raised: T('卡住了，挂了事项等人拿主意'), handback_answer_abort: T('答复要求中止（要在任务页点）'), workspace_build_output_discarded: T('撤掉了验收留下的构建产物'), advance_retry_requested: T('答复：再试一次'), stall_detected: T('停等报警'), approval_read: T('系统判读了对方案的答复'), approval_confirm_raised: T('挂了【先确认一下】事项（答复以「A」开头又像要改）'), project_append_queued: T('添加任务：已排队'), project_append_queue_dropped: T('排队的需求没能起草'), project_append_requested: T('添加任务'), choices_review_raised: T('AI 自己定的事交给人过目'), choices_kept: T('同意了 AI 定的事'), choices_change_appended: T('要改 AI 定的事（替人添加了任务）'), choices_noted: T('对 AI 定的事补了一句说明'), choices_review_failed: T('AI 自己定的事没能交给人过目'), cosign_merged: T('会签：几个人的答复合在一起'),
+const ACTION_NAMES = { question_raised: T('提出事项'), question_answered: T('事项已答复'), answer_recorded: T('记录答复'), answer_overridden: T('负责人修改结论'), conflict_raised: T('答复不一致，生成冲突事项'), conflict_resolved: T('冲突已有结论'), question_transferred: T('事项已转交'), question_rerouted: T('事项已改派'), question_defaulted: T('已按默认处理'), node_done: T('步骤完成'), node_failed: T('步骤失败'), task_done: T('任务完成'), task_delivered: T('已交付'), task_signed_off: T('签收'), signoff_requested: T('待签收'), signoff_voided: T('签收作废（产物已变更）'), limit_breached: T('达到上限，暂停并提问'), limit_set: T('修改上限'), egress_requested: T('请求联网'), egress_allowlist_set: T('修改联网许可'), message_received: T('收到消息'), revision_proposed: T('提出计划变更'), revision_applied: T('计划变更已应用'), revision_rejected: T('计划变更已驳回'), task_paused: T('暂停'), task_resumed: Tc('activity', '继续'), task_aborted: T('中止'), orchestrator_started: T('开始运行'), orchestrator_exit: T('本轮结束'), node_escalated: T('升级模型后重试'), dissent_noted: T('对已决事项的异议'), answer_abstained: T('弃权（这条不归我）'), answer_withdrawn: T('撤回自己的立场'), question_unassigned: T('无人认领，等人处理'), contract_rule_overruled: T('任务说明里有一条被判作废'), message_released: T('消息核对完毕，开始处理'), message_held_for_verdict: T('消息暂不执行，等裁定'), decision_check_done: T('核对了已有决定'), decision_conflict_raised: T('和已有决定对不上，挂了冲突事项'), decision_conflict_resolved: T('决定冲突已有结论'), decision_registered: T('记入已定的约定'), decision_voided: T('约定作废'), preview_captured: T('自动测试通过后截了页面图'), preview_failed: T('页面截图没截出来'), preview_skipped: T('这一轮没改界面，没截页面图'), preview_node_added: T('系统自动加了一步：写页面截图说明（没有它就截不了图）'), preview_seed_node_added: T('系统自动加了一步：给截图准备样例数据（不然截到的是空列表）'), env_setup_done: T('自动装好了依赖'), env_setup_failed: T('自动装依赖失败'), runtime_down: T('沙箱暂时用不了（Docker 没在运行）'), runtime_up: T('沙箱恢复了'), workspace_created: T('建好了工作区'), task_created: T('建了任务'), user_login: T('登录'), task_verify_failed: T('验收没过'), handback_raised: T('卡住了，挂了事项等人拿主意'), handback_answer_abort: T('答复要求中止（要在任务页点）'), workspace_build_output_discarded: T('撤掉了验收留下的构建产物'), advance_retry_requested: T('答复：再试一次'), stall_detected: T('停等报警'), approval_read: T('系统判读了对方案的答复'), approval_confirm_raised: T('挂了【先确认一下】事项（答复以「A」开头又像要改）'), project_append_queued: T('添加任务：已排队'), project_append_queue_dropped: T('排队的需求没能起草'), project_append_requested: T('添加任务'), choices_review_raised: T('AI 自己定的事交给人过目'), choices_kept: T('同意了 AI 定的事'), choices_change_appended: T('要改 AI 定的事（替人添加了任务）'), choices_noted: T('对 AI 定的事补了一句说明'), choices_review_failed: T('AI 自己定的事没能交给人过目'), cosign_merged: T('会签：几个人的答复合在一起'),
   // 活动流里不该出现原始英文动作名（handoff_verified、report_generated……）
   answer_superseded: T('后来的答复取代了前一条'), conflict_escalated: T('冲突转负责人裁定'), contract_register_failed: T('方案没能记进约定清单'), decision_check_failed: T('核对已有决定没跑成'),
   decision_register_failed: T('没能记进约定清单'), draft_abandoned: T('草案放弃'), draft_approved: T('草案已批准'), draft_attempt: T('草案不合规，重出'), draft_proposed: T('出了草案'),
@@ -1736,7 +1829,7 @@ function renderLimits() {
     const from = L.from ?? ((x) => String(x));
     const used = L.live ? '—' : (detail.measured?.[k] == null ? '—' : `${from(detail.measured[k])} ${L.unit}`);
     return `<div><span class="name"><abbr title="${esc(L.hint)}">${esc(L.name)}</abbr></span> <span class="used small">${esc(L.verb)} ${esc(used)}</span></div>
-      <div class="edit"><label for="lim-${k}">${Tc('field', '上限')}</label><input id="lim-${k}" data-lim="${k}" value="${from(v.value)}" ${canEdit ? '' : 'disabled'}><span class="unit">${esc(L.unit)}</span>${canEdit ? `<button data-limset="${k}" class="small">${T('保存「{name}」', { name: esc(L.name) })}</button>` : ''}</div>`;
+      <div class="edit"><label for="lim-${k}">${Tc('field', '上限')}</label><input id="lim-${k}" data-lim="${k}" value="${from(v.value)}" ${canEdit ? '' : 'disabled'}><span class="unit">${esc(L.unit)}</span>${canEdit ? `<button data-limset="${k}" class="small">${T('保存「{name}」', { name: esc(L.name) })}</button>${savedMark(`lim:${k}`)}` : ''}</div>`;
   }).join('');
   // 摘要行：用量 ≥ 80% 的维度点名，其余只给个数
   const near = Object.entries(detail.limits).filter(([k, v]) => { const m = detail.measured?.[k]; return m != null && v.value > 0 && m / v.value >= 0.8; }).map(([k, v]) => (LIM[k]?.name ?? T(v.label)));
@@ -1746,7 +1839,7 @@ function renderLimits() {
     const k = b.dataset.limset; const L = LIM[k] ?? {}; const raw = $(`input[data-lim="${k}"]`).value;
     const value = L.to ? L.to(raw) : Number(raw);
     if (!Number.isFinite(value) || value < 0) return toast(T('请输入非负数'), true);
-    act('limit', { key: k, value }, T('上限已保存'));
+    SAVED.set(`lim:${k}`, Date.now()); act('limit', { key: k, value }, T('上限已保存')).then((r) => { if (!r) { SAVED.delete(`lim:${k}`); renderLimits(); } });
   });
 }
 
@@ -2354,7 +2447,8 @@ $('#btnArchive').onclick = () => act('archive', { archived: !detail?.task?.archi
 $('#btnSignoffOk').onclick = () => act('signoff', { accept: true }, T('签收已记录')).then((r) => { if (r?.result?.accepted === null) toast(r.result.note); });
 $('#btnSignoffNo').onclick = () => { const reason = prompt(T('打回理由（系统将据此重新规划）')); if (reason) act('signoff', { accept: false, reason }, T('已打回。AI 会按你的理由修改，改好了重新请你签收（不用做别的，等通知）')).then((r) => { if (r?.result?.accepted === null) toast(r.result.note); }); };
 $('#btnDeliver').onclick = async () => { const remote = prompt(T('远端仓库 URL（首次必填；之后留空则沿用上次的值）')) ?? null; if (remote === null) return;
-  const pr = confirm(T('同时创建 PR？')); await act('deliver', { remote: remote || null, pr }, T('已交付')); };
+  // PR 只有 GitHub 开得了；留空沿用上次的远端时不知道是哪儿，照旧问一句
+  const pr = remote.trim() && !/github\.com[/:]/i.test(remote) ? false : confirm(T('同时创建 PR？')); await act('deliver', { remote: remote || null, pr }, T('已交付')); };
 $('#btnSay').onclick = () => { const body = $('#sayBody').value.trim(); if (!body) return toast(T('内容不能为空'), true);
   const kind = me?.role === 'observer' ? 'context' : $('#sayKind').value;
   const about = $('#sayAbout').value;

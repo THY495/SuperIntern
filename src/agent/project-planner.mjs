@@ -26,7 +26,7 @@ import { planAppend, appendStateOf, appendPending, startQueuedAppend } from './p
 import { decisionsSection, recordReservation } from '../core/decisions.mjs';
 import { maxOpenOf, DEFAULT_MAX_OPEN, parallelOf } from '../core/project-settings.mjs';
 import { validateParallelPlan, TASK_KINDS, recordSharedPaths } from '../core/parallel.mjs';
-import { skeletonCoverageProblems } from '../core/contract-coverage.mjs';
+import { skeletonCoverageProblems, cliCoverageProblems } from '../core/contract-coverage.mjs';
 import { getParam, setParam } from '../core/params.mjs';
 import { diffSpecs, renderSpecDiff, roundHistory, renderRoundHistory } from './spec-diff.mjs';
 
@@ -139,7 +139,7 @@ const SYSTEM = `你是一个长期运行的自主 agent 的"项目规划器"。�
 
 切法的规矩：
 - 2 到 ${MAX_TASKS} 个任务，每个是一个实现方几小时内能做完、能用一条命令验收的单位。按"消费方"切：先做被依赖的库 / 接口，再做用它的东西。
-- **接口名写死**：文件名、导出名、子命令名、字段名、退出码都写进完成定义。后面的任务只按这些名字引用前面的产物 —— 实现方看得到前面任务的代码，但契约不能靠"看代码猜"。
+- **接口名写死**：文件名、导出名、子命令名、字段名、退出码都写进完成定义。规格里写成 \`node 某脚本 …… --参数\` 的命令行用法，原样写进负责那个脚本的任务（参数名一个不少，系统会机械核对）。后面的任务只按这些名字引用前面的产物 —— 实现方看得到前面任务的代码，但契约不能靠"看代码猜"。
 - **依赖要如实写**（depends_on，任务编号从 1 起）：B 用到 A 的接口 / 文件 → B 依赖 A；互不相干的任务（例如各自独立的模块、前端与后端各按同一份接口约定实现）**不要**互相依赖，写 []
   或只依赖它们共同的前置。把它们汇到一起的任务（集成 / 端到端）依赖它们全部。不确定就写上依赖 —— 多一条边只是慢，少一条边会让任务在缺东西的仓库上开工。
 - 每个任务的 verify_command 只写自己新增的测试；任务开工时，系统会把当时已合并的全部任务的验收命令累加成它的回归义务。
@@ -362,6 +362,7 @@ export async function planProject(db, { client, projectId, tier = 'heavy', maxAt
         if (parallel) spec.shared_paths = call.args?.shared_paths;
         errs.push(...validateProjectSpec(spec, { brief: p.brief, requireRules: true, deps: { startOrder: 1, existing: [] } }));
         if (parallel) errs.push(...validateParallelPlan(spec), ...skeletonCoverageProblems(spec, p.brief));
+        errs.push(...cliCoverageProblems(spec, p.brief));   // 规格写死的命令行用法，负责那个脚本的任务要写到（串行 / 并行都核）
         if (spec.tasks.some((t) => t?.blocks !== undefined)) errs.push('首次规划不要用 blocks（没有已有任务可让它等）');
         if (spec.tasks.length > MAX_TASKS) errs.push(`任务数 ${spec.tasks.length} 超过 ${MAX_TASKS}`);
         if (spec.tasks.length < 2 && !errs.length) errs.push('至少切成 2 个任务；只有一个就不需要项目层，用 new --file');

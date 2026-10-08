@@ -926,9 +926,9 @@ function conflictHunks(wsDir, files) {
   return out.join('\n\n');
 }
 
-export const SIDE_NAME = { ours: '这个任务这一侧', theirs: '项目分支那一侧' };
+export const SIDE_NAME = { ours: '这个任务这一侧', theirs: '项目分支那一侧', union: '两边都保留新增内容' };
 /** 按内容语言写出那一侧的名字（写进库里的文字用它；SIDE_NAME 是中文原文）。 */
-const sideName = (lang, side) => (side === 'ours' ? tl(lang, '这个任务这一侧') : side === 'theirs' ? tl(lang, '项目分支那一侧') : SIDE_NAME[side]);
+const sideName = (lang, side) => (side === 'ours' ? tl(lang, '这个任务这一侧') : side === 'theirs' ? tl(lang, '项目分支那一侧') : side === 'union' ? tl(lang, '两边都保留新增内容') : SIDE_NAME[side]);
 
 /**
  * 按人选定的一侧，机械地解掉这一趟合并的全部冲突。**零模型、零判断**：
@@ -942,8 +942,68 @@ const sideName = (lang, side) => (side === 'ours' ? tl(lang, '这个任务这一
  * 两边各自新建同名文件（add/add）时没有 stage 1 —— 用空文件当祖先，这正是 merge-file 对那种情形的正确处理。
  * 选中的那一侧**没有**这个文件（一侧删了、另一侧改了）→ 就删掉它：merge-file 在那种情形下没有意义。
  */
-function resolveConflictWith(wsDir, side) {
+/**
+ * 一个冲突文件按 diff3 切出的冲突块：{ ours, base, theirs }（行数组）与块外的原样行。
+ * "新增块" = 祖先那一段是空的：两边都是在同一处各自新加了行（最常见的是各自往测试文件末尾追加用例）。
+ * 这种块取哪一侧都会丢掉另一侧的新内容，两边都留才是对的。
+ */
+function diff3Blocks(dir, f) {
+  let out = '';
+  try { out = execFileSync('git', ['merge-file', '-p', '--diff3', join(dir, 'stage2'), join(dir, 'stage1'), join(dir, 'stage3')], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }); }
+  catch (e) { out = String(e.stdout ?? ''); }   // 有冲突时退出码 = 冲突数，输出照样在 stdout
+  const parts = []; let cur = null, sec = null;
+  for (const line of out.split('\n')) {
+    if (line.startsWith('<<<<<<< ')) { cur = { ours: [], base: [], theirs: [] }; sec = 'ours'; continue; }
+    if (cur && line.startsWith('||||||| ')) { sec = 'base'; continue; }
+    if (cur && line === '=======') { sec = 'theirs'; continue; }
+    if (cur && line.startsWith('>>>>>>> ')) { parts.push(cur); cur = null; continue; }
+    if (cur) cur[sec].push(line); else parts.push(line);
+  }
+  return parts;
+}
+// 祖先里本来就有这个文件、这一块祖先那段是空的，才算"两边都新增"。两边各自新建了同名文件（add/add）不算：
+// 两份不同的新文件拼在一起多半是坏的（重复的声明、两段互不相干的内容），那要人来定。
+const isAdditive = (b, hasBase) => hasBase && b.base.length === 0;
+/** 把冲突文件的三个 stage 写到临时目录；返回祖先在不在、项目分支一侧在不在。 */
+function writeStages(wsDir, dir, f) {
+  const has = {};
+  for (const st of [1, 2, 3]) {
+    try { writeFileSync(join(dir, `stage${st}`), gitBuf(wsDir, 'show', `:${st}:${f}`)); has[st] = true; }
+    catch { writeFileSync(join(dir, `stage${st}`), ''); has[st] = false; }
+  }
+  return has;
+}
+
+/** 这一趟冲突里有几处"两边都是新增"的块、一共几处（给事项正文：有这种块才给 (D)）。 */
+export function countConflictBlocks(wsDir, files) {
+  let additive = 0, total = 0;
+  const dir = mkdtempSync(join(tmpdir(), 'si-merge-'));
+  try {
+    for (const f of files) {
+      const has = writeStages(wsDir, dir, f);
+      for (const p of diff3Blocks(dir, f)) if (typeof p !== 'string') { total++; if (isAdditive(p, has[1])) additive++; }
+    }
+  } catch { /* 数不出来就当没有，(D) 不给 */ } finally { try { rmSync(dir, { recursive: true, force: true }); } catch { /* 尽力 */ } }
+  return { additive, total };
+}
+
+export function resolveConflictWith(wsDir, side) {
   const files = git(wsDir, 'diff', '--name-only', '--diff-filter=U').split('\n').filter(Boolean);
+  // (D) 两边都保留新增内容：新增块两边都留（项目分支的在前，它先合进来）；其余块取项目分支一侧 ——
+  // 项目分支那一侧已经过了集成验收，是不新增时更稳的默认。一侧缺了这个文件时同 (B)。
+  if (side === 'union') {
+    const dir = mkdtempSync(join(tmpdir(), 'si-merge-'));
+    try {
+      for (const f of files) {
+        const has = writeStages(wsDir, dir, f);
+        if (!has[3]) { git(wsDir, 'rm', '-q', '-f', '--', f); continue; }
+        const text = diff3Blocks(dir, f).flatMap((p) => (typeof p === 'string' ? [p] : isAdditive(p, has[1]) ? [...p.theirs, ...p.ours] : p.theirs)).join('\n');
+        writeFileSync(join(wsDir, f), text);
+        git(wsDir, 'add', '--', f);
+      }
+    } finally { try { rmSync(dir, { recursive: true, force: true }); } catch { /* 尽力 */ } }
+    return files;
+  }
   const mine = side === 'ours' ? 2 : 3;
   const dir = mkdtempSync(join(tmpdir(), 'si-merge-'));
   try {
@@ -1019,15 +1079,15 @@ export async function integrateProjectBranch(db, { project, task, home, makeExec
     const msg = String(e.stderr ?? e.message ?? '').trim().split('\n').slice(-12).join('\n');
     let files = [];
     try { files = git(wsDir, 'diff', '--name-only', '--diff-filter=U').split('\n').filter(Boolean); } catch { /* 拿不到就不列 */ }
-    // **回滚之前**把带冲突标记的那几段抠出来。
-    // 最要紧的一手证据（到底哪两行撞了）机器手里有，而事项里原来只给 git 的提示文本。
-    // 负责人的第一反应会是"先看一眼冲突内容，不能凭猜测下结论"—— 那一眼本该在这一页上就给他。
+    // **回滚之前**把带冲突标记的那几段抠出来：最要紧的一手证据（到底哪两行撞了）机器手里有，
+    // 事项里只给 git 的提示文本的话，负责人得先自己去翻冲突内容才能下结论 —— 那一眼本该在这一页上就给他。
     const hunks = conflictHunks(wsDir, files);
+    const blocks = countConflictBlocks(wsDir, files);
     // 人已经在事项里选过一侧（而且选的就是对着**这个**项目分支头的那一次）→ 这一趟机械解掉。
     // 选择是在上一拍记下的，不是在这里判的：系统只执行"取哪一侧"。
     const pick = getParam(db, task.id, 'task.integrate_resolution');
     let resolveError = null;
-    if (pick && pick.onto === target && ['ours', 'theirs'].includes(pick.side)) {
+    if (pick && pick.onto === target && ['ours', 'theirs', 'union'].includes(pick.side)) {
       try {
         resolveConflictWith(wsDir, pick.side);
         git(wsDir, '-c', 'user.name=superintern', '-c', 'user.email=superintern@local', 'commit', '--no-edit');
@@ -1039,7 +1099,7 @@ export async function integrateProjectBranch(db, { project, task, home, makeExec
       audit(db, { actorKind: 'system', action: 'project_task_integrate_conflict', targetType: 'task', targetId: task.id,
         payload: { projectId: project.id, onto: target, files, hunks: String(hunks).slice(0, 400), message: msg.slice(0, 600),
           resolveError, triedSide: resolveError ? pick.side : null } });
-      return { kind: 'conflict', target, files, hunks,
+      return { kind: 'conflict', target, files, hunks, blocks,
         tail: resolveError ? `${msg}\n\n${tl(L, '（按你选的「{side}」机械解冲突没成功：{error}）', { side: sideName(L, pick.side), error: resolveError })}` : msg };
     }
     setParam(db, { taskId: task.id, key: 'task.integrate_resolution', value: null, by: { kind: 'agent', id: 'project' }, governance: 'execution' });
@@ -1138,6 +1198,7 @@ export function conflictSide(body) {
   const s = String(body ?? '').trim();
   if (/^[（(]?\s*A[）)]?([\s，,。.:：]|$)/i.test(s) || /^取?(我|这个?任务|任务\s*#?\d+)这一?侧/.test(s) || /^按\s*HEAD/i.test(s)) return 'ours';
   if (/^[（(]?\s*B[）)]?([\s，,。.:：]|$)/i.test(s) || /^取?项目分支(这|那)?一?侧/.test(s)) return 'theirs';
+  if (/^[（(]?\s*D[）)]?([\s，,。.:：]|$)/i.test(s) || /^两边都保留/.test(s) || /^keep both/i.test(s)) return 'union';
   return 'other';
 }
 
@@ -1239,6 +1300,9 @@ export function raiseIntegrateBlocked(db, { project, task, result }) {
   const mineSigner = signerOf(db, task.id);
   const L = contentLang(db);
   const order = task.project_order;
+  // 两边都是新增的冲突块有几处：有才给 (D)。各自往同一个测试文件末尾追加用例时，取任何一侧都会丢掉另一侧的用例，
+  // 丢了又得打回补回来。
+  const additive = conflict ? (result.blocks?.additive ?? 0) : 0;
   const text = `${markOf(L, 'structural')}${tl(L, '任务 #{order}「{title}」合不进项目分支：{why}。', { order, title: task.title, why: conflict ? tl(L, '合并有冲突') : tl(L, '合并之后重跑验收没过') })}\n\n`
     + tl(L, '原因：这个任务开工之后，项目分支上又合并了别的任务（现在是 {head}）。系统已经机械地把项目分支合进它的分支', { head })
     + (conflict ? `${tl(L, '，但有冲突，已回滚到合并前的状态：')}\n${tl(L, '冲突文件：')}${(result.files ?? []).join(tl(L, '、')) || tl(L, '（拿不到清单）')}\n`
@@ -1258,15 +1322,19 @@ export function raiseIntegrateBlocked(db, { project, task, result }) {
     // 曾经有第四条"打回让它自己改"，它曾烧掉一整轮（人看懂了冲突却没法把结论表达成一侧），
     // 换成 merge 之后正确答案基本都落在某一侧上，那条出路的价值没了、代价还在。
     + (conflict
-      ? `${tl(L, '请选一条（答复里写 A、B 或 C 就行）：')}\n`
+      ? `${additive ? tl(L, '请选一条（答复里写 A、B、C 或 D 就行）：') : tl(L, '请选一条（答复里写 A、B 或 C 就行）：')}\n`
       + `${tl(L, '(A) **取任务 #{order} 这一侧** —— 冲突的每一处都按它的写法定。系统会重做一次合并、只在冲突处取这一侧', { order })}\n`
       + `${tl(L, '　　（同一个文件里没冲突的部分照常合并，不受影响），然后重跑它自己的验收命令与全部回归义务。')}\n`
       + `${tl(L, '(B) **取项目分支这一侧** —— 冲突的每一处都按项目分支上已有的写法定。其余同 (A)。')}\n`
-      + `${tl(L, '(C) **两边都不对** —— 系统不动手。出路是在项目页加一个任务去修这一处，或者中止这个任务（都得你自己去点）。')}\n\n`
-      + `${tl(L, '⚠ 选 A 或 B 之后，合并出来的是一份**谁都还没签过字的新状态**，所以会重新找你签收一次；')}\n`
+      + `${tl(L, '(C) **两边都不对** —— 系统不动手。出路是在项目页加一个任务去修这一处，或者中止这个任务（都得你自己去点）。')}\n`
+      + (additive ? `${tl(L, '(D) **两边都保留新增的内容** —— 这次的 {total} 处冲突里有 {n} 处是两边在同一位置各自新加了行（例如各自追加了测试用例）：这几处两边都留下，项目分支的在前；', { n: additive, total: result.blocks?.total ?? additive })}\n`
+        + `${tl(L, '　　其余的冲突处取项目分支这一侧（同 B）。之后同样重跑验收。')}\n` : '')
+      + '\n'
+      + `${additive ? tl(L, '⚠ 选 A、B 或 D 之后，合并出来的是一份**谁都还没签过字的新状态**，所以会重新找你签收一次；') : tl(L, '⚠ 选 A 或 B 之后，合并出来的是一份**谁都还没签过字的新状态**，所以会重新找你签收一次；')}\n`
       + `${tl(L, '　那一次只给你看这一轮真正变了什么，集成带进来的别人的产物会单独列出来、不混在里面。')}\n`
       + `${tl(L, '⚠ 重跑验收拦得住"合起来跑不起来"，**拦不住这一侧在语义上选错了** —— A/B 是一次取舍，不是一道审批。')}\n`
-      + tl(L, '⚠ 粒度是"全部冲突文件一起取一侧"，没有逐块挑。如果两处冲突要往不同方向定，那就是 (C)。')
+      + (additive ? tl(L, '⚠ 粒度：A、B 是"全部冲突文件一起取一侧"；D 只认得"两边都是新增"这一种块。如果两处冲突要往别的方向定，那就是 (C)。')
+        : tl(L, '⚠ 粒度是"全部冲突文件一起取一侧"，没有逐块挑。如果两处冲突要往不同方向定，那就是 (C)。'))
       : `${tl(L, '请选一条：')}\n`
       + `${tl(L, '(A) 让它自己改：**直接在下面写下要它怎么改**。你写的那段会原样当成打回理由发给它，')}\n`
       + `${tl(L, '　　任务重新开工，改完再签收 —— 和手敲 node src/cli.mjs signoff {id} --reject "…" 是同一条路，不用再去敲命令。', { id: task.id })}\n`
@@ -1282,7 +1350,7 @@ export function raiseIntegrateBlocked(db, { project, task, result }) {
     // blockedAtHead 那一行读的是 undefined，于是"打回让它改"这条路走到底是死的 —— 只有项目分支
     // 恰好又动过才解得开。
     setParam(db, { taskId: task.id, key: 'task.rebase_blocked',
-      value: { onto: result.target ?? null, taskHead: doneHeadOf(db, task.id), kind: result.kind, at: t, questionId: id },
+      value: { onto: result.target ?? null, taskHead: doneHeadOf(db, task.id), kind: result.kind, at: t, questionId: id, additive: additive },
       by: { kind: 'agent', id: 'project' }, governance: 'execution' });
     audit(db, { actorKind: 'system', action: 'project_task_integrate_blocked', targetType: 'project', targetId: project.id,
       payload: { taskId: task.id, order: task.project_order, kind: result.kind, onto: result.target ?? null, questionId: id } });
@@ -1341,7 +1409,7 @@ function structuralHook(db, { question, finalBody, by, messageId, at }) {
   // 这样解冲突、重跑验收、写审计全都还在那条唯一的路上，不在这里另起一套。
   if (blocked.kind === 'conflict') {
     const side = conflictSide(body);
-    if (side === 'ours' || side === 'theirs') {
+    if (side === 'ours' || side === 'theirs' || (side === 'union' && blocked.additive > 0)) {
       setParam(db, { taskId, key: 'task.integrate_resolution',
         value: { side, onto: blocked.onto ?? null, by, at, questionId: question.id },
         by: { kind: 'user', id: by }, governance: 'constitutional' });

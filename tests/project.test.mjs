@@ -575,6 +575,7 @@ section('11b. 集成之后重跑没过 / 集成有冲突：任务原样留着，
   assert(/\*\*项目分支这一侧\*\*/.test(q.text) && /任务 #1「D」（shared\.mjs/.test(q.text), '正文点名另一侧是哪个任务带进来的、动的哪个文件');
   assert(/由local-owner签收/.test(q.text), '连谁签的字都写出来了');
   assert(/拦不住这一侧在语义上选错了/.test(q.text) && /粒度是"全部冲突文件一起取一侧"/.test(q.text), '两条已知限制当场说破，不藏');
+  assert(!/\(D\)/.test(q.text), '两边各自新建同名文件（add/add）不算"两边都新增" → 不给 (D)：两份不同的新文件拼起来多半是坏的');
 
   // 同一个项目分支头不再试第二次 —— 集成 + 重跑要起一次容器，每拍重试一遍就是在烧钱
   ran = [];
@@ -599,15 +600,43 @@ section('11b. 集成之后重跑没过 / 集成有冲突：任务原样留着，
     signOff(db, { taskId: e, accept: true, plaintextToken: owner.plaintext, userId: owner.userId });
   }
 
-  // 封闭答案空间的口径（③）：认前缀，不猜语义。认不出来就是 (C)，宁可停在那儿被停等账本报出来。
+  // 封闭答案空间的口径：认前缀，不猜语义。认不出来就是 (C)，宁可停在那儿被停等账本报出来。
   eq(conflictSide('A'), 'ours', '"A" → 取我这侧');
   eq(conflictSide('(B) 取项目分支那侧'), 'theirs', '"(B) …" → 取项目分支那侧');
   eq(conflictSide('取我这侧，这个任务的写法是对的'), 'ours', '写汉字也认');
   eq(conflictSide('C'), 'other', '"C" → 两边都不对');
-  eq(conflictSide('你把 scripts 三项都保留一下'), 'other', '**不在答案空间里的自由文本不猜一侧** —— 这正是容易白烧一整轮的那种写法');
+  eq(conflictSide('你把 scripts 三项都保留一下'), 'other', '**不在答案空间里的自由文本不猜一侧** —— 这种写法会白白烧掉一整轮');
+  eq(conflictSide('D'), 'union', '"D" → 两边都保留新增内容');
+  eq(conflictSide('(D) keep both'), 'union', '英文写法也认');
+
+  // (D) 两边都保留新增内容：两边各自往同一个测试文件末尾追加用例时，取任何一侧都丢掉另一侧的用例。
+  // 新增块两边都留（项目分支的在前），其余冲突块取项目分支一侧。
+  {
+    const { countConflictBlocks, resolveConflictWith } = await import('../src/core/project.mjs');
+    const R = join(TMP, 'union'); mkdirSync(R);
+    const g = (...a) => execFileSync('git', ['-c', 'user.name=t', '-c', 'user.email=t@t', '-c', 'core.autocrlf=false', ...a], { cwd: R, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
+    g('init', '-q', '-b', 'main');
+    writeFileSync(join(R, 'cases.test.mjs'), "test('base');\n"); writeFileSync(join(R, 'cfg.json'), '{"seed": "old"}\n');
+    g('add', '.'); g('commit', '-q', '-m', 'base');
+    g('checkout', '-q', '-b', 'task');
+    writeFileSync(join(R, 'cases.test.mjs'), "test('base');\ntest('task case');\n"); writeFileSync(join(R, 'cfg.json'), '{"seed": "task"}\n');
+    g('commit', '-q', '-am', 'task');
+    g('checkout', '-q', 'main');
+    writeFileSync(join(R, 'cases.test.mjs'), "test('base');\ntest('project case');\n"); writeFileSync(join(R, 'cfg.json'), '{"seed": "project"}\n');
+    g('commit', '-q', '-am', 'project');
+    g('checkout', '-q', 'task');
+    try { g('merge', '--no-edit', 'main'); } catch { /* 预期冲突 */ }
+    const files = g('diff', '--name-only', '--diff-filter=U').split('\n').filter(Boolean).sort();
+    eq(files.join(), 'cases.test.mjs,cfg.json', '两个文件都冲突');
+    eq(JSON.stringify(countConflictBlocks(R, files)), JSON.stringify({ additive: 1, total: 2 }), '一处是两边都新增，一处是改同一行');
+    resolveConflictWith(R, 'union');
+    eq(readFileSync(join(R, 'cases.test.mjs'), 'utf8'), "test('base');\ntest('project case');\ntest('task case');\n", '新增块两边都留，项目分支的在前');
+    eq(readFileSync(join(R, 'cfg.json'), 'utf8'), '{"seed": "project"}\n', '改同一行的那处取项目分支一侧');
+    eq(g('diff', '--name-only', '--diff-filter=U'), '', '没有残留冲突');
+  }
 
   // 事项底下就是答复框，人在里面写下处置 —— 那就**是**一次动作，不是一条被记下来然后没人管的留言。
-  // ③ 之后那个动作是"取哪一侧"：系统只记下选择，真正的合并在下一拍由 integrateProjectBranch 机械执行，
+  // 那个动作是"取哪一侧"：系统只记下选择，真正的合并在下一拍由 integrateProjectBranch 机械执行，
   // 于是解冲突、重跑验收、写审计全都还在那条唯一的路上。
   const qid = db.one(`SELECT id FROM questions WHERE task_id=? AND status='open' AND decision_type='structural' ORDER BY asked_at DESC LIMIT 1`, e).id;
   const ansRes = recordAnswer(db, { questionId: qid, body: 'A', plaintextToken: owner.plaintext });

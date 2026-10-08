@@ -39,16 +39,29 @@ const localUrl = (raw) => { try { const u = new URL(String(raw ?? '')); return [
  * 只用来决定"没写 si-preview.json 要不要补一步"（有前端的任务不写它，签收人就看不到页面，只能打回）。
  */
 const UI_DEPS = ['vite', 'react', 'react-dom', 'vue', 'svelte', 'next', 'nuxt', 'preact', '@angular/core', 'solid-js', 'astro', 'webpack', 'parcel'];
-export function hasUi(dir) {
+/** 看起来是界面的目录（'.' = 仓库根本身就是前端）。判法同 hasUi。 */
+export function uiDirsOf(dir) {
   const dirs = ['.', ...(() => { try { return readdirSync(dir, { withFileTypes: true }).filter((d) => d.isDirectory() && !d.name.startsWith('.') && d.name !== 'node_modules').map((d) => d.name); } catch { return []; } })()];
-  for (const d of dirs) {
+  return dirs.filter((d) => {
     if (existsSync(join(dir, d, 'index.html'))) return true;
     const pj = join(dir, d, 'package.json');
-    if (!existsSync(pj)) continue;
+    if (!existsSync(pj)) return false;
     try { const j = JSON.parse(readFileSync(pj, 'utf8')); const deps = { ...j.dependencies, ...j.devDependencies };
-      if (UI_DEPS.some((k) => k in deps)) return true; } catch { /* 坏的 package.json 不算 */ }
-  }
-  return false;
+      return UI_DEPS.some((k) => k in deps); } catch { return false; }   // 坏的 package.json 不算
+  });
+}
+export const hasUi = (dir) => uiDirsOf(dir).length > 0;
+
+/**
+ * 这一轮改动碰没碰界面：改了界面目录里的文件，或者改了截图说明本身。仓库根就是前端时，任何改动都算。
+ * 只用来决定签收页要不要截图 —— 命令行工具、导入器、通知器的签收页挂一张网页截图，看的人只会困惑（拿它判断不了什么）。
+ * 拿不到改动清单（files 为 null）时当作碰了：宁可多截一张，不让该有的截图没了。
+ */
+export function touchesUi(dir, files) {
+  if (!Array.isArray(files)) return true;
+  const ui = uiDirsOf(dir);
+  if (ui.includes('.')) return files.length > 0;
+  return files.some((f) => f === PREVIEW_FILE || ui.some((d) => f.startsWith(`${d}/`)));
 }
 
 /** 读并校验 si-preview.json。返回 { spec } 或 { error }；文件不存在返回 null。

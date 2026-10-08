@@ -21,6 +21,7 @@ import { markOf } from '../i18n/marks.mjs';
 import { newId, now, audit } from '../db/db.mjs';
 import { getParam, setParam } from '../core/params.mjs';
 import { routeQuestion, specPrefixes, wholeProjectPrefixes } from '../core/routing.mjs';
+import { cliCoverageProblems } from '../core/contract-coverage.mjs';
 import { createProjectTasks, validateProjectSpec, projectTasks, chainGraph, renderRules, renderDeps, scopeOverlaps, renderScopeOverlaps, renderScopePaths, scopePathsNote, SCOPE_PATHS_NOTE, PROJECT_TASK_RUNTIME_MS } from '../core/project.mjs';
 import { canAddTasks } from '../core/project-members.mjs';
 import { projectVerifyCommand, gearOf, gearPrereqStatus, budgetState, maxOpenOf, parallelOf } from '../core/project-settings.mjs';
@@ -286,7 +287,7 @@ const SYSTEM_APPEND = (max) => `你是一个长期运行的自主 agent 的"项�
 - **依赖要如实写**（depends_on，用清单上的任务编号）：新任务用到哪个任务的产物就依赖哪个；一个独立的小模块、不碰别的任务的东西 → 写 []，它不用等任何任务。
   不确定就写上依赖。只有人明确要求"先做这个"、或某个**还没开工**的已有任务不先有新任务就做不成时，才用 blocks 让那个任务等新任务。
 - 每个任务是几小时内能做完、能用一条命令验收的单位；按"消费方"切，先做被依赖的。能用一个任务做完就只出一个，不要为了凑数而拆。
-- **接口名写死**：文件名、导出名、子命令名、字段名、退出码都写进完成定义；引用前面任务的产物时用它们契约里写死的名字。
+- **接口名写死**：文件名、导出名、子命令名、字段名、退出码都写进完成定义；规格里写成 \`node 某脚本 …… --参数\` 的命令行用法，原样写进负责那个脚本的任务（参数名一个不少，系统会机械核对）；引用前面任务的产物时用它们契约里写死的名字。
 - verify_command 只写本任务新增的测试；任务开工时，系统会把当时已合并的全部任务的验收命令累加成回归义务。
 - node --test 后面写测试文件或 glob（例如 cli/*.test.mjs），**不要写目录**：Node 22 的 --test 不展开目录。规则、完成定义里提到的测试命令也一样。
 - scope_paths 要包含本任务会**追加用例的测试文件**（或测试目录）：实现方先写测试，测试文件不在可动路径里，交接会被越界校验拒回。
@@ -455,6 +456,8 @@ export async function planAppend(db, { client, project, tier = 'heavy', maxAttem
       spec = { title: project.title, tasks: Array.isArray(call.args?.tasks) ? call.args.tasks : [] };
       errs.push(...validateProjectSpec(spec, { brief: quoteSource, requireRules: true,
         deps: { startOrder, existing: chainGraph(db, project.id).map((t) => ({ order: t.order, started: t.started, dependsOn: t.dependsOn })) } }));
+      // 这次追加说明里写死的命令行用法，负责那个脚本的新任务要写到（只核这次的说明：原规格里的由当初的任务负责）
+      errs.push(...cliCoverageProblems(spec, st.brief));
       if (spec.tasks.length > MAX_APPEND_TASKS) errs.push(`任务数 ${spec.tasks.length} 超过 ${MAX_APPEND_TASKS}`);
     }
     if (!errs.length) {

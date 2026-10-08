@@ -9,6 +9,7 @@ import { normScopePaths, prefixesOfPaths, filesOfPaths, scopePathProblems, scope
 import { getParam, getProjectParam, setProjectParam } from './params.mjs';
 import { parallelOf } from './project-settings.mjs';
 import { PREVIEW_FILE } from './preview.mjs';
+import { tl, contentLang } from '../i18n/index.mjs';
 
 export const TASK_KINDS = ['skeleton', 'module', 'integration'];
 
@@ -132,22 +133,27 @@ export function parallelText(db, taskId) {
   if (!t?.project_id || !parallelOf(db, t.project_id)) return '';
   const kind = getParam(db, taskId, 'task.kind');
   const granted = grantedSharedFor(db, taskId);
-  const shared = sharedPathsOf(db, t.project_id).join('、') || '（无）';
-  const locked = lockedPathsFor(db, taskId).join('、') || '（无）';
-  if (kind === 'skeleton') return '\n\n## 并行开发：你是骨架任务\n'
-    + `你合并之后，本项目的各模块会由几个实现方**同时**开发，每个只能改自己的目录、改不得共享路径（${shared}）。`
-    + '所以要在你这里一次定下它们需要的东西：接口契约写死名字（路径、字段、状态码、导出名、命令行参数与退出码）；两个模块都要遵守的内部约定（共用的表结构、活动 / 事件的格式、环境变量）写进契约文件；'
-    + '每个模块要用的第三方依赖现在就装好、写进依赖清单（之后锁文件对模块只读）—— **包括各模块的测试运行器与测试库**（例如前端的组件测试框架与 DOM 环境），并给每个模块在它自己的清单里留好 test 脚本；'
-    + '几个模块共用的数据库：把表结构（表名、列名与类型）写进契约文件，写明哪个模块写、哪个模块读；根验收脚本留好各模块的位置。桩实现只要让契约测试与串通跑过，**不要实现业务**。';
-  if (kind === 'module') return '\n\n## 并行开发：你是模块任务\n'
-    + '别的模块正由别人**同时**开发，你看不到它们的进展，也不要去改它们的目录。只按骨架定下的接口契约写；需要别的模块配合的地方，对着它的桩 / 契约写。'
-    + `共享路径对你**只读**：${locked}。缺依赖、契约少一个字段、契约有错 —— 不要自己改，用 raise_question 说明要改什么、为什么（那是计划变更，由人批准）。`
-    + '装依赖不要改动锁文件（锁文件也是共享路径）：骨架已经装好你要用的依赖。'
-    + (granted.length ? `例外：人批准过的契约变更放行了 ${granted.join('、')} —— 这几处你可以改，只为契约里写明的那个目的。` : '')
-    // 模块任务容易把"测试先行"的验收写成"目标文件不存在 → Cannot find module"，撞上骨架放好的桩，就各提一条结构问题
-    + '你的目录里**已经有骨架放的桩**（能跑，按契约报"未实现"或返回占位结果）。测试先行时，实现前的失败基线是"桩的行为不合测试"，不是"文件不存在"；实现时直接改写桩的内容，不必删它。';
-  if (kind === 'integration') return '\n\n## 并行开发：你是集成任务\n'
-    + '各模块是对着同一份契约分别开发、分别合并的；你要把它们真接起来跑端到端，补齐根验收脚本里的端到端检查。'
-    + '发现某个模块与契约对不上：模块里明显的接线问题可以修；改契约本身要用 raise_question。';
+  // 按内容语言写：执行器写给人的问题里常常原样引这段话（英文部署里冒出过整句中文）
+  const L = contentLang(db);
+  const sep = tl(L, '、');
+  const shared = sharedPathsOf(db, t.project_id).join(sep) || tl(L, '（无）');
+  const locked = lockedPathsFor(db, taskId).join(sep) || tl(L, '（无）');
+  if (kind === 'skeleton') return `\n\n## ${tl(L, '并行开发：你是骨架任务')}\n`
+    + tl(L, '你合并之后，本项目的各模块会由几个实现方**同时**开发，每个只能改自己的目录、改不得共享路径（{shared}）。', { shared })
+    + tl(L, '所以要在你这里一次定下它们需要的东西：接口契约写死名字（路径、字段、状态码、导出名、命令行参数与退出码）；两个模块都要遵守的内部约定（共用的表结构、活动 / 事件的格式、环境变量）写进契约文件；')
+    + tl(L, '每个模块要用的第三方依赖现在就装好、写进依赖清单（之后锁文件对模块只读）—— **包括各模块的测试运行器与测试库**（例如前端的组件测试框架与 DOM 环境），并给每个模块在它自己的清单里留好 test 脚本；')
+    // 规划的约束里限定了依赖（"不加某某之外的第三方依赖"）时，上面那句与约束打架，骨架会为此提一条发给全员的结构问题
+    + tl(L, '规划的约束里明确限定了第三方依赖的，按约束来（测试运行器也一样，用语言自带的测试工具），不必为此提问；')
+    + tl(L, '几个模块共用的数据库：把表结构（表名、列名与类型）写进契约文件，写明哪个模块写、哪个模块读；根验收脚本留好各模块的位置。桩实现只要让契约测试与串通跑过，**不要实现业务**。');
+  if (kind === 'module') return `\n\n## ${tl(L, '并行开发：你是模块任务')}\n`
+    + tl(L, '别的模块正由别人**同时**开发，你看不到它们的进展，也不要去改它们的目录。只按骨架定下的接口契约写；需要别的模块配合的地方，对着它的桩 / 契约写。')
+    + tl(L, '共享路径对你**只读**：{locked}。缺依赖、契约少一个字段、契约有错 —— 不要自己改，用 raise_question 说明要改什么、为什么（那是计划变更，由人批准）。', { locked })
+    + tl(L, '装依赖不要改动锁文件（锁文件也是共享路径）：骨架已经装好你要用的依赖。')
+    + (granted.length ? tl(L, '例外：人批准过的契约变更放行了 {paths} —— 这几处你可以改，只为契约里写明的那个目的。', { paths: granted.join(sep) }) : '')
+    // 测试先行的验收曾被写成"目标文件不存在 → Cannot find module"，撞上骨架放好的桩
+    + tl(L, '你的目录里**已经有骨架放的桩**（能跑，按契约报"未实现"或返回占位结果）。测试先行时，实现前的失败基线是"桩的行为不合测试"，不是"文件不存在"；实现时直接改写桩的内容，不必删它。');
+  if (kind === 'integration') return `\n\n## ${tl(L, '并行开发：你是集成任务')}\n`
+    + tl(L, '各模块是对着同一份契约分别开发、分别合并的；你要把它们真接起来跑端到端，补齐根验收脚本里的端到端检查。')
+    + tl(L, '发现某个模块与契约对不上：模块里明显的接线问题可以修；改契约本身要用 raise_question。');
   return '';
 }

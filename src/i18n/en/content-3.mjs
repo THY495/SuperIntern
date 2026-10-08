@@ -99,6 +99,16 @@ export default {
   '任务没有合并，产物原样留着；项目分支不前进就不会再试一次。本事项由系统直接生成，未调用模型。':
     'The task was not merged and its output is left as is; it will not be retried until the project branch moves. This item was generated directly by the system, without calling a model.',
   '请选一条（答复里写 A、B 或 C 就行）：': 'Please pick one (just write A, B or C in your reply):',
+  '请选一条（答复里写 A、B、C 或 D 就行）：': 'Please pick one (just write A, B, C or D in your reply):',
+  '(D) **两边都保留新增的内容** —— 这次的 {total} 处冲突里有 {n} 处是两边在同一位置各自新加了行（例如各自追加了测试用例）：这几处两边都留下，项目分支的在前；':
+    '(D) **Keep what both sides added** — {n} of the {total} conflicts here are places where each side added new lines at the same spot (for example, each appended test cases): both are kept there, the project branch\'s first;',
+  '　　其余的冲突处取项目分支这一侧（同 B）。之后同样重跑验收。':
+    '　　the remaining conflicts take the project branch\'s side (as in B). The acceptance checks are re-run afterwards as well.',
+  '⚠ 选 A、B 或 D 之后，合并出来的是一份**谁都还没签过字的新状态**，所以会重新找你签收一次；':
+    '⚠ After you pick A, B or D, the merged result is a **new state nobody has signed off yet**, so you will be asked to sign off again;',
+  '⚠ 粒度：A、B 是"全部冲突文件一起取一侧"；D 只认得"两边都是新增"这一种块。如果两处冲突要往别的方向定，那就是 (C)。':
+    '⚠ Granularity: A and B take one side for all conflicting files together; D only recognises spots where both sides added lines. If conflicts need to go some other way, that is (C).',
+  '两边都保留新增内容': 'keep what both sides added',
   '(A) **取任务 #{order} 这一侧** —— 冲突的每一处都按它的写法定。系统会重做一次合并、只在冲突处取这一侧':
     '(A) **Take task #{order}\'s side** — every conflict is settled its way. The system redoes the merge and takes this side only where there are conflicts',
   '　　（同一个文件里没冲突的部分照常合并，不受影响），然后重跑它自己的验收命令与全部回归义务。':

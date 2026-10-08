@@ -9,13 +9,14 @@
 // ⑤ 页面截图说明接了后端却没写 seed：系统补一步让执行器放样例数据（每个任务只补一次）
 // ⑥ 同一条机械拒收连续出现：第三次系统替执行器把问题提给人（否则会重交到 20 轮上限）
 // ⑦ 并行骨架的契约与规格对不上：补一步让骨架补上（否则契约漏的接口要到集成时才发现是 405）
+// ⑧ 只有碰了界面的任务才截图（命令行 / 后端任务的签收页不挂无关的网页截图）
 
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
-import { openDb, ensureOwner, newId, now, sha256 } from '../src/db/db.mjs';
+import { openDb, ensureOwner, newId, now, sha256, audit } from '../src/db/db.mjs';
 import { titleFromText } from '../src/agent/project-planner.mjs';
 import { applyTemplate, rulesOf, validateRules, routeQuestion, transferQuestion } from '../src/core/routing.mjs';
 import { renderReached } from '../src/agent/project-append.mjs';
@@ -172,6 +173,27 @@ section('⑤ 截图说明接了后端却没写 seed → 补一步放样例数据
   assert(q && /连续 3 次交了同样的改动/.test(q.text) && q.level === 2 && q.default_action, '问题是系统代填的：说清重交不会改判、给出默认动作');
   const narr = db.one(`SELECT 1 FROM audit_log a JOIN nodes n ON n.id=a.target_id WHERE a.action='question_raised' AND n.task_id=?`, e.tid);
   assert(narr, '照常记 question_raised（复工简报照留）');
+
+  section('⑧ 只有碰了界面的任务才截图：命令行 / 后端任务的签收页不挂一张跟它无关的网页截图');
+  {
+    const { touchesUi } = await import('../src/core/preview.mjs');
+    const W = join(TMP, 'ui-dirs'); mkdirSync(join(W, 'web'), { recursive: true }); mkdirSync(join(W, 'cli'), { recursive: true });
+    writeFileSync(join(W, 'web', 'package.json'), JSON.stringify({ devDependencies: { vite: '^5' } }));
+    eq(touchesUi(W, ['cli/tw.mjs', 'cli/tw.test.mjs']), false, '只改了命令行 → 不算碰界面');
+    eq(touchesUi(W, ['cli/tw.mjs', 'web/src/App.jsx']), true, '改了界面目录里的文件 → 算');
+    eq(touchesUi(W, ['si-preview.json']), true, '改了截图说明本身 → 算');
+    eq(touchesUi(W, null), true, '拿不到改动清单 → 当作碰了（宁可多截一张）');
+    const R = join(TMP, 'ui-root'); mkdirSync(R, { recursive: true }); writeFileSync(join(R, 'package.json'), JSON.stringify({ dependencies: { react: '^18' } }));
+    eq(touchesUi(R, ['server/api.js']), true, '仓库根本身就是前端 → 任何改动都算');
+    const h = await run('backend-only', [
+      call('write_file', { path: 'backend/app.py', content: 'print(1)\n' }), call('submit_handoff', H('backend/app.py')),
+    ], spec(['python backend/seed.py']), undefined, (tid, ws) => {
+      audit(db, { actorKind: 'system', action: 'workspace_created', targetType: 'task', targetId: tid, payload: { head: git(ws, 'rev-parse', 'HEAD').trim() } });
+    });
+    eq(h.r.kind, 'complete', '后端任务照常做完');
+    assert(db.one(`SELECT 1 FROM audit_log WHERE action='preview_skipped' AND target_id=?`, h.tid), '只改了后端 → 记下"没碰界面，不截"');
+    assert(!db.one(`SELECT 1 FROM audit_log WHERE action IN ('preview_captured','preview_failed') AND target_id=?`, h.tid), '没有去截图');
+  }
 
   section('⑦ 并行骨架做完、契约与规格对不上 → 补一步让骨架补上（只补一次），不提事项给人');
   const { setParallel } = await import('../src/core/project-settings.mjs');

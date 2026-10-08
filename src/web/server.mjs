@@ -126,12 +126,15 @@ export function projectList(db, lang = 'zh') {   // lang：上限数值按看的
     const appendQueue = (ap?.queue ?? []).map((q) => ({ by: uname(q.userId), brief: q.brief, at: q.at }));
     for (const t of tasks) { const rb = getParam(db, t.id, 'task.requested_by'); if (rb) t.requestedBy = uname(rb); }
     const budget = budgetState(db, p.id);
-    const delivered = !!db.one(`SELECT 1 FROM audit_log WHERE action='project_delivered' AND target_id=? LIMIT 1`, p.id);
+    const lastDel = db.one(`SELECT ts, payload FROM audit_log WHERE action='project_delivered' AND target_id=? ORDER BY id DESC LIMIT 1`, p.id);
+    const delivered = !!lastDel;
+    // 上一次交付推到了哪儿：页面上照实写出来，再交付时远端地址也预先填好（不用再从别处翻）
+    const lastDelivery = lastDel ? (() => { const x = safeJson(lastDel.payload) ?? {}; return { at: lastDel.ts, remote: x.remote ?? null, branch: x.branch ?? null, pr: x.pr?.url ?? null }; })() : null;
     // 交付过之后又合并了新任务（持续维护迭代）：还要再交付 —— 与收件箱「等你交付」同一个口径
     const deliverDue = projectsToDeliver(db, { ownerId: p.owner_id }).some((x) => x.projectId === p.id);
     // 交付前的一手证据。只在**能交付**的项目上算 —— 它要读一次 git，不该每次轮询给每个项目都跑一遍。
     const evidence = (p.status === 'done' || p.status === 'aborted') ? deliveryEvidence(db, { projectId: p.id }) : null;
-    return { ...p, tasks, carrier, superseded, spendMicro, planningMicro, append, appendQueue, delivered, deliverDue, evidence, members: listMembers(db, p.id),
+    return { ...p, tasks, carrier, superseded, spendMicro, planningMicro, append, appendQueue, delivered, deliverDue, lastDelivery, evidence, members: listMembers(db, p.id),
       gear: gearOf(db, p.id), gears: GEARS, gearPrereqs: gearPrereqStatus(db, p.id),
       budget: { gate: budget.gate, spent: budget.spent, remaining: budget.remaining, over: budget.over },
       verifyCommand: projectVerifyCommand(db, p.id), limits: projectLimits(db, p.id, lang), layerNames: LAYER_NAMES,
@@ -252,9 +255,11 @@ export function taskDetail(db, taskId, { userId = null } = {}) {
 const safeJson = (s) => { try { return JSON.parse(s ?? 'null'); } catch { return s; } };
 /** 最近一次"看运行效果"的结论。没有 si-preview.json 的任务从来没截过 → null。 */
 export function previewOf(db, taskId) {
-  const a = db.one(`SELECT action, ts, payload FROM audit_log WHERE target_id=? AND action IN ('preview_captured','preview_failed') ORDER BY id DESC LIMIT 1`, taskId);
+  const a = db.one(`SELECT action, ts, payload FROM audit_log WHERE target_id=? AND action IN ('preview_captured','preview_failed','preview_skipped') ORDER BY id DESC LIMIT 1`, taskId);
   if (!a) return null;
   const p = safeJson(a.payload) ?? {};
+  // 这一轮没碰界面，系统没截（见 orchestrator finalize）：照实告诉签收的人，而不是说"仓库里没有截图说明"
+  if (a.action === 'preview_skipped') return { ok: false, skipped: true, at: a.ts, head: p.head ?? null, headKey: String(p.head ?? 'nohead').slice(0, 12), shots: [], why: p.why ?? null, log: null, warnings: [] };
   return { ok: a.action === 'preview_captured', at: a.ts, head: p.head ?? null, headKey: String(p.head ?? 'nohead').slice(0, 12),
     shots: Array.isArray(p.shots) ? p.shots.map((s) => ({ title: s.title, path: s.path, file: s.file, warnings: s.warnings ?? [] })) : [], why: p.why ?? null, log: p.log ?? null,
     warnings: p.warnings ?? [] };
@@ -306,6 +311,39 @@ export function makeControls(db, { home, tokenPlain, launcher = makeLauncher(db,
   // 分类器 client：测试可注入 fake（makeClassifierClient）；默认按库里的生效注册表建 live client（每次现读）。
   const newClassifierClient = makeClassifierClient
     ?? (() => new LlmClient({ mode: 'live', ...registryFor(db) }));
+  const say = async (o) => {
+    const { taskId, body, kind, urgent, about } = o;
+    const hasKind = !!kind;
+    // 已合并的项目任务：它不会再跑了，发给它的修正 / 新指令没有人接 —— 消息被放行后就悬着，
+    // 项目随即宣布达成，需求就丢了。这种话就是一条新需求：
+    // 转成项目的「添加任务」，记在说话的人名下（与项目页入口同一条路，权限也一样查）。
+    const tk = db.one(`SELECT project_id, project_order, merged_at FROM tasks WHERE id=?`, taskId);
+    const merged = !!(tk?.project_id && tk.project_order > 0 && tk.merged_at);
+    if (merged && ['correction', 'instruction'].includes(kind)) {
+      return { kind, appended: true, append: requestAppend(db, { projectId: tk.project_id, userId: auth(o).userId, brief: body }) };
+    }
+    const out = await sayWithClassifier(db, {
+      taskId, body,
+      kind: hasKind ? kind : null,
+      urgency: urgent ? 'urgent' : 'normal',
+      aboutQuestionId: about || null,
+      plaintextToken: auth(o).plaintextToken,
+      holdForCheck: true,   // 下面要比对，比对完之前别让守护进程拉走
+      ...(hasKind ? {} : { llmClient: newClassifierClient() }),
+    });
+    if (merged && ['correction', 'instruction'].includes(out.kind)) {
+      markConsumed(db, { taskId, ids: [out.messageId], why: tl(contentLang(db), '任务已合并：这句话转成了项目的「添加任务」') });
+      try { return { ...out, appended: true, append: requestAppend(db, { projectId: tk.project_id, userId: auth(o).userId, brief: body }) }; }
+      catch (e) { return { ...out, appended: false, appendError: tl(o._lang, '这个任务已经合并，改不了了；这句话读着像新需求，但没能转成「添加任务」：{msg}', { msg: translateError(e, o._lang) }) }; }
+    }
+    // 变更消息落地之后再比对（5c 入口②）：只比 correction / instruction —— 补充信息不改变要做什么。
+    if (['correction', 'instruction'].includes(out.kind)) {
+      await afterInput(db, { taskId, text: body, entry: 'revision', by: auth(o).userId, makeClient: newClassifierClient, sourceId: out.messageId });
+    }
+    // answer 场景：分类器判为"这是在回答某个开着的问题"，不入库也不自动答复。
+    // 返回 questionId 与原文，供看板渲染"转为答复"按钮（走既有 answer 控制杆，签当前用户名）。
+    return out.kind === 'answer' ? { ...out, body } : out;
+  };
   return {
     // 答复落地之后再比对：比对不阻塞答复 —— 命中只是另外挂一条事项。
     // 附议 / 弃权不比对：它们不引入新说法。
@@ -314,12 +352,20 @@ export function makeControls(db, { home, tokenPlain, launcher = makeLauncher(db,
       const q = db.one(`SELECT task_id FROM questions WHERE id=?`, o.questionId);
       const r = recordAnswer(db, { questionId: o.questionId, body: o.body, stance: o.stance ?? 'answer',
         agreesWith: o.agreesWith ?? null, plaintextToken });
-      if ((o.stance ?? 'answer') === 'answer' && q?.task_id) {
+      // 答复同时作为计划变更提交：结构矛盾的出路常常就是改契约，而答复本身改不了契约 —— 原来要人答完再去任务页
+      // 发一条内容一样的修正，两次动作之间执行器已经按答复复工、去改范围外的文件，被越界校验拒回又来问。
+      // 这里同一次请求里紧接着记下修正（先暂扣，比对完才放行；编排器见到暂扣的修正就先停下等它），
+      // 于是复工的那一轮先重规划、再按新契约做。比对只做一次（修正那一路做），同一段话不比两遍。
+      let correction = null;
+      if (o.alsoCorrection && (o.stance ?? 'answer') === 'answer' && q?.task_id) {
+        correction = await say({ ...o, taskId: q.task_id, kind: 'correction', about: o.questionId, urgent: false });
+      } else if ((o.stance ?? 'answer') === 'answer' && q?.task_id) {
         await afterInput(db, { taskId: q.task_id, text: o.body, entry: 'answer', by: userId, makeClient: newClassifierClient, sourceId: r?.messageId ?? null });
       }
       // 方案批准的答复：回显系统怎么读这句话。判读本身仍由状态机做，这里用的是同一个函数。
       const th = (o.stance ?? 'answer') === 'answer' ? approvalThreadOf(db, o.questionId) : null;
-      return th ? { ...r, reading: describeReading({ body: o.body, labels: th.labels, reached: th.reached, tense: 'did', lang: contentLang(db) }) } : r;
+      const out = correction ? { ...r, correction: { messageId: correction.messageId ?? null, appended: !!correction.appended } } : r;
+      return th ? { ...out, reading: describeReading({ body: o.body, labels: th.labels, reached: th.reached, tense: 'did', lang: contentLang(db) }) } : out;
     },
     // 答之前的实时预览：只读，不落库。看不见这个任务的人拿不到（与任务详情同一道可见性）。
     interpret: (o) => {
@@ -330,39 +376,7 @@ export function makeControls(db, { home, tokenPlain, launcher = makeLauncher(db,
       return { reading: describeReading({ body: String(o.body ?? ''), labels: th.labels, reached: th.reached, tense: 'will', lang: contentLang(db) }) };
     },
     transfer: (o) => transferQuestion(db, { questionId: o.questionId, to: [].concat(o.to ?? []), reason: o.reason ?? null, byUserId: auth(o).userId }),
-    say: async (o) => {
-      const { taskId, body, kind, urgent, about } = o;
-      const hasKind = !!kind;
-      // 已合并的项目任务：它不会再跑了，发给它的修正 / 新指令没有人接（否则消息被放行后就悬着，
-      // 项目随即宣布达成，这条需求就丢了）。这种话就是一条新需求：
-      // 转成项目的「添加任务」，记在说话的人名下（与项目页入口同一条路，权限也一样查）。
-      const tk = db.one(`SELECT project_id, project_order, merged_at FROM tasks WHERE id=?`, taskId);
-      const merged = !!(tk?.project_id && tk.project_order > 0 && tk.merged_at);
-      if (merged && ['correction', 'instruction'].includes(kind)) {
-        return { kind, appended: true, append: requestAppend(db, { projectId: tk.project_id, userId: auth(o).userId, brief: body }) };
-      }
-      const out = await sayWithClassifier(db, {
-        taskId, body,
-        kind: hasKind ? kind : null,
-        urgency: urgent ? 'urgent' : 'normal',
-        aboutQuestionId: about || null,
-        plaintextToken: auth(o).plaintextToken,
-        holdForCheck: true,   // 下面要比对，比对完之前别让守护进程拉走
-        ...(hasKind ? {} : { llmClient: newClassifierClient() }),
-      });
-      if (merged && ['correction', 'instruction'].includes(out.kind)) {
-        markConsumed(db, { taskId, ids: [out.messageId], why: tl(contentLang(db), '任务已合并：这句话转成了项目的「添加任务」') });
-        try { return { ...out, appended: true, append: requestAppend(db, { projectId: tk.project_id, userId: auth(o).userId, brief: body }) }; }
-        catch (e) { return { ...out, appended: false, appendError: tl(o._lang, '这个任务已经合并，改不了了；这句话读着像新需求，但没能转成「添加任务」：{msg}', { msg: translateError(e, o._lang) }) }; }
-      }
-      // 变更消息落地之后再比对：只比 correction / instruction —— 补充信息不改变要做什么。
-      if (['correction', 'instruction'].includes(out.kind)) {
-        await afterInput(db, { taskId, text: body, entry: 'revision', by: auth(o).userId, makeClient: newClassifierClient, sourceId: out.messageId });
-      }
-      // answer 场景：分类器判为"这是在回答某个开着的问题"，不入库也不自动答复。
-      // 返回 questionId 与原文，供看板渲染"转为答复"按钮（走既有 answer 控制杆，签当前用户名）。
-      return out.kind === 'answer' ? { ...out, body } : out;
-    },
+    say,
     revision: (o) => {
       const { taskId, approve, why, reservation } = o;
       const userId = requireLead(o, taskId);

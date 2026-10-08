@@ -113,5 +113,20 @@ const json = { openapi: '3.0.3', paths: {
 eq(contractGaps(ws('json', { 'contracts/openapi.json': JSON.stringify(json, null, 2) }), { brief: BRIEF, sharedPaths: ['contracts/'] }).gaps, [], 'JSON 契约写全了 → 没有缺口；路径参数名不同（{key}）照样对得上');
 eq(contractGaps(ws('none', { 'README.md': 'GET /api/projects' }), { brief: BRIEF, sharedPaths: ['README.md'] }), { files: [], gaps: [] }, '共享路径下没有机器可读的契约文件 → 不核对');
 
+section('5. 命令行用法：规格写死的参数名，负责那个脚本的任务要写到');
+{
+  const { specCommands, cliCoverageProblems } = await import('../src/core/contract-coverage.mjs');
+  const spec = 'Run `node importer/import.mjs <file.csv> --project <KEY>`. The notifier: `python worker/notifier.py --once`. CLI: `node cli/tw.mjs <command>`.';
+  eq(specCommands(spec).map((c) => `${c.path}:${c.flags}`), ['importer/import.mjs:--project', 'worker/notifier.py:--once'], '只抽带参数名的命令；没有参数名的（cli 那条）不核');
+  const T = (kind, scope_paths, dod) => ({ kind, goal: 'g', scope: 's', scope_paths, definition_of_done: dod, rules: [] });
+  const plan = { tasks: [T('skeleton', ['importer/', 'worker/', 'contracts/'], 'stubs only'), T('module', ['importer/'], 'node importer/import.mjs <PROJECT_KEY> <CSV_FILE>'), T('module', ['worker/'], 'python worker/notifier.py --once processes activity'), T('integration', ['verify.mjs'], 'e2e')] };
+  const errs = cliCoverageProblems(plan, spec);
+  assert(errs.length === 1 && /任务 #2 负责 `importer\/import\.mjs`/.test(errs[0]) && /`--project`/.test(errs[0]), '导入器任务漏了 --project → 拒回并点名（一次漏摘就是后面一整串事项）');
+  plan.tasks[1].definition_of_done = 'node importer/import.mjs <file.csv> --project <KEY>';
+  eq(cliCoverageProblems(plan, spec), [], '写到了 → 不拒；骨架、集成任务不要求写');
+  eq(cliCoverageProblems({ tasks: [T('module', ['api/'], 'x')] }, spec), [], '没有任务负责那个脚本 → 不核');
+  eq(cliCoverageProblems(plan, 'no commands here'), [], '规格里没有带参数名的命令 → 不核');
+}
+
 console.log(`\n${pass} 通过，${fail} 失败`);
 if (fail) process.exitCode = 1;

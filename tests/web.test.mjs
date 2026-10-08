@@ -105,6 +105,27 @@ section('3. 控制杆只经已有入口');
   eq(db.one(`SELECT status FROM questions WHERE id=?`, qId).status, 'answered', '问题 answered');
   eq(db.one(`SELECT status FROM nodes WHERE id=?`, n2).status, 'pending', '分支解冻');
 
+  // 结构矛盾的答复同时作为计划变更提交：一次请求里记下答复和一条内容一样的修正（修正关联这条事项、先暂扣等比对）。
+  // 原来要答完再去任务页另发一条修正，两次之间执行器已经按答复复工、去改范围外的文件，被越界校验拒回又来问。
+  {
+    const qS = newId('q');
+    db.run(`INSERT INTO questions (id,task_id,node_id,level,level_source,text,default_action,asked_at,timeout_at,status,decision_type)
+            VALUES (?,?,?,2,'classifier','要不要把 docs/ 也放进范围？','不放',?,?,'open','structural')`, qS, taskId, n1, t0, t0 + 30 * 60_000);
+    const before = db.one(`SELECT count(*) n FROM messages WHERE task_id=? AND kind='correction'`, taskId).n;
+    r = await post(`/api/tasks/${taskId}/answer`, { questionId: qS, body: '放进去：这个任务也可以改 docs/usage.md', alsoCorrection: true });
+    eq(r.status, 200, '答复兼计划变更：请求成功');
+    eq(db.one(`SELECT status FROM questions WHERE id=?`, qS).status, 'answered', '事项照常答复');
+    const m = db.one(`SELECT * FROM messages WHERE task_id=? AND kind='correction' ORDER BY received_at DESC LIMIT 1`, taskId);
+    eq(db.one(`SELECT count(*) n FROM messages WHERE task_id=? AND kind='correction'`, taskId).n, before + 1, '同时记下了一条修正');
+    eq(m.body, '放进去：这个任务也可以改 docs/usage.md', '修正就是答复原文');
+    assert(r.result.correction?.messageId === m.id, '返回里带着这条修正');
+    const qS2 = newId('q');
+    db.run(`INSERT INTO questions (id,task_id,node_id,level,level_source,text,default_action,asked_at,timeout_at,status,decision_type)
+            VALUES (?,?,?,2,'classifier','用哪个分隔符？','逗号',?,?,'open','structural')`, qS2, taskId, n1, t0, t0 + 30 * 60_000);
+    r = await post(`/api/tasks/${taskId}/answer`, { questionId: qS2, body: '在现有范围内用逗号就行' });
+    eq(db.one(`SELECT count(*) n FROM messages WHERE task_id=? AND kind='correction'`, taskId).n, before + 1, '不勾就只是答复，不多出修正');
+  }
+
   r = await post(`/api/tasks/${taskId}/priority`, { nodeId: n1, priority: 1 });
   eq(db.one(`SELECT priority FROM nodes WHERE id=?`, n1).priority, 1, '优先级改了');
   eq(db.one(`SELECT count(*) n FROM audit_log WHERE action='node_priority_set' AND target_id=?`, n1).n, 1, '优先级改动进审计');

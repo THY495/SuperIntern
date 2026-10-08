@@ -16,7 +16,7 @@ import { raiseSignoffQuestion } from './deliver.mjs';
 import { join, resolve } from 'node:path';
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { effectiveSetupOf, runSetupCommands, setupFingerprint, parallelOf } from './project-settings.mjs';
-import { readPreviewSpec, capturePreview, hasUi, PREVIEW_FILE } from './preview.mjs';
+import { readPreviewSpec, capturePreview, hasUi, touchesUi, PREVIEW_FILE } from './preview.mjs';
 import { setParam, getParam as paramValue } from './params.mjs';
 import { lockedPathsFor, coveredBy, sharedPathsOf } from './parallel.mjs';
 import { contractGaps } from './contract-coverage.mjs';
@@ -38,7 +38,7 @@ import { verdictsOn } from './decision-check.mjs';
 import { replan } from '../agent/replan.mjs';
 import { nodesForReplan, proposeRevision, applyRevision, pendingRevision,
   recordReplanQuestion } from './revision.mjs';
-import { workspaceStatus, commitWorkspace, isBuildOutput, discardChanges } from './workspace.mjs';
+import { workspaceStatus, commitWorkspace, isBuildOutput, discardChanges, contributionOf } from './workspace.mjs';
 import { raiseVerifyFailed, raiseReplanFailed } from './handback.mjs';
 import { LocalExecutor } from './executor.mjs';
 import { isInfraError, HardLimitError } from './errors.mjs';
@@ -58,12 +58,9 @@ export const PREVIEW_NODE_KEY = 'preview.auto_node';
 export const PREVIEW_NODE = {
   // 显示在看板步骤图上：插入节点时按内容语言翻（键是这句中文原文，与 PREVIEW_FILE 同值，写成字面量才登记得上）
   title: N_('写页面截图说明（si-preview.json）'),
-  spec: `仓库里有界面（前端），但根目录还没有 ${PREVIEW_FILE}，签收的人因此看不到做出来的页面。按沙箱说明写一份 ${PREVIEW_FILE}：`
-    + `start（起后端、起前端的命令，每条一个后台进程，监听 127.0.0.1）、url（前端地址）、ready（后端一个能返回 200 的地址）、`
-    + `seed（可选：服务起来后放几条样例数据的命令，每条可写成字符串数组，例如用 curl 调新建接口 —— 空列表证明不了功能）、pages（要截的页，至多 6 页）。`
-    + `只改 ${PREVIEW_FILE}（需要样例数据脚本时可以新加一个）；不要自己起浏览器截图，不要提交图片 —— 截图由系统按这份文件做，放到签收页上。`,
-  acceptance: `仓库根目录有 ${PREVIEW_FILE}：合法 JSON，start 非空、url 是 http://127.0.0.1:端口、pages 非空；`
-    + `在沙箱里按 start 实际起一遍服务，url 与 ready 里每个地址都返回 2xx（交接记录里贴出这几次请求的结果）。`,
+  // 规格与验收也按内容语言写：系统补的这一步显示在看板的步骤详情里，英文部署里不该冒出一段中文
+  spec: (L) => tl(L, '仓库里有界面（前端），但根目录还没有 {file}，签收的人因此看不到做出来的页面。按沙箱说明写一份 {file}：start（起后端、起前端的命令，每条一个后台进程，监听 127.0.0.1）、url（前端地址）、ready（后端一个能返回 200 的地址）、seed（可选：服务起来后放几条样例数据的命令，每条可写成字符串数组，例如用 curl 调新建接口 —— 空列表证明不了功能）、pages（要截的页，至多 6 页）。只改 {file}（需要样例数据脚本时可以新加一个）；不要自己起浏览器截图，不要提交图片 —— 截图由系统按这份文件做，放到签收页上。', { file: PREVIEW_FILE }),
+  acceptance: (L) => tl(L, '仓库根目录有 {file}：合法 JSON，start 非空、url 是 http://127.0.0.1:端口、pages 非空；在沙箱里按 start 实际起一遍服务，url 与 ready 里每个地址都返回 2xx（交接记录里贴出这几次请求的结果）。', { file: PREVIEW_FILE }),
 };
 
 // 页面接了后端（写了 ready 或不止一条 start）却没写 seed：截图里的列表是空的，证明不了功能
@@ -71,17 +68,20 @@ export const PREVIEW_NODE = {
 export const PREVIEW_SEED_NODE_KEY = 'preview.seed_node';
 export const PREVIEW_SEED_NODE = {
   title: N_('给页面截图补样例数据（si-preview.json 的 seed）'),
-  spec: `${PREVIEW_FILE} 里的页面接了后端，但没写 seed：系统截图时库是空的，签收的人只看得到空列表。`
-    + `补一条或几条 seed（至多 3 条，每条一个进程、不经 shell）：服务起来之后往里放几条有代表性的样例数据 ——`
-    + `例如写一个样例数据脚本（通过后端的新建接口写入，或直接写库），或用 curl 调新建接口。样例要覆盖页面上主要的几种状态。`
-    + `只改 ${PREVIEW_FILE} 与新加的样例数据脚本；不要自己截图、不要提交图片或数据库文件。`,
-  acceptance: `${PREVIEW_FILE} 的 seed 非空；在沙箱里按 start 起服务、跑一遍 seed 后，列表接口返回的数据不为空（交接记录里贴出这次请求的结果）。`,
+  spec: (L) => tl(L, '{file} 里的页面接了后端，但没写 seed：系统截图时库是空的，签收的人只看得到空列表。补一条或几条 seed（至多 3 条，每条一个进程、不经 shell）：服务起来之后往里放几条有代表性的样例数据 ——例如写一个样例数据脚本（通过后端的新建接口写入，或直接写库），或用 curl 调新建接口。样例要覆盖页面上主要的几种状态。只改 {file} 与新加的样例数据脚本；不要自己截图、不要提交图片或数据库文件。', { file: PREVIEW_FILE }),
+  acceptance: (L) => tl(L, '{file} 的 seed 非空；在沙箱里按 start 起服务、跑一遍 seed 后，列表接口返回的数据不为空（交接记录里贴出这次请求的结果）。', { file: PREVIEW_FILE }),
 };
 
 /** 这个任务补不补截图那两步（理由见 finalize 里那段注释）。纯查询，测试直接调。 */
 export function previewStepsFor(db, taskId) {
   const preview = !coveredBy(PREVIEW_FILE, lockedPathsFor(db, taskId));
-  return { preview, seed: preview && paramValue(db, taskId, 'task.kind') !== 'skeleton' };
+  const kind = paramValue(db, taskId, 'task.kind');
+  const pid = db.one(`SELECT project_id FROM tasks WHERE id=?`, taskId)?.project_id;
+  // 并行项目里样例数据只由集成任务补：骨架只有桩，模块对截图说明只读；追加进来的任务没有 kind、也不受只读限制，
+  // 补给它就会和同时开着的别的任务各改一份 si-preview.json（只改契约的追加任务也被补过，和集成任务撞成合并冲突）。
+  // 集成任务补过之后，说明里已经有 seed，后面追加的任务也就用不着补了。
+  const seed = preview && (pid && parallelOf(db, pid) ? kind === 'integration' : kind !== 'skeleton');
+  return { preview, seed };
 }
 
 /**
@@ -89,14 +89,14 @@ export function previewStepsFor(db, taskId) {
  * （放到根目录的 seed 脚本全被越界校验拒回，执行器会一直重交到 20 轮上限）。
  * si-preview.json 本身不受范围限制（ALWAYS_IN_SCOPE），脚本受 —— 所以把可放的位置写进这一步的规格。范围不执法（抽不出路径 / *）时不加。
  */
-export function seedPlacement(db, taskId) {
+export function seedPlacement(db, taskId, L = contentLang(db)) {
   const dirs = prefixesOf(db, taskId) ?? [];
   if (dirs.includes('*')) return '';
   const files = scopeFilesOf(db, taskId) ?? [];
   if (!dirs.length && !files.length) return '';
-  return dirs.length
-    ? `\n样例数据脚本**只能**放在本任务的可动目录里：${dirs.map((d) => `${d}/`).join('、')}（例如 ${dirs[0]}/seed_preview 加相应后缀）；放到别处（包括仓库根目录）交接会被越界校验拒回。`
-    : `\n本任务的可动路径只有 ${files.join('、')}，放不下新脚本：seed 只用调新建接口的命令（例如 curl），不新建脚本。`;
+  return `\n${dirs.length
+    ? tl(L, '样例数据脚本**只能**放在本任务的可动目录里：{dirs}（例如 {first}/seed_preview 加相应后缀）；放到别处（包括仓库根目录）交接会被越界校验拒回。', { dirs: dirs.map((d) => `${d}/`).join(tl(L, '、')), first: dirs[0] })
+    : tl(L, '本任务的可动路径只有 {files}，放不下新脚本：seed 只用调新建接口的命令（例如 curl），不新建脚本。', { files: files.join(tl(L, '、')) })}`;
 }
 
 // 并行开发的骨架任务：契约文件与规格对不上（缺接口 / 查询参数 / 字段）→ 补一步让骨架补上，每个任务只补一次。
@@ -105,16 +105,15 @@ export function seedPlacement(db, taskId) {
 export const CONTRACT_NODE_KEY = 'contract.coverage_node';
 export const CONTRACT_NODE = {
   title: N_('把规格里的接口补全进契约'),
-  spec: (files, gaps) => `契约文件（${files.join('、')}）与规格对不上 —— 规格里写死的这些，契约里没有：\n- ${gaps.join('\n- ')}\n`
-    + '照规格原文把它们补进契约文件（路径、方法、查询参数、请求 / 响应字段、状态码）；契约测试若逐项核对接口，也把这几处加上。'
-    + '只改契约文件与契约测试；桩跟着契约补上能跑的占位即可，不要实现业务。',
-  acceptance: '契约文件里有上面列出的每一处；契约测试与根验收照样通过（交接记录里贴出结果）。',
+  spec: (L, files, gaps) => `${tl(L, '契约文件（{files}）与规格对不上 —— 规格里写死的这些，契约里没有：', { files: files.join(tl(L, '、')) })}\n- ${gaps.join('\n- ')}\n`
+    + tl(L, '照规格原文把它们补进契约文件（路径、方法、查询参数、请求 / 响应字段、状态码）；契约测试若逐项核对接口，也把这几处加上。只改契约文件与契约测试；桩跟着契约补上能跑的占位即可，不要实现业务。'),
+  acceptance: (L) => tl(L, '契约文件里有上面列出的每一处；契约测试与根验收照样通过（交接记录里贴出结果）。'),
 };
 export function contractCoverageFor(db, taskId, workspace) {
   if (!workspace || paramValue(db, taskId, 'task.kind') !== 'skeleton') return null;
   const t = db.one(`SELECT t.project_id, p.brief FROM tasks t JOIN projects p ON p.id=t.project_id WHERE t.id=?`, taskId);
   if (!t?.project_id || !parallelOf(db, t.project_id)) return null;
-  return contractGaps(workspace, { brief: t.brief, sharedPaths: sharedPathsOf(db, t.project_id) });
+  return contractGaps(workspace, { brief: t.brief, sharedPaths: sharedPathsOf(db, t.project_id), lang: contentLang(db) });
 }
 
 /** 节点状态直方图。编排器判"接下来该干什么"只需要这一个东西。 */
@@ -718,7 +717,7 @@ export async function orchestrate(db, {
       if (!getParam(db, taskId, CONTRACT_NODE_KEY)) {
         const nid = newId('n');
         db.run(`INSERT INTO nodes (id,task_id,title,spec,acceptance,status,risk_tier,model_tier,created_at) VALUES (?,?,?,?,?,'pending','low','standard',?)`,
-          nid, taskId, tlN(L, CONTRACT_NODE.title), CONTRACT_NODE.spec(cov.files, cov.gaps), CONTRACT_NODE.acceptance, now());
+          nid, taskId, tlN(L, CONTRACT_NODE.title), CONTRACT_NODE.spec(L, cov.files, cov.gaps), CONTRACT_NODE.acceptance(L), now());
         setParam(db, { taskId, key: CONTRACT_NODE_KEY, value: nid, by: { kind: 'agent', id: 'orchestrator' }, governance: 'execution' });
         audit(db, { actorKind: 'system', action: 'contract_node_added', targetType: 'task', targetId: taskId, payload: { pid, nodeId: nid, files: cov.files, gaps: cov.gaps } });
         onEvent({ type: 'contract_node_added', nodeId: nid, gaps: cov.gaps.length });
@@ -742,7 +741,7 @@ export async function orchestrate(db, {
     if (previewWritable && exec?.isolated && workspace && !readPreviewSpec(workspace) && hasUi(workspace) && !getParam(db, taskId, PREVIEW_NODE_KEY)) {
       const nid = newId('n');
       db.run(`INSERT INTO nodes (id,task_id,title,spec,acceptance,status,risk_tier,model_tier,created_at) VALUES (?,?,?,?,?,'pending','low','standard',?)`,
-        nid, taskId, tlN(L, PREVIEW_NODE.title), PREVIEW_NODE.spec, PREVIEW_NODE.acceptance, now());
+        nid, taskId, tlN(L, PREVIEW_NODE.title), PREVIEW_NODE.spec(L), PREVIEW_NODE.acceptance(L), now());
       setParam(db, { taskId, key: PREVIEW_NODE_KEY, value: nid, by: { kind: 'agent', id: 'orchestrator' }, governance: 'execution' });
       audit(db, { actorKind: 'system', action: 'preview_node_added', targetType: 'task', targetId: taskId, payload: { pid, nodeId: nid } });
       onEvent({ type: 'preview_node_added', nodeId: nid });
@@ -752,7 +751,7 @@ export async function orchestrate(db, {
     if (seedable && pv?.spec && !pv.spec.seed.length && (pv.spec.ready.length > 1 || pv.spec.start.length > 1) && !getParam(db, taskId, PREVIEW_SEED_NODE_KEY)) {
       const nid = newId('n');
       db.run(`INSERT INTO nodes (id,task_id,title,spec,acceptance,status,risk_tier,model_tier,created_at) VALUES (?,?,?,?,?,'pending','low','standard',?)`,
-        nid, taskId, tlN(L, PREVIEW_SEED_NODE.title), PREVIEW_SEED_NODE.spec + seedPlacement(db, taskId), PREVIEW_SEED_NODE.acceptance, now());
+        nid, taskId, tlN(L, PREVIEW_SEED_NODE.title), PREVIEW_SEED_NODE.spec(L) + seedPlacement(db, taskId, L), PREVIEW_SEED_NODE.acceptance(L), now());
       setParam(db, { taskId, key: PREVIEW_SEED_NODE_KEY, value: nid, by: { kind: 'agent', id: 'orchestrator' }, governance: 'execution' });
       audit(db, { actorKind: 'system', action: 'preview_seed_node_added', targetType: 'task', targetId: taskId, payload: { pid, nodeId: nid } });
       onEvent({ type: 'preview_node_added', nodeId: nid });
@@ -769,7 +768,13 @@ export async function orchestrate(db, {
     // 只在真沙箱里做（测试的本地执行器不起服务）；截不出来不拦签收，原因照实记下。
     if (exec?.isolated && workspace) {
       const read = readPreviewSpec(workspace, L);
-      if (read) {
+      // 这个任务没碰界面（命令行、导入器、后端……）就不截：签收页上挂一张跟它无关的网页截图，看的人只会困惑。
+      // 改动按"这个任务相对项目分支贡献了什么"算（与签收页的改动对比同一个口径），集成带进来的别人的改动不算。
+      const mine = read ? contributionOf(db, { taskId, dir: workspace, head: ws?.head ?? null }).files : null;
+      if (read && !touchesUi(workspace, mine)) {
+        audit(db, { actorKind: 'system', action: 'preview_skipped', targetType: 'task', targetId: taskId,
+          payload: { head: ws?.head ?? null, why: 'no_ui_change', files: (mine ?? []).length } });
+      } else if (read) {
         const outDir = join(resolve(workspace, '..', '..'), 'previews', taskId, String(ws?.head ?? 'nohead').slice(0, 12));
         const r = read.error ? { ok: false, shots: [], why: read.error } : await capturePreview(exec, workspace, read.spec, { outDir, lang: L });
         audit(db, { actorKind: 'system', action: r.ok ? 'preview_captured' : 'preview_failed', targetType: 'task', targetId: taskId,

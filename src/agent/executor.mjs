@@ -221,17 +221,18 @@ export const MECHANICAL_REPEAT_STOP = 3;
 export const alwaysInScope = (p) => ALWAYS_IN_SCOPE.has(p)
   || /(^|\/)(requirements[^/]*\.txt|pyproject\.toml|package\.json|package-lock\.json|\.gitignore)$/.test(p)
   || isBuildOutput(p);   // 把已提交的构建产物从跟踪里摘掉（git rm --cached）也是仓库卫生
-export function validateHandoff(args, { exec, workspace, changed, scopePrefixes = null, scopeFiles = [], scopeStructured = false, lockedPaths = [], grantedPaths = [] }) {
+export function validateHandoff(args, { exec, workspace, changed, scopePrefixes = null, scopeFiles = [], scopeStructured = false, lockedPaths = [], grantedPaths = [], lang = 'zh' }) {
   const errs = [];
+  // 拒收理由按内容语言写：它进审计、活动记录，系统代提的问题（同一条拒收重复出现时）里也原样给人看
+  const L = lang;
+  const list = (xs) => xs.map((p) => `\`${p}\``).join(tl(L, '、'));
   // 并行开发：模块任务改不得共享路径 —— **先于**上面那条"依赖清单不受范围限制"的放行：
   // 那条放行是给串行任务修仓库卫生的；并行时根依赖清单、锁文件正是几个同时开着的任务最容易撞上的地方。
   if (changed && lockedPaths.length) {
     // 人批准过的契约变更点名放行的共享路径不算（grantedSharedFor）
     const hit = [...changed].filter((p) => coveredBy(p, lockedPaths) && !(grantedPaths.length && coveredBy(p, grantedPaths))).sort();
     if (hit.length) {
-      errs.push(`改了共享路径：${hit.map((p) => `\`${p}\``).join('、')}。这些是骨架任务定下的共享文件（接口契约、根依赖清单与锁文件、根验收脚本……），`
-        + `几个模块任务同时在开发，对模块任务只读 —— 撤销这些改动（例如 git checkout -- <文件>；装依赖改写了锁文件也一样撤销）。`
-        + `确实要改接口或共享文件（缺一个依赖、契约里少一个字段），用 raise_question 说明要改什么、为什么：那是计划变更，由人批准`);
+      errs.push(tl(L, '改了共享路径：{paths}。这些是骨架任务定下的共享文件（接口契约、根依赖清单与锁文件、根验收脚本……），几个模块任务同时在开发，对模块任务只读 —— 撤销这些改动（例如 git checkout -- <文件>；装依赖改写了锁文件也一样撤销）。确实要改接口或共享文件（缺一个依赖、契约里少一个字段），用 raise_question 说明要改什么、为什么：那是计划变更，由人批准', { paths: list(hit) }));
     }
   }
   // scope 机械执法（写边界的任务级形式）：宪法块 scope 里抽得出目录前缀时，相对基线的每一处改动
@@ -249,20 +250,20 @@ export function validateHandoff(args, { exec, workspace, changed, scopePrefixes 
     const inScope = (p) => alwaysInScope(p) || (scopePrefixes ?? []).some((s) => p === s || p.startsWith(`${s}/`)) || scopeFiles.includes(p);   // 范围里点名的文件（package.json 之类）
     const out = [...changed].filter((p) => !inScope(p)).sort();
     if (out.length) {
-      errs.push(`越界改动：${out.map((p) => `\`${p}\``).join('、')} 不在宪法块 scope 划定的范围（${[...(scopePrefixes ?? []).map((x) => `${x}/`), ...scopeFiles].join('、')}）里 —— `
-        + `撤销这些改动；确实必须动它们的话用 raise_question 说明，由人改 scope，你无权自己扩`);
+      errs.push(tl(L, '越界改动：{paths} 不在宪法块 scope 划定的范围（{scope}）里 —— 撤销这些改动；确实必须动它们的话用 raise_question 说明，由人改 scope，你无权自己扩',
+        { paths: list(out), scope: [...(scopePrefixes ?? []).map((x) => `${x}/`), ...scopeFiles].join(tl(L, '、')) }));
     }
   }
   const arts = args?.artifacts;
-  if (!Array.isArray(arts) || !arts.length) errs.push('artifacts 为空 —— 没有产物的节点不算完成');
+  if (!Array.isArray(arts) || !arts.length) errs.push(tl(L, 'artifacts 为空 —— 没有产物的节点不算完成'));
   else for (const [i, a] of arts.entries()) {
-    if (!a?.path) { errs.push(`artifacts[${i}].path 缺失`); continue; }
+    if (!a?.path) { errs.push(tl(L, 'artifacts[{i}].path 缺失', { i })); continue; }
     const p = String(a.path).replace(/\\/g, '/').replace(/\/+$/, '');
     if (exec && !exec.exists(workspace, p)) {
-      errs.push(`artifacts[${i}] 声称产出了 \`${a.path}\`，但工作区里没有这个东西`); continue;
+      errs.push(tl(L, 'artifacts[{i}] 声称产出了 `{path}`，但工作区里没有这个东西', { i, path: a.path })); continue;
     }
     if (exec?.isDir(workspace, p)) {
-      errs.push(`artifacts[${i}] \`${a.path}\` 是个目录 —— 目录不是产物，列具体文件`); continue;
+      errs.push(tl(L, 'artifacts[{i}] `{path}` 是个目录 —— 目录不是产物，列具体文件', { i, path: a.path })); continue;
     }
     // "存在" ≠ "是你产出的"。工作区是 git repo，正是为了能机械地问后一个问题。
     //
@@ -275,18 +276,17 @@ export function validateHandoff(args, { exec, workspace, changed, scopePrefixes 
     if (changed && !changed.has(p)) {
       if (a.already_done === true) {
         if (!String(a.produced_by ?? '').trim()) {
-          errs.push(`artifacts[${i}] \`${a.path}\` 标了 already_done 但没说 produced_by —— 是哪个节点 / 哪次提交做的，要写出来`);
+          errs.push(tl(L, 'artifacts[{i}] `{path}` 标了 already_done 但没说 produced_by —— 是哪个节点 / 哪次提交做的，要写出来', { i, path: a.path }));
         }
       } else {
-        errs.push(`artifacts[${i}] \`${a.path}\` 相对基线没有任何改动 —— 本节点没有产出它，不要把现成的东西算作自己的产物。`
-          + `若它确实是本节点该交的东西、而上游节点已经做掉了：加 already_done: true 与 produced_by 说明，不要为了凑 diff 去做规格没要求的改动`);
+        errs.push(tl(L, 'artifacts[{i}] `{path}` 相对基线没有任何改动 —— 本节点没有产出它，不要把现成的东西算作自己的产物。若它确实是本节点该交的东西、而上游节点已经做掉了：加 already_done: true 与 produced_by 说明，不要为了凑 diff 去做规格没要求的改动', { i, path: a.path }));
       }
     }
   }
-  if (!args?.interface_contract?.trim()) errs.push('interface_contract 为空 —— 下游没法照着用');
-  if (!args?.acceptance_evidence?.trim()) errs.push('acceptance_evidence 为空 —— 验收标准是机械判定的，要给出跑了什么、结果如何');
+  if (!args?.interface_contract?.trim()) errs.push(tl(L, 'interface_contract 为空 —— 下游没法照着用'));
+  if (!args?.acceptance_evidence?.trim()) errs.push(tl(L, 'acceptance_evidence 为空 —— 验收标准是机械判定的，要给出跑了什么、结果如何'));
   for (const [i, d] of (args?.key_decisions ?? []).entries()) {
-    if (!d?.summary?.trim() || !d?.rationale?.trim()) errs.push(`key_decisions[${i}] 缺 summary 或 rationale`);
+    if (!d?.summary?.trim() || !d?.rationale?.trim()) errs.push(tl(L, 'key_decisions[{i}] 缺 summary 或 rationale', { i }));
   }
   errs.push(...validateAssumptions(args?.assumptions ?? []));
   return errs;
@@ -483,7 +483,7 @@ export function persistHandoff(db, { taskId, nodeId, args, narrativeRef }) {
  * 一轮白白的往返，起因只是这段话没说**谁**该去发。所以现在明写"这条得由你来发"。
  */
 // 按内容语言写（0.2.0）：L = contentLang(db)
-const SCOPE_NOTE = (L) => '\n\n——\n' + tl(L, '**系统附注（不由模型生成）**：如果这条矛盾的出路是**改契约**（范围 scope / 行为规则 / 验收标准），请注意**在这条事项里答复改不了契约**。执行方仍然受宪法块里那份 scope 的机械校验：照你的授权去做，交接时会被判越界并撤销，于是又回到这条问题上。要真正改，**这条得由你来发**（做这个任务的 AI 只能改代码，改不了自己的契约）：到任务页「发送」，类别选「修正」，写清楚把范围 / 规则改成什么。系统会给出影响评估与计划变更；触及契约的要按路由表批准后才生效。如果不想改契约，就在答复里给一条**在现有范围内可行**的出路。');
+const SCOPE_NOTE = (L) => '\n\n——\n' + tl(L, '**系统附注（不由模型生成）**：如果这条矛盾的出路是**改契约**（范围 scope / 行为规则 / 验收标准），请注意**在这条事项里答复改不了契约**。执行方仍然受宪法块里那份 scope 的机械校验：照你的授权去做，交接时会被判越界并撤销，于是又回到这条问题上。要真正改，**这条得由你来发**（做这个任务的 AI 只能改代码，改不了自己的契约）：答复时勾上答复框下的「同时作为计划变更提交」，写清楚把范围 / 规则改成什么（也可以到任务页「发送」，类别选「修正」）。系统会给出影响评估与计划变更；触及契约的要按路由表批准后才生效。如果不想改契约，就在答复里给一条**在现有范围内可行**的出路。');
 
 function recordQuestion(db, { taskId, nodeId, args, narrativeRef, contextTokens }) {
   const id = newId('q');
@@ -579,7 +579,7 @@ export async function executeNode(db, {
     // 非 git 工作区（离线测试）时退化为只查存在性与"不是目录"。
     let changed = null;
     if (baseRef) { try { changed = changedSince(workspace, baseRef); } catch { /* 忽略 */ } }
-    const errs = validateHandoff(args, { exec, workspace, changed, scopePrefixes, scopeFiles, scopeStructured, lockedPaths, grantedPaths });
+    const errs = validateHandoff(args, { exec, workspace, changed, scopePrefixes, scopeFiles, scopeStructured, lockedPaths, grantedPaths, lang: contentLang(db) });
     if (errs.length) {
       rejections.push(errs);
       audit(db, { actorKind: 'agent', actorId: 'executor', action: 'handoff_rejected',

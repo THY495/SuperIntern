@@ -112,12 +112,35 @@ section('4. 开关：默认关；开了之后规划器走并行出口、形状�
   section('5. 执法：模块任务改共享路径被拒；骨架 / 集成 / 串行项目不受限');
   eq(lockedPathsFor(db, ids[1]), [...GOOD.shared_paths, 'si-preview.json'], '模块任务锁共享路径，外加截图说明（全项目一份，归骨架）');
   const vp = validateHandoff(H0(), { changed: new Set(['api/x.py', 'si-preview.json']), scopePrefixes: ['api'], scopeStructured: true, lockedPaths: lockedPathsFor(db, ids[1]) });
-  assert(vp.some((e) => /改了共享路径：`si-preview\.json`/.test(e)), '模块写截图说明 → 拒（几个模块各写一份必然合并冲突）');
+  assert(vp.some((e) => /改了共享路径：`si-preview\.json`/.test(e)), '模块写截图说明 → 拒（否则几个模块各写一份，合并必然冲突）');
+
+  section('5a. 英文部署：执行器会原样转给人看的那几段不夹中文（拒收理由、并行开发说明、系统补的步骤）');
+  {
+    const { setSetting } = await import('../src/core/settings.mjs');
+    const { parallelText } = await import('../src/core/parallel.mjs');
+    const { seedPlacement, PREVIEW_NODE, PREVIEW_SEED_NODE, CONTRACT_NODE } = await import('../src/core/orchestrator.mjs');
+    const CJK = /[一-鿿]/;
+    setSetting(db, { key: 'deploy.content_lang', value: 'en', userId: owner.userId });
+    for (const [i, what] of [[0, '骨架'], [1, '模块'], [4, '集成']]) assert(!CJK.test(parallelText(db, ids[i])), `${what}任务的并行开发说明是英文`);
+    const v = validateHandoff({ artifacts: [{ path: 'api/x.py' }] }, { changed: new Set(['api/x.py', 'package-lock.json', 'docs/a.md']), scopePrefixes: ['api'], scopeStructured: true, lockedPaths: lockedPathsFor(db, ids[1]), lang: 'en' });
+    assert(v.length >= 2 && v.every((e) => !CJK.test(e)), `拒收理由是英文（${v.length} 条）`);
+    assert(![PREVIEW_NODE.spec('en'), PREVIEW_NODE.acceptance('en'), PREVIEW_SEED_NODE.spec('en'), PREVIEW_SEED_NODE.acceptance('en'), seedPlacement(db, ids[4], 'en'), CONTRACT_NODE.spec('en', ['contracts/openapi.yaml'], ['x']), CONTRACT_NODE.acceptance('en')].some((s) => CJK.test(s)), '系统补的步骤（截图说明、样例数据、补契约）的说明与验收是英文');
+    setSetting(db, { key: 'deploy.content_lang', value: 'zh', userId: owner.userId });
+    assert(/并行开发：你是骨架任务/.test(parallelText(db, ids[0])), '中文部署照旧是中文');
+  }
 
   section('5b. 截图那两步补给谁：系统补的步骤也守范围');
-  eq(previewStepsFor(db, ids[0]), { preview: true, seed: false }, '骨架：写截图说明照补（这一步骨架做得到），不补样例数据（桩没有数据）');
+  eq(previewStepsFor(db, ids[0]), { preview: true, seed: false }, '骨架：写截图说明照补，不补样例数据（桩没有数据）');
   eq([1, 2, 3].map((i) => previewStepsFor(db, ids[i])), [0, 0, 0].map(() => ({ preview: false, seed: false })), '模块：两步都不补（文件对它只读）');
   eq(previewStepsFor(db, ids[4]), { preview: true, seed: true }, '集成：两步都照补（样例数据在这里才有真接口可调）');
+  {
+    // 追加进来的任务没有 kind、不受只读限制：补样例数据会和同时开着的集成任务各改一份截图说明 → 合并冲突
+    const tid = 't_appended'; db.run(`INSERT INTO tasks (id,owner_id,title,status,created_at,project_id,project_order) VALUES (?,?,'T8','running',?,?,8)`, tid, owner.userId, Date.now(), P.projectId);
+    eq(previewStepsFor(db, tid), { preview: true, seed: false }, '并行项目里的追加任务：截图说明缺了才补，样例数据不补（只由集成任务补）');
+    setParallel(db, { projectId: P.projectId, on: false, userId: owner.userId });
+    eq(previewStepsFor(db, tid), { preview: true, seed: true }, '串行项目的追加任务与原来一样');
+    setParallel(db, { projectId: P.projectId, on: true, userId: owner.userId });
+  }
   const sp = seedPlacement(db, ids[4]);
   assert(/只能.*放在本任务的可动目录里/.test(sp) && !/仓库根目录里/.test(sp.split('；')[0]), '样例脚本的位置写进那一步的规格：本任务的可动目录');
   setParallel(db, { projectId: P.projectId, on: false, userId: owner.userId });

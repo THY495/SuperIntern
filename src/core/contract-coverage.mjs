@@ -9,6 +9,7 @@
 
 import { readFileSync, readdirSync, statSync, existsSync } from 'node:fs';
 import { join, relative } from 'node:path';
+import { tl } from '../i18n/index.mjs';
 
 const METHODS = 'GET|POST|PUT|PATCH|DELETE';
 const EP_RE = new RegExp(`\\b(${METHODS})\\s+\`?(\\/[A-Za-z0-9_\\-./{}:]*)(\\?[^\\s\`]*)?`, 'g');
@@ -81,6 +82,52 @@ export function skeletonCoverageProblems(spec, brief) {
   if (!missing.length) return [];
   return [`骨架任务的完成定义要逐条点名规格里的每个接口（写成 \`METHOD /path\`）：模块任务只对着骨架定下的契约写，漏一个，两个模块就各按各的理解做、到集成时才撞上。`
     + `缺：${missing.map((e) => `\`${e.method} ${e.path}\``).join('、')}。查询参数与请求 / 响应字段也照规格写进契约`];
+}
+
+// ── 规划时：规格里写死的命令行用法，负责那个脚本的任务要写到 ──────────────────
+// 接口不只是 HTTP：规格写成 `node importer/import.mjs <file.csv> --project <KEY>` 的，参数名同样是写死的外部行为。
+// 规划器拆任务时没把它摘进负责那个脚本的任务，执行器就只能自己拟一个调用形式来问人，人又多半照着 AI 的草稿点头
+// —— 一处漏摘，到集成、签收时才发现，前后要人答一串。这里只核对参数名（--xxx）：位置参数怎么写各有各的写法，
+// 参数名对不上才是硬伤。
+const CMD_RE = /`((?:node|python3?|npx)\s+([\w./-]+\.(?:mjs|cjs|js|ts|py))(?:\s[^`]*)?)`/g;
+/** 规格里带参数名的命令：[{ path, flags, cmd }]（同一个脚本的几种写法合在一起）。 */
+export function specCommands(text) {
+  const by = new Map();
+  for (const [, cmd, path] of String(text ?? '').matchAll(CMD_RE)) {
+    const flags = [...new Set(cmd.match(/(?<![\w-])--[a-z][\w-]*/gi) ?? [])];
+    if (!flags.length) continue;
+    const e = by.get(path) ?? { path, flags: new Set(), cmd };
+    flags.forEach((f) => e.flags.add(f));
+    by.set(path, e);
+  }
+  return [...by.values()].map((e) => ({ ...e, flags: [...e.flags] }));
+}
+const coversPath = (scopePaths, p) => (Array.isArray(scopePaths) ? scopePaths : []).some((s) => {
+  const x = String(s).replace(/^\.\//, '');
+  return x !== '*' && (x === p || (x.endsWith('/') && p.startsWith(x)));
+});
+const taskText = (t) => [t.goal, t.scope, t.definition_of_done,
+  ...(Array.isArray(t.rules) ? t.rules.map((r) => `${r?.rule ?? ''} ${r?.quote ?? ''}`) : [])].join('\n');
+/**
+ * 规划时：规格里每条带参数名的命令，负责那个脚本的任务（可动路径覆盖它、不是骨架 / 集成）要在契约文字里写到它的每个参数名。
+ * 没有一个任务覆盖那个脚本 → 不核（不归这次规划）。返回错误列表（给规划器看，中文）。
+ */
+export function cliCoverageProblems(spec, text) {
+  const cmds = specCommands(text);
+  const tasks = Array.isArray(spec?.tasks) ? spec.tasks : [];
+  if (!cmds.length || !tasks.length) return [];
+  const errs = [];
+  for (const c of cmds) {
+    const covering = tasks.map((t, i) => ({ t, n: i + 1 })).filter(({ t }) => coversPath(t?.scope_paths, c.path));
+    const owners = covering.filter(({ t }) => !['skeleton', 'integration'].includes(t.kind));
+    for (const { t, n } of owners.length ? owners : covering.filter(({ t }) => t.kind !== 'skeleton')) {
+      const body = taskText(t);
+      const missing = c.flags.filter((f) => !new RegExp(`(?<![\\w-])${f.replace(/[-]/g, '\\-')}(?![\\w-])`).test(body));
+      if (missing.length) errs.push(`任务 #${n} 负责 \`${c.path}\`，规格写死了它的用法 \`${c.cmd}\`，但这个任务的完成定义 / 规则里没有写到 ${missing.map((f) => `\`${f}\``).join('、')}：`
+        + '执行器只能自己拟一个调用形式，和别的部分、和验收对不上。把这条用法原样写进完成定义（参数名一个不少）');
+    }
+  }
+  return errs;
 }
 
 // ── 骨架做完时：对着契约文件核对 ─────────────────────────────────────────
@@ -161,7 +208,7 @@ const hasWord = (text, w) => new RegExp(`(^|[^A-Za-z0-9_])${w}([^A-Za-z0-9_]|$)`
 /**
  * 契约文件缺什么：返回 { files, gaps:[人看得懂的一句] }。规格里没有接口、或者找不到契约文件 → gaps 为空（不核对）。
  */
-export function contractGaps(workspace, { brief, sharedPaths }) {
+export function contractGaps(workspace, { brief, sharedPaths, lang = 'zh' }) {
   const eps = specEndpoints(brief);
   if (!eps.length) return { files: [], gaps: [] };
   const files = contractFiles(workspace, sharedPaths, eps);
@@ -174,11 +221,11 @@ export function contractGaps(workspace, { brief, sharedPaths }) {
   const gaps = [];
   for (const e of eps) {
     const b = blocks.get(normPath(e.path));
-    if (!b || !b.methods.has(e.method)) { gaps.push(`缺接口 \`${e.method} ${e.path}\``); continue; }
+    if (!b || !b.methods.has(e.method)) { gaps.push(tl(lang, '缺接口 `{ep}`', { ep: `${e.method} ${e.path}` })); continue; }
     const params = e.params.filter((n) => !hasWord(b.text, n));
-    if (params.length) gaps.push(`\`${e.method} ${e.path}\` 缺查询参数 ${params.map((n) => `\`${n}\``).join('、')}`);
+    if (params.length) gaps.push(tl(lang, '`{ep}` 缺查询参数 {names}', { ep: `${e.method} ${e.path}`, names: params.map((n) => `\`${n}\``).join(tl(lang, '、')) }));
     const fields = e.fields.filter((n) => !hasWord(b.text, n));
-    if (fields.length) gaps.push(`\`${e.method} ${e.path}\` 的请求 / 响应里缺字段 ${fields.map((n) => `\`${n}\``).join('、')}`);
+    if (fields.length) gaps.push(tl(lang, '`{ep}` 的请求 / 响应里缺字段 {names}', { ep: `${e.method} ${e.path}`, names: fields.map((n) => `\`${n}\``).join(tl(lang, '、')) }));
   }
   return { files: files.map((f) => f.file), gaps };
 }
