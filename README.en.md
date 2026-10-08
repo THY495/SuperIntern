@@ -9,7 +9,7 @@ SuperIntern is a self-hosted autonomous coding agent that runs for long periods 
 ![node](https://img.shields.io/badge/node-%E2%89%A5%2022.13-green)
 ![deps](https://img.shields.io/badge/npm%20dependencies-0-brightgreen)
 
-> The web UI and the CLI are available in **English and Chinese**. Each person picks their own interface language (top right of the board). An admin sets the team's *content language* under Settings → Members: the language of open items, reports and everything the AI writes for people. Documentation other than this README is in Chinese.
+> The web UI and the CLI are available in **English and Chinese**. Each person picks their own interface language (top right of the board). An admin sets the team's *content language* under Settings → Members: the language of open items, reports and everything the AI writes for people. The deployment and known-limitations guides are also available in English.
 
 ---
 
@@ -35,7 +35,7 @@ SuperIntern is a self-hosted autonomous coding agent that runs for long periods 
 **Good fit:** individuals or small teams handing well-scoped, small-to-medium development tasks to an agent on a machine they control, such as a new small app or features and tests for an existing repo, while they only make decisions.
 **Not a good fit:** large legacy codebases, tasks that need several days of continuous reasoning, or exposing it to strangers on the public internet.
 
-See [docs/known-limits.md](docs/known-limits.md) (Chinese) for known gaps.
+See [docs/known-limits.en.md](docs/known-limits.en.md) for known gaps.
 
 ## What it does
 
@@ -99,7 +99,7 @@ node src/cli.mjs init --name YourName   # 3. database, admin token, model tiers
 scripts/start.sh                        # 4. web UI + task scheduler, foreground (Ctrl+C stops)
 ```
 
-The first sandbox image build downloads about 400 MB from Docker Hub and the Debian mirrors (including Chromium for screenshots). On a slow network this can take tens of minutes. If the machine cannot reach them, build the images elsewhere and copy them over; see [deploy-linux.md](docs/deploy-linux.md#主机够不着-docker-hub-时) (Chinese).
+The first sandbox image build downloads about 400 MB from Docker Hub and the Debian mirrors (including Chromium for screenshots). On a slow network this can take tens of minutes. If the machine cannot reach them, build the images elsewhere and copy them over; see [deploy-linux.en.md](docs/deploy-linux.en.md#when-the-host-cannot-reach-docker-hub).
 
 `setup` is safe to re-run. It never overwrites `.env`, never rebuilds existing images and never touches an existing database. When it checks `.env`, it only reports which keys are set, never their values.
 
@@ -124,7 +124,7 @@ Open **http://127.0.0.1:7357/**. In local mode there is no login: you are the ad
   scripts/start.sh --public-url https://si.example.lan
   ```
 
-  For the reverse proxy config (Caddy / nginx), creating accounts, and what team mode does and does not protect against, see [docs/deploy-team.md](docs/deploy-team.md) (Chinese). **Do not expose it to the public internet.**
+  For the reverse proxy config (Caddy / nginx), creating accounts, and what team mode does and does not protect against, see [docs/deploy-team.en.md](docs/deploy-team.en.md). **Do not expose it to the public internet.**
 
 In both modes, permissions attach to *decisions*, not people. Go to Project settings → 决策路由 (decision routing), pick a template and adjust it.
 
@@ -135,7 +135,7 @@ The `start` scripts run in the foreground. To start at login or boot and restart
 - **Windows:** Task Scheduler. Run `powershell -ExecutionPolicy Bypass -File scripts\daemon.ps1 install` (also `status | start | stop | uninstall`).
 - **Linux:** a systemd user unit. Run `scripts/daemon.sh install` (add `--public-url https://…` for team mode).
 
-Details, including WSL2, are in [docs/deploy.md](docs/deploy.md) and [docs/deploy-linux.md](docs/deploy-linux.md) (both Chinese).
+Details, including WSL2, are in [docs/deploy.en.md](docs/deploy.en.md) and [docs/deploy-linux.en.md](docs/deploy-linux.en.md).
 
 ## CLI
 
