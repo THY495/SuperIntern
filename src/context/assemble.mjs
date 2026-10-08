@@ -9,12 +9,14 @@
 // 改动点之后全部失效，所以稳定段必须连续且在最前，易变段一律靠后。
 
 import { withOutputLang, contentLang } from '../i18n/index.mjs';
+import { dirLikeTestArgs } from '../core/verify-argv.mjs';
 import { newId, now, audit } from '../db/db.mjs';
 import { pendingMessages } from '../core/inbox.mjs';
 import { CACHE_FLOORS } from '../llm/canonical.mjs';
 import { relevantDecisions, renderDecisions, scopeHints, overruledContractRules, renderOverruled } from '../core/decisions.mjs';
 import { egressContext } from '../core/egress.mjs';
 import { getParam } from '../core/params.mjs';
+import { parallelText } from '../core/parallel.mjs';
 
 /**
  * 粗略 token 估算。中英混排按 3.5 字符/token——只用于装配审计与缓存门槛校验，
@@ -88,7 +90,12 @@ function verifyGateText(db, taskId) {
   const extra = extraRaw.map(asArgv).filter(Boolean);
   return `\n\n## 任务级验收\n全部步骤做完后，系统会在这个沙箱里、仓库根目录下**原样**跑下面这条命令（argv，不经 shell），退出码 0 任务才算完成：\n- \`${own.join(' ')}\``
     + (extra.length ? `\n另有 ${extra.length} 条前面任务的回归命令，同样要过：\n${extra.map((a) => `- \`${a.join(' ')}\``).join('\n')}` : '')
-    + `\n做到它该通过的时候，就用这条**原样命令**确认，别换成自以为等价的写法 —— 比如 \`pytest\` 与 \`python -m pytest\` 的导入路径就不一样，你那边绿了、这边照样挂。`;
+    + `\n做到它该通过的时候，就用这条**原样命令**确认，别换成自以为等价的写法 —— 比如 \`pytest\` 与 \`python -m pytest\` 的导入路径就不一样，你那边绿了、这边照样挂。`
+    // 执行器不知道系统会展开 `node --test <目录>`，就会向人要改验收命令，或给 package.json 加 main 指向测试文件绕过去
+    + ([own, ...extra].some((a) => dirLikeTestArgs(a).length)
+      ? '\n其中 `node --test <目录>` 在 Node 22 上不展开目录；系统执行时会把它改写成 `<目录>/**/*.test.{cjs,mjs,js}` 再跑。你自己在沙箱里确认时用这个 glob 写法；'
+        + '**不要**为它改 package.json（例如加 main）、也不要为它提问要求改验收命令 —— 那条命令系统照常能跑。'
+      : '');
 }
 
 export function assembleExecutor(db, { taskId, nodeId, tier, vendorId, maxIterations = 20, recipe = 'executor/v0-four-part' }) {
@@ -131,7 +138,7 @@ ${JSON.parse(c.constraints || '[]').map((x) => `- ${x}`).join('\n') || '（无�
     // 不在这里把裁定挂出来，执行器看到的就是一份没有异议的契约，照着作废的规则做。
     const ov = renderOverruled(db, overruledContractRules(db, taskId));
     return ov ? `\n\n${ov}` : '';
-  })()}${verifyGateText(db, taskId)}
+  })()}${verifyGateText(db, taskId)}${parallelText(db, taskId)}
 
 ${egressContext(db, taskId)}`;
 

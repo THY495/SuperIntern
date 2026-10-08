@@ -52,7 +52,8 @@ import { getParam } from '../core/params.mjs';
 import { LlmClient } from '../llm/client.mjs';
 import { afterInput } from '../core/decision-check.mjs';
 import { activeDecisions, SOURCE_NAMES, sourceNamesOf, overruledContractRules } from '../core/decisions.mjs';
-import { budgetState, setProjectBudget, projectVerifyCommand, setProjectVerify, gearOf, setGear, gearPrereqStatus, GEARS, deferredSignoffs, maxOpenOf, setMaxOpen, MAX_OPEN_CEILING, setupCommandsOf, setSetupCommands, detectSetupCommands } from '../core/project-settings.mjs';
+import { budgetState, setProjectBudget, projectVerifyCommand, setProjectVerify, gearOf, setGear, gearPrereqStatus, GEARS, deferredSignoffs, maxOpenOf, setMaxOpen, MAX_OPEN_CEILING, parallelOf, setParallel, setupCommandsOf, setSetupCommands, detectSetupCommands } from '../core/project-settings.mjs';
+import { sharedPathsOf } from '../core/parallel.mjs';
 import { TIERS, EFFORTS } from '../llm/canonical.mjs';
 import { registryFor, endpointsOf, endpointDiff, keyPresence, catalogOf, bindable, bindingOf, bindingProblems, setBinding, saveEndpoint, setEndpointEnabled,
   removeEndpoint, testEndpoint, listEndpointModels, saveModel, removeModel, checkableCatalog, ADAPTERS, ADAPTER_DEFAULTS } from '../llm/registry.mjs';
@@ -143,6 +144,8 @@ export function projectList(db, lang = 'zh') {   // lang：上限数值按看的
       current: tasks.find((t) => !t.merged_at && t.status !== 'aborted' && startedIds.has(t.id))?.id ?? null,
       openIds: tasks.filter((t) => !t.merged_at && t.status !== 'aborted' && startedIds.has(t.id)).map((t) => t.id),
       maxOpen: maxOpenOf(db, p.id),
+      parallel: parallelOf(db, p.id),
+      sharedPaths: parallelOf(db, p.id) ? sharedPathsOf(db, p.id) : [],
       egress: projectEgressOf(db, p.id),
       setupCommands: setupCommandsOf(db, p.id).map((a) => a.join(' ')),
       // 不填时自动识别出的那几条（按项目仓库当前的依赖清单）：页面上给人看"系统会替你跑什么"
@@ -773,11 +776,14 @@ export function startWeb(db, { home, port = 7357, host = '127.0.0.1', tokenPlain
         // 新建的唯一入口。目标 + 完成定义必填；plan 给了 = 已写好的规划（规划器切），没给 = 第一个任务从目标起草（追问器）。
         const empty = !!body.empty;
         if (!empty) checkRepoSource(body.source, { required: true });
+        // 并行开发：只在"已有规划"时可开 —— 规划器的切法取决于它，从目标起草的第一个任务没有可切的东西。
+        if (body.parallel && !String(body.plan ?? '').trim()) return json(res, 400, { error: new I18nError('并行开发要配合一份已写好的规划（勾选"这是一份已写好的规划"并粘贴全文）') });
         const r = startProject(db, { userId: me.userId, goal: body.goal, doneDefinition: body.doneDefinition, plan: body.plan ?? null,
           source: empty ? null : body.source, empty, base: body.base || null, title: body.title || null, home });
+        if (body.parallel) setParallel(db, { projectId: r.projectId, on: true, userId: me.userId });
         return json(res, 200, { ok: true, result: r });
       }
-      const pm = p.match(/^\/api\/projects\/([^/]+)\/(advance|deliver|abort|redo|rename|archive|append|review|member|visibility|goal|budget|verify|gear|limit|signoff_all|max_open|egress|setup)$/);
+      const pm = p.match(/^\/api\/projects\/([^/]+)\/(advance|deliver|abort|redo|rename|archive|append|review|member|visibility|goal|budget|verify|gear|limit|signoff_all|max_open|parallel|egress|setup)$/);
       if (pm && req.method === 'POST') {
         const body = await readBody(req);
         const a = authenticate(db, tokenPlain);
@@ -791,6 +797,12 @@ export function startWeb(db, { home, port = 7357, host = '127.0.0.1', tokenPlain
         // 项目的旋钮 + 后置签收：一律只有负责人（上面那道 403 已经挡住别人了）。
         if (pm[2] === 'setup') {
           try { return json(res, 200, { ok: true, result: setSetupCommands(db, { projectId: pm[1], commands: body.commands ?? '', userId: me.userId }) }); }
+          catch (e) { return json(res, 400, { error: e }); }
+        }
+        if (pm[2] === 'parallel') {
+          // 只许关：开不开要在规划前定（建项目时），批准之后再打开，已经切好的任务不是按并行的形状切的。
+          if (body.on) return json(res, 400, { error: new I18nError('并行开发只能在新建项目时开启（规划器的切法取决于它）') });
+          try { return json(res, 200, { ok: true, result: setParallel(db, { projectId: pm[1], on: false, userId: me.userId }) }); }
           catch (e) { return json(res, 400, { error: e }); }
         }
         if (pm[2] === 'egress') {

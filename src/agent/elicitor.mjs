@@ -13,6 +13,7 @@
 // "好，但是把 X 改成 Y" 不算批准，算反馈。签字这件事不交给分类器。
 
 import { withOutputLang, contentLang, tl, I18nError } from '../i18n/index.mjs';
+import { dirLikeTestArgs } from '../core/verify-argv.mjs';
 import { markOf } from '../i18n/marks.mjs';
 import { routeQuestion, scopePathProblems, normScopePaths, renderScopePaths, SCOPE_PATHS_NOTE, scopePathsNote, specPrefixes } from '../core/routing.mjs';
 import { newId, now, audit } from '../db/db.mjs';
@@ -108,6 +109,10 @@ export function verifyCommandProblems(raw) {
   if (/[\r\n]/.test(s)) errs.push('verify_command 是多行脚本 —— 只能是一条命令；把脚本列进完成定义让实现方交付，这里只写运行它的命令');
   const meta = s.match(/(\|\||&&|\||;|\$\(|`|>|<|\bset -e\b|\btrap\b)/);
   if (meta) errs.push(`verify_command 含 shell 语法「${meta[1]}」—— 命令不经 shell 执行，管道 / 串联 / 重定向 / 变量都不生效`);
+  // `node --test cli/` 在 Node 22 上不展开目录（Cannot find module）。系统执行时会改写成 glob（verify-argv），
+  // 但契约里写着目录形式，执行器、签收的人都会以为它跑不通，于是提问、要求改命令，一个问题要来回好几步。
+  const dirs = dirLikeTestArgs(s.split(/\s+/));
+  if (dirs.length) errs.push(`verify_command 里 \`node --test ${dirs[0]}\` 写的是目录 —— Node 22 的 --test 不展开目录。写成 glob，例如 \`${dirs[0].replace(/\/+$/, '')}/*.test.mjs\`；规则里提到测试命令也用同样的写法`);
   return errs;
 }
 

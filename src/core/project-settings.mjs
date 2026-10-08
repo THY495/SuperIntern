@@ -56,6 +56,16 @@ export const maxOpenOf = (db, projectId) => {
   return Number.isInteger(n) && n >= 1 && n <= MAX_OPEN_CEILING ? n : DEFAULT_MAX_OPEN;
 };
 
+// ── 并行开发（默认关）──────────────────────────────────────────────────
+// 开着时：规划先出接口契约与"骨架"任务，其余按模块切、范围两两不相交；骨架合并后，共享文件（接口、根依赖清单、
+// 根验收脚本……）对模块任务只读；调度"就绪就开"（并发上限内），不再只在都等人时让路。
+// 关着时一切与 0.2.0 相同。要在规划前定：规划器的切法取决于它。
+export const PARALLEL_KEY = 'project.parallel';
+export const parallelOf = (db, projectId) => (projectId ? getProjectParam(db, projectId, PARALLEL_KEY) === true : false);
+export function setParallel(db, { projectId, on, userId }) {
+  return writeOne(db, { projectId, key: PARALLEL_KEY, value: !!on, userId, action: 'project_parallel_set', payload: { on: !!on } });
+}
+
 /** 挡位。default 是 propose —— 沉默的默认永远是"提议"，显式授权才进自动挡。 */
 export const GEARS = {
   propose: { label: N_('提议'), blurb: N_('每次签收后，规划器对照项目目标提下一批任务或声明已达成；建任务前都要人批一次。') },
@@ -228,7 +238,10 @@ export function detectSetupCommands(dir) {
     if (!has(pkg)) continue;
     const lock = posix.join(d, 'package-lock.json');
     const prefix = d ? ['--prefix', d] : [];
-    argvs.push(has(lock) ? ['npm', 'ci', '--no-audit', '--no-fund', ...prefix] : ['npm', 'install', '--no-audit', '--no-fund', ...prefix]);
+    // 没有锁文件时 --no-package-lock：环境准备是系统替人跑的，不该在工作区里生成一个没人提交过的锁文件
+    // （比如根目录只有 npm workspaces 的 package.json：每个任务的工作区都会冒出 package-lock.json，
+    // 验收前被判"有没提交的改动"、合并前被判"签收后还有改动"，一次次给人添事项）。要锁文件的任务自己会生成并提交它。
+    argvs.push(has(lock) ? ['npm', 'ci', '--no-audit', '--no-fund', ...prefix] : ['npm', 'install', '--no-audit', '--no-fund', '--no-package-lock', ...prefix]);
     note(pkg); if (has(lock)) note(lock);
   }
   return { argvs, manifests };

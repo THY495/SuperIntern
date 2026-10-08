@@ -23,7 +23,7 @@ import { getParam, setParam } from '../core/params.mjs';
 import { routeQuestion, specPrefixes, wholeProjectPrefixes } from '../core/routing.mjs';
 import { createProjectTasks, validateProjectSpec, projectTasks, chainGraph, renderRules, renderDeps, scopeOverlaps, renderScopeOverlaps, renderScopePaths, scopePathsNote, SCOPE_PATHS_NOTE, PROJECT_TASK_RUNTIME_MS } from '../core/project.mjs';
 import { canAddTasks } from '../core/project-members.mjs';
-import { projectVerifyCommand, gearOf, gearPrereqStatus, budgetState, maxOpenOf } from '../core/project-settings.mjs';
+import { projectVerifyCommand, gearOf, gearPrereqStatus, budgetState, maxOpenOf, parallelOf } from '../core/project-settings.mjs';
 import { activeDecisions, recordReservation } from '../core/decisions.mjs';
 import { checkDecisions } from '../core/decision-check.mjs';
 import { decisionsSection } from '../core/decisions.mjs';
@@ -274,7 +274,7 @@ export function renderAppendProposal(db, { project, spec, version, notes, startO
   if (overlaps) L.push(overlaps, '');
   if (notes) L.push(tl(lg, '规划器说明：{v}', { v: notes }), '');
   L.push(tl(lg, '每个任务的硬上限：累计运行时长 {h} h（其余按默认）。', { h: Math.round(PROJECT_TASK_RUNTIME_MS / 3600000) }), '');
-  L.push(tl(lg, '批准后新任务按上面的依赖关系排进项目：依赖的任务都签收并合并后才开工；已有任务的契约不受影响。{sched}依赖关系不对，直接在反馈里说。请回复：', { sched: schedLine(maxOpen, lg) }), tl(lg, '(A) 批准 —— 回 "A" 或 "批准"'), tl(lg, '(B) 要改 —— 直接写要改什么，会出下一版'), review ? tl(lg, '(C) 先放着（还没想好） —— 回 "C" 或 "先放着"：这批任务不加，项目也不算做完，转为停滞，以后再添加任务、重新复盘或中止') : tl(lg, '(C) 放弃 —— 回 "C" 或 "放弃"（不追加，项目其余照旧）'), tl(lg, '(D) 批准，但留一句保留意见 —— **它不挡任何东西**：这一批照样全部生效，效果与 (A) 一模一样。它只把你那句话留在项目的约定清单上、标成〔保留意见〕，让下一个碰这一处的人看得到。要**挡住**其中某一条，只能 (B) 说清哪一条不要、让它重出一版。写法：先回 A，**另起一行**写「保留：…」。'), ...(review ? [tl(lg, '(E) 项目其实已经做完了，这些任务都不需要 —— 回 "E" 或 "已达成"：这批任务不加，项目算做完（之后可以交付）')] : []));
+  L.push(tl(lg, '批准后新任务按上面的依赖关系排进项目：依赖的任务都签收并合并后才开工；已有任务的契约不受影响。{sched}依赖关系不对，直接在反馈里说。请回复：', { sched: schedLine(maxOpen, lg, parallelOf(db, project.id)) }), tl(lg, '(A) 批准 —— 回 "A" 或 "批准"'), tl(lg, '(B) 要改 —— 直接写要改什么，会出下一版'), review ? tl(lg, '(C) 先放着（还没想好） —— 回 "C" 或 "先放着"：这批任务不加，项目也不算做完，转为停滞，以后再添加任务、重新复盘或中止') : tl(lg, '(C) 放弃 —— 回 "C" 或 "放弃"（不追加，项目其余照旧）'), tl(lg, '(D) 批准，但留一句保留意见 —— **它不挡任何东西**：这一批照样全部生效，效果与 (A) 一模一样。它只把你那句话留在项目的约定清单上、标成〔保留意见〕，让下一个碰这一处的人看得到。要**挡住**其中某一条，只能 (B) 说清哪一条不要、让它重出一版。写法：先回 A，**另起一行**写「保留：…」。'), ...(review ? [tl(lg, '(E) 项目其实已经做完了，这些任务都不需要 —— 回 "E" 或 "已达成"：这批任务不加，项目算做完（之后可以交付）')] : []));
   return L.join('\n');
 }
 
@@ -288,7 +288,9 @@ const SYSTEM_APPEND = (max) => `你是一个长期运行的自主 agent 的"项�
 - 每个任务是几小时内能做完、能用一条命令验收的单位；按"消费方"切，先做被依赖的。能用一个任务做完就只出一个，不要为了凑数而拆。
 - **接口名写死**：文件名、导出名、子命令名、字段名、退出码都写进完成定义；引用前面任务的产物时用它们契约里写死的名字。
 - verify_command 只写本任务新增的测试；任务开工时，系统会把当时已合并的全部任务的验收命令累加成回归义务。
-- 每个新任务的约束里必须有这一条（原文照抄）："既有测试文件只许追加用例；唯一例外是断言了被本契约明确取代的中间行为的用例，可以改那一条并在交接记录里说明；其余一行不许改、不许删"。
+- node --test 后面写测试文件或 glob（例如 cli/*.test.mjs），**不要写目录**：Node 22 的 --test 不展开目录。规则、完成定义里提到的测试命令也一样。
+- scope_paths 要包含本任务会**追加用例的测试文件**（或测试目录）：实现方先写测试，测试文件不在可动路径里，交接会被越界校验拒回。
+- 每个新任务的约束里必须有这一条（原文照抄）："既有测试文件只许追加用例；唯一例外是断言了被本契约明确取代的中间行为的用例，可以改那一条并在交接记录里说明；其余一行不许改、不许删"。输出语言是英文时照抄这一句英文："Existing test files may only have cases appended; the one exception is a case asserting an intermediate behavior that this contract explicitly replaces — you may change that one case and say so in the handoff; nothing else may be changed or deleted"。
 - 不要把"尚未实现的行为"写进完成定义。完成定义里的行为样例带精确的期望输出，每个任务 3 到 8 个，不要穷举。
 - **每条行为规则要有出处**（rules 字段）：quote 逐字引人的原文（原规划或这次的追加说明都行，系统会机械核对是子串）；人没写的，用 assumption 说明你怎么定的。不要把推断写成规格口吻的硬规则。
 - **一条规则只讲一件事**：分号连起来的多个断言会被拒，拆开写、各带各的出处；规则用原文的说法写，别改写关键词。

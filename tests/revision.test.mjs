@@ -129,6 +129,21 @@ section('1. 覆盖性：impact 必须逐一交代每个节点，"没提到"不�
   eq(validateRevision(withRule('这一句在宪法块里根本找不到吧'), { nodes }).filter((e) => /找不到/.test(e)).length, 0, '不传 constitution 就不核（旧调用方式不受影响）');
   const real = String(constitution.goal).slice(0, 12);
   eq(validateRevision(withRule(real), { nodes, constitution }).filter((e) => /找不到/.test(e)).length, 0, '逐字引宪法块原文 → 通过');
+
+  // 修正点名了范围外的路径（更正要测试先行节点改测试文件，重规划只改节点规格 → 越界拒收死循环，人得一轮轮地答）。
+  // 只在提示里说"要扩就填 scope_paths"不够；这里改成机械的：每条范围外路径要么进 scope_paths，要么明说不需要改。
+  const scoped = { ...constitution, scope: '只改 web/src/App.jsx', scope_paths: JSON.stringify(['web/src/App.jsx']) };
+  const all = { impact: ids.map((i) => mark(i, 'unaffected')), rationale: 'x' };
+  const t12 = 'Please write the failing test in web/src/App.test.jsx first, then change web/src/App.jsx. App.test.jsx is new.';
+  hasErr(validateRevision(all, { nodes, constitution: scoped, messageBody: t12 }), '`web/src/App.test.jsx`', '更正要改范围外的测试文件、修订只改节点 → 拒回，点名那个文件（只写文件名的同一文件不重复点名）');
+  eq(validateRevision({ ...all, constitution_patch: { scope_paths: ['web/src/App.jsx', 'web/src/App.test.jsx'] } }, { nodes, constitution: scoped, messageBody: t12 }).length, 0, '扩进 scope_paths → 通过（交人批准由门禁管）');
+  eq(validateRevision({ ...all, scope_not_needed: ['web/src/App.test.jsx'] }, { nodes, constitution: scoped, messageBody: t12 }).length, 0, '明说不需要改 → 通过');
+  eq(validateRevision(all, { nodes, constitution: scoped, messageBody: 'In verify.mjs run node --test web/ instead.' }).filter((e) => /范围（scope_paths）之外/.test(e)).length, 1, '"In verify.mjs" 是在说要改它 → 照样核');
+  eq(validateRevision(all, { nodes, constitution: scoped, messageBody: 'Use node --test importer/*.test.mjs and python worker/notifier.py --once; add @testing-library/react; see https://example.com/a.js; Node.js 22.' }).length, 0, '命令参数、npm 包名、网址、Node.js 都不算路径');
+  eq(validateRevision(all, { nodes, constitution: scoped, messageBody: 'Fix web/src/App.jsx.\n\n —— 系统附（不由模型生成）——\n验收命令：node verify.mjs\n失败于 contracts/check.mjs' }).length, 0, '系统附在后面的验收输出不算人点名');
+  eq(validateRevision(all, { nodes, constitution: scoped, messageBody: 'also update si-preview.json and package.json' }).length, 0, '本来就不受范围限制的文件（截图说明、依赖清单）不核');
+  eq(validateRevision(all, { nodes, constitution: { ...scoped, scope: '.', scope_paths: '[]' }, messageBody: t12 }).length, 0, '范围不执法（抽不出路径）→ 不核');
+  eq(validateRevision(all, { nodes, constitution: scoped }).length, 0, '不传修正正文（旧调用方式）→ 不核');
   db.close();
 }
 

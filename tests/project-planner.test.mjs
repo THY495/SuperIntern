@@ -56,7 +56,7 @@ const db = openDb(':memory:');
 const owner = ensureOwner(db);
 const call = (name, args, id = 'c1') => ({ stopReason: 'tool_call', content: [{ type: 'tool_call', id, name, args }], usage: { inputTokens: 10, outputTokens: 5 } });
 const client = (script) => new LlmClient({ mode: 'fake', fake: makeFake(script) });
-const task = (t) => ({ title: t, goal: `g ${t}`, scope: 's', scope_paths: [`src/${t}/`], definition_of_done: `d ${t}`, rules: [{ rule: `r ${t}`, assumption: '规格没写' }], constraints: ['既有测试一行不许改'], verify_command: `node --test tests/${t}.test.mjs` });
+const task = (t) => ({ title: t, goal: `g ${t}`, scope: 's', scope_paths: [`src/${t}/`], definition_of_done: `d ${t}`, rules: [{ rule: `r ${t}`, assumption: '规格没写' }], constraints: ['既有测试一行不许改'], verify_command: `node --test tests/${t.replace(/\s+/g, '_')}.test.mjs` });
 const propose = (tasks, over = {}) => call('propose_project', { title: '演示项目', tasks, notes: '拍了两个板', ...over });
 const answer = (qid, body) => recordAnswer(db, { questionId: qid, body, plaintextToken: owner.plaintext });
 const project = (id) => db.one(`SELECT * FROM projects WHERE id=?`, id);

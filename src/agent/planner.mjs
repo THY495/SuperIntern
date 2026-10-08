@@ -17,6 +17,7 @@ import { textOf, toolCallsOf, truncatedEmpty, TruncatedEmptyError } from '../llm
 import { validateRules, foldRules } from '../core/rules.mjs';
 import { newId, now, insertEdge, audit } from '../db/db.mjs';
 import { getParam } from '../core/params.mjs';
+import { parallelText } from '../core/parallel.mjs';
 
 const RISK_TIERS = ['low', 'normal', 'high'];
 const MODEL_TIERS = ['light', 'standard', 'heavy'];
@@ -291,7 +292,9 @@ export async function plan(db, { client, taskId, constitution, tier = 'heavy', m
       // 契约里已被人判作废的条目 —— 不挂上，规划器会把作废的规则原样切进节点规格与验收标准。
       + ((ov) => (ov ? `\n\n${ov}` : ''))(renderOverruled(db, overruledContractRules(db, taskId)))
       // 基线漂移提示（project.mjs startTask）：契约定稿之后，有不在它依赖关系里的任务先合并了。
-      + (driftNote ? `\n\n## 开工前须知（系统按合并记录机械生成）\n${driftNote}` : '') }],
+      + (driftNote ? `\n\n## 开工前须知（系统按合并记录机械生成）\n${driftNote}` : '')
+      // 并行开发：骨架 / 模块 / 集成各自该知道的（执行器那边在 context/assemble.mjs 里挂同一段）
+      + parallelText(db, taskId) }],
   }];
   const rejections = [];
 

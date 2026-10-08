@@ -13,7 +13,7 @@ import { execFileSync } from 'node:child_process';
 import { existsSync, mkdirSync, rmSync, readFileSync, writeFileSync } from 'node:fs';
 import { resolve, join } from 'node:path';
 import { audit, newId } from '../db/db.mjs';
-import { I18nError } from '../i18n/index.mjs';
+import { I18nError, tl } from '../i18n/index.mjs';
 
 const gitRaw = (cwd, ...args) =>
   execFileSync('git', args, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
@@ -140,15 +140,23 @@ export function changedSince(dir, base) {
  * 幂等：已经写过就不再写。
  */
 //
-// 构建产物同理：若前面的任务把 `frontend/dist/` 提交进了仓库（写 .gitignore 的那一步排在它后面），
-// 之后每个任务的验收一跑 `npm run build` 就改动这些已跟踪的文件，撞"验收不许留下改动"—— 会成为一连串停摆的源头。
+// 构建产物同理：早先的任务把 `frontend/dist/` 提交进了仓库（写 .gitignore 的那一步排在它后面），
+// 之后每个任务的验收一跑 `npm run build` 就改动这些已跟踪的文件，撞"验收不许留下改动"—— 引出一连串停摆。
 // 不放 `build/`、`out/`：有些项目拿它们放源码（vue-cli 2 的 `build/` 是 webpack 配置），排除了 agent 新写的文件就静默进不了仓库。
+/**
+ * 行尾按仓库原样，**写进这个仓库自己的配置**。克隆时带的 `-c core.autocrlf=false` 只管克隆那一条命令；之后系统在宿主机上
+ * 往工作区里合并、检出、解冲突，读的是 Git for Windows 的系统级 core.autocrlf=true，照样签出成 CRLF —— Linux 沙箱里
+ * 逐字比对的测试就挂（合并后契约测试成片失败，执行器修来修去一直修到撞调用上限）。
+ * 仓库级配置压过系统级。
+ */
+export const pinLineEndings = (dir) => git(dir, 'config', 'core.autocrlf', 'false');
+
 export const DEP_EXCLUDES = ['node_modules/', '.venv/', 'venv/', '__pycache__/', '*.pyc', '.pytest_cache/', '.mypy_cache/', '.npm/', '.cache/', 'dist-newstyle/', '.si-preview/', '*.db', '*.sqlite', '*.sqlite3', '*.db-journal', '*.db-wal', '*.db-shm',
   'dist/', 'coverage/', '.next/', '.nuxt/', '.vite/', '.turbo/', '.parcel-cache/', '*.tsbuildinfo',
-  // 测试工具跑一遍就会写出来的产物（例如 Playwright 失败时往 frontend/test-results/ 写 .last-run.json、error-context.md，
-  // 否则交接次次被范围校验判越界，直到撞重试上限）。它们与 coverage/ 同类：跑测试的副产物，不是谁的改动。
+  // 测试工具跑一遍就会写出来的产物（比如 Playwright 失败时往 frontend/test-results/ 写 .last-run.json、error-context.md，
+  // 交接次次被范围校验判越界，直到撞重试上限）。它们与 coverage/ 同类：跑测试的副产物，不是谁的改动。
   'test-results/', 'playwright-report/', 'blob-report/', '.nyc_output/', 'htmlcov/', '.coverage',
-  // pip install -e 留下的包元数据（例如 UNKNOWN.egg-info/，否则会让交接被判越界）
+  // pip install -e 留下的包元数据（比如 UNKNOWN.egg-info/，不排除就会让交接被判越界）
   '*.egg-info/'];
 
 /**
@@ -233,6 +241,7 @@ export function ensureWorkspace(db, { taskId, source, dir, force = false, ref = 
     }
     mkdirSync(ws, { recursive: true });
     git(ws, 'init', '-q', '-b', branch);
+    pinLineEndings(ws);
     git(ws, '-c', 'user.name=superintern', '-c', 'user.email=superintern@local', 'commit', '-q', '--allow-empty', '-m', `init: ${taskId}`);
     const head = git(ws, 'rev-parse', 'HEAD');
     writeDepExcludes(ws);
@@ -261,16 +270,14 @@ export function ensureWorkspace(db, { taskId, source, dir, force = false, ref = 
   // autocrlf 关掉：Windows 上默认 true，克隆把文件写成 CRLF，容器（Linux）里的 git 一开始就报 ' M'，
   // agent 得花两条假设去证明"不是我改的"。工作区只给容器用，行尾按仓库原样。
   git(src, '-c', 'core.autocrlf=false', 'clone', '--quiet', '--no-hardlinks', src, ws);
+  pinLineEndings(ws);
 
   // `ref` 让工作区落在某个历史提交上，而不是当前 HEAD。
   //
-  // 自举带来的一个具体问题（"自举偏置"的一个面向）：源仓库里
-  // 装着我们自己写的实验设计与预注册预测。直接从 HEAD 克隆，agent 一 grep
-  // 实验记录目录就能读到"我们正在量它会不会提问"——那实验就废了。
-  // 落在实验设计之前的提交上，是**污染隔离**，不是讲究。
+  // 源仓库可能含有比 ref 更新的文件。只签出旧提交，仍能通过其它引用读取这些文件。
+  // 指定 ref 时需要隔离后续历史，保证工作区只包含该提交及其祖先。
   //
-  // ⚠️ 而只签出**不是隔离**，只是换了个签出的树。实测证明了这一点：
-  // `--ref` 之后 `main` 与 `origin/main`
+  // ⚠️ 光签出旧提交**不是隔离**，只是换了个签出的树：`--ref` 之后 `main` 与 `origin/main`
   // 照旧指向 HEAD，`git show <新提交>:<文件路径>` 一句话就读回来了。
   // 换句话说：**把文件从工作树里拿走，不等于把它从仓库里拿走。**
   //
@@ -345,12 +352,12 @@ export function workspaceStatus(dir) {
 }
 
 /** 没提交的改动各是什么样子（给人看的一行字）：新文件 / 改过 / 删了。 */
-export function describeChanges(dir) {
+export function describeChanges(dir, lang = 'zh') {
   const porcelain = gitRaw(dir, 'status', '--porcelain').replace(/\n$/, '');
   return porcelain.split('\n').filter(Boolean).map((l) => {
     const xy = l.slice(0, 2), path = l.slice(3);
-    const how = xy === '??' ? (path.endsWith('/') ? '新目录，从没提交过' : '新文件，从没提交过')
-      : xy.includes('D') ? '删了（仓库里有）' : '改过（仓库里有旧版）';
+    const how = xy === '??' ? (path.endsWith('/') ? tl(lang, '新目录，从没提交过') : tl(lang, '新文件，从没提交过'))
+      : xy.includes('D') ? tl(lang, '删了（仓库里有）') : tl(lang, '改过（仓库里有旧版）');
     return { path, how };
   });
 }

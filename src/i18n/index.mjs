@@ -29,6 +29,7 @@ import content7 from './en/content-7.mjs';
 import content8 from './en/content-8.mjs';
 import core from './en/core.mjs';
 import cli from './en/cli.mjs';
+import parallel from './en/parallel.mjs';
 
 export const LANGS = ['zh', 'en'];
 export const DEFAULT_LANG = 'zh';
@@ -48,7 +49,7 @@ function merge(parts) {
   return out;
 }
 // 看板按段分文件（多人同时补译时互不冲突）：ui-1…7 是脚本各段，ui-shell 是静态 HTML
-export const CATALOGS = { en: merge({ ui, ui1, ui2, ui3, ui4, ui5, ui6, ui7, uiShell, core, cli, content1, content2, content3, content4, content5, content6, content7, content8 }) };
+export const CATALOGS = { en: merge({ ui, ui1, ui2, ui3, ui4, ui5, ui6, ui7, uiShell, core, cli, content1, content2, content3, content4, content5, content6, content7, content8, parallel }) };
 
 /** 把 {名字} 换成参数；参数里没有的占位符原样留着（看得出漏传了什么）。 */
 export const fmt = (s, params) => (params ? String(s).replace(/\{(\w+)\}/g, (m, k) => (k in params ? String(params[k] ?? '') : m)) : String(s));

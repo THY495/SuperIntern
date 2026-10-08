@@ -10,7 +10,7 @@
 // 批准前规划器**不提问**（问题要挂任务，而任务在提案之后才有）：拿不准的写进 notes，人在反馈里说。
 // 这是目前的形状；要提问就得把载体任务提前建出来，等实际出现"不问就写不出契约"的案例再加。
 
-import { withOutputLang, contentLang, tl, I18nError } from '../i18n/index.mjs';
+import { withOutputLang, contentLang, tl, I18nError, N_ } from '../i18n/index.mjs';
 import { markOf } from '../i18n/marks.mjs';
 import { applyEgressDefaults } from '../core/egress.mjs';
 import { routeQuestion, specPrefixes } from '../core/routing.mjs';
@@ -24,7 +24,9 @@ import { reservationOf, readApproval, confirmBeforeRevising, feedbackOf, REACHED
 import { initProjectRepo, createProjectTasks, validateProjectSpec, renderRules, renderDeps, scopeOverlaps, renderScopeOverlaps, renderScopePaths, SCOPE_PATHS_NOTE, scopePathsNote, PROJECT_TASK_RUNTIME_MS } from '../core/project.mjs';
 import { planAppend, appendStateOf, appendPending, startQueuedAppend } from './project-append.mjs';
 import { decisionsSection, recordReservation } from '../core/decisions.mjs';
-import { maxOpenOf, DEFAULT_MAX_OPEN } from '../core/project-settings.mjs';
+import { maxOpenOf, DEFAULT_MAX_OPEN, parallelOf } from '../core/project-settings.mjs';
+import { validateParallelPlan, TASK_KINDS, recordSharedPaths } from '../core/parallel.mjs';
+import { skeletonCoverageProblems } from '../core/contract-coverage.mjs';
 import { getParam, setParam } from '../core/params.mjs';
 import { diffSpecs, renderSpecDiff, roundHistory, renderRoundHistory } from './spec-diff.mjs';
 
@@ -76,6 +78,45 @@ const PROPOSE_PROJECT = {
   },
 };
 
+// 并行开发模式的出口：同一个工具，多两样东西 —— 每个任务的 kind、顶层的 shared_paths。
+// 名字不变（propose_project）：草案落库、比对、批准都走同一条路，只是形状校验多一道（validateParallelPlan）。
+const PROPOSE_PROJECT_PARALLEL = {
+  ...PROPOSE_PROJECT,
+  description: `提交整批任务契约（2 到 ${MAX_TASKS} 个）：#1 骨架、若干模块、最后一个集成。依赖满足的任务会同时开工（并发上限内）。人会看到全文并批准 / 提修改 / 放弃。`,
+  parameters: {
+    ...PROPOSE_PROJECT.parameters,
+    properties: {
+      ...PROPOSE_PROJECT.parameters.properties,
+      shared_paths: { type: 'array', items: { type: 'string' },
+        description: '骨架定下、之后对模块任务**只读**的路径（写法同 scope_paths）：接口契约文件 / 目录、根依赖清单与锁文件、根验收脚本、README、.gitignore、共享的类型 / 常量。骨架任务的 scope_paths 要覆盖它们全部；模块任务的 scope_paths 不能与它们相交' },
+      tasks: {
+        ...PROPOSE_PROJECT.parameters.properties.tasks,
+        items: {
+          ...PROPOSE_PROJECT.parameters.properties.tasks.items,
+          properties: {
+            ...PROPOSE_PROJECT.parameters.properties.tasks.items.properties,
+            kind: { type: 'string', enum: TASK_KINDS, description: 'skeleton = #1 骨架（接口契约 + 各模块的桩 + 串通 + 契约测试 + 全部共享文件）；module = 只实现一个模块、只依赖骨架；integration = 最后一个，把模块真接起来跑端到端' },
+          },
+          required: [...PROPOSE_PROJECT.parameters.properties.tasks.items.required, 'kind'],
+        },
+      },
+    },
+    required: [...PROPOSE_PROJECT.parameters.required, 'shared_paths'],
+  },
+};
+
+const PARALLEL_SECTION = `
+
+## 并行开发模式（本项目已开启，覆盖上面"一次只执行一个"的说法）
+本项目的任务会**同时**由多个实现方开发：依赖满足就开工（在并发上限内），不再一个接一个。所以切法换成"契约优先 + 行走骨架"：
+1. **#1 必须是骨架任务**（kind = "skeleton"，depends_on []）：写出模块之间的接口契约（HTTP 接口用 OpenAPI 或等价的机器可读文件；进程内接口用类型 / 桩模块），把每个模块的目录建好、放最小的桩实现，把整条链串起来跑通，并写出契约测试；同时把**全部共享文件**定好：根目录依赖清单与锁文件、各模块要用的第三方依赖（在骨架里就装好、写进清单）、根验收脚本的框架、README 骨架、.gitignore。骨架的完成定义写成"桩实现 + 契约测试全绿"，不实现业务。
+2. **模块任务**（kind = "module"）：每个只实现一个模块，**只依赖骨架**（depends_on [1]）；只有真的要用到另一个模块的**实现**（不是接口）才依赖它，并在 notes 里说明为什么。模块任务的 scope_paths 只写自己模块的目录，**两两不相交**，也不能与 shared_paths 相交。模块之间只通过契约交互：开发时对着别的模块的桩 / 契约写，不等别人做完。
+3. **集成任务**（kind = "integration"，排最后，依赖全部模块任务）：把各模块真接起来跑端到端，把根验收脚本里的端到端检查补齐；它可以改根验收脚本与 README。
+4. **shared_paths**（顶层字段）：骨架定下、之后对模块任务只读的路径 —— 接口契约、根依赖清单与锁文件（package.json、package-lock.json、requirements*.txt、pyproject.toml）、根验收脚本、README、.gitignore、共享的类型 / 常量模块。骨架任务的 scope_paths 要覆盖它们全部。模块任务之后要改它们，只能由人批准计划变更。
+5. 模块按规格里真实存在、能独立开发的部分切，至少 2 个；不要为了并行把一个模块硬拆成几个改同一批文件的任务。模块自己的依赖清单（例如 web/package.json）放在模块目录里、归模块；但用 npm workspaces 时锁文件只有根目录一份，所以模块要用的第三方包在骨架里一次装好。
+6. 接口契约要小、名字写死（路径、字段、状态码、导出名、命令行参数与退出码）：规格里写死的外部行为原样落进契约；规格没写、但两个模块都要遵守的内部约定（共用的表结构、事件 / 活动记录的格式、配置的环境变量）也在骨架里定下、写进契约文件，不要留给各模块各自猜。**骨架任务的完成定义要逐条点名规格里的每个接口**（写成 \`METHOD /path\`，连同它的查询参数与请求 / 响应字段）：系统会机械核对，漏一个就拒回草案；骨架做完时还会对着契约文件再核一遍。
+7. 每个模块任务的 verify_command 只跑本模块自己的测试；集成任务跑端到端。`;
+
 // 复盘时多出来的那个出口。**只有复盘用得上它** —— 首次规划与人发起的追加都不会带它进去：
 // 那两种场合"已经达成"不是一个合法答案（人刚说了要做什么）。
 const GOAL_REACHED = {
@@ -102,7 +143,8 @@ const SYSTEM = `你是一个长期运行的自主 agent 的"项目规划器"。�
 - **依赖要如实写**（depends_on，任务编号从 1 起）：B 用到 A 的接口 / 文件 → B 依赖 A；互不相干的任务（例如各自独立的模块、前端与后端各按同一份接口约定实现）**不要**互相依赖，写 []
   或只依赖它们共同的前置。把它们汇到一起的任务（集成 / 端到端）依赖它们全部。不确定就写上依赖 —— 多一条边只是慢，少一条边会让任务在缺东西的仓库上开工。
 - 每个任务的 verify_command 只写自己新增的测试；任务开工时，系统会把当时已合并的全部任务的验收命令累加成它的回归义务。
-- 从第二个任务起，约束里必须有这一条（原文照抄）："既有测试文件只许追加用例；唯一例外是断言了被本契约明确取代的中间行为的用例，可以改那一条并在交接记录里说明；其余一行不许改、不许删"。
+- node --test 后面写测试文件或 glob（例如 cli/*.test.mjs），**不要写目录**：Node 22 的 --test 不展开目录。规则、完成定义里提到的测试命令（例如根验收脚本要跑什么）也一样。
+- 从第二个任务起，约束里必须有这一条（原文照抄）："既有测试文件只许追加用例；唯一例外是断言了被本契约明确取代的中间行为的用例，可以改那一条并在交接记录里说明；其余一行不许改、不许删"。输出语言是英文时照抄这一句英文："Existing test files may only have cases appended; the one exception is a case asserting an intermediate behavior that this contract explicitly replaces — you may change that one case and say so in the handoff; nothing else may be changed or deleted"。
 - **不要把"尚未实现的行为"写进完成定义**（例如"本任务 X 节点抛 Error，下一任务再实现"）：实现方会把它写进测试，下一任务实现 X 时就与既有测试冲突。没实现的东西不提；要提也只放在说明里，明说"不要为它写断言"。
 - 范围要写两遍：scope 用一段话写明动哪些、不动哪些、为什么；scope_paths 用路径把同一件事再写一遍（机器只认后者去执法，前者不参与）。不引入第三方依赖除非规划明说。
 - **scope_paths 要把这个任务真正要碰的都列全**：要新建的文件也列（不必已存在）。目录写成 src/store/（结尾一条斜杠 = 含其下全部），具体文件写全名。两个互不依赖的任务尽量不要都列上同一个文件 —— 它们可能同时开着，撞在一起要回头问人取哪一侧。实在避不开（比如都要往根 package.json 的 scripts 里加一条），照实列，批准页会把这种重叠指出来让人决定。
@@ -182,15 +224,24 @@ function repoGlance(repo) {
  * 人正是在这一页上批准依赖关系，而"并列的两个任务会不会同时做"直接影响他怎么看那张图。
  * 所以它必须跟着同时开着的上限走：上限 > 1 时还写"同一时间只执行一个"，就是把错的那句给了负责人。
  */
-export const schedLine = (maxOpen, lang = 'zh') => (maxOpen > 1
+export const schedLine = (maxOpen, lang = 'zh', parallel = false) => (parallel
+  ? tl(lang, '同时最多开着 {n} 个：并行开发已开启 —— 依赖满足的任务同时开工，模块任务各自只改自己的目录。', { n: maxOpen })
+  : maxOpen > 1
   ? tl(lang, '同时最多开着 {n} 个任务：平时一次只做一个，只有开着的任务全都在等人（等你答题、等你签收）时，系统才会让独立的下一个先跑起来。', { n: maxOpen })
   : tl(lang, '同一时间只执行一个任务。'));
+const KIND_LABEL = { skeleton: N_('〔骨架〕'), module: N_('〔模块〕'), integration: N_('〔集成〕') };
+/** 并行草案开头那一段：这一批怎么跑、哪些路径骨架之后只读。 */
+function parallelIntro(spec, maxOpen, lg) {
+  return [tl(lg, '并行开发：#1 骨架先定下模块之间的接口契约、各模块的桩和全部共享文件；它合并后，依赖满足的模块任务同时开工（同时最多 {n} 个），各自只改自己的目录；最后一个任务把模块真接起来跑端到端。', { n: maxOpen }),
+    tl(lg, '共享路径（骨架之后对模块任务只读，要改得由人批准计划变更）：{v}', { v: (spec.shared_paths ?? []).join(tl(lg, '、')) || tl(lg, '（无）') })].join('\n');
+}
 /** `lang`：内容语言（调用方传 contentLang(db)；默认中文）。 */
-export function renderProposal(spec, version, notes, { maxOpen = DEFAULT_MAX_OPEN, lang = 'zh' } = {}) {
+export function renderProposal(spec, version, notes, { maxOpen = DEFAULT_MAX_OPEN, lang = 'zh', parallel = false } = {}) {
   const lg = lang;
   const L = [markOf(lg, 'projectDraft', { version }), tl(lg, '项目：{v}', { v: spec.title }), ''];
+  if (parallel) L.push(parallelIntro(spec, maxOpen, lg), '');
   spec.tasks.forEach((t, i) => {
-    L.push(`${i + 1}. ${t.title}`, tl(lg, '   依赖：{v}', { v: renderDeps(t, i + 1, 1, lg) }), tl(lg, '   目标：{v}', { v: t.goal }), tl(lg, '   范围：{v}', { v: t.scope }), tl(lg, '   可动路径（判据）：{v}', { v: renderScopePaths(t.scope_paths, lg) }), tl(lg, '   完成定义：{v}', { v: t.definition_of_done }));
+    L.push(`${i + 1}. ${t.title}${parallel && KIND_LABEL[t.kind] ? ` ${tl(lg, KIND_LABEL[t.kind])}` : ''}`, tl(lg, '   依赖：{v}', { v: renderDeps(t, i + 1, 1, lg) }), tl(lg, '   目标：{v}', { v: t.goal }), tl(lg, '   范围：{v}', { v: t.scope }), tl(lg, '   可动路径（判据）：{v}', { v: renderScopePaths(t.scope_paths, lg) }), tl(lg, '   完成定义：{v}', { v: t.definition_of_done }));
     if (t.rules?.length) L.push(tl(lg, '   规则：{v}', { v: renderRules(t.rules, lg).map((r) => `\n     - ${r}`).join('') }));
     if (t.constraints?.length) L.push(tl(lg, '   约束：{v}', { v: t.constraints.map((c) => `\n     - ${c}`).join('') }));
     L.push(tl(lg, '   验收命令：{v}{extra}', { v: t.verify_command, extra: i > 0 ? tl(lg, '（开工时系统会再累加当时已合并的全部任务的验收命令）') : '' }), '');
@@ -206,7 +257,7 @@ export function renderProposal(spec, version, notes, { maxOpen = DEFAULT_MAX_OPE
   if (overlaps) L.push(overlaps, '');
   if (notes) L.push(tl(lg, '规划器说明：{v}', { v: notes }), '');
   L.push(tl(lg, '每个任务的硬上限：累计运行时长 {h} h（其余按默认）；批准后可用 cli limit <taskId> 改。', { h: Math.round(PROJECT_TASK_RUNTIME_MS / 3600000) }), '');
-  L.push(tl(lg, '批准后会自动逐个规划、执行：一个任务要等它依赖的任务都签收并合并后才开工；每个任务做完你签收一次。{sched}依赖关系不对，直接在反馈里说（例如"3 不依赖 2"）。请回复：', { sched: schedLine(maxOpen, lg) }), tl(lg, '(A) 批准 —— 回 "A" 或 "批准"'), tl(lg, '(B) 要改 —— 直接写要改什么，会出下一版'), tl(lg, '(C) 放弃 —— 回 "C" 或 "放弃"'), tl(lg, '(D) 批准，但留一句保留意见 —— **它不挡任何东西**：这一批照样全部生效，效果与 (A) 一模一样。它只把你那句话留在项目的约定清单上、标成〔保留意见〕，让下一个碰这一处的人看得到。要**挡住**其中某一条，只能 (B) 说清哪一条不要、让它重出一版。写法：先回 A，**另起一行**写「保留：…」。'));
+  L.push(tl(lg, '批准后会自动逐个规划、执行：一个任务要等它依赖的任务都签收并合并后才开工；每个任务做完你签收一次。{sched}依赖关系不对，直接在反馈里说（例如"3 不依赖 2"）。请回复：', { sched: parallel ? tl(lg, '并行开发：骨架合并后，依赖满足的模块任务同时开工（同时最多 {n} 个）。', { n: maxOpen }) : schedLine(maxOpen, lg) }), tl(lg, '(A) 批准 —— 回 "A" 或 "批准"'), tl(lg, '(B) 要改 —— 直接写要改什么，会出下一版'), tl(lg, '(C) 放弃 —— 回 "C" 或 "放弃"'), tl(lg, '(D) 批准，但留一句保留意见 —— **它不挡任何东西**：这一批照样全部生效，效果与 (A) 一模一样。它只把你那句话留在项目的约定清单上、标成〔保留意见〕，让下一个碰这一处的人看得到。要**挡住**其中某一条，只能 (B) 说清哪一条不要、让它重出一版。写法：先回 A，**另起一行**写「保留：…」。'));
   return L.join('\n');
 }
 
@@ -288,23 +339,29 @@ export async function planProject(db, { client, projectId, tier = 'heavy', maxAt
       const prev = { title: p.title, tasks: prevTasks.map((t) => ({ ...t, constraints: JSON.parse(t.constraints || '[]'), verify_command: t.verify ? JSON.parse(t.verify).join(' ') : '' })) };
       // 上一版 = 人当时看到的原文（批准事项正文）；拿不到才用库里重建的
       const hist = roundHistory(db, { carrierId: carrier.id });
-      parts.push(`## 上一版草案（v${p.draft_version}，人看到的原文）\n${hist.prevText ?? renderProposal(prev, p.draft_version, p.draft_notes, { lang: L })}`);
+      parts.push(`## 上一版草案（v${p.draft_version}，人看到的原文）\n${hist.prevText ?? renderProposal(prev, p.draft_version, p.draft_notes, { lang: L, parallel: parallelOf(db, projectId) })}`);
       const h = renderRoundHistory(hist);
       if (h) parts.push(h);
     }
     if (feedback) parts.push(`## 人对上一版草案的反馈（经认证通道，具指令效力）\n${feedback}\n\n按反馈出下一版。`);
     const messages = [{ role: 'user', content: [{ type: 'text', text: parts.join('\n\n') }] }];
 
+    const parallel = parallelOf(db, projectId);
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-      const resp = await client.complete({ tier, system: withOutputLang(SYSTEM, contentLang(db)), messages, tools: [PROPOSE_PROJECT], maxTokens: MAX_TOKENS, effort: 'high' });
+      const resp = await client.complete({ tier, system: withOutputLang(parallel ? SYSTEM + PARALLEL_SECTION : SYSTEM, contentLang(db)), messages, tools: [parallel ? PROPOSE_PROJECT_PARALLEL : PROPOSE_PROJECT], maxTokens: MAX_TOKENS, effort: 'high' });
       if (truncatedEmpty(resp)) throw new TruncatedEmptyError('项目规划器', MAX_TOKENS);
       const call = toolCallsOf(resp).find((c) => c.name === 'propose_project');
       const errs = [];
       let spec = null;
       if (!call) errs.push(`没有调用 propose_project（stopReason=${resp.stopReason}）。只输出工具调用，不要只输出文字。`);
+      // 参数不是合法 JSON（适配器解析失败时给空对象）：原来报的是"缺 title / tasks 要是非空数组"，模型不知道真正的问题，
+      // 重试时照样写坏（模块多的大规划，参数动辄几万字符）。说清是 JSON 坏了、多长，让它写短、写对。
+      else if (call.argsError) errs.push(`propose_project 的参数不是合法 JSON（${call.argsError}；共 ${String(call.argsRaw ?? '').length} 个字符）。重新调用一次，参数要是完整、合法的 JSON；太长就精简 —— 每个任务的样例 3 到 8 个、规则只列关键的，不要穷举`);
       else {
         spec = { title: String(call.args?.title ?? '').trim(), tasks: Array.isArray(call.args?.tasks) ? call.args.tasks : [] };
+        if (parallel) spec.shared_paths = call.args?.shared_paths;
         errs.push(...validateProjectSpec(spec, { brief: p.brief, requireRules: true, deps: { startOrder: 1, existing: [] } }));
+        if (parallel) errs.push(...validateParallelPlan(spec), ...skeletonCoverageProblems(spec, p.brief));
         if (spec.tasks.some((t) => t?.blocks !== undefined)) errs.push('首次规划不要用 blocks（没有已有任务可让它等）');
         if (spec.tasks.length > MAX_TASKS) errs.push(`任务数 ${spec.tasks.length} 超过 ${MAX_TASKS}`);
         if (spec.tasks.length < 2 && !errs.length) errs.push('至少切成 2 个任务；只有一个就不需要项目层，用 new --file');
@@ -314,7 +371,7 @@ export async function planProject(db, { client, projectId, tier = 'heavy', maxAt
         return exit('proposed', { ...r, attempts: attempt });
       }
       audit(db, { actorKind: 'agent', actorId: 'project_planner', action: 'project_plan_attempt', targetType: 'project', targetId: projectId,
-        payload: { attempt, rejections: errs, say: textOf(resp).slice(0, 600) || null, stopReason: resp.stopReason } });
+        payload: { attempt, rejections: errs, say: textOf(resp).slice(0, 600) || null, stopReason: resp.stopReason, ...(call?.argsError ? { argsError: call.argsError, argsLen: String(call.argsRaw ?? '').length, argsTail: String(call.argsRaw ?? '').slice(-300) } : {}), outputTokens: resp.usage?.outputTokens ?? null } });
       if (attempt === maxAttempts) throw new I18nError('项目规划器 {n} 次都没给出合规契约：{errs}', { n: maxAttempts, errs: errs.join('；') });
       messages.push({ role: 'assistant', content: resp.content });
       if (call) messages.push({ role: 'tool_results', results: [{ callId: call.id, name: call.name, isError: true, content: `被拒：\n- ${errs.join('\n- ')}` }] });
@@ -333,7 +390,7 @@ function recordProposal(db, { project, carrier, spec, notes, prevSpec = null }) 
   const version = project.draft_version + 1;
   const qid = newId('q');
   const L = contentLang(db);
-  let text = renderProposal(spec, version, notes, { maxOpen: maxOpenOf(db, project.id), lang: L });
+  let text = renderProposal(spec, version, notes, { maxOpen: maxOpenOf(db, project.id), lang: L, parallel: parallelOf(db, project.id) });
   // 和上一版逐字比对：少了的任务 / 约束 / 规则写在标题行下面
   if (prevSpec) { const i = text.indexOf('\n'); text = `${text.slice(0, i + 1)}${renderSpecDiff(diffSpecs(prevSpec, spec), { prevVersion: project.draft_version, lang: L })}${text.slice(i + 1)}`; }
   const old = db.all(`SELECT id FROM tasks WHERE project_id=? AND project_order>0`, project.id).map((r) => r.id);
@@ -343,6 +400,7 @@ function recordProposal(db, { project, carrier, spec, notes, prevSpec = null }) 
       payload: { version: project.draft_version, tasks: old } });
   }
   const taskIds = createProjectTasks(db, { projectId: project.id, userId: project.owner_id, tasks: spec.tasks });
+  if (Array.isArray(spec.shared_paths)) recordSharedPaths(db, { projectId: project.id, paths: spec.shared_paths, userId: project.owner_id });
   db.tx(() => {
     db.run(`INSERT INTO questions (id,task_id,node_id,level,level_source,text,default_action,asked_at,timeout_at,status)
             VALUES (?,?,NULL,3,'hard_rule',?,NULL,?,NULL,'open')`, qid, carrier.id, text, t);

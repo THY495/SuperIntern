@@ -235,6 +235,9 @@
     <div class="row" style="margin-top:6px">
       <label class="small" title="勾选后，系统不再逐条澄清，而是把这份规划直接拆成多个任务：各任务逐个签收，前一个合并后才启动下一个。适用于已写明各部分的接口、文件与验收要求的规划；不确定时不要勾选 —— 不勾选时，系统从项目目标起草第一个任务，之后随时可以在项目页添加任务"><input type="checkbox" id="newIsPlan" style="width:auto"> 这是一份已写好的规划，直接拆成多个任务</label>
     </div>
+    <div class="row hide" style="margin-top:6px" id="newParallelRow">
+      <label class="small" title="系统先做一个骨架任务：定下模块之间的接口契约、每个模块的桩和全部共享路径（接口文件、根依赖清单、根验收脚本……）；它合并后，各模块任务同时开工，每个只改自己的目录、改不得共享路径；最后一个任务把模块真接起来跑端到端。适合有几个能独立开发的部分的大项目；只有一两个部分的不要勾选。实验功能：同时干活的任务多了，同时花钱的也多，合并时撞上的机会也多；开了之后可以在项目设置里关掉（改回一次一个），但关掉后不能再打开"><input type="checkbox" id="newParallel" style="width:auto"> 并行开发（实验）：先定接口与骨架，之后各模块同时开发</label>
+    </div>
     <div class="row hide" style="margin-top:6px" id="newPlanRow">
       <textarea id="newText" rows="5" placeholder="粘贴完整规划：各项工作及其接口 / 命令 / 文件、验收要求" style="flex:1"></textarea>
     </div>
@@ -431,6 +434,10 @@ const T = (s, p) => { const hit = I18N.catalog[s] ?? s; return p ? String(hit).r
 const Tc = (ctx, s, p) => { const k = `${ctx}|${s}`; const hit = I18N.catalog[k] ?? I18N.catalog[s] ?? s; return p ? String(hit).replace(/\{(\w+)\}/g, (m, n) => (n in p ? String(p[n] ?? '') : m)) : hit; };
 // 日期时间按界面语言写，不跟浏览器的系统语言走（英文界面里冒出"2026年9月30日 下午9:28"）
 const LOCALE = I18N.lang === 'en' ? 'en-US' : 'zh-CN';
+// 契约原文里系统写进去的几段固定中文（规则标题、出处标签、那条固定约束）：库里保持中文（执行器、验收员、路由都认这些标记），只在显示时按界面语言换掉
+const CONTRACT_FIXED = [T('行为规则（每条带出处：〔规格〕后是规格原文，是最高依据，实现与它矛盾时提问；〔规划器假设〕是规格没写、规划器定的，人批准时已看到，按字面执行）：'), T('既有测试文件只许追加用例；唯一例外是断言了被本契约明确取代的中间行为的用例，可以改那一条并在交接记录里说明；其余一行不许改、不许删'), T('〔规格〕'), T('〔规划器假设〕')];
+const CONTRACT_FIXED_ZH = ['行为规则（每条带出处：〔规格〕后是规格原文，是最高依据，实现与它矛盾时提问；〔规划器假设〕是规格没写、规划器定的，人批准时已看到，按字面执行）：', '既有测试文件只许追加用例；唯一例外是断言了被本契约明确取代的中间行为的用例，可以改那一条并在交接记录里说明；其余一行不许改、不许删', '〔规格〕', '〔规划器假设〕'];
+const locContract = (s) => (I18N.lang === 'zh' ? String(s ?? '') : CONTRACT_FIXED_ZH.reduce((acc, k, i) => acc.split(k).join(CONTRACT_FIXED[i]), String(s ?? '')));
 const $ = (s) => document.querySelector(s);
 const esc = (s) => String(s ?? '').replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
 const usd = (m) => '$' + ((m ?? 0) / 1e6).toFixed(4);
@@ -644,7 +651,7 @@ function renderProject() {
     ${p.tasks.map((t) => `<tr${t.id === p.current ? '' : ended(t.status) ? ' class="off"' : ''}><td class="num">${t.project_order}</td><td><a href="#${t.id}"${(p.openIds ?? [p.current]).includes(t.id) ? ' style="font-weight:600"' : ''}>${esc(t.title)}</a>${t.requestedBy ? ` <span class="small mute" title="${T('谁用「添加任务」提的这个任务。决策路由里的「需求提出人」就是这个人；任务合并后，收件箱会告诉这个人。没有这个标注的任务（项目开头规划的、复盘给出的）没有需求提出人：路由里的这一项对它自动空缺，只剩同一行的其他人')}">${T('· {name}提的', { name: esc(t.requestedBy) })}</span>` : ''}${(p.openIds ?? [p.current]).includes(t.id) ? ` <span class="pill running" title="${T('这个任务已经开工（有工作区、还没合并）。同时最多开 {n} 个：只有开着的任务全都在等人时，系统才会让路再开一个。是否正在运行，见本行「状态」列', { n: p.maxOpen ?? 1 })}">${T('执行中')}</span>` : ''}</td>
       <td class="small mute">${(t.dependsOn ?? []).length ? t.dependsOn.map((n) => `#${n}`).join(' ') : '—'}</td>
       <td>${!t.started && !ended(t.status) && ((t.waitsFor ?? []).length || (p.current && p.current !== t.id)) ? `<span class="pill" title="${(t.waitsFor ?? []).length ? T('依赖的任务还没有全部合并') : T('依赖已满足；等当前执行的任务合并后开工（同一时间只执行一个）')}">${(t.waitsFor ?? []).length ? T('等待 {deps}', { deps: t.waitsFor.map((n) => `#${n}`).join(' ') }) : T('排队中')}</span>` : `<span class="pill ${t.status}">${ST_NAME[t.status] ?? t.status}</span>`}</td><td class="small">${t.status === 'done' ? (so[t.signoff] ?? T('待签收')) : ''}</td><td class="small mute">${t.merged_at ? T('{t}前', { t: ago(t.merged_at) }) : ''}</td></tr>`).join('') || (carrier ? '' : `<tr><td colspan="6" class="mute">${T('暂无任务')}</td></tr>`)}</table>`}
-    <div class="small mute" style="margin-top:6px">${T('任务按依赖关系执行：一个任务要等它「依赖」的任务都签收并合并后才开工；多个都可以开工时先做编号小的。')}<br>${T('同时最多开着 {n} 个{how}。', { n: p.maxOpen ?? 1, how: (p.maxOpen ?? 1) > 1 ? T('：平时一次只做一个，只有开着的任务<b>全都在等人</b>（等你答题、等你签收）时，系统才会让独立的下一个先跑起来 —— 那段时间本来是白等的') : T('（串行，一次只做一个）') })}${lead ? `${T('改：')}<a href="#p/${p.id}/settings">${T('项目设置 → 预算与上限')}</a>` : ''}</div>
+    <div class="small mute" style="margin-top:6px">${T('任务按依赖关系执行：一个任务要等它「依赖」的任务都签收并合并后才开工；多个都可以开工时先做编号小的。')}<br>${p.parallel ? T('同时最多开着 {n} 个：并行开发已开启 —— 依赖满足的任务同时开工，模块任务各自只改自己的目录。', { n: p.maxOpen ?? 2 }) : T('同时最多开着 {n} 个{how}。', { n: p.maxOpen ?? 1, how: (p.maxOpen ?? 1) > 1 ? T('：平时一次只做一个，只有开着的任务<b>全都在等人</b>（等你答题、等你签收）时，系统才会让独立的下一个先跑起来 —— 那段时间本来是白等的') : T('（串行，一次只做一个）') })}${lead ? `${T('改：')}<a href="#p/${p.id}/settings">${T('项目设置 → 预算与上限')}</a>` : ''}</div>
     ${p.append ? (p.append.kind === 'review'
       ? `<div class="item flag" style="margin-top:10px">${T('<b>正在复盘</b>：本项目的任务都已完成并合并，系统正在对照项目目标与完成定义判断还差什么。')}${p.append.stage === 'proposed' ? T('结论 v{v} 待你确认 —— {link}（要么确认项目达成，要么说还差什么）', { v: p.append.version, link: `<a href="#${p.carrier}">${T('前往查看')}</a>` }) : (daemonOn ? T('通常几分钟内给出结论。') : T('自动运行未开启：请运行 {cmd}', { cmd: `node src/cli.mjs project plan ${p.id}` }))}</div>`
       : `<div class="item flag" style="margin-top:10px">${T('<b>正在添加任务</b>：')}${p.append.stage === 'proposed' ? T('新任务的方案 v{v} 待批准 —— {link}', { v: p.append.version, link: `<a href="#${p.carrier}">${T('前往批准 / 提修改 / 放弃')}</a>` }) : (daemonOn ? T('已提交，正在起草新任务的方案（通常几分钟内）') : T('已提交，等待起草新任务的方案。自动运行未开启：请运行 {cmd}', { cmd: `node src/cli.mjs project plan ${p.id}` }))}${T('。批准前不会新建任何任务，现有任务照常执行。')}</div>`) : ''}
@@ -908,7 +915,8 @@ function renderProjSet() {
       <span class="small ${b.over ? 'bad' : 'mute'}">${b.gate === null ? T('当前没有闸门：花多少都不会被拦住') : b.over ? T('已花 {spent}，<b>已撞闸</b>', { spent: usd(b.spent) }) : T('已花 {spent}，还剩 {left}', { spent: usd(b.spent), left: usd(b.remaining) })}</span>
     </div>
     <div class="small mute" style="margin-top:4px">${T('把闸门改得比已花的还低是允许的 —— 那是让项目尽快停下来的办法（正在跑的那个任务在它下一轮体检时停，不会被半路掐断）。')}<br>${T('改闸门只影响之后的判断，不动任何已经做完的事。')}</div>
-    <div style="margin-top:18px"><b class="small">${T('同时开着的任务')}</b> <span class="small mute">${T('平时一次只做一个；只有开着的任务<b>全都在等人</b>时，系统才会让独立的下一个先跑起来 —— 那段时间本来是白等的')}</span></div>
+    <div style="margin-top:18px"><b class="small">${T('同时开着的任务')}</b> <span class="small mute">${p.parallel ? T('并行开发已开启：依赖满足的任务<b>同时开工</b>（在下面的上限内）；模块任务改不得共享路径') : T('平时一次只做一个；只有开着的任务<b>全都在等人</b>时，系统才会让独立的下一个先跑起来 —— 那段时间本来是白等的')}</span></div>
+    ${p.parallel ? `<div class="row" style="margin-top:6px"><span class="small mute">${T('共享路径（骨架定下，对模块任务只读）：{v}', { v: (p.sharedPaths ?? []).map(esc).join(T('、')) || T('（骨架任务的方案批准后在这里列出）') })}</span>${psRo ? '' : `<button id="psParallelOff" class="ghost">${T('关掉并行，改回让路调度（关掉后不能再打开）')}</button>`}</div>` : ''}
     <div class="row" style="margin-top:6px">
       <span class="small mute" style="white-space:nowrap">${T('最多同时开')}</span>
       <select id="psMaxOpen" style="width:auto" ${psRo ? 'disabled' : ''}>${[1, 2, 3, 4].map((n) => `<option value="${n}"${(p.maxOpen ?? 2) === n ? ' selected' : ''}>${T('{n} 个', { n })}${n === 1 ? T('（串行，一次只做一个）') : ''}${n === 2 ? T('（默认）') : ''}</option>`).join('')}</select>
@@ -917,7 +925,7 @@ function renderProjSet() {
       <br>${T('两个任务同时做，后完成的那个开工时看到的项目分支已经旧了。合并前系统会先<b>把项目分支合进它的分支</b>（一次 git merge），再重跑它自己的验收命令与<b>此刻</b>的全部回归义务（其他已合并任务的验收命令）。这一步是机械的，不调模型；它<b>不改写</b>这个任务已有的提交，你签收时看的那一版仍然在。')}
       <br>${T('合不上（两个任务改了同一处）—— 那个任务<b>不会合并</b>，产物原样留着，你会收到一条待决事项。事项里有冲突的原文，并写明哪一段是这个任务的、哪一段是项目分支上哪个任务带进来的、由谁签的收。你只有三个选择：<b>取这个任务这一侧</b>、<b>取项目分支这一侧</b>、<b>两边都不对</b>。选一侧是<b>一次性的</b>：这一趟所有冲突处都按那一侧定，不能这处按这边、那处按那边（要那样就只能选"两边都不对"）。选完系统重做一次合并，<b>只在冲突的那几处</b>取你选的那一侧，同一文件里没冲突的部分照常合并、不受影响，重跑验收，然后<b>重新找你签收一次</b> —— 合出来的是一份谁都还没签过字的新东西。<b>系统永远不自己决定合并后长什么样</b>，也不让 AI 决定。')}
       <br>${T('合上之后有哪条命令没过，那是另一回事：事项里给失败输出，出路是打回让它自己改、先看清楚经过、或中止这个任务。')}
-      <br>${T('所以每多开一个，就多一份这种事发生的机会。<b>这不是吞吐旋钮</b>：它换来的只有"A 在等你的时候 B 别干等着"，不会让任何一个任务本身做得更快。')}</div>
+      <br>${p.parallel ? T('并行开发开着时，这个上限就是<b>同时干活</b>的任务数：模块任务互不等待、同时开工，所以每多开一个，同时花钱的也多一个、合并时撞上的机会也多一份（共享路径只读就是为了少撞）。设成 1 = 暂时一次只做一个，随时可以调回来，契约与只读规则不变；「关掉并行」则改回让路调度、解除只读规则，而且不能再打开。') : T('所以每多开一个，就多一份这种事发生的机会。<b>这不是吞吐旋钮</b>：它换来的只有"A 在等你的时候 B 别干等着"，不会让任何一个任务本身做得更快。')}</div>
     <div style="margin-top:18px"><b class="small">${T('本项目新任务的默认上限')}</b></div>
     <div class="small mute" style="margin-top:2px">${T('下面这张表管的是<b>单个任务</b>各自的上限，与上面的项目预算闸是两回事：闸门管整个项目合计花多少，这张表管每个任务各自最多花多少、跑多久、调几次。')}<br>${T('这里设的是<b>默认值</b>；任务页单独改过的任务，以任务页为准，不受这里影响。改了之后，正在跑的任务在它下一轮体检时按新值算。')}</div>
     <table class="rt" style="margin-top:6px"><tr><th>${T('上限项')}</th><th>${T('当前生效值')}</th><th>${T('这个值来自哪一层')}</th><th>${T('部署默认值')}</th><th></th></tr>
@@ -927,6 +935,7 @@ function renderProjSet() {
         <td>${psRo ? '' : `<button class="small ghost" data-lim="${esc(r.key)}" title="${r.source === 'project' ? T('点开后输入一个新的数值，作为本项目新任务的默认（当前 {value}）', { value: esc(r.valueText) }) : T('点开后输入一个新的数值，作为本项目新任务的默认（现在用的是部署默认 {value}）', { value: esc(r.deployText) })}">${r.source === 'project' ? T('改这个值…') : T('设为本项目默认…')}</button>${r.source === 'project' ? ` <button class="small ghost" data-limclr="${esc(r.key)}" title="${T('删掉本项目的这个设定，回落到部署默认 {value}', { value: esc(r.deployText) })}">${T('清掉（回到 {value}）', { value: esc(r.deployText) })}</button>` : ''}`}</td></tr>`).join('')}
     </table>
     <div class="small mute" style="margin-top:6px">${T('三层取值：部署默认（代码里的内置天花板，只能改代码）→ 项目默认（这一表）→ 任务覆盖（任务页）。下层设了就压过上层；清掉一层就回落到上一层。上限永远不会变成"不限"。')}<br>${T('填多少由你定：系统只挡住 0 和负数（0 的意思是"一分钱都不许花"，不是"不限"），<b>填得比部署默认高也照收</b> —— 这一层就是用来给特别费的项目放宽的。')}</div>`;
+  if ($('#psParallelOff')) $('#psParallelOff').onclick = () => confirm(T('关掉之后：任务改回"开着的都在等人时才让路"，模块任务也不再被禁止改共享路径。已经开着的任务不受影响。之后不能再打开。确定？')) && pact('parallel', { on: false }, T('已关掉并行开发'));
   if ($('#psMaxOpen')) $('#psMaxOpen').onchange = (e) => pact('max_open', { n: Number(e.target.value) }, T('同时最多开 {n} 个任务', { n: e.target.value }));
   if ($('#psBudgetSave')) $('#psBudgetSave').onclick = () => {
     const v = $('#psBudgetUsd').value.trim();
@@ -1168,7 +1177,7 @@ function renderConstitution() {
   const c = detail.constitution, d = detail.draft;
   const stageText = { asking: T('澄清中，待决事项答复后继续'), proposed: T('草案待批准（见待决事项）'), approved: T('草案已批准，正在规划') };
   $('#constTag').textContent = d ? stageText[d.stage] ?? d.stage : c ? `v${c.version}${(c.overruled || []).length ? ` · ${T('其中 {n} 条已被判作废', { n: c.overruled.length })}` : ''}` : T('（无）');
-  const block = c ? `${(c.overruled || []).length ? `<div class="item"><div class="small">${T('<b>⚠ 下面这份任务说明里有 {n} 条已被判作废</b>（原文没改，执行时照新的说法做；读完成标准时以这里为准）：', { n: c.overruled.length })}</div>${c.overruled.map((o) => `<div class="small">· ${T('「{t}」', { t: esc(String(o.statement).slice(0, 200)) })}—— ${nameOf(o.by)} ${o.at ? new Date(o.at).toISOString().slice(0, 10) : ''} ${o.viaQuestion ? T('在冲突事项里判了「以新为准」') : T('手工作废')}${o.quote ? T('，新的说法：「{quote}」', { quote: esc(String(o.quote).slice(0, 160)) }) : ''}</div>`).join('')}</div>` : ''}<div class="body">${T('目标：{v}', { v: esc(c.goal) })}\n${T('范围：{v}', { v: esc(c.scope) })}\n${T('完成标准：{v}', { v: esc(c.definition_of_done) })}\n${T('约束：{v}', { v: (c.constraints || []).length ?'\n' + c.constraints.map((x) => `  - ${esc(x)}`).join('\n') : T('（无）') })}${d?.verifyCommand ? `\n${T('验收命令：{v}', { v: esc(d.verifyCommand) })}` : ''}${d?.notes ? `\n\n${T('草案说明：{v}', { v: esc(d.notes) })}` : ''}</div>` : '';
+  const block = c ? `${(c.overruled || []).length ? `<div class="item"><div class="small">${T('<b>⚠ 下面这份任务说明里有 {n} 条已被判作废</b>（原文没改，执行时照新的说法做；读完成标准时以这里为准）：', { n: c.overruled.length })}</div>${c.overruled.map((o) => `<div class="small">· ${T('「{t}」', { t: esc(String(o.statement).slice(0, 200)) })}—— ${nameOf(o.by)} ${o.at ? new Date(o.at).toISOString().slice(0, 10) : ''} ${o.viaQuestion ? T('在冲突事项里判了「以新为准」') : T('手工作废')}${o.quote ? T('，新的说法：「{quote}」', { quote: esc(String(o.quote).slice(0, 160)) }) : ''}</div>`).join('')}</div>` : ''}<div class="body">${T('目标：{v}', { v: esc(c.goal) })}\n${T('范围：{v}', { v: esc(c.scope) })}\n${T('完成标准：{v}', { v: esc(locContract(c.definition_of_done)) })}\n${T('约束：{v}', { v: (c.constraints || []).length ?'\n' + c.constraints.map((x) => `  - ${esc(locContract(x))}`).join('\n') : T('（无）') })}${d?.verifyCommand ? `\n${T('验收命令：{v}', { v: esc(d.verifyCommand) })}` : ''}${d?.notes ? `\n\n${T('草案说明：{v}', { v: esc(d.notes) })}` : ''}</div>` : '';
   const idea = d ? `<div class="item"><div class="small mute">${T('原始需求')}${d.source ? ` · ${T('现有仓库 {src}', { src: esc(d.source) })}` : ` · ${T('新仓库')}`}</div><div class="body">${esc(d.idea)}</div></div>` : '';
   $('#constitution').innerHTML = idea + (block || (d ? `<span class="mute">${T('（暂无草案）')}</span>` : `<span class="mute small">${T('无')}</span>`));
 }
@@ -2370,10 +2379,12 @@ function syncNewForm() {
   $('#newRepoPath').classList.toggle('hide', v !== '__other');
   $('#newBase').classList.toggle('hide', v === '__new');
   $('#newPlanRow').classList.toggle('hide', !plan);
-  $('#newHelp').textContent = plan ? T('系统把这份规划拆成多个任务，起草整批方案；你批准一次后开始执行，各任务逐个签收。')
+  $('#newParallelRow').classList.toggle('hide', !plan);
+  $('#newHelp').textContent = plan && $('#newParallel').checked ? T('系统先起草一个骨架任务定下接口与共享路径（接口文件、根依赖清单等），再把各模块切成可以同时开发的任务；你批准一次后开始执行，骨架合并后各模块同时开工，每个任务做完你签收一次。')
+    : plan ? T('系统把这份规划拆成多个任务，起草整批方案；你批准一次后开始执行，各任务逐个签收。')
     : T('写明项目目标与完成定义。系统据此起草第一个任务：先提问澄清，再出方案，你批准后才开始执行。一次性的小活就是只有一个任务的项目；之后随时可以在项目页添加任务。');
 }
-$('#newRepo').onchange = syncNewForm; $('#newIsPlan').onchange = syncNewForm;
+$('#newRepo').onchange = syncNewForm; $('#newIsPlan').onchange = syncNewForm; $('#newParallel').onchange = syncNewForm;
 $('#btnCreate').onclick = async () => {
   const goal = $('#newGoal').value.trim(), doneDefinition = $('#newDone').value.trim();
   if (!goal) return toast(T('请填写项目目标'), true);
@@ -2385,11 +2396,11 @@ $('#btnCreate').onclick = async () => {
   const source = empty ? '' : v === '__other' ? $('#newRepoPath').value.trim() : v;
   if (v === '__other' && !source) return toast(T('请填写仓库路径或 URL'), true);
   try {
-    const r = await api('/api/projects', { goal, doneDefinition, ...(plan ? { plan: planText } : {}), source, empty, base: $('#newBase').value.trim(), title: $('#newTitle').value.trim() });
+    const r = await api('/api/projects', { goal, doneDefinition, ...(plan ? { plan: planText, parallel: $('#newParallel').checked } : {}), source, empty, base: $('#newBase').value.trim(), title: $('#newTitle').value.trim() });
     try { localStorage.setItem('si_repo', v === '__other' ? source : v); } catch { /* 隐私窗口 */ }
     toast(T('项目已创建'));
     for (const id of ['#newGoal', '#newDone', '#newText', '#newTitle', '#newRepoPath', '#newBase']) $(id).value = '';
-    $('#newIsPlan').checked = false; syncNewForm();
+    $('#newIsPlan').checked = false; $('#newParallel').checked = false; syncNewForm();
     $('#newWrap').classList.add('hide'); await loadTasks(); location.hash = r.result.firstTaskId;
   } catch (e) { toast(e.message, true); }
 };

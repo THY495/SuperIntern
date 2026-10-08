@@ -341,8 +341,8 @@ section('环境准备：没人填就按依赖清单自动识别');
   writeFileSync(join(D, 'frontend', 'package-lock.json'), '{}');
   writeFileSync(join(D, 'package.json'), '{"name":"root"}');
   eq(JSON.stringify(cmds()), JSON.stringify(['python -m venv .venv', '.venv/bin/pip install -r backend/requirements.txt',
-    'npm install --no-audit --no-fund', 'npm ci --no-audit --no-fund --prefix frontend']),
-    '前后端分目录：一个根 venv 装后端依赖；前端有锁文件用 npm ci --prefix；根 package.json 没锁文件用 npm install');
+    'npm install --no-audit --no-fund --no-package-lock', 'npm ci --no-audit --no-fund --prefix frontend']),
+    '前后端分目录：一个根 venv 装后端依赖；前端有锁文件用 npm ci --prefix；根 package.json 没锁文件用 npm install --no-package-lock（不在工作区里生成没人提交的锁文件）');
   mkdirSync(join(D, 'api')); writeFileSync(join(D, 'api', 'pyproject.toml'), '[project]\nname="api"\n');
   assert(cmds().includes('.venv/bin/pip install -e api'), '只有 pyproject.toml 的目录：pip install -e');
   const fp1 = setupFingerprint(detectSetupCommands(D).argvs, detectSetupCommands(D).manifests);

@@ -22,6 +22,7 @@ import { raiseEgressQuestion, sourceOf, hostProblem } from '../core/egress.mjs';
 import { changedSince, nodeBaseline, clearNodeBaseline, isBuildOutput } from '../core/workspace.mjs';
 import { isInfraError } from '../core/errors.mjs';
 import { timeoutFor } from '../core/timeouts.mjs';
+import { coveredBy, lockedPathsFor, grantedSharedFor } from '../core/parallel.mjs';
 
 // ═══════════════════════════════════════════════════════════════════════════
 // 工具
@@ -212,14 +213,27 @@ export function makeHandlers(exec, workspace, trace) {
  * 文件在不在算数。
  */
 export const ALWAYS_IN_SCOPE = new Set(['si-preview.json']);
-// 依赖清单与 .gitignore 不受范围限制：曾出现过 AI 发现 requirements.txt 缺 uvicorn、
-// frontend/dist/ 被提交进了仓库，两次都因为"边界外"只披露没修 —— 前者让截图拍到报错页、交付的清单起不来后端，
-// 后者只能靠人介入。这两类文件是仓库卫生，不是任务的产物；放开它们不放开任何业务代码。
+/** 同一条机械拒收连续出现几次就停下节点、转成问题（见 submit_handoff）。 */
+export const MECHANICAL_REPEAT_STOP = 3;
+// 依赖清单与 .gitignore 不受范围限制：AI 发现依赖清单缺了运行要用的包、或构建产物被提交进了仓库，
+// 若因为"边界外"只披露不修 —— 前者让截图拍到报错页、交付的清单起不来后端，后者只能等人介入。
+// 这两类文件是仓库卫生，不是任务的产物；放开它们不放开任何业务代码。
 export const alwaysInScope = (p) => ALWAYS_IN_SCOPE.has(p)
   || /(^|\/)(requirements[^/]*\.txt|pyproject\.toml|package\.json|package-lock\.json|\.gitignore)$/.test(p)
   || isBuildOutput(p);   // 把已提交的构建产物从跟踪里摘掉（git rm --cached）也是仓库卫生
-export function validateHandoff(args, { exec, workspace, changed, scopePrefixes = null, scopeFiles = [], scopeStructured = false }) {
+export function validateHandoff(args, { exec, workspace, changed, scopePrefixes = null, scopeFiles = [], scopeStructured = false, lockedPaths = [], grantedPaths = [] }) {
   const errs = [];
+  // 并行开发：模块任务改不得共享路径 —— **先于**上面那条"依赖清单不受范围限制"的放行：
+  // 那条放行是给串行任务修仓库卫生的；并行时根依赖清单、锁文件正是几个同时开着的任务最容易撞上的地方。
+  if (changed && lockedPaths.length) {
+    // 人批准过的契约变更点名放行的共享路径不算（grantedSharedFor）
+    const hit = [...changed].filter((p) => coveredBy(p, lockedPaths) && !(grantedPaths.length && coveredBy(p, grantedPaths))).sort();
+    if (hit.length) {
+      errs.push(`改了共享路径：${hit.map((p) => `\`${p}\``).join('、')}。这些是骨架任务定下的共享文件（接口契约、根依赖清单与锁文件、根验收脚本……），`
+        + `几个模块任务同时在开发，对模块任务只读 —— 撤销这些改动（例如 git checkout -- <文件>；装依赖改写了锁文件也一样撤销）。`
+        + `确实要改接口或共享文件（缺一个依赖、契约里少一个字段），用 raise_question 说明要改什么、为什么：那是计划变更，由人批准`);
+    }
+  }
   // scope 机械执法（写边界的任务级形式）：宪法块 scope 里抽得出目录前缀时，相对基线的每一处改动
   // 都必须落在某个前缀之下；越界即打回 —— 撤销这些改动，或用 raise_question 说明为什么必须动它们（那是人来改 scope 的事）。
   // 抽不出前缀（scope 写的是 "." 或没有路径样的词）= 不执法，与路由的 `*` 行同一份判断。
@@ -549,11 +563,14 @@ export async function executeNode(db, {
   const scopeFiles = scopeFilesOf(db, taskId);
   // 这份范围是契约里直接给的路径（v17）还是从散文里抽的？两者的"抽不出目录"含义不同，见 validateHandoff。
   const scopeStructured = scopePathsOf(db, taskId).length > 0;
+  const lockedPaths = lockedPathsFor(db, taskId);
+  const grantedPaths = grantedSharedFor(db, taskId);
 
   const trace = [];
   const handlers = makeHandlers(exec, workspace, trace);
   let outcome = null;
   const rejections = [];
+  let lastMechanical = null, sameMechanical = 0;
 
   // 出口两个都挂在 handler 上：runToolLoop 只认"工具调用 → 结果"，
   // 所以出口也走工具，收尾由 stopReason 之外的这个 outcome 标记决定。
@@ -562,13 +579,37 @@ export async function executeNode(db, {
     // 非 git 工作区（离线测试）时退化为只查存在性与"不是目录"。
     let changed = null;
     if (baseRef) { try { changed = changedSince(workspace, baseRef); } catch { /* 忽略 */ } }
-    const errs = validateHandoff(args, { exec, workspace, changed, scopePrefixes, scopeFiles, scopeStructured });
+    const errs = validateHandoff(args, { exec, workspace, changed, scopePrefixes, scopeFiles, scopeStructured, lockedPaths, grantedPaths });
     if (errs.length) {
       rejections.push(errs);
       audit(db, { actorKind: 'agent', actorId: 'executor', action: 'handoff_rejected',
         targetType: 'node', targetId: nodeId, payload: { errs, artifacts: args?.artifacts } });
+      // 机械校验是确定性的：同一份改动重交，拒收一字不差。放任不管，执行器会把同一条越界拒收重交到 20 轮上限，
+      // 节点被收回后再来 20 轮（一路撞到调用上限），最后还是得提问题。
+      // 第二次一样 → 说清只剩两条路；第三次一样 → 不再等，系统替它把问题提给人。
+      const sig = errs.join('\n');
+      sameMechanical = sig === lastMechanical ? sameMechanical + 1 : 1;
+      lastMechanical = sig;
+      if (sameMechanical >= MECHANICAL_REPEAT_STOP) {
+        const L = contentLang(db);
+        outcome = { kind: 'question', args: {
+          level: 2, kind: 'structural',
+          text: tl(L, '这一步连续 {n} 次交了同样的改动，都被同一条机械校验拒回（见下面"卡在哪"）。重交不会改判：要么撤销被点名的改动，要么由人发一条计划变更把它们放进本任务的范围。', { n: sameMechanical }),
+          default_action: tl(L, '撤销被点名的改动后重交'),
+          blocked_by: errs.join('\n'),
+          work_done: tl(L, '（系统代填）本步的改动还在工作区里、没有提交；过程见这一步的执行叙事。'),
+          plan_after_answer: tl(L, '撤销：撤掉被点名的改动再交。放进范围：范围改好后原样重交。'),
+        } };
+        return '同一条机械拒收已连续出现，系统已把它转成问题交人，本节点挂起。不要再调用任何工具。';
+      }
+      if (sameMechanical === 2) {
+        return `交接记录被拒，**与上一次一字不差**：\n- ${errs.join('\n- ')}\n`
+          + '这是机械校验，同样的改动重交只会得到同样的结果。现在只有两条路：撤销上面点名的改动再交；'
+          + '或调用 raise_question（kind=structural）说明为什么必须动它们。再原样交一次，系统会直接停下本节点、把它转成问题交人。';
+      }
       return `交接记录被拒，修好再交：\n- ${errs.join('\n- ')}`;
     }
+    lastMechanical = null; sameMechanical = 0;
     // schema 过了才轮到验收员（"schema 校验为代码层前置条件"）。它只看交接记录
     // 与产物，不看这个循环里的任何东西。打回走与 schema 拒回**同一条路** ——
     // 执行器看到的是理由，改完再交；几次都过不了就是 stalled，与现在一样。

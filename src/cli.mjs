@@ -4,6 +4,7 @@
 // 所有状态变更都发生在库里，CLI 只负责把人的意思翻译成一次写入，
 // 再把库里的状态翻译回人能读的样子。任何"只有 CLI 知道"的状态都是 bug。
 
+import './core/win-hide.mjs';   // Windows：子进程默认不弹控制台窗口（必须最先执行）
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -38,7 +39,7 @@ import { flushLedger, taskSpendMicroUsd } from './core/ledger.mjs';
 import { plan, persistPlan } from './agent/planner.mjs';
 import { ensureWorkspace } from './core/workspace.mjs';
 import { LIMITS, limitOf, setLimit, checkLimits, raiseLimitQuestion, setProjectLimit, projectLimits, LAYER_NAMES } from './core/limits.mjs';
-import { budgetState, setProjectBudget, projectVerifyCommand, setProjectVerify, gearOf, setGear, gearPrereqStatus, GEARS, deferredSignoffs, maxOpenOf, setMaxOpen, fmtUsd as fmtBudget, sandboxFlavorOf, setSandboxFlavor, SANDBOX_FLAVORS, setupCommandsOf, setSetupCommands, detectSetupCommands } from './core/project-settings.mjs';
+import { budgetState, setProjectBudget, projectVerifyCommand, setProjectVerify, gearOf, setGear, gearPrereqStatus, GEARS, deferredSignoffs, maxOpenOf, setMaxOpen, setParallel, fmtUsd as fmtBudget, sandboxFlavorOf, setSandboxFlavor, SANDBOX_FLAVORS, setupCommandsOf, setSetupCommands, detectSetupCommands } from './core/project-settings.mjs';
 import { replay, renderReplay } from './core/replay.mjs';
 import { pendingRevision, nodesForReplan, gateOf, renderDiff, applyRevision,
   rejectRevision } from './core/revision.mjs';
@@ -1129,10 +1130,12 @@ async function cmdProject(db, sub, args, flags) {
     const planFlag = flags.plan ?? flags.brief;
     if (!flags.goal || !flags.done) die(tl(lang(), 'project new --goal <文本或文件> --done <文本或文件> (--source <仓库路径或 URL> | --empty) [--plan <规划文本或文件>] [--base <ref>] [--title <标题>]'));
     let r;
+    if (flags.parallel && planFlag === undefined) die(tl(lang(), '并行开发要配合一份已写好的规划（--plan）'));
     try {
       if (!flags.empty) checkRepoSource(flags.source === true ? '' : flags.source, { required: true });
       r = startProject(db, { userId, goal: textOrFile(flags.goal), doneDefinition: textOrFile(flags.done), plan: planFlag === undefined ? null : textOrFile(planFlag),
         source: flags.empty ? null : flags.source, empty: !!flags.empty, base: flags.base ?? null, title: flags.title === true ? null : flags.title ?? null, home: HOME });
+      if (flags.parallel) setParallel(db, { projectId: r.projectId, on: true, userId });
     } catch (e) { die(translateError(e, lang())); }
     console.log(tl(lang(), '项目 {id}\n  仓库 {repo}\n  分支 {branch} @ {base}', { id: r.projectId, repo: r.repo, branch: r.branch, base: r.baseRef.slice(0, 8) }));
     if (r.planned) console.log(tl(lang(), '  方案待起草（载体任务 {carrier}）。守护进程会拉规划器；没开守护进程：node src/cli.mjs project plan {id}', { carrier: r.carrierId, id: r.projectId }));

@@ -1,6 +1,6 @@
 {
   "name": "superintern",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "A long-running, self-hosted autonomous coding agent: you answer, decide, change course or stop it; it plans, codes in a sandbox and verifies. Multi-user, multi-vendor.",
   "type": "module",
   "license": "MIT",

@@ -35,6 +35,8 @@ import { textOf } from '../llm/canonical.mjs';
 import { newId, now, audit } from '../db/db.mjs';
 import { validateNodeSet, constitutionText } from './planner.mjs';
 import { overruledContractRules, renderOverruled } from '../core/decisions.mjs';
+import { normScopePaths, prefixesOfPaths, filesOfPaths, prefixesOfScope, filesOfScope } from '../core/routing.mjs';
+import { alwaysInScope } from './executor.mjs';
 
 export const IMPACT_MARKS = {
   unaffected: '无关 —— 这条修正不影响它，照原样做/保留',
@@ -137,6 +139,9 @@ const SUBMIT_REVISION = {
         },
       },
       rationale: { type: 'string', description: '整体判断：这条修正到底在改什么，你为什么这样切。' },
+      scope_not_needed: { type: 'array', items: { type: 'string' },
+        description: '修正里提到、但执行器**不需要改**的范围外路径（例如修正只是引用它、或明说不要动它）。'
+          + '修正点名了范围外的路径时，系统要求每一条要么进 constitution_patch.scope_paths、要么列在这里 —— 两边都没有就拒回。' },
     },
     required: ['impact', 'rationale'],
   },
@@ -192,8 +197,9 @@ const RAISE_QUESTION = {
  * 既有状态对不对得上"。新增节点部分复用 validateNodeSet —— 新增的东西没有
  * 理由比一开始规划出来的东西宽松。
  */
-export function validateRevision(rev, { nodes, constitution = null }) {
+export function validateRevision(rev, { nodes, constitution = null, messageBody = null }) {
   const errs = [];
+  if (messageBody != null && constitution) errs.push(...scopeWideningProblems(rev, { constitution, messageBody }));
   const byId = new Map(nodes.map((n) => [n.id, n]));
   const impact = rev?.impact ?? [];
 
@@ -386,6 +392,51 @@ export function validateRevision(rev, { nodes, constitution = null }) {
   return errs;
 }
 
+// ── 修正点名了范围外的路径 ─────────────────────────────────────────────
+// 人发来"测试先行节点要改测试文件"，重规划只改了节点规格、没扩 scope_paths → 执行器交接一再被越界校验拒回，人得一轮轮地答。
+// 只在提示里写"要扩就填 scope_paths"，就得靠模型记得。这里改成机械的：修正正文里点名的每条范围外路径，
+// 要么进 constitution_patch.scope_paths（于是交人批准），要么由重规划器明说"不需要改"（scope_not_needed）。两边都没有 → 拒回重交。
+// 只认像路径的词：带斜杠的、或带常见代码 / 配置后缀的文件名；网址与 Node.js 这类名字不算。
+const PATH_EXT = 'py|mjs|cjs|js|jsx|ts|tsx|mts|json|ya?ml|toml|md|txt|sh|css|scss|html|sql|ini|cfg|env|lock';
+const PATH_RE = new RegExp(`(?:^|[\\s(（"'\`「，,：:])((?:[A-Za-z0-9_.@-]+\\/)+(?:[A-Za-z0-9_.@-]+)?|[A-Za-z0-9_@-][A-Za-z0-9_.@-]*\\.(?:${PATH_EXT}))(?=$|[\\s)）"'\`」，,。;；:：!?！？]|\\.(?:\\s|$))`, 'g');
+const NOT_PATHS = /^(node|next|nuxt|vue|react|express|three|d3|chart|moment|socket\.io)\.js$/i;
+// 系统附在更正后面的那一段（验收命令、输出尾巴……）不是人说的话：里面提到的文件不算"修正点名了"
+const SYSTEM_ATTACHED = /\n[ \t]*[—-]{1,2}\s*(系统附|Attached by the system)[\s\S]*$/;
+export function pathsNamedIn(text) {
+  const out = new Set();
+  const said = String(text ?? '').replace(SYSTEM_ATTACHED, '');
+  for (const m of said.matchAll(PATH_RE)) {
+    // 命令的参数（`node --test importer/`、`python worker/notifier.py`）是在说怎么跑，不是要改它
+    if (/\b(node|python3?|pytest|npm|npx|pip3?|uvicorn|bash|sh|deno|bun)(\s+-{1,2}[A-Za-z-]+)*\s+$/.test(said.slice(Math.max(0, m.index - 40), m.index + 1))) continue;
+    const p = m[1].replace(/^\.\//, '').replace(/[.]+$/, '');
+    if (!p || p.includes('://') || /^\/\//.test(p) || NOT_PATHS.test(p) || /^\d/.test(p)) continue;
+    if (/^(https?|www)\b/i.test(p) || /^[a-z0-9-]+\.(com|org|net|io|dev)(\/|$)/i.test(p)) continue;
+    if (p.startsWith('@') || p.split('/').some((s) => s.startsWith('-'))) continue;   // npm 的 @scope/name；cli/-only 这类不是路径
+    out.add(p.replace(/^\/+/, ''));
+  }
+  // 只写了文件名、同一段里又写过它的完整路径（App.test.jsx 与 web/src/App.test.jsx）→ 是同一个文件
+  const full = [...out].filter((p) => p.includes('/'));
+  return [...out].filter((p) => p.includes('/') || !full.some((f) => f.endsWith(`/${p}`)));
+}
+const parseList = (s) => { try { const v = JSON.parse(s || '[]'); return Array.isArray(v) ? v : []; } catch { return []; } };
+export function scopeWideningProblems(rev, { constitution, messageBody }) {
+  const structured = normScopePaths(parseList(constitution.scope_paths));
+  const prefixes = structured.length ? prefixesOfPaths(structured) : prefixesOfScope(constitution.scope);
+  const files = structured.length ? filesOfPaths(structured) : filesOfScope(constitution.scope);
+  if ((prefixes ?? []).includes('*') || (!(prefixes ?? []).length && !files.length)) return [];   // 范围不执法，就不核
+  const inScope = (p, pre, fs) => alwaysInScope(p) || pre.some((s) => p === s || p.startsWith(`${s}/`) || `${p}/`.startsWith(`${s}/`)) || fs.includes(p);
+  const outside = pathsNamedIn(messageBody).filter((p) => !inScope(p, prefixes, files));
+  if (!outside.length) return [];
+  const patched = Array.isArray(rev?.constitution_patch?.scope_paths) ? normScopePaths(rev.constitution_patch.scope_paths) : null;
+  const pPre = patched ? prefixesOfPaths(patched) : [], pFiles = patched ? filesOfPaths(patched) : [];
+  const waived = new Set((Array.isArray(rev?.scope_not_needed) ? rev.scope_not_needed : []).map((x) => String(x).replace(/^\.\//, '').replace(/\/+$/, '')));
+  const open = outside.filter((p) => !(patched && inScope(p, pPre, pFiles)) && !waived.has(p.replace(/\/+$/, '')));
+  if (!open.length) return [];
+  return [`修正点名了本任务范围（scope_paths）之外的路径：${open.map((p) => `\`${p}\``).join('、')}。`
+    + '执行器要改它们 → 在 constitution_patch.scope_paths 里写上新的完整清单（原有的照抄、再加上这几条；会交人批准），'
+    + '只改节点规格不扩清单，执行器的交接照样被越界校验拒回；执行器不需要改它们（修正只是提到、或明说别动）→ 把它们列进 scope_not_needed'];
+}
+
 /** 一份补丁里**真正会被应用**的字段。gateOf / applyRevision 共用，免得两边口径分叉。 */
 export const patchFields = (patch) => (
   patch && typeof patch === 'object' && !Array.isArray(patch)
@@ -444,7 +495,11 @@ ${constitution.goal}
 
 ## 范围
 ${constitution.scope}
-
+${((sp) => (sp.length ? `\n允许改动的路径（scope_paths，执行器交接时的越界校验**只认这一份**）：${sp.map((p) => `\`${p}\``).join('、')}\n`
+    // 修正要求测试先行节点改测试文件，重规划若只改节点规格、不扩 scope_paths → 执行器交接一再被越界校验拒回，人得一轮轮地答
+    + '修正若要求执行器改这份清单**之外**的文件，必须在 constitution_patch.scope_paths 里把它加进去（会交人批准）；'
+    + '只改节点规格不扩清单，执行器的交接照样会被拒回。修正只是提到、执行器不需要改的范围外文件，列进 scope_not_needed —— '
+    + '系统会机械核对修正里点名的每一条范围外路径，两边都没有就拒回。\n' : ''))((() => { try { const v = JSON.parse(constitution.scope_paths || '[]'); return Array.isArray(v) ? v : []; } catch { return []; } })())}
 ## 完成定义
 ${constitution.definition_of_done}
 
@@ -475,7 +530,7 @@ ${renderVerdicts(db, verdicts)}
       maxTokens: 16000, effort: 'high',
     }, {
       submit_revision: async (args) => {
-        const errs = validateRevision(args, { nodes, constitution });
+        const errs = validateRevision(args, { nodes, constitution, messageBody: message.body });
         if (errs.length) { out = { kind: 'rejected', errs }; return `方案被拒，修好再交：\n- ${errs.join('\n- ')}`; }
         out = { kind: 'revision', args };
         return '方案已受理。不要再调用任何工具。';

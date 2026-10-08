@@ -9,14 +9,18 @@
 // 不是四条代码路径共用一个名字，是同一条路径——把 while 换成进程重启，
 // 行为一模一样。挂起后进程退出、复工时重新进来，靠的正是后者。
 
+import { runnableArgv } from './verify-argv.mjs';
 import { hasMark } from '../i18n/marks.mjs';
 import { tl, contentLang, I18nError, N_ } from '../i18n/index.mjs';
 import { raiseSignoffQuestion } from './deliver.mjs';
 import { join, resolve } from 'node:path';
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
-import { effectiveSetupOf, runSetupCommands, setupFingerprint } from './project-settings.mjs';
+import { effectiveSetupOf, runSetupCommands, setupFingerprint, parallelOf } from './project-settings.mjs';
 import { readPreviewSpec, capturePreview, hasUi, PREVIEW_FILE } from './preview.mjs';
-import { setParam } from './params.mjs';
+import { setParam, getParam as paramValue } from './params.mjs';
+import { lockedPathsFor, coveredBy, sharedPathsOf } from './parallel.mjs';
+import { contractGaps } from './contract-coverage.mjs';
+import { prefixesOf, scopeFilesOf } from './routing.mjs';
 import { raiseChoiceReviews, CHOICES_MARK } from './choices.mjs';
 
 /** 这条开着的事项挡不挡执行（见 run 里 pending 那一行）。停等 / 空转的标记与 liveness.mjs 一致（不 import，免得成环）。 */
@@ -73,6 +77,45 @@ export const PREVIEW_SEED_NODE = {
     + `只改 ${PREVIEW_FILE} 与新加的样例数据脚本；不要自己截图、不要提交图片或数据库文件。`,
   acceptance: `${PREVIEW_FILE} 的 seed 非空；在沙箱里按 start 起服务、跑一遍 seed 后，列表接口返回的数据不为空（交接记录里贴出这次请求的结果）。`,
 };
+
+/** 这个任务补不补截图那两步（理由见 finalize 里那段注释）。纯查询，测试直接调。 */
+export function previewStepsFor(db, taskId) {
+  const preview = !coveredBy(PREVIEW_FILE, lockedPathsFor(db, taskId));
+  return { preview, seed: preview && paramValue(db, taskId, 'task.kind') !== 'skeleton' };
+}
+
+/**
+ * 样例数据脚本放哪：这一步是系统补的，规格里不说放哪，执行器每次都放到仓库根目录，而根目录多半不在任务范围里
+ * （放到根目录的 seed 脚本全被越界校验拒回，执行器会一直重交到 20 轮上限）。
+ * si-preview.json 本身不受范围限制（ALWAYS_IN_SCOPE），脚本受 —— 所以把可放的位置写进这一步的规格。范围不执法（抽不出路径 / *）时不加。
+ */
+export function seedPlacement(db, taskId) {
+  const dirs = prefixesOf(db, taskId) ?? [];
+  if (dirs.includes('*')) return '';
+  const files = scopeFilesOf(db, taskId) ?? [];
+  if (!dirs.length && !files.length) return '';
+  return dirs.length
+    ? `\n样例数据脚本**只能**放在本任务的可动目录里：${dirs.map((d) => `${d}/`).join('、')}（例如 ${dirs[0]}/seed_preview 加相应后缀）；放到别处（包括仓库根目录）交接会被越界校验拒回。`
+    : `\n本任务的可动路径只有 ${files.join('、')}，放不下新脚本：seed 只用调新建接口的命令（例如 curl），不新建脚本。`;
+}
+
+// 并行开发的骨架任务：契约文件与规格对不上（缺接口 / 查询参数 / 字段）→ 补一步让骨架补上，每个任务只补一次。
+// 骨架契约漏了接口或参数名时，契约测试只验正常路径、照样全绿；模块撞上后各改一次契约、各要一次人批，
+// 漏掉的接口要到集成时才发现是 405。模块只对着契约写，这一步不该靠骨架自己想得周全（见 contract-coverage.mjs）。
+export const CONTRACT_NODE_KEY = 'contract.coverage_node';
+export const CONTRACT_NODE = {
+  title: N_('把规格里的接口补全进契约'),
+  spec: (files, gaps) => `契约文件（${files.join('、')}）与规格对不上 —— 规格里写死的这些，契约里没有：\n- ${gaps.join('\n- ')}\n`
+    + '照规格原文把它们补进契约文件（路径、方法、查询参数、请求 / 响应字段、状态码）；契约测试若逐项核对接口，也把这几处加上。'
+    + '只改契约文件与契约测试；桩跟着契约补上能跑的占位即可，不要实现业务。',
+  acceptance: '契约文件里有上面列出的每一处；契约测试与根验收照样通过（交接记录里贴出结果）。',
+};
+export function contractCoverageFor(db, taskId, workspace) {
+  if (!workspace || paramValue(db, taskId, 'task.kind') !== 'skeleton') return null;
+  const t = db.one(`SELECT t.project_id, p.brief FROM tasks t JOIN projects p ON p.id=t.project_id WHERE t.id=?`, taskId);
+  if (!t?.project_id || !parallelOf(db, t.project_id)) return null;
+  return contractGaps(workspace, { brief: t.brief, sharedPaths: sharedPathsOf(db, t.project_id) });
+}
 
 /** 节点状态直方图。编排器判"接下来该干什么"只需要这一个东西。 */
 const census = (db, taskId) => Object.fromEntries(
@@ -649,7 +692,8 @@ export async function orchestrate(db, {
       // 这比只读弱一档（改了又改回去的抓不到），但把"落缓存"和"改源码"分开了 ——
       // 前者是工具的正常行为，后者才是要防的事。
       const before = safeStatus(workspace)?.changed ?? null;
-      const out = await exec.execute({ file: argv[0], args: argv.slice(1) }, workspace,
+      const run = runnableArgv(argv, workspace);   // node --test <目录> → glob（Node 22 不展开目录）
+      const out = await exec.execute({ file: run[0], args: run.slice(1) }, workspace,
         { mode: 'write', timeoutMs: 300_000 });
       const after = safeStatus(workspace)?.changed ?? null;
       const touched = before && after ? after.filter((p) => !before.includes(p)) : [];
@@ -669,10 +713,33 @@ export async function orchestrate(db, {
       onEvent({ type: 'verified', verification });
       if (out.code !== 0 || out.timedOut || mutated.length) return verifyFailed(verification);
     }
+    const cov = contractCoverageFor(db, taskId, workspace);
+    if (cov?.gaps.length) {
+      if (!getParam(db, taskId, CONTRACT_NODE_KEY)) {
+        const nid = newId('n');
+        db.run(`INSERT INTO nodes (id,task_id,title,spec,acceptance,status,risk_tier,model_tier,created_at) VALUES (?,?,?,?,?,'pending','low','standard',?)`,
+          nid, taskId, tlN(L, CONTRACT_NODE.title), CONTRACT_NODE.spec(cov.files, cov.gaps), CONTRACT_NODE.acceptance, now());
+        setParam(db, { taskId, key: CONTRACT_NODE_KEY, value: nid, by: { kind: 'agent', id: 'orchestrator' }, governance: 'execution' });
+        audit(db, { actorKind: 'system', action: 'contract_node_added', targetType: 'task', targetId: taskId, payload: { pid, nodeId: nid, files: cov.files, gaps: cov.gaps } });
+        onEvent({ type: 'contract_node_added', nodeId: nid, gaps: cov.gaps.length });
+        return AGAIN;
+      }
+      // 补过一次还对不上：不再补，照实记下、照常请签收（签收的人在审计里看得到缺哪几处）
+      audit(db, { actorKind: 'system', action: 'contract_gaps_remain', targetType: 'task', targetId: taskId, payload: { pid, files: cov.files, gaps: cov.gaps } });
+    }
     // 有界面却没写 si-preview.json：签收的人看不到页面，只能打回（打回后 AI 还可能把截图提交进仓库
     // —— 越界、改范围、几人会批，平白多出一串事项）。这不该交给人：系统补一步让执行器写，
     // 写完回到这里重新验收、截图、再请签收。每个任务只补一次，补了还是没有就照旧签收（签收页照实说没截图）。
-    if (exec?.isolated && workspace && !readPreviewSpec(workspace) && hasUi(workspace) && !getParam(db, taskId, PREVIEW_NODE_KEY)) {
+    //
+    // 系统补的步骤也守任务的范围：补给一个**写不了**那份文件的任务，就是逼执行器越界。所以
+    //   - 并行开发的模块任务：si-preview.json 对它只读（lockedPathsFor）→ 两步都不补。截图说明由骨架写，
+    //     样例数据留给集成任务（模块分支上别的模块只是桩，接口给不出数据）。否则每个模块各被补一遍 →
+    //     几份根目录 si-preview.json 必然合并冲突，样例脚本写到根目录越界一再被拒。
+    //   - 骨架任务：写截图说明照补（这一步骨架做得到；它写下的那份让所有模块免补），
+    //     **只不补样例数据**：桩接口没有数据，那步验收不可能过。
+    //     两步都挡掉也不对：骨架不再写这份文件，于是每个模块各补一遍 —— 挡多了一步。
+    const { preview: previewWritable, seed: seedable } = previewStepsFor(db, taskId);
+    if (previewWritable && exec?.isolated && workspace && !readPreviewSpec(workspace) && hasUi(workspace) && !getParam(db, taskId, PREVIEW_NODE_KEY)) {
       const nid = newId('n');
       db.run(`INSERT INTO nodes (id,task_id,title,spec,acceptance,status,risk_tier,model_tier,created_at) VALUES (?,?,?,?,?,'pending','low','standard',?)`,
         nid, taskId, tlN(L, PREVIEW_NODE.title), PREVIEW_NODE.spec, PREVIEW_NODE.acceptance, now());
@@ -682,10 +749,10 @@ export async function orchestrate(db, {
       return AGAIN;
     }
     const pv = exec?.isolated && workspace ? readPreviewSpec(workspace, L) : null;
-    if (pv?.spec && !pv.spec.seed.length && (pv.spec.ready.length > 1 || pv.spec.start.length > 1) && !getParam(db, taskId, PREVIEW_SEED_NODE_KEY)) {
+    if (seedable && pv?.spec && !pv.spec.seed.length && (pv.spec.ready.length > 1 || pv.spec.start.length > 1) && !getParam(db, taskId, PREVIEW_SEED_NODE_KEY)) {
       const nid = newId('n');
       db.run(`INSERT INTO nodes (id,task_id,title,spec,acceptance,status,risk_tier,model_tier,created_at) VALUES (?,?,?,?,?,'pending','low','standard',?)`,
-        nid, taskId, tlN(L, PREVIEW_SEED_NODE.title), PREVIEW_SEED_NODE.spec, PREVIEW_SEED_NODE.acceptance, now());
+        nid, taskId, tlN(L, PREVIEW_SEED_NODE.title), PREVIEW_SEED_NODE.spec + seedPlacement(db, taskId), PREVIEW_SEED_NODE.acceptance, now());
       setParam(db, { taskId, key: PREVIEW_SEED_NODE_KEY, value: nid, by: { kind: 'agent', id: 'orchestrator' }, governance: 'execution' });
       audit(db, { actorKind: 'system', action: 'preview_seed_node_added', targetType: 'task', targetId: taskId, payload: { pid, nodeId: nid } });
       onEvent({ type: 'preview_node_added', nodeId: nid });

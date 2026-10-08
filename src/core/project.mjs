@@ -26,6 +26,7 @@
 // 没做（有意）：模型写整批契约的项目规划器（`project new --file` 由人给 JSON，等于"整批批一次"）；任务 done 后的重规划
 // （目前没有证据说它常被需要，留位）；并行任务。
 
+import { runnableArgv } from './verify-argv.mjs';
 import { hasMark, markOf } from '../i18n/marks.mjs';
 import { tl, contentLang, I18nError } from '../i18n/index.mjs';
 import { applyEgressDefaults } from './egress.mjs';
@@ -34,7 +35,7 @@ import { join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 import { execFileSync } from 'node:child_process';
 import { newId, now, audit, insertEdge } from '../db/db.mjs';
-import { ensureWorkspace, workspaceStatus, isBuildOutput, discardChanges, describeChanges } from './workspace.mjs';
+import { ensureWorkspace, workspaceStatus, isBuildOutput, discardChanges, describeChanges, pinLineEndings } from './workspace.mjs';
 import { handbackHook, openHandback, raiseDirtyWorkspace } from './handback.mjs';
 import { deliverTask, signoffOf, finalReport, parseGithub, pushEnv, doneHeadOf, signoffHeadOf, raiseSignoffQuestion } from './deliver.mjs';
 import { verifyCommandProblems } from '../agent/elicitor.mjs';
@@ -42,7 +43,7 @@ import { validateRules, renderRules, normalizeQuote, foldRules } from './rules.m
 import { setLimit } from './limits.mjs';
 import { getParam, setParam } from './params.mjs';
 import { recordFromContract, recordGoalChange } from './decisions.mjs';
-import { budgetState, raiseProjectBudget, projectVerifyCommand, deferredSignoffs, maxOpenOf, effectiveSetupOf, runSetupCommands } from './project-settings.mjs';
+import { budgetState, raiseProjectBudget, projectVerifyCommand, deferredSignoffs, maxOpenOf, parallelOf, effectiveSetupOf, runSetupCommands } from './project-settings.mjs';
 import { routeQuestion, prefixesOfScope, filesOfScope, prefixesOfPaths, filesOfPaths, scopePathProblems, normScopePaths, renderScopePaths, SCOPE_PATHS_NOTE, scopePathsNote } from './routing.mjs';
 import { waitingOnHuman } from './addressee.mjs';
 import { RESOLUTION_HOOKS } from './answers.mjs';
@@ -230,6 +231,8 @@ export function createTaskFromSpec(db, spec, { userId, projectId = null, order =
     if (projectId && Array.isArray(dependsOn)) param('task.depends_on', dependsOn);
     // 批次：同一次规划 / 添加里定稿的任务共用一个值。漂移提示靠它判断"这份契约定稿时，规划器知不知道那个任务"。
     if (projectId && batch !== null) param('task.batch', batch);
+    // 并行开发：骨架 / 模块 / 集成。模块任务改不得共享路径（executor 按它执法）。
+    if (projectId && ['skeleton', 'module', 'integration'].includes(spec.kind)) param('task.kind', spec.kind);
     db.run(`INSERT INTO constitutions (id,task_id,version,goal,scope,scope_paths,definition_of_done,constraints,valid_from,recorded_at)
             VALUES (?,?,1,?,?,?,?,?,?,?)`,
       constId, taskId, spec.goal, spec.scope ?? tl(contentLang(db), '未限定'),JSON.stringify(normScopePaths(spec.scope_paths)), dod, JSON.stringify(spec.constraints ?? []), t, t);
@@ -260,6 +263,7 @@ export function initProjectRepo({ home, projectId, source, base = null, empty = 
     if (source) throw new I18nError('--empty 与 --source 只能给一个');
     mkdirSync(repo, { recursive: true });
     git(repo, 'init', '-q', '-b', branch);
+    pinLineEndings(repo);
     git(repo, '-c', 'user.name=superintern', '-c', 'user.email=superintern@local', 'commit', '-q', '--allow-empty', '-m', `init: ${projectId}`);
     return { repo, branch, baseRef: git(repo, 'rev-parse', 'HEAD'), source: null };
   }
@@ -268,6 +272,7 @@ export function initProjectRepo({ home, projectId, source, base = null, empty = 
   // 克隆 / 检出失败不留半截目录（新建项目时当场克隆，路径或 URL 不对是常见的人为错误）。
   try {
     git(dir, '-c', 'core.autocrlf=false', 'clone', '--quiet', src, repo);
+    pinLineEndings(repo);   // 项目分支上的合并也在宿主机上做（见 workspace.mjs）
     if (base) git(repo, 'checkout', '-q', '--detach', base);
     git(repo, 'checkout', '-q', '-b', branch);
   } catch (e) {
@@ -477,7 +482,7 @@ export async function advanceProject(db, { projectId, home, userId = null, makeE
       if (budget.over) return budgetStop();
       const task = sch.ready.find((t) => t.id === next.taskId);
       startTask(db, { project: p, task, tasks: sch.tasks, home });
-      return { advanced: true, reason: sch.open.length ? 'workspace_created:letting_through' : 'workspace_created', taskId: task.id, concurrent: sch.open.length + 1 };
+      return { advanced: true, reason: !sch.open.length ? 'workspace_created' : next.parallel ? 'workspace_created:parallel' : 'workspace_created:letting_through', taskId: task.id, concurrent: sch.open.length + 1 };
     }
     if (sch.open.length) return { advanced: false, reason: next.why ?? `waiting:${sch.open[0].status}`, taskId: sch.open[0].id, open: sch.open.map((t) => t.id) };
     // 没有能推进的：剩下的任务要么自己被中止，要么在等被中止的任务。
@@ -534,7 +539,7 @@ export async function advanceProject(db, { projectId, home, userId = null, makeE
       const open = openHandback(db, cur.id, 'dirty_workspace');
       if (open) return { advanced: false, reason: 'waiting:dirty_workspace', taskId: cur.id, questionId: open.questionId };
       // 只给文件名的话，人看不出 tickets.db 是新生成的还是仓库里本来就有的 —— 写"都不要"之前得知道这个。
-      const how = new Map((() => { try { return describeChanges(wsDir); } catch { return []; } })().map((c) => [c.path, c.how]));
+      const how = new Map((() => { try { return describeChanges(wsDir, L); } catch { return []; } })().map((c) => [c.path, c.how]));
       const q = raiseDirtyWorkspace(db, { taskId: cur.id, files: rest.map((f) => (how.get(f) ? tl(L, '{file}（{how}）', { file: f, how: how.get(f) }) : f)) });
       return { advanced: true, reason: 'dirty_workspace', taskId: cur.id, questionId: q.questionId, files: rest };
     }
@@ -737,7 +742,8 @@ export async function runProjectVerify(db, { projectId, home, makeExec = null, o
         return r;
       }
     }
-    const out = await exec.execute({ file: argv[0], args: argv.slice(1) }, dir, { mode: 'write', timeoutMs: 600_000 });
+    const runArgv = runnableArgv(argv, dir);
+    const out = await exec.execute({ file: runArgv[0], args: runArgv.slice(1) }, dir, { mode: 'write', timeoutMs: 600_000 });
     // 原来只留最后 40 行。例：负责人展开一看，尾部恰好是五条配置自检
     // （MAX_PAGE_SIZE 等于 50、package.json 的 type 是 module…），于是问：
     // 「39 条里另外 34 条测的是啥，它没给我看」——而那个项目真正会出问题的分页边界与
@@ -799,7 +805,8 @@ async function runMergedTaskVerifies(db, { projectId, exec, dir, onEvent = () =>
     onEvent({ type: 'task_verify_start', taskId: t.id, argv: base.argv });
     const at = now();
     try {
-      const r = await exec.execute({ file: base.argv[0], args: base.argv.slice(1) }, dir, { mode: 'write', timeoutMs: PER_TASK_VERIFY_TIMEOUT_MS });
+      const run = runnableArgv(base.argv, dir);
+      const r = await exec.execute({ file: run[0], args: run.slice(1) }, dir, { mode: 'write', timeoutMs: PER_TASK_VERIFY_TIMEOUT_MS });
       out.push({ ...base, ok: r.code === 0 && !r.timedOut, code: r.code, timedOut: !!r.timedOut, elapsedMs: now() - at,
         tail: (r.code === 0 && !r.timedOut) ? null : (r.stdout + r.stderr).trim().split('\n').slice(-20).join('\n').slice(0, 1200) });
     } catch (e) {
@@ -1064,11 +1071,39 @@ export async function integrateProjectBranch(db, { project, task, home, makeExec
       payload: { projectId: project.id, onto: target, why: tl(L, '这个任务没有验收命令，集成后无从重跑') } });
     return { kind: 'integrated', target, head: after, verified: false, ran: 0, resolved };
   }
+  // 集成这一步不该在工作区里留下任何东西：环境准备的 npm install 会在没有锁文件的仓库里生成 package-lock.json，
+  // 验收命令也可能写出文件 —— 留着就成了"签收后还有没提交的改动"，合并卡住、平白给人一条事项。
+  // 跑之前记下已有的改动，跑完把这一步新冒出来的撤掉。
+  const dirtyBefore = new Set((() => { try { return workspaceStatus(wsDir).changed; } catch { return []; } })());
+  const restoreWorkspace = () => {
+    try {
+      const fresh = workspaceStatus(wsDir).changed.filter((p) => !dirtyBefore.has(p));
+      if (fresh.length) {
+        discardChanges(wsDir, fresh);
+        audit(db, { actorKind: 'system', action: 'workspace_integrate_leftovers_discarded', targetType: 'task', targetId: task.id, payload: { paths: fresh.slice(0, 40) } });
+      }
+    } catch { /* 尽力；没撤掉的在合并前那道"没提交的改动"检查里还会被看到 */ }
+  };
   try {
     const bad = await withSandbox(db, { taskId: task.id, home, makeExec }, async (exec) => {
+      // 先按合并后的依赖清单准备环境：本任务开工时项目里还没有别人的依赖清单
+      // （比如别的任务后来才加的 api/requirements.txt），合进来之后重跑别人的验收命令，沙箱里缺它们的依赖 ——
+      // "No module named pytest" 报成本任务集成失败，挂一条结构矛盾给人。与项目级验收同一条做法。
+      const { argvs: setupArgvs, source: setupSource } = effectiveSetupOf(db, project.id, wsDir);
+      if (setupArgvs.length) {
+        const su = await runSetupCommands(exec, wsDir, setupArgvs, L);
+        audit(db, { actorKind: 'system', action: su.ok ? 'env_setup_done' : 'env_setup_failed', targetType: 'task', targetId: task.id,
+          payload: { for: 'integrate', projectId: project.id, source: setupSource, results: su.results.map((x) => ({ cmd: x.argv.join(' '), code: x.code, timedOut: x.timedOut, tail: x.tail.slice(-600) })) } });
+        if (!su.ok) {
+          const b = su.results.at(-1);
+          return { argv: b.argv, code: b.code, timedOut: b.timedOut, regression: false, setupFailed: true,
+            tail: `${tl(L, '环境准备命令失败，验收命令没有跑：')}\n$ ${b.argv.join(' ')}\n${b.tail}` };
+        }
+      }
       for (const [i, argv] of argvs.entries()) {
         onEvent({ type: 'integrate_verify', taskId: task.id, argv, index: i, total: argvs.length });
-        const out = await exec.execute({ file: argv[0], args: argv.slice(1) }, wsDir, { mode: 'write', timeoutMs: 600_000 });
+        const run = runnableArgv(argv, wsDir);
+        const out = await exec.execute({ file: run[0], args: run.slice(1) }, wsDir, { mode: 'write', timeoutMs: 600_000 });
         if (out.code !== 0 || out.timedOut) {
           return { argv, code: out.code, timedOut: out.timedOut, regression: i > 0,
             tail: (out.stdout + out.stderr).trim().split('\n').slice(-40).join('\n') };
@@ -1086,6 +1121,8 @@ export async function integrateProjectBranch(db, { project, task, home, makeExec
     audit(db, { actorKind: 'system', action: 'project_task_integrate_verify_failed', targetType: 'task', targetId: task.id,
       payload: { projectId: project.id, onto: target, error: String(e.message).slice(0, 400) } });
     return { kind: 'verify_failed', target, head: after, code: null, tail: tl(L, '集成后的重跑没能跑起来：{error}', { error: String(e.message).slice(0, 400) }) };
+  } finally {
+    restoreWorkspace();
   }
   audit(db, { actorKind: 'system', action: 'project_task_integrate_verified', targetType: 'task', targetId: task.id,
     payload: { projectId: project.id, onto: target, head: after, ran: argvs.length } });
@@ -1419,6 +1456,8 @@ export function lettableNext(db, { project, sch, home }) {
   if (!sch.open.length) return { taskId: ready.id };                       // 没人开着：照旧，这不是并发
   const maxOpen = maxOpenOf(db, project.id);
   if (sch.open.length >= maxOpen) return { taskId: null, why: openWhy(db, sch.open, head) ?? `at_capacity:${maxOpen}` };
+  // 并行开发：就绪就开，不必等开着的都在等人 —— 模块之间范围不相交、只读共享路径，是规划时就保证了的。
+  if (parallelOf(db, project.id)) return { taskId: ready.id, parallel: true };
   const busy = sch.open.filter((t) => !waitingOnHuman(db, t.id));
   if (busy.length) return { taskId: null, why: openWhy(db, busy, head) };  // 有一个真的在跑 → 不加塞
   return { taskId: ready.id, lettingThrough: true };

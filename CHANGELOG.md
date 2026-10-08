@@ -1,5 +1,27 @@
 # 更新记录 / Changelog
 
+## v0.3.0 — 2026-10-08
+
+**并行开发（实验功能）/ Parallel development (experimental)**
+
+- 从写好的规划新建项目时可以勾选「并行开发」：先做骨架任务（接口契约、各模块的桩、共享文件），合并后各模块任务同时开发、各改各的目录，共享文件对模块任务只读，最后由集成任务接起来跑端到端。默认关闭；可以在项目设置里关掉，关掉后不能再打开。
+  New option when creating a project from a written plan: a skeleton task first fixes the interface contract, a stub per module and the shared files; once it is merged, module tasks are built at the same time, each in its own directory, with shared files read-only for them; an integration task connects everything end to end. Off by default; it can be turned off in project settings, but not turned on again afterwards.
+- 「同时开着的任务数」上限在并行项目里就是同时干活的任务数。/ In parallel projects, the "tasks open at the same time" limit is the number of tasks working at once.
+- 契约覆盖核对：规划时骨架任务要点名规格里的每个 `METHOD /path`；骨架做完时对着契约文件核对接口、查询参数与字段，缺了系统补一步让骨架补上。/ Contract coverage check: at planning time the skeleton task must name every `METHOD /path` in the spec; when the skeleton is done, the contract file is checked for those endpoints, query parameters and fields, and the system adds a step to fill any gap.
+- 人批准过的计划变更点名的共享文件，对那个模块任务放行。/ Shared files named in a plan change a person approved are opened up for that module task.
+- 页面截图的两步按任务能写哪些文件来补：并行项目里截图说明由骨架写、样例数据由集成任务补；样例数据脚本的可放位置写进那一步的说明。/ The two screenshot steps follow what the task may write: in parallel projects the skeleton writes the screenshot spec and the integration task adds sample data; the step says where a sample-data script may go.
+
+**修正 / Fixes**
+
+- 工作区与项目仓库的行尾按仓库原样（在 Windows 宿主机上合并进来的文件不再变成 CRLF）。/ Workspaces and project repositories keep line endings as committed (files merged on a Windows host no longer turn into CRLF).
+- 同一条机械拒收连续出现三次，系统直接把问题交给人，不再重交到调用上限。/ When the same mechanical rejection comes back three times in a row, the system hands the question to a person instead of retrying up to the call limit.
+- 修正里点名了任务可动路径之外的文件时，重规划要么把它们加进可动路径（交人批准），要么说明不需要改。/ When a correction names files outside a task's allowed paths, the replan must either add them to the allowed paths (sent for approval) or state that they need no change.
+- 验收命令里的 `node --test <目录>` 按等价的 glob 执行，规划时也会要求改成文件或 glob 写法。/ `node --test <directory>` in acceptance commands is run as the equivalent glob, and planning asks for a file or glob form.
+- 追加任务的可动路径包含它要追加用例的测试文件。/ Appended tasks' allowed paths include the test files they add cases to.
+- 集成前按合并后的依赖清单准备环境；集成这一步留下的文件会撤掉；没有锁文件时环境准备不再生成锁文件。/ Before integrating, the environment is prepared from the merged dependency lists; files left by the integration step are removed; environment setup no longer creates a lockfile when the repository has none.
+- Windows 上后台任务调用 docker / git 时不再弹出控制台窗口。/ On Windows, background tasks no longer pop up console windows when they call docker or git.
+- 英文部署里几处漏出的中文。/ A few places where Chinese leaked into English deployments.
+
 ## v0.2.0 — 2026-10-01
 
 **中英双语 / English and Chinese**
