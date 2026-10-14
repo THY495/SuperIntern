@@ -139,6 +139,10 @@ export const GEMINI_THINKING_BUDGET = { low: 512, medium: 4096, high: 16384 };
  * 计费字段一一对应（reasoningTokens 不单独计价，已含在 output 里）。
  * 价格取自 OpenRouter 公开 models API（无需 key），与各家官网口径一致。
  *
+ * `vision: true` = 收图片输入（验收员看截图）。**只标核实过的**：没标的按不收处理，截图工具不给、只读页面文字。
+ * 核实来源：OpenRouter 公开 models API 的 architecture.input_modalities（2026-10-14 抓取）。直连 DeepSeek 的 API 收不收图没核实
+ * （网关上 deepseek-v4.1-flash 标了 image，直连同名模型未测），先不标。
+ *
  * ⚠️ 定价与模型 ID 一样会过期，且过期方式更隐蔽（不会报错，只是账算错）。
  * `scripts/check-models.mjs` 同时核对两者。
  */
@@ -151,35 +155,35 @@ export const MODEL_CATALOG = {
     // 只有 haiku 这一档不是——同一厂商内的命名约定都不统一，只能逐个核。
     model: 'claude-haiku-4-5-20251001',
     // 实测 400 "This model does not support the effort parameter."
-    efforts: [],
+    efforts: [], vision: true,
     pricing: { input: 1.00, output: 5.00, cacheRead: 0.10, cacheWrite: 1.25 },
     notes: [N_('2025-10 发布，暂无后继的轻量模型；不支持 effort 参数，无法通过提高推理强度升档')],
   },
   'anthropic/claude-sonnet-5': {
-    vendor: 'anthropic', model: 'claude-sonnet-5',
+    vendor: 'anthropic', model: 'claude-sonnet-5', vision: true,
     pricing: { input: 2.00, output: 10.00, cacheRead: 0.20, cacheWrite: 2.50 },
   },
   'anthropic/claude-opus-5': {
-    vendor: 'anthropic', model: 'claude-opus-5',
+    vendor: 'anthropic', model: 'claude-opus-5', vision: true,
     pricing: { input: 5.00, output: 25.00, cacheRead: 0.50, cacheWrite: 6.25 },
     notes: [N_('启用 thinking 时约 1/8 的响应为 stop_reason=tool_use 但不含 tool_use 块；系统按空工具调用自动重试')],
   },
   'anthropic/claude-fable-5': {
-    vendor: 'anthropic', model: 'claude-fable-5',
+    vendor: 'anthropic', model: 'claude-fable-5', vision: true,
     pricing: { input: 10.00, output: 50.00, cacheRead: 1.00, cacheWrite: 12.50 },
     notes: [N_('定位高于 opus-5；默认未分配到任何档位')],
   },
   // ── OpenAI（gpt-5.6 三档族：Sol 旗舰 / Terra 均衡 / Luna 高性价比）─────────
   'openai/gpt-5.6-luna': {
-    vendor: 'openai', model: 'gpt-5.6-luna',
+    vendor: 'openai', model: 'gpt-5.6-luna', vision: true,
     pricing: { input: 1.00, output: 6.00, cacheRead: 0.10, cacheWrite: 1.25 },
   },
   'openai/gpt-5.6-terra': {
-    vendor: 'openai', model: 'gpt-5.6-terra',
+    vendor: 'openai', model: 'gpt-5.6-terra', vision: true,
     pricing: { input: 2.50, output: 15.00, cacheRead: 0.25, cacheWrite: 3.125 },
   },
   'openai/gpt-5.6-sol': {
-    vendor: 'openai', model: 'gpt-5.6-sol',
+    vendor: 'openai', model: 'gpt-5.6-sol', vision: true,
     pricing: { input: 5.00, output: 30.00, cacheRead: 0.50, cacheWrite: 6.25 },
   },
   // ── DeepSeek ─────────────────────────────────────────────────────────────
@@ -191,8 +195,10 @@ export const MODEL_CATALOG = {
   //   - `deepseek-v4-flash` 已退役：请求由 DeepSeek-V4.1-Flash 代答、按 Flash 计价，正式名 `deepseek-flash`。旧键保留（绑定 /
   //     旧账本 / 测试还在引用），价格与新键相同；默认绑定改用新键。
   //   此前的价格（flash 0.14/0.28、pro 0.435/0.87）是 2026-07 的旧价，2026-09 之前的账本按旧价算，**偏低**，见 docs/known-limits.md。
+  // vision：2026-10-14 `catalog check --vision` 实测两次（图挂在工具结果上，和验收员看截图同一条路），两次都认出了颜色。
+  // 同一次实测里 v4-pro 两次都说没收到图 —— 不标。
   'deepseek/deepseek-flash': {
-    vendor: 'deepseek', model: 'deepseek-flash', contextWindow: 1_000_000,
+    vendor: 'deepseek', model: 'deepseek-flash', contextWindow: 1_000_000, vision: true,
     pricing: { input: 0.30, output: 1.20, cacheRead: 0.006, cacheWrite: 0 },
     notes: [N_('DeepSeek-V4.1-Flash；所列为峰时单价，谷时减半'), N_('输出与输入单价比为 4:1')],
   },
@@ -208,16 +214,16 @@ export const MODEL_CATALOG = {
   },
   // ── Gemini ───────────────────────────────────────────────────────────────
   'gemini/gemini-3.5-flash-lite': {
-    vendor: 'gemini', model: 'gemini-3.5-flash-lite',
+    vendor: 'gemini', model: 'gemini-3.5-flash-lite', vision: true,
     pricing: { input: 0.30, output: 2.50, cacheRead: 0.03, cacheWrite: 0.0833 },
   },
   'gemini/gemini-3.6-flash': {
-    vendor: 'gemini', model: 'gemini-3.6-flash',
+    vendor: 'gemini', model: 'gemini-3.6-flash', vision: true,
     pricing: { input: 1.50, output: 7.50, cacheRead: 0.15, cacheWrite: 0.0833 },
     notes: [N_('Gemini 3.x 的多轮工具调用必须原样回传 thought_signature，否则返回 HTTP 400')],
   },
   'gemini/gemini-3.1-pro-preview': {
-    vendor: 'gemini', model: 'gemini-3.1-pro-preview',
+    vendor: 'gemini', model: 'gemini-3.1-pro-preview', vision: true,
     pricing: { input: 2.00, output: 12.00, cacheRead: 0.20, cacheWrite: 0.375 },
     notes: [N_('preview 模型，可能下线（gemini-3-pro-preview 已返回 404）'), N_('thinking 占用 maxOutputTokens；额度不足时返回 MALFORMED_FUNCTION_CALL 而非 MAX_TOKENS')],
   },
@@ -228,19 +234,19 @@ export const MODEL_CATALOG = {
   // 钉死 Moonshot 官方上游（它自己的 mxfp4 量化版；第三方有 bf16 但最大输出只有 16384，装不下我们的推理预算）。
   // 实测：推理算在 max_tokens 内、超了按 length 截断（与 DeepSeek 不同，DeepSeek 不受预算限制）；reasoning_effort 认。
   'openrouter/kimi-k3@moonshotai': {
-    vendor: 'openrouter', model: 'moonshotai/kimi-k3',
+    vendor: 'openrouter', model: 'moonshotai/kimi-k3', vision: true,
     providerPrefs: { only: ['moonshotai'] },
     pricing: { input: 3.00, output: 15.00, cacheRead: 0.30, cacheWrite: 0 },   // 兜底；记账走网关回报
-    notes: [N_('输出单价约为直连 DeepSeek-pro 的 17 倍；推理 token 计入输出 token，需预留足够的 maxTokens')],
+    notes: [N_('输出单价约为直连 DeepSeek-pro 的 4 倍（按 DeepSeek 峰时价；谷时约 8 倍）；推理 token 计入输出 token，需预留足够的 maxTokens')],
   },
   'openrouter/claude-opus-5@anthropic': {
-    vendor: 'openrouter', model: 'anthropic/claude-opus-5',
+    vendor: 'openrouter', model: 'anthropic/claude-opus-5', vision: true,
     providerPrefs: { only: ['anthropic'] },     // 钉死厂商官方：与直连同一上游
     pricing: { input: 5.00, output: 25.00, cacheRead: 0.50, cacheWrite: 6.25 },  // 仅作回报缺失时的兜底
     notes: [N_('固定上游为 Anthropic，行为与直连一致，多经过一层网关；计费与余额在网关侧')],
   },
   'openrouter/claude-opus-5': {
-    vendor: 'openrouter', model: 'anthropic/claude-opus-5',
+    vendor: 'openrouter', model: 'anthropic/claude-opus-5', vision: true,
     // 不填 providerPrefs = 用网关默认路由。代价（上游身份/量化/上下文上限浮动）
     // 由界面披露，不由代码禁止——这是用户的选择，不是我们的规矩。
     pricing: { input: 5.00, output: 25.00, cacheRead: 0.50, cacheWrite: 6.25 },
@@ -273,6 +279,32 @@ export const SINGLE_VENDOR_BINDINGS = {
 };
 
 /**
+ * 模型出自哪家（按角色绑定"验收员换一家"按这个比，不按服务商比）。
+ * 直连服务商：就是服务商自己（gemini 记作 google，与网关上的前缀同名）；
+ * 网关（gateway:true）：一个网关挂着许多家的模型，取模型名的前缀（`moonshotai/kimi-k3` → moonshotai）。
+ * 目录项可以写 `maker` 直接指定（自加的兼容端点背后是谁，只有人知道）。
+ */
+const VENDOR_MAKER = { gemini: 'google' };
+export function makerOf(entry, vendors = VENDORS) {
+  if (!entry) return null;
+  if (entry.maker) return entry.maker;
+  if (vendors[entry.vendor]?.gateway && typeof entry.model === 'string' && entry.model.includes('/')) return entry.model.split('/')[0];
+  return VENDOR_MAKER[entry.vendor] ?? entry.vendor ?? null;
+}
+
+/**
+ * 调模型的角色与它们没单独绑定时走哪一档。各角色的调用处从这里取档位，不各写一份。
+ * executor 是 null：它的档位按步骤定（规划器给每步定档，重试多了自动升档）。
+ * 角色单独绑了模型就不看档位了（executor 单独绑 = 所有步骤都用那一个，规划器定的档位不再起作用）。
+ */
+export const LLM_ROLES = {
+  planner: 'heavy', project_planner: 'heavy', elicitor: 'heavy', replanner: 'heavy',
+  executor: null, compactor: null, verifier: 'standard', classifier: 'standard', reporter: 'light', 'decision-check': 'light',
+};
+/** 请求里的 role → 绑定用的角色名。项目追加与它的复核记在项目规划下（账本一直这么记）。 */
+export const bindRoleOf = (role) => (role === 'project_append' || role === 'project_append_review' ? 'project_planner' : role);
+
+/**
  * 档位 → 完整解析结果。这是"档位 → (服务商, 模型, 协议, 推理强度取值, 单价)"的唯一入口。
  * 绑定与目录都可由调用方替换，因此用户改配置不需要改代码。
  */
@@ -280,14 +312,22 @@ export function tierEntry(tier, binding = TIER_BINDING, catalog = MODEL_CATALOG,
   // 这里抛的都是 ConfigError：绑定 / 目录 / 服务商配错了，不是节点的错 —— 编排器据此退回 pending 且不计重试。
   const key = binding?.[tier];
   if (!key) throw new ConfigError(`${tier} 档没有绑模型`, { tier });
+  return modelEntry(key, catalog, vendors, { tier, label: `${tier} 档` });
+}
+
+/**
+ * 模型键 → 完整解析（角色单独绑定时不经档位，直接从键解析）。label 只用于报错（"x 档" / "验收 角色"）。
+ */
+export function modelEntry(key, catalog = MODEL_CATALOG, vendors = VENDORS, { tier = null, role = null, label = key } = {}) {
+  const ctx = { tier, role, key };
   const entry = catalog[key];
-  if (!entry) throw new ConfigError(`${tier} 档绑的 ${key} 不在模型目录里`, { tier, key });
-  if (entry.orphan) throw new ConfigError(`${tier} 档绑的 ${key} 在升级后的系统里已经没有了 —— 改绑定`, { tier, key });
+  if (!entry) throw new ConfigError(`${label}绑的 ${key} 不在模型目录里`, ctx);
+  if (entry.orphan) throw new ConfigError(`${label}绑的 ${key} 在升级后的系统里已经没有了 —— 改绑定`, ctx);
   const vendor = vendors[entry.vendor];
-  if (!vendor) throw new ConfigError(`${tier} 档绑的 ${key} 指向的服务商 ${entry.vendor} 不存在`, { tier, key, vendor: entry.vendor, model: entry.model });
+  if (!vendor) throw new ConfigError(`${label}绑的 ${key} 指向的服务商 ${entry.vendor} 不存在`, { ...ctx, vendor: entry.vendor, model: entry.model });
   // 库里停用的服务商 / 模型不静默换厂商，建客户端时就报（绑定页会提前标出来）
-  if (vendor.enabled === false) throw new ConfigError(`${tier} 档绑的 ${key} 所在服务商 ${entry.vendor} 已停用 —— 改绑定或重新启用`, { tier, key, vendor: entry.vendor, model: entry.model });
-  if (entry.enabled === false) throw new ConfigError(`${tier} 档绑的 ${key} 已停用 —— 改绑定或重新启用`, { tier, key, vendor: entry.vendor, model: entry.model });
+  if (vendor.enabled === false) throw new ConfigError(`${label}绑的 ${key} 所在服务商 ${entry.vendor} 已停用 —— 改绑定或重新启用`, { ...ctx, vendor: entry.vendor, model: entry.model });
+  if (entry.enabled === false) throw new ConfigError(`${label}绑的 ${key} 已停用 —— 改绑定或重新启用`, { ...ctx, vendor: entry.vendor, model: entry.model });
   return {
     key,
     vendorId: entry.vendor,
@@ -306,6 +346,8 @@ export function tierEntry(tier, binding = TIER_BINDING, catalog = MODEL_CATALOG,
     // 用哪家上游是用户的选择，不是我们的规矩。不填就走网关的默认路由，
     // 代价（量化/上下文/缓存能力随上游浮动）由界面披露，不由代码禁止。
     providerPrefs: entry.providerPrefs,
+    // 收不收图片：只认显式 true，没标的按不收
+    vision: entry.vision === true,
   };
 }
 

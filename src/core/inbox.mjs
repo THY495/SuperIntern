@@ -8,6 +8,7 @@
 // 如果这条路径能被无令牌写入，那"必须照办"就成了任何能写库的东西都能伪造的东西。
 
 import { newId, now, audit, insertEdge, authenticate } from '../db/db.mjs';
+import { insertMessage, markMessageConsumed, holdMessage, releaseMessageHold } from '../db/messages.mjs';
 import { commentOnQuestion } from './answers.mjs';
 import { classify } from './classifier.mjs';
 import { flushLedger } from './ledger.mjs';
@@ -108,10 +109,7 @@ export function recordMessage(db, {
   const mid = newId('m');
   const t = now();
   return db.tx(() => {
-    db.run(`INSERT INTO messages (id,task_id,sender_id,body,kind,kind_source,urgency,urgency_source,
-              trust_label,token_id,received_at)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
-      mid, taskId, auth.user_id, body, kind, kindSource, urgency, urgencySource, trust, auth.token_id, t);
+    insertMessage(db, { id: mid, taskId, senderId: auth.user_id, body, kind, kindSource, urgency, urgencySource, trustLabel: trust, tokenId: auth.token_id, receivedAt: t });
     if (replyToMessageId) insertEdge(db, mid, replyToMessageId, 'reply_to', t);
     // 调用方接下来要拿这条去和已登记的决定比对 —— 同一个事务里标"待比对"，守护进程就不可能抢在比对之前拉走它。
     if (hold && (kind === 'correction' || kind === 'instruction') && hasComparableDecisions(db, taskId)) holdForCheck(db, [mid], { at: t });
@@ -156,6 +154,9 @@ export async function sayWithClassifier(db, {
   if (!llmClient) {
     throw new I18nError('未指定消息类别，且分类器不可用');
   }
+  // 先认人、再花钱：分类器是一次付费的模型调用，原来在 recordMessage 的认证之前就调了 ——
+  // 无效令牌也能让系统替它花一次钱。认证规矩与 recordMessage 一致（失败不泄露任务存不存在）。
+  if (!authenticate(db, plaintextToken)) throw new I18nError('令牌无效或已吊销');
 
   const qs = openQs ?? openQuestions(db, taskId);
   let cls;
@@ -243,8 +244,7 @@ export const hasSteering = (db, taskId, { at = now() } = {}) =>
 /** 标"待比对"。只标还没消费的修正 / 新指令。 */
 export function holdForCheck(db, ids, { at = now() } = {}) {
   for (const id of ids) {
-    db.run(`UPDATE messages SET held_until=? WHERE id=? AND consumed_at IS NULL AND kind IN ('correction','instruction')`,
-      at + HOLD_FOR_CHECK_MS, id);
+    holdMessage(db, id, at + HOLD_FOR_CHECK_MS);
   }
 }
 
@@ -259,7 +259,7 @@ export function releaseCheckHold(db, { taskId, ids, at = now() }) {
   for (const id of ids) {
     const m = db.one(`SELECT id, held_until, consumed_at FROM messages WHERE id=?`, id);
     if (!m || m.held_until == null) continue;
-    db.run(`UPDATE messages SET held_until=NULL WHERE id=?`, id);
+    releaseMessageHold(db, id);
     if (m.consumed_at != null) continue;
     const qs = verdictWaitOf(db, id);
     if (qs.length) waiting.push({ id, questionIds: qs }); else freed.push(id);
@@ -300,7 +300,7 @@ export function steeringFrom(db, sourceId) {
 export function markConsumed(db, { taskId, ids, why }) {
   if (!ids.length) return 0;
   const t = now();
-  for (const id of ids) db.run(`UPDATE messages SET consumed_at=? WHERE id=? AND consumed_at IS NULL`, t, id);
+  for (const id of ids) markMessageConsumed(db, id, t);
   audit(db, { actorKind: 'system', action: 'messages_consumed', targetType: 'task', targetId: taskId,
     payload: { messageIds: ids, why, pid: process.pid } });
   return ids.length;

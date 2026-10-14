@@ -20,7 +20,10 @@ import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import { newId, now, audit } from '../db/db.mjs';
+import { applyRoute, setRecipients, setRouteParties, appendQuestionText, resolutionOf } from './questions.mjs';
 import { getParam } from './params.mjs';
+import { addBusinessDays, UTC_CALENDAR, dayKey, partsAt, daysBetween, validDayKey, zonedTime, fmtAt, addCalendarDays, addDaysKey } from './tz.mjs';
+import { calendarOf, deployTz } from './calendar.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -56,7 +59,8 @@ const typeLabel = (lang, t) => { const l = DECISION_TYPES[t]?.label; return l ? 
 // 英文正文（内容语言 en 时模型用英文提问）同一套三类表述。
 export const STRUCTURAL_RULE = /规格原文.{0,8}(矛盾|冲突)|与.{0,16}(规格|〔规格〕).{0,8}(矛盾|冲突)|依赖不成立|契约规则.{0,12}(矛盾|冲突)|(规格|契约|方案).{0,6}自相矛盾|\b(contradicts?|conflicts? with|inconsistent with)\b.{0,16}\b(spec|specification|contract)\b|\b(spec|specification|contract|plan)\b.{0,12}\b(contradicts itself|self-contradictory)\b|\bdependency\b.{0,12}\b(does not|doesn't) hold\b/i;
 export function decisionTypeOfQuestion({ kind = null, text = '' } = {}) {
-  if (kind === 'structural') return { decisionType: 'structural', typeSource: 'self' };
+  // "做不到"出口"做不到"（验收标准 / 测试 / 规格互相冲突，或给定约束下做不出来）：出路是改其中一方，与结构矛盾同一类人拍板
+  if (kind === 'structural' || kind === 'impossible') return { decisionType: 'structural', typeSource: 'self' };
   if (STRUCTURAL_RULE.test(String(text ?? ''))) return { decisionType: 'structural', typeSource: 'hard_rule' };
   return { decisionType: 'spec_choice', typeSource: kind ? 'self' : 'default' };
 }
@@ -72,26 +76,20 @@ export function loadTemplates() {
 }
 
 // ── 时长 ─────────────────────────────────────────────────────────────────
-/** '30m' / '8h' / '1d' / '1bd'（工作日：跳过周六日；不做节假日）→ 到期时刻。 */
-export function dueAfter(at, after) {
+/**
+ * '30m' / '8h' / '1d' / '1bd' → 到期时刻。m / h / d 是固定时长（1d = 24 小时）；bd = 工作日：按部署日历（cal，见 core/calendar.mjs）
+ * 落到第 n 个工作日的同一个墙上时刻 —— 跳过周末与节假日、算上调休补班。不给 cal = 按 UTC、没有节假日（升级前的行为）。
+ */
+export function dueAfter(at, after, cal = UTC_CALENDAR) {
   const m = /^(\d+)(m|h|d|bd)$/.exec(String(after ?? '').trim());
   if (!m) throw new I18nError('超时无效：{after}（应为 30m / 8h / 1d / 1bd 格式）', { after: `${after}` });
   const n = Number(m[1]);
   if (m[2] === 'm') return at + n * 60_000;
   if (m[2] === 'h') return at + n * 3600_000;
   if (m[2] === 'd') return at + n * 86400_000;
-  return addBusinessDays(at, n);
+  return addBusinessDays(at, n, cal);
 }
-export function addBusinessDays(at, n) {
-  const d = new Date(at);
-  let left = n;
-  while (left > 0) {
-    d.setUTCDate(d.getUTCDate() + 1);
-    const wd = d.getUTCDay();
-    if (wd !== 0 && wd !== 6) left -= 1;
-  }
-  return d.getTime();
-}
+export { addBusinessDays };
 export const isValidAfter = (s) => /^(\d+)(m|h|d|bd)$/.test(String(s ?? ''));
 
 // ── 键与负责人 ────────────────────────────────────────────────────────────
@@ -375,6 +373,14 @@ export function validateRules(db, key, rules, { repoDirs = null, lang = 'zh' } =
 const bare = (r) => r.recipients.some((s) => String(s).replace(/^inform:/, '') === 'parties');
 
 /** 覆盖式保存：整张项目表换成 rules（校验不过就不动）。记审计。 */
+// ── 交接用的三个就地改写（路由三表只由本模块写；交接逐行换人，不走整表重存）──
+/** 某一行路由的收件人解析器列表换掉。 */
+export const setRuleRecipients = (db, ruleId, recipients) => db.run(`UPDATE routing_rules SET recipients=? WHERE id=?`, JSON.stringify(recipients), ruleId);
+/** 某个项目（key）模板占位符的绑定换掉。 */
+export const setProfileBindings = (db, key, bindings, at = now()) => db.run(`UPDATE routing_profiles SET bindings=?, updated_at=? WHERE project_id=?`, JSON.stringify(bindings), at, key);
+/** 某个项目（key）值班日历的轮换名单换掉（起点与周期不动）。 */
+export const setDutyUsers = (db, key, users, at = now()) => db.run(`UPDATE duty_calendar SET users=?, updated_at=? WHERE project_id=?`, JSON.stringify(users), at, key);
+
 export function saveRules(db, { key, rules, template = null, bindings = {}, userId, repoDirs = null, lang = 'zh' }) {
   rules = rules.map((r) => ({ ...r, scope: normScope(r.scope) }));
   // 交上来的表缺新加的类型（旧页面 / 旧脚本）：与 rulesOf 同一条规则借行补齐，而不是整张表报错
@@ -427,24 +433,101 @@ export function diffFromTemplate(db, key) {
 }
 
 // ── 值班日历 ──────────────────────────────────────────────────────────────
+// 换班时刻 = 起点在部署时区里的那个墙上时刻（起点 9 月 21 日 09:00 = 每轮在第 period_days 天的 09:00 换）。
+// tz 跟着部署时区走：只改部署时区不改起点，换班的墙上时刻按新时区重读（存的是时刻，看的是墙上时间）。
 export function dutyCalendarOf(db, key) {
   const r = db.one(`SELECT * FROM duty_calendar WHERE project_id=?`, key);
-  return r ? { ...r, users: JSON.parse(r.users || '[]') } : null;
+  if (!r) return null;
+  const tz = deployTz(db);
+  let overrides = []; try { overrides = JSON.parse(r.overrides || '[]'); } catch { /* 库层 CHECK 保证是数组 */ }
+  return { ...r, users: JSON.parse(r.users || '[]'), overrides, tz, startDay: dayKey(r.start_at, tz), startTime: fmtAt(r.start_at, tz, { zone: false }).slice(11) };
+}
+/** 'YYYY-MM-DD' 与 'HH:MM'（部署时区的墙上时间）→ 时刻 */
+export function dutyStartAt(db, day, time = '00:00') {
+  const m = /^(\d{1,2}):(\d{2})$/.exec(String(time || '00:00').trim());
+  if (!validDayKey(String(day)) || !m || +m[1] > 23 || +m[2] > 59) throw new I18nError('值班起点无效：{v}（应为 2026-09-21 与 09:00 这样的日期和时刻）', { v: `${day} ${time ?? ''}`.trim() });
+  const [y, mo, d] = String(day).split('-').map(Number);
+  return zonedTime(y, mo, d, +m[1], +m[2], 0, deployTz(db));
 }
 export function setDutyCalendar(db, { key, users, startAt, periodDays = 7, userId }) {
   if (!Array.isArray(users) || !users.length) throw new I18nError('值班表不能为空');
   for (const u of users) if (!db.one(`SELECT id FROM users WHERE id=?`, u)) throw new I18nError('值班表中的成员不存在：{id}', { id: `${u}` });
+  if (!Number.isFinite(startAt)) throw new I18nError('值班起点无效：{v}（应为 2026-09-21 与 09:00 这样的日期和时刻）', { v: `${startAt}` });
+  if (!(Number.isInteger(periodDays) && periodDays >= 1 && periodDays <= 366)) throw new I18nError('轮换周期无效：{v}（应为 1–366 天）', { v: `${periodDays}` });
   const t = now();
   db.run(`INSERT INTO duty_calendar (project_id,users,start_at,period_days,updated_at) VALUES (?,?,?,?,?)
           ON CONFLICT(project_id) DO UPDATE SET users=excluded.users, start_at=excluded.start_at, period_days=excluded.period_days, updated_at=excluded.updated_at`,
   key, JSON.stringify(users), startAt, periodDays, t);
   audit(db, { actorKind: 'user', actorId: userId, action: 'duty_calendar_set', targetType: 'project', targetId: key || '(default)', payload: { users, startAt, periodDays } });
 }
-/** 目前：用户列表 + 起始日期 + 按 period_days 轮换。不做节假日与换班。 */
+/**
+ * 此刻谁值班。先看换班（overrides：部署时区的整天，后写的盖前写的），再按轮换：从起点算过了几个"起点墙上时刻"，
+ * 按日历日数 / period_days 取第几个人。按日历日数而不是毫秒差，夏令时那天不会把换班挪一小时。
+ * 节假日不影响值班（值班就是为了没人上班的时候有人接）；节假日只影响 bd 时限。
+ */
 export function onDutyAt(cal, at) {
   if (!cal?.users?.length) return null;
-  const idx = Math.floor((at - cal.start_at) / (cal.period_days * 86400_000));
+  const tz = cal.tz ?? 'UTC';
+  const k = dayKey(at, tz);
+  const ov = (cal.overrides ?? []).findLast((o) => o && o.from <= k && k <= o.to && o.user);
+  if (ov) return ov.user;
+  const s = partsAt(cal.start_at, tz), p = partsAt(at, tz);
+  let days = daysBetween(dayKey(cal.start_at, tz), k);
+  if (p.h * 3600 + p.mi * 60 + p.s < s.h * 3600 + s.mi * 60 + s.s) days -= 1;   // 今天还没到换班时刻
+  const idx = Math.floor(days / (cal.period_days || 7));
   return cal.users[((idx % cal.users.length) + cal.users.length) % cal.users.length];
+}
+/**
+ * 值班表的"结果"（看板显示用）：此刻谁值、是代班还是轮到的；接下来几次轮换交接；每条代班顶掉的是谁（按轮换本来该谁）；
+ * 路由表里有没有哪一行用到值班人（没用到的话值班表设了也不起作用）。有人写了"张三出差"的代班，那几天其实轮到李四 ——
+ * 页面只列规则不列结果，错了看不出来。
+ */
+export function dutyView(db, key, at = now(), { turns = 4 } = {}) {
+  const cal = dutyCalendarOf(db, key);
+  if (!cal?.users?.length) return null;
+  const tz = cal.tz, period = cal.period_days || 7;
+  const rot = { ...cal, overrides: [] };
+  const k = dayKey(at, tz);
+  const ov = (cal.overrides ?? []).findLast((o) => o && o.from <= k && k <= o.to && o.user) ?? null;
+  // 当前轮次：与 onDutyAt 同一算法（日历日数，未到起点钟点算前一天）
+  const s = partsAt(cal.start_at, tz), p = partsAt(at, tz);
+  let days = daysBetween(dayKey(cal.start_at, tz), k);
+  if (p.h * 3600 + p.mi * 60 + p.s < s.h * 3600 + s.mi * 60 + s.s) days -= 1;
+  const idx = Math.floor(days / period);
+  const userAt = (i) => cal.users[((i % cal.users.length) + cal.users.length) % cal.users.length];
+  const next = [];
+  for (let i = Math.max(idx + 1, 0); next.length < turns; i++) next.push({ user: userAt(i), at: addCalendarDays(cal.start_at, i * period, tz) });
+  // 代班顶掉的人：那几天（部署时区整天）里按轮换本来值班的人；交接在当天的起点钟点，所以每天看 00:00 与 23:59 两个时刻
+  const covers = (cal.overrides ?? []).map((o) => {
+    const set = new Set();
+    for (let d = o.from, n = 0; d <= o.to && n < 367; d = addDaysKey(d, 1), n++) {
+      const [y, mo, dd] = d.split('-').map(Number);
+      for (const [h, mi] of [[0, 0], [23, 59]]) { const u = onDutyAt(rot, zonedTime(y, mo, dd, h, mi, 0, tz)); if (u) set.add(u); }
+    }
+    return [...set];
+  });
+  const used = rulesOf(db, key).some((r) => r.recipients.some((x) => x === 'on_duty' || x === 'inform:on_duty'));
+  return { now: { user: ov ? ov.user : userAt(idx), override: ov, rotationUser: idx >= 0 ? userAt(idx) : null, started: idx >= 0 }, next, covers, used, tz, today: k };
+}
+/** 换班整张换掉：[{ from, to, user, note? }]（部署时区的日期，含两端）。user 可以不在轮换名单里（找人代班），但必须是能答事项的成员。 */
+export const DUTY_OVERRIDES_MAX = 200;
+export function setDutyOverrides(db, { key, overrides, userId }) {
+  const cal = dutyCalendarOf(db, key);
+  if (!cal) throw new I18nError('还没有值班表：先设轮换名单与起点，再加代班');
+  if (!Array.isArray(overrides) || overrides.length > DUTY_OVERRIDES_MAX) throw new I18nError('代班最多 {max} 条', { max: DUTY_OVERRIDES_MAX });
+  const clean = overrides.map((o, i) => {
+    const from = String(o?.from ?? '').trim(), to = String(o?.to ?? o?.from ?? '').trim(), user = String(o?.user ?? '').trim();
+    const note = String(o?.note ?? '').replace(/[\u0000-\u001f\u007f]/g, ' ').trim().slice(0, 200);
+    if (!validDayKey(from) || !validDayKey(to) || to < from) throw new I18nError('第 {n} 条代班的日期无效：{from} – {to}', { n: i + 1, from, to });
+    if (daysBetween(from, to) > 366) throw new I18nError('第 {n} 条代班超过一年：{from} – {to}', { n: i + 1, from, to });
+    if (!db.one(`SELECT id FROM users WHERE id=? AND role<>'observer' AND disabled_at IS NULL`, user)) throw new I18nError('第 {n} 条代班的值班人不存在、已停用或是旁观者：{id}', { n: i + 1, id: user });
+    return note ? { from, to, user, note } : { from, to, user };
+  });
+  db.tx(() => {
+    db.run(`UPDATE duty_calendar SET overrides=?, updated_at=? WHERE project_id=?`, JSON.stringify(clean), now(), key);
+    audit(db, { actorKind: 'user', actorId: userId, action: 'duty_overrides_set', targetType: 'project', targetId: key || '(default)', payload: { from: cal.overrides, to: clean } });
+  });
+  return clean;
 }
 
 // ── 解析器 ────────────────────────────────────────────────────────────────
@@ -458,8 +541,10 @@ export function onDutyAt(cal, at) {
  * 任务没有记出处（首批规划、复盘切出来的）或那个人已停用 / 是旁观者 → 解析为空，只剩同一行里的其他人。
  */
 export function requesterOf(db, taskId) {
-  const id = taskId ? getParam(db, taskId, 'task.requested_by') : null;
-  return id && db.one(`SELECT id FROM users WHERE id=? AND role<>'observer' AND disabled_at IS NULL`, id) ? [id] : [];
+  const v = taskId ? getParam(db, taskId, 'task.requested_by') : null;
+  // 几个人的需求并成一轮、一个任务同时服务了几个人时记的是数组
+  const ids = Array.isArray(v) ? v : v ? [v] : [];
+  return [...new Set(ids)].filter((id) => db.one(`SELECT id FROM users WHERE id=? AND role<>'observer' AND disabled_at IS NULL`, id));
 }
 
 export function resolveRecipients(db, key, resolvers, { parties = [], requester = [], at = now(), lead = undefined } = {}) {
@@ -514,7 +599,26 @@ export function matchChains(rules, { decisionType, prefixes = [] }) {
  * route = { stage, chains: [{ scope, rules: [rule_id...] }], rows: [{ rule_id, recipients, quorum, conflict_policy, timeout_action, timeout_after }] }
  * rows 是当前 stage 各链的行。
  */
-export function routeQuestion(db, { questionId, decisionType, typeSource, prefixes = null, parties = [], at = now(), stage = 0 }) {
+/** 前缀各自命中的具体目录段（不含 *）：与 matchChains 同一个"最长匹配"口径。 */
+function scopeHits(rules, decisionType, prefixes) {
+  const rows = rules.filter((r) => r.decision_type === decisionType && r.scope !== '*');
+  return new Set(prefixes.map((p) => rows.filter((r) => scopeMatches(r.scope, p)).sort((a, b) => b.scope.length - a.scope.length)[0]?.scope).filter(Boolean));
+}
+
+/**
+ * advisory：**顺带**的前缀。只被它们命中的目录段收得到、能答（会签时说的话照样并进结论），但不计法定人数（row.quorum = '0'、row.advisory）。
+ * 达成确认覆盖整个项目，按目录分段路由后 backend/、frontend/ 各要 2 人，三个人都得表态才生效 ——
+ * 全局的事被套上了"改哪个目录就要那个目录的人签"的规则。计数的必须至少有一段：都是顺带时补上 * 那一段（没配 * 就是负责人）。
+ */
+export function routeQuestion(db, { questionId, decisionType, typeSource, prefixes = null, advisory = null, parties = [], at = now(), stage = 0 }) {
+  const r = computeRoute(db, { questionId, decisionType, prefixes, advisory, parties, at, stage });
+  applyRoute(db, questionId, { decisionType, typeSource, quorum: r.quorum, conflictPolicy: r.policy, addressedTo: r.answerers, informed: r.informed, route: r.route, routeDueAt: r.dueAt });
+  appendTransferHint(db, questionId, decisionType);
+  return { key: r.key, decisionType, answerers: r.answerers, informed: r.informed, route: r.route, dueAt: r.dueAt };
+}
+
+/** 按现在的路由表算一条事项该发给谁（不写库）。routeQuestion 与改表后的改发（rerouteOpen）共用 */
+function computeRoute(db, { questionId, decisionType, prefixes = null, advisory = null, parties = [], at = now(), stage = 0 }) {
   if (!DECISION_TYPES[decisionType]) throw new I18nError('决策类型无效：{type}', { type: `${decisionType}` });
   const q = db.one(`SELECT task_id, level FROM questions WHERE id=?`, questionId);
   if (!q) throw new I18nError('事项不存在：{id}', { id: questionId });
@@ -523,6 +627,12 @@ export function routeQuestion(db, { questionId, decisionType, typeSource, prefix
   const rules = rulesOf(db, key);
   const pf = prefixes ?? routePrefixesOf(db, q.task_id);
   const chains = matchChains(rules, { decisionType, prefixes: pf });
+  const adv = new Set();
+  if (advisory?.length) {
+    const req = scopeHits(rules, decisionType, (pf ?? []).filter((p) => !advisory.includes(p)));
+    for (const c of chains) if (c.scope !== '*' && !req.has(c.scope)) adv.add(c.scope);
+    if (chains.every((c) => adv.has(c.scope))) chains.push(...matchChains(rules, { decisionType, prefixes: [] }));
+  }
   const stageRows = [];
   const answerers = new Set(), informed = new Set();
   let due = null;
@@ -531,22 +641,58 @@ export function routeQuestion(db, { questionId, decisionType, typeSource, prefix
     if (!rule) continue;
     const res = resolveRecipients(db, key, rule.recipients, { parties, requester: requesterOf(db, q.task_id), at, lead });
     res.answerers.forEach((u) => answerers.add(u)); res.informed.forEach((u) => informed.add(u));
-    const row = { rule_id: rule.id, scope, recipients: res.answerers, quorum: String(rule.quorum), conflict_policy: rule.conflict_policy,
-      timeout_action: rule.timeout_action, timeout_after: rule.timeout_after ?? null, last: stage >= chain.length - 1 };
+    const side = adv.has(scope);
+    const row = { rule_id: rule.id, scope, recipients: res.answerers, quorum: side ? '0' : String(rule.quorum), conflict_policy: rule.conflict_policy,
+      timeout_action: rule.timeout_action, timeout_after: rule.timeout_after ?? null, last: stage >= chain.length - 1, ...(side ? { advisory: true } : {}) };
     stageRows.push(row);
-    if (rule.timeout_action !== 'hang' && rule.timeout_after) {
-      const d = dueAfter(at, rule.timeout_after);
+    if (!side && rule.timeout_action !== 'hang' && rule.timeout_after) {
+      const d = dueAfter(at, rule.timeout_after, calendarOf(db));
       due = due === null ? d : Math.min(due, d);
     }
   }
+  // 都是顺带、又没配 * 那一段：负责人那一票计数（总得有人能拍板）
+  if (stageRows.length && stageRows.every((r) => r.advisory)) {
+    stageRows.push({ rule_id: null, scope: '*', recipients: lead ? [lead] : [], quorum: '1', conflict_policy: 'block', timeout_action: 'hang', timeout_after: null, last: true });
+    if (lead) answerers.add(lead);
+  }
   for (const u of answerers) informed.delete(u);
-  const route = { stage, chains: chains.map((c) => ({ scope: c.scope, rules: c.chain.map((r) => r.id) })), rows: stageRows, prefixes: pf };
+  const route = { stage, chains: chains.map((c) => ({ scope: c.scope, rules: c.chain.map((r) => r.id) })), rows: stageRows, prefixes: pf, ...(advisory?.length ? { advisory } : {}) };
   const quorum = stageRows.map((r) => r.quorum).sort().at(-1) ?? '1';
-  const policy = stageRows.some((r) => r.conflict_policy === 'latest') ? 'latest' : 'block';
-  db.run(`UPDATE questions SET decision_type=?, type_source=?, quorum=?, conflict_policy=?, addressed_to=?, informed=?, route=?, route_due_at=? WHERE id=?`,
-    decisionType, typeSource, quorum, policy, JSON.stringify([...answerers]), JSON.stringify([...informed]), JSON.stringify(route), due, questionId);
-  appendTransferHint(db, questionId, decisionType);
-  return { key, decisionType, answerers: [...answerers], informed: [...informed], route, dueAt: due };
+  const policy = stageRows.some((r) => !r.advisory && r.conflict_policy === 'latest') ? 'latest' : 'block';
+  return { key, answerers: [...answerers], informed: [...informed], route, quorum, policy, dueAt: due };
+}
+
+/**
+ * 改了路由表 / 值班之后，已发出的事项按新规则改发（改了路由，已发出的不按新规则重发，也没提示）。
+ *   - 改发：还在等答复、还没人答过、没被人手动转交过的；收件人按新表算出来变了才改（没变的不碰，免得重置时限）。
+ *   - 不动：已经有人答过的（会签进行中，换人会丢掉已有的表态）、人手动转交过的（人的决定优先于表）、冲突事项（收件人是当事双方）。
+ * 新收件人由通知按 notified_to 补推。返回 { moved: [{ id, from, to }], kept: [{ id, why }] } 给改表的人看。
+ */
+export function rerouteOpen(db, { key, byUserId = null, at = now() }) {
+  const tasks = key ? db.all(`SELECT id FROM tasks WHERE project_id=?`, key) : db.all(`SELECT id FROM tasks WHERE project_id IS NULL`);
+  const moved = [], kept = [];
+  if (!tasks.length) return { moved, kept };
+  const qs = db.all(`SELECT * FROM questions WHERE task_id IN (${tasks.map(() => '?').join(',')}) AND status IN ('open','escalated')
+                      AND decision_type IS NOT NULL AND decision_type NOT IN ('conflict','delivery') ORDER BY asked_at`, ...tasks.map((t) => t.id));
+  for (const q of qs) {
+    const route = JSON.parse(q.route || 'null');
+    if (!route) continue;
+    const from = JSON.parse(q.addressed_to || '[]');
+    const next = computeRoute(db, { questionId: q.id, decisionType: q.decision_type, prefixes: route.prefixes ?? null, advisory: route.advisory ?? null, parties: route.parties ?? [], at, stage: route.stage ?? 0 });
+    const same = next.answerers.length === from.length && next.answerers.every((u) => from.includes(u));
+    if (same) continue;
+    const brief = { id: q.id, taskId: q.task_id, text: stripTransferHint(q.text).split('\n').find((l) => l.trim())?.trim().slice(0, 80) ?? '' };
+    if (route.transferred) { kept.push({ ...brief, why: 'transferred', at: from }); continue; }
+    if (db.one(`SELECT 1 FROM answers WHERE question_id=? AND stance IN ('answer','dissent') LIMIT 1`, q.id)) { kept.push({ ...brief, why: 'answered', at: from }); continue; }
+    db.tx(() => {
+      applyRoute(db, q.id, { decisionType: q.decision_type, typeSource: q.type_source, quorum: next.quorum, conflictPolicy: next.policy, addressedTo: next.answerers, informed: next.informed, route: next.route, routeDueAt: next.dueAt });
+      if (route.parties?.length) setRouteParties(db, q.id, route.parties);
+      audit(db, { actorKind: byUserId ? 'user' : 'system', actorId: byUserId, action: 'question_rerouted', targetType: 'question', targetId: q.id,
+        payload: { from, to: next.answerers, why: 'routing_changed', dueAt: next.dueAt } });
+    });
+    moved.push({ ...brief, from, to: next.answerers });
+  }
+  return { moved, kept };
 }
 
 /**
@@ -576,7 +722,7 @@ function appendTransferHint(db, questionId, decisionType) {
   if (decisionType === 'conflict' || decisionType === 'delivery') return;
   const row = db.one(`SELECT text FROM questions WHERE id=?`, questionId);
   if (!row || indexOfMark(row.text, 'transferHint') >= 0) return;
-  db.run(`UPDATE questions SET text=? WHERE id=?`, `${row.text}${transferHintFor(questionId, contentLang(db))}`, questionId);
+  appendQuestionText(db, questionId, transferHintFor(questionId, contentLang(db)));
 }
 
 /** 转下一行（超时 next）或转交后重算。返回新的解析结果；没有下一行 → null（保持挂起）。 */
@@ -587,8 +733,8 @@ export function advanceRoute(db, { questionId, at = now() }) {
   const hasNext = route.chains.some((c) => c.rules.length > route.stage + 1);
   if (!hasNext) return null;
   const parties = route.parties ?? [];
-  const r = routeQuestion(db, { questionId, decisionType: q.decision_type, typeSource: q.type_source, prefixes: route.prefixes, parties, at, stage: route.stage + 1 });
-  if (parties.length) db.run(`UPDATE questions SET route=json_set(route,'$.parties',json(?)) WHERE id=?`, JSON.stringify(parties), questionId);
+  const r = routeQuestion(db, { questionId, decisionType: q.decision_type, typeSource: q.type_source, prefixes: route.prefixes, advisory: route.advisory ?? null, parties, at, stage: route.stage + 1 });
+  if (parties.length) setRouteParties(db, questionId, parties);
   return r;
 }
 
@@ -602,7 +748,10 @@ export function advanceRoute(db, { questionId, at = now() }) {
 export function transferQuestion(db, { questionId, to, byUserId, reason = null, at = now() }) {
   const q = db.one(`SELECT * FROM questions WHERE id=?`, questionId);
   if (!q) throw new I18nError('事项不存在：{id}', { id: questionId });
-  if (!['open', 'escalated'].includes(q.status)) throw new I18nError('事项 {id} 状态为 {status}，无法转交', { id: questionId, status: q.status });
+  if (!['open', 'escalated'].includes(q.status)) {
+    const r = resolutionOf(db, q);   // 告诉晚到的一方是谁、何时结的
+    throw Object.assign(new I18nError('事项 {id} 已由 {who} 于 {when} {how}，无法再转交', { id: questionId, who: r.who, when: r.when, how: r.how }), { status: 409, handled: r });
+  }
   const key = routingKeyOf(db, q.task_id);
   const lead = leadOf(db, q.task_id);
   const cur = JSON.parse(q.addressed_to || '[]');
@@ -639,13 +788,13 @@ export function transferQuestion(db, { questionId, to, byUserId, reason = null, 
       }
       r.recipients = res.answerers;
       if (r.timeout_action !== 'hang' && r.timeout_after) {
-        const d = dueAfter(at, r.timeout_after);
+        const d = dueAfter(at, r.timeout_after, calendarOf(db));
         due = due === null ? d : Math.min(due, d);
       }
     }
     route.transferred = true;
   }
-  db.run(`UPDATE questions SET addressed_to=?, informed=?, route=?, route_due_at=? WHERE id=?`, JSON.stringify(res.answerers), JSON.stringify(informed), route ? JSON.stringify(route) : q.route, due, questionId);
+  setRecipients(db, questionId, { addressedTo: res.answerers, informed, route: route ?? q.route, routeDueAt: due });
   audit(db, { actorKind: 'user', actorId: byUserId, action: 'question_transferred', targetType: 'question', targetId: questionId,
     // 转交附一句理由（否则被转交的人不知道为什么转给自己）。可留空。
     payload: { from: cur, to: res.answerers, resolvers: to, dueAt: due, reason: String(reason ?? '').trim().slice(0, 500) || null } });

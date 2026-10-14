@@ -9,7 +9,7 @@
 //
 // 只读 git，不调模型。读不到就如实返回 reason，页面照实说，不渲染成一个空的"没有改动"。
 
-import { execFileSync } from 'node:child_process';
+import { gitRaw } from './git.mjs';
 import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { contributionOf } from './workspace.mjs';
@@ -19,7 +19,7 @@ import { tl, contentLang } from '../i18n/index.mjs';
 // 读不到时的 reason 是给看板上的人看的：取区间的几个函数（有 db）默认按内容语言写，调用方可传 lang（看的人的界面语言）；
 // 区间对象上带着 lang，viewOf / linesOf 据此写自己的 reason。没带就是中文。
 
-const git = (dir, ...a) => execFileSync('git', ['-c', 'core.quotepath=off', ...a], { cwd: dir, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 64 * 1024 * 1024 });
+const git = (dir, ...a) => gitRaw(dir, ['-c', 'core.quotepath=off', ...a]);
 
 /** 总量上限：超过的文件只给增删行数，不给逐行（页面说"太大，只列行数"）。 */
 export const DIFF_LIMITS = { totalLines: 20_000, fileLines: 3_000 };

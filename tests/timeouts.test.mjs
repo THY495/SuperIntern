@@ -128,7 +128,8 @@ section('4. 汇报里标注：超时走默认进"自作主张"');
   const n1 = node('a');
   ask({ level: 1, nodeId: n1, def: '用逗号', askedAt: t, ttl: 30 * MIN });
   sweepTimeouts(db, { taskId, at: t + 31 * MIN });
-  const f = gatherSince(db, taskId, t - 1);
+  // 窗口从头开始：这里测的是"超时事件取得到"，不是窗口切法（按时刻切会受墙钟回拨影响 —— WSL 上偶发过一次，见 tests/clock.test.mjs）
+  const f = gatherSince(db, taskId, 0);
   eq(f.timeouts?.length, 1, 'gatherSince 取到超时事件');
   const text = renderSelfDecided(f);
   assert(text.includes('超时走默认') && text.includes('用逗号'), '渲染进自作主张段，带默认动作原文');

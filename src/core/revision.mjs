@@ -12,16 +12,22 @@
 // 就是又造一个"填个数就能满足"的假护栏。
 
 import { routeQuestion, decisionTypeOfQuestion } from './routing.mjs';
-import { newId, now, audit, insertEdge } from '../db/db.mjs';
+import { newId, now, audit, insertEdge, supersedeEdges } from '../db/db.mjs';
+import { writeConstitution, insertDecision } from '../db/constitutions.mjs';
+import { insertNode } from '../db/nodes.mjs';
+import { insertUserMessage } from '../db/messages.mjs';
 import { markConsumed } from './inbox.mjs';
 import { clearNodeBaseline } from './workspace.mjs';
 import { patchFields } from '../agent/replan.mjs';
 import { recordFromRevision, recordReservation } from './decisions.mjs';
 import { normScopePaths } from './project.mjs';
-import { RESOLUTION_HOOKS, revisionSide } from './answers.mjs';
-import { reservationOf } from '../agent/approval.mjs';
+import { RESOLUTION_HOOKS } from './answers.mjs';
+import { reservationOf, readApproval, readVerdict } from '../agent/approval.mjs';
 import { tl, contentLang, I18nError } from '../i18n/index.mjs';
 import { markOf } from '../i18n/marks.mjs';
+import { transition } from '../db/state.mjs';
+import { bindApproval } from './provenance.mjs';
+import { insertQuestion } from './questions.mjs';
 
 export const DISCARD_THRESHOLD_KEY = 'revision.discard_threshold';
 export const DEFAULT_DISCARD_THRESHOLD = 0.30;   // 确认门，"阈值可配置"
@@ -140,7 +146,40 @@ export function gateOf(db, { taskId, rev, nodes }) {
     counts: { unaffected: 0, needs_change: 0, obsolete: 0, ...tally([...marks.values()]) },
     newCount: (rev.new_nodes ?? []).length,
     byId,
+    patchBefore: patchBeforeOf(db, taskId, patched),
   };
+}
+
+// 契约改动的"原来"：只列要改的字段。走查（进程退出记录第三轮）：只写改成什么，人分不出"多了一个目录"和"顺手删了一个目录"。
+function patchBeforeOf(db, taskId, fields) {
+  if (!fields.length) return null;
+  const cur = db.one(`SELECT * FROM constitutions WHERE task_id=? AND superseded_at IS NULL ORDER BY version DESC LIMIT 1`, taskId);
+  if (!cur) return null;
+  const arr = (s) => { try { return JSON.parse(s || '[]'); } catch { return []; } };
+  const all = { goal: cur.goal, scope: cur.scope, scope_paths: arr(cur.scope_paths), definition_of_done: cur.definition_of_done, constraints: arr(cur.constraints) };
+  return Object.fromEntries(fields.map((k) => [k, all[k] ?? null]));
+}
+
+const patchLabel = (lang, k) => ({ goal: tl(lang, '目标'), scope: tl(lang, '范围说明'), scope_paths: tl(lang, 'AI 可以改动的路径'), definition_of_done: tl(lang, '完成标准'), constraints: tl(lang, '约束') })[k] ?? k;
+function renderPatchField(lang, k, v, before) {
+  const head = `  ${tl(lang, '{label}（{field}）：', { label: patchLabel(lang, k), field: k })}`;
+  const cut = (x) => (typeof x === 'string' ? x : JSON.stringify(x)).slice(0, 300);
+  if (before === undefined) return [`${head}${cut(v)}`];      // 读不到原来的（老库 / 测试桩）：照旧只写改成什么
+  if (Array.isArray(v) && (Array.isArray(before) || before == null)) {
+    const norm = (x) => (typeof x === 'string' ? x.trim() : JSON.stringify(x));
+    const was = (before ?? []).map(norm), now_ = v.map(norm);
+    // 原来是空的：对 scope_paths 来说"空"不是"什么都不许动"，是"没有路径清单、越界按散文判断" —— 照 +/- 写会读成"原来一条都不许"
+    if (!was.length) return [head, `    ${k === 'scope_paths' ? tl(lang, '原来没列路径（越界只按「范围说明」的文字判断）；改成之后机器按下面这几条判越界：') : tl(lang, '原来是空的；改成：')}`,
+      ...now_.map((x) => `    + ${x}`)];
+    const added = now_.filter((x) => !was.includes(x)), removed = was.filter((x) => !now_.includes(x)), kept = was.filter((x) => now_.includes(x));
+    const L = [head];
+    for (const x of added) L.push(`    + ${x}${tl(lang, '　（新增）')}`);
+    for (const x of removed) L.push(`    - ${x}${tl(lang, '　（**去掉**）')}`);
+    L.push(`    ${kept.length ? tl(lang, '不变：{list}', { list: kept.join(tl(lang, '、')) }) : tl(lang, '原来的一条都没留')}`);
+    if (!added.length && !removed.length) L.push(`    ${tl(lang, '（内容没变，只是写法不同）')}`);
+    return L;
+  }
+  return [head, `    ${tl(lang, '原来：{v}', { v: before == null || before === '' ? tl(lang, '（空）') : cut(before) })}`, `    ${tl(lang, '改成：{v}', { v: cut(v) })}`];
 }
 const tally = (xs) => xs.reduce((o, x) => ({ ...o, [x]: (o[x] ?? 0) + 1 }), {});
 
@@ -161,21 +200,20 @@ export function proposeRevision(db, { taskId, message, rev, nodes }) {
         + `${tl(L, '为什么要你批：{gate}', { gate: g.gate })}\n\n`
         + tl(L, `这条问题由**状态机**生成、强制定为 Ⅲ 级（触及安全边界或宪法层的操作由 harness 定级，不是模型自评）。
 
-请选一条。发给了几个人的，可能要几个人都批才生效 —— 还差谁，看这条事项上方的「待…答复」。负责人在任务页「计划变更」卡片上点批准 / 驳回，就等于在这里答了一次，不用再答：
+请选一条。发给了几个人的，可能要几个人都表态才生效 —— 还差谁，看这条事项上方的「待…答复」。负责人在任务页「计划变更」卡片上点的按钮，就等于在这里答了一次，不用再答：
 (A) 批准：回「A」—— 够数后变更生效，任务接着跑
-(B) 驳回：回「B：理由」—— 计划原样不动，修正记为已处理；要换个改法，再发一条修正
-(C) 先看细节：任务页的「计划变更」卡片（改哪几步、新增哪几步、范围怎么变）
+(B) 重出一版：回「B：要怎么改」—— 这一版不用；你写的话连同原来那条修正一起交给 AI 重出一版，出来再问你
+(C) 不要这份变更：回「C」—— 那条修正作罢，计划原样不动
 (D) 批准，但留一句保留意见：回「A」，另起一行写「保留：……」。
 　　**它不挡任何东西**：这份变更照样全部生效，效果与 (A) 一模一样。它只把你那句话留在项目的
 　　约定清单上、标成〔保留意见〕，让下一个碰这一处的人看得到。
-　　要**挡住**里面某一条，只能 (B) 驳回并说清哪一条不要，让它重出一版 —— 这份方案不能只批一半。`);
-      db.run(`INSERT INTO questions (id,task_id,node_id,level,level_source,text,default_action,
-                asked_at,timeout_at,status) VALUES (?,?,NULL,3,'hard_rule',?,NULL,?,NULL,'open')`,
-      questionId, taskId, text, t);
+　　要**挡住**里面某一条，回 (B) 写明哪一条不要 —— 这份方案不能只批一半。
+先看细节：任务页的「计划变更」卡片（改哪几步、新增哪几步、范围怎么变）。`);
+      insertQuestion(db, { id: questionId, taskId, level: 3, text, askedAt: t });
       // 出处：这条问题**因为那条认证消息而存在**。
       insertEdge(db, questionId, message.id, 'derived_from', t);
       routeQuestion(db, { questionId, decisionType: 'contract_approval', typeSource: 'hard_rule', at: t });
-      db.run(`UPDATE tasks SET status='waiting' WHERE id=?`, taskId);
+      transition(db, 'tasks', taskId, 'waiting');
     }
 
     db.run(`INSERT INTO revisions (id,task_id,message_id,status,impact,salvage,changed_nodes,new_nodes,
@@ -203,7 +241,7 @@ export function proposeRevision(db, { taskId, message, rev, nodes }) {
  *
  * @param {'auto'|'user'} by  auto=没触发门直接生效；user=人批准的
  */
-export function applyRevision(db, { taskId, revisionId, by = 'auto', userId = null, reservation = null }) {
+export function applyRevision(db, { taskId, revisionId, by = 'auto', userId = null, reservation = null, approvalMessageId = null }) {
   const rv = db.one(`SELECT * FROM revisions WHERE id=? AND task_id=?`, revisionId, taskId);
   if (!rv) throw new I18nError('没有这份提案：{id}', { id: revisionId });
   if (rv.status !== 'proposed') throw new I18nError('提案 {id} 状态是 {status}，不能重复应用', { id: revisionId, status: rv.status });
@@ -226,27 +264,22 @@ export function applyRevision(db, { taskId, revisionId, by = 'auto', userId = nu
 
     for (const m of impact) {
       if (m.mark === 'obsolete') {
-        db.run(`UPDATE nodes SET status='void' WHERE id=?`, m.node_id);
+        transition(db, 'nodes', m.node_id, 'void');
         voided.push(m.node_id);
         // "编码场景下'放弃'**不删代码**，在工程笔记记录
         // '此路径因修正 #N 作废'，git 历史保底。" 决策日志就是那本工程笔记。
         const s = salvage.get(m.node_id);
-        const did = newId('d');
-        db.run(`INSERT INTO decisions (id,task_id,node_id,summary,rationale,actor_kind,actor_id,layer,
-                  valid_from,recorded_at) VALUES (?,?,?,?,?,'agent','replanner','execution',?,?)`,
-        did, taskId, m.node_id, tl(L, '节点因修正 {msg} 作废', { msg: rv.message_id }),
-        `${m.reason}\n\n${tl(L, '产物处置：{what}', { what: s ? `${s.disposition} —— ${s.note}` : tl(L, '（未完成，无产物）') })}\n`
-          + tl(L, '⚠️ 产物**没有被删除**：git 历史里仍然在，这条记录是为了让人知道那条路径不再算数。'),
-        t, t);
+        const did = insertDecision(db, { taskId, nodeId: m.node_id, summary: tl(L, '节点因修正 {msg} 作废', { msg: rv.message_id }),
+          rationale: `${m.reason}\n\n${tl(L, '产物处置：{what}', { what: s ? `${s.disposition} —— ${s.note}` : tl(L, '（未完成，无产物）') })}\n`
+            + tl(L, '⚠️ 产物**没有被删除**：git 历史里仍然在，这条记录是为了让人知道那条路径不再算数。'),
+          actorKind: 'agent', actorId: 'replanner', layer: 'execution', at: t });
         insertEdge(db, did, rv.message_id, 'derived_from', t);
       } else if (m.mark === 'needs_change') {
         const c = changed.get(m.node_id) ?? {};
         const cur = db.one(`SELECT * FROM nodes WHERE id=?`, m.node_id);
-        db.run(`UPDATE nodes SET title=?, spec=?, acceptance=?, status=?, retry_count=0 WHERE id=?`,
-          c.title ?? cur.title, c.spec ?? cur.spec, c.acceptance ?? cur.acceptance,
-          // 已完成的节点改了规格就得重做。**重试次数归零**：新规格是一件新活，
-          // 旧规格下失败过几次不该算在它头上 —— 与"被闸门掐停不计重试"同理。
-          cur.status === 'done' ? 'pending' : cur.status, m.node_id);
+        // 已完成的节点改了规格就得重做。**重试次数归零**：新规格是一件新活，
+        // 旧规格下失败过几次不该算在它头上 —— 与"被闸门掐停不计重试"同理。
+        transition(db, 'nodes', m.node_id, cur.status === 'done' ? 'pending' : cur.status, { set: { title: c.title ?? cur.title, spec: c.spec ?? cur.spec, acceptance: c.acceptance ?? cur.acceptance, retry_count: 0 } });
         respecced.push(m.node_id);
         // 新规格是新的一段工作：产物基线重取，否则旧规格下已提交的东西会被算成这段的产物
         clearNodeBaseline(db, { taskId, nodeId: m.node_id });
@@ -263,8 +296,7 @@ export function applyRevision(db, { taskId, revisionId, by = 'auto', userId = nu
         // 与 params 同一条规矩：旧边留着，`superseded_at` 记下它什么时候不算数了。
         // 事后要答的问题是"这个节点当初依赖谁、什么时候被改的"，delete 答不出来。
         if (Array.isArray(c.depends_on)) {
-          db.run(`UPDATE edges SET superseded_at=?, valid_to=? WHERE from_id=? AND relation='depends_on'
-                  AND superseded_at IS NULL`, t, t, m.node_id);
+          supersedeEdges(db, { from: m.node_id, relation: 'depends_on', t });
           for (const d of c.depends_on) insertEdge(db, m.node_id, idOf.get(d) ?? d, 'depends_on', t);
           rewired.push({ node: m.node_id, deps: c.depends_on.map((d) => idOf.get(d) ?? d) });
         }
@@ -276,9 +308,7 @@ export function applyRevision(db, { taskId, revisionId, by = 'auto', userId = nu
     // "当时被要求了什么"。
     for (const n of news) {
       const nid = idOf.get(n.key);
-      db.run(`INSERT INTO nodes (id,task_id,title,spec,acceptance,status,risk_tier,model_tier,created_at)
-              VALUES (?,?,?,?,?,'pending',?,?,?)`,
-      nid, taskId, n.title, n.spec, n.acceptance, n.risk_tier, n.model_tier, t);
+      insertNode(db, { id: nid, taskId, title: n.title, spec: n.spec, acceptance: n.acceptance, riskTier: n.risk_tier, modelTier: n.model_tier, uiChecks: n.ui_checks, createdAt: t });
       insertEdge(db, nid, rv.message_id, 'derived_from', t);
       added.push(nid);
     }
@@ -305,30 +335,25 @@ export function applyRevision(db, { taskId, revisionId, by = 'auto', userId = nu
     if (patch && patchFields(patch).length) {
       const cur = db.one(`SELECT * FROM constitutions WHERE task_id=? AND superseded_at IS NULL
                           ORDER BY version DESC LIMIT 1`, taskId);
-      db.run(`UPDATE constitutions SET superseded_at=?, valid_to=? WHERE id=?`, t, t, cur.id);
-      newConstitution = newId('c');
-      db.run(`INSERT INTO constitutions (id,task_id,version,goal,scope,scope_paths,definition_of_done,constraints,
-                valid_from,recorded_at) VALUES (?,?,?,?,?,?,?,?,?,?)`,
-      newConstitution, taskId, cur.version + 1,
-      patch.goal ?? cur.goal, patch.scope ?? cur.scope,
-      // scope_paths 是越界校验的判据，**必须跟着契约走**：漏了它，改一次 scope 散文就会把判据悄悄清空，
-      // 表现是越界校验从此不执法 —— 一个只在"改过契约的任务"上出现、且没有任何报错的洞。
-      patch.scope_paths !== undefined ? JSON.stringify(normScopePaths(patch.scope_paths)) : (cur.scope_paths ?? '[]'),
-      patch.definition_of_done ?? cur.definition_of_done,
-      JSON.stringify(patch.constraints ?? JSON.parse(cur.constraints || '[]')), t, t);
+      newConstitution = writeConstitution(db, { taskId, version: cur.version + 1, supersedes: cur.id, at: t,
+        goal: patch.goal ?? cur.goal, scope: patch.scope ?? cur.scope,
+        // scope_paths 是越界校验的判据，**必须跟着契约走**：漏了它，改一次 scope 散文就会把判据悄悄清空，
+        // 表现是越界校验从此不执法 —— 一个只在"改过契约的任务"上出现、且没有任何报错的洞。
+        scopePaths: patch.scope_paths !== undefined ? normScopePaths(patch.scope_paths) : JSON.parse(cur.scope_paths || '[]'),
+        definitionOfDone: patch.definition_of_done ?? cur.definition_of_done,
+        constraints: patch.constraints ?? JSON.parse(cur.constraints || '[]') });
       insertEdge(db, newConstitution, rv.message_id, 'derived_from', t);
       insertEdge(db, newConstitution, cur.id, 'supersedes', t);
+      // 批准：人在事项里答的 → 那条答复；命令行 / 卡片直接批的 → 那个人；没触发批准门 → 修正消息本身就是指令
+      bindApproval(db, by === 'user' ? { constitutionId: newConstitution, messageId: approvalMessageId, userId, at: t } : { constitutionId: newConstitution, messageId: rv.message_id, at: t });
       // 宪法层的改动记一条**宪法层**决策 —— layer 这一列存在的意义就是让
       // "谁动了目标"和"谁动了做法"在事后分得开。
-      const did = newId('d');
-      db.run(`INSERT INTO decisions (id,task_id,summary,rationale,actor_kind,actor_id,layer,
-                valid_from,recorded_at) VALUES (?,?,?,?,'user',?,'constitutional',?,?)`,
-      did, taskId, tl(L, '宪法块修订至 v{version}', { version: cur.version + 1 }),
-      tl(L, '因修正 {msg}：{why}', { msg: rv.message_id, why: rv.rationale }), userId, t, t);
+      const did = insertDecision(db, { taskId, summary: tl(L, '宪法块修订至 v{version}', { version: cur.version + 1 }),
+        rationale: tl(L, '因修正 {msg}：{why}', { msg: rv.message_id, why: rv.rationale }), actorKind: 'user', actorId: userId, layer: 'constitutional', at: t });
       insertEdge(db, did, rv.message_id, 'derived_from', t);
     }
 
-    db.run(`UPDATE revisions SET status='applied', resolved_at=? WHERE id=?`, t, revisionId);
+    transition(db, 'revisions', revisionId, 'applied', { from: ['proposed'], set: { resolved_at: t } });
     closeRevisionQuestion(db, rv, t);
     markConsumed(db, { taskId, ids: [rv.message_id], why: tl(L, '已由修正提案 {id} 处理', { id: revisionId }) });
     // 任务从 waiting 解冻的条件是"没有别的问题还开着"，与 recordAnswer 同一条规矩。
@@ -336,7 +361,7 @@ export function applyRevision(db, { taskId, revisionId, by = 'auto', userId = nu
                               AND status IN ('open','escalated')`, taskId).n;
     // 从 waiting **或 done** 回到 running：修正可以重开一个已完成的任务（编排器那头
     // 对应放行了 done 任务上的修正）。跑完会再走一遍 finalize，任务级验收重跑。
-    if (!stillOpen) db.run(`UPDATE tasks SET status='running' WHERE id=? AND status IN ('waiting','done')`, taskId);
+    if (!stillOpen) transition(db, 'tasks', taskId, 'running', { from: ['waiting', 'done'], onMismatch: 'skip' });
 
     audit(db, { actorKind: by === 'user' ? 'user' : 'system', actorId: userId ?? 'orchestrator',
       action: 'revision_applied', targetType: 'task', targetId: taskId,
@@ -365,25 +390,42 @@ export function applyRevision(db, { taskId, revisionId, by = 'auto', userId = nu
   });
 }
 
-/** 驳回。计划原样不动，但那条修正算处理过了 —— 否则下一轮又会停在同一处。 */
-export function rejectRevision(db, { taskId, revisionId, userId = null, why = '' }) {
+/**
+ * 驳回。这一版方案作废，那条修正算处理过了 —— 否则下一轮又会停在同一处。
+ *
+ * `redo`（{ text, tokenId }）：人不要这一版、但写了要怎么改 —— 把原来的修正连同这段话合成一条新修正，
+ * 重规划器按它重出一版，再来问人。三人选 B 并写了新方向，可 B 当时的意思是"计划原样不动、
+ * 修正记为已处理"，新方向全丢，任务以同一个提交零改动重新请签收；选项 D 的说明却又说 B "让它重出一版"。
+ * 现在两件事分开：要改（写了怎么改）→ 重出；不改了 → 作罢。
+ */
+export function rejectRevision(db, { taskId, revisionId, userId = null, why = '', redo = null }) {
   const rv = db.one(`SELECT * FROM revisions WHERE id=? AND task_id=?`, revisionId, taskId);
   if (!rv) throw new I18nError('没有这份提案：{id}', { id: revisionId });
   if (rv.status !== 'proposed') throw new I18nError('提案 {id} 状态是 {status}', { id: revisionId, status: rv.status });
   const t = now();
   const L = contentLang(db);
   return db.tx(() => {
-    db.run(`UPDATE revisions SET status='rejected', resolved_at=? WHERE id=?`, t, revisionId);
+    transition(db, 'revisions', revisionId, 'rejected', { from: ['proposed'], set: { resolved_at: t } });
     closeRevisionQuestion(db, rv, t);
     markConsumed(db, { taskId, ids: [rv.message_id], why: tl(L, '修正提案 {id} 被驳回', { id: revisionId }) });
+    let redoMessageId = null;
+    if (String(redo?.text ?? '').trim()) {
+      const orig = db.one(`SELECT body, sender_id, token_id FROM messages WHERE id=?`, rv.message_id);
+      redoMessageId = newId('m');
+      const body = tl(L, '上一版方案不用，按下面的意见重出一版。\n\n驳回时写的：\n{why}\n\n原来那条修正：\n> {orig}', {
+        why: String(redo.text).trim(), orig: String(orig?.body ?? '').replace(/\n/g, '\n> ') });
+      insertUserMessage(db, { id: redoMessageId, taskId, senderId: userId ?? orig?.sender_id ?? null, tokenId: redo.tokenId ?? null, body, kind: 'correction', receivedAt: t });
+      insertEdge(db, redoMessageId, rv.message_id, 'derived_from', t);
+      insertEdge(db, redoMessageId, revisionId, 'derived_from', t);
+    }
     const stillOpen = db.one(`SELECT count(*) AS n FROM questions WHERE task_id=?
                               AND status IN ('open','escalated')`, taskId).n;
     // 从 waiting **或 done** 回到 running：修正可以重开一个已完成的任务（编排器那头
     // 对应放行了 done 任务上的修正）。跑完会再走一遍 finalize，任务级验收重跑。
-    if (!stillOpen) db.run(`UPDATE tasks SET status='running' WHERE id=? AND status IN ('waiting','done')`, taskId);
+    if (!stillOpen) transition(db, 'tasks', taskId, 'running', { from: ['waiting', 'done'], onMismatch: 'skip' });
     audit(db, { actorKind: 'user', actorId: userId, action: 'revision_rejected',
-      targetType: 'task', targetId: taskId, payload: { revisionId, messageId: rv.message_id, why } });
-    return { revisionId };
+      targetType: 'task', targetId: taskId, payload: { revisionId, messageId: rv.message_id, why, redoMessageId } });
+    return { revisionId, redoMessageId };
   });
 }
 
@@ -444,7 +486,8 @@ export function renderDiff(g, rev, lang = g?.lang ?? 'zh') {
   if (rev.constitution_patch && Object.keys(rev.constitution_patch).length) {
     L.push(tl(lang, '**宪法块改动**（这是要你批的主要理由）：'));
     for (const [k, v] of Object.entries(rev.constitution_patch)) {
-      L.push(`  ${tl(lang, '{field}：{value}', { field: k, value: typeof v === 'string' ? v.slice(0, 300) : JSON.stringify(v).slice(0, 300) })}`);
+      if (g.patchBefore && k in g.patchBefore) L.push(...renderPatchField(lang, k, v, g.patchBefore[k]));
+      else L.push(`  ${tl(lang, '{field}：{value}', { field: k, value: typeof v === 'string' ? v.slice(0, 300) : JSON.stringify(v).slice(0, 300) })}`);
     }
   }
   L.push(tl(lang, '理由：{why}', { why: rev.rationale }));
@@ -463,11 +506,10 @@ export function recordReplanQuestion(db, { taskId, message, args }) {
   const t = now();
   const def = args.level === 3 ? null : (args.default_action ?? null);
   return db.tx(() => {
-    db.run(`INSERT INTO questions (id,task_id,node_id,level,level_source,text,default_action,asked_at,status)
-            VALUES (?,?,NULL,?,'classifier',?,?,?,'open')`, id, taskId, args.level, args.text, def, t);
+    insertQuestion(db, { id, taskId, level: args.level, levelSource: 'classifier', text: args.text, defaultAction: def, askedAt: t });
     insertEdge(db, id, message.id, 'derived_from', t);
     routeQuestion(db, { questionId: id, ...decisionTypeOfQuestion({ kind: args.kind, text: args.text }), at: t });
-    db.run(`UPDATE tasks SET status='waiting' WHERE id=?`, taskId);
+    transition(db, 'tasks', taskId, 'waiting');
     audit(db, { actorKind: 'agent', actorId: 'replanner', action: 'question_raised',
       targetType: 'task', targetId: taskId,
       payload: { questionId: id, level: args.level, levelSource: 'classifier',
@@ -477,10 +519,25 @@ export function recordReplanQuestion(db, { taskId, message, args }) {
   });
 }
 
+const stripLead = (b) => String(b ?? '').replace(/^\s*[（(]?\s*(B|C|驳回|reject(?:ed)?)\s*[)）]?[\s：:，,。.、]*/i, '').trim();
+/**
+ * 人写的"要怎么改"。会签合并过的答复（cosign_merged）开头是"会签：某某要改"这类系统写的字 ——
+ * 从各人的原答复里取，只要真写了内容的那几句；三个人都只回了「B」就是空的（重出也只会出同一版）。
+ */
+function redoTextOf(db, ctx) {
+  const merged = ctx.messageId && db.one(`SELECT 1 FROM audit_log WHERE action='cosign_merged' AND target_id=? AND json_extract(payload,'$.messageId')=?`, ctx.question.id, ctx.messageId);
+  if (!merged) return stripLead(ctx.finalBody);
+  return db.all(`SELECT a.body, u.display_name AS who FROM answers a LEFT JOIN users u ON u.id=a.user_id
+                 WHERE a.question_id=? AND a.stance='answer' ORDER BY a.created_at, a.rowid`, ctx.question.id)
+    .filter((a) => readVerdict(a.body) === 'feedback')
+    .map((a) => ({ who: a.who, text: stripLead(a.body) })).filter((a) => a.text)
+    .map((a) => tl(contentLang(db), '{who}：{text}', a)).join('\n');
+}
+
 /** 修订已应用 / 已驳回：它那条批准事项还开着就一并了结（命令行直接批的那条路；走事项答复的那条路此时事项已经结了）。 */
 function closeRevisionQuestion(db, rv, t) {
   if (!rv.question_id) return;
-  db.run(`UPDATE questions SET status='answered', resolved_at=? WHERE id=? AND status IN ('open','escalated')`, t, rv.question_id);
+  transition(db, 'questions', rv.question_id, 'answered', { from: ['open', 'escalated'], onMismatch: 'skip', set: { resolved_at: t } });
 }
 
 // 计划变更的批准事项够数了 → 在这里应用 / 驳回。若只有负责人卡片上的按钮会应用，
@@ -491,12 +548,22 @@ function closeRevisionQuestion(db, rv, t) {
   RESOLUTION_HOOKS.contract_approval = (db, ctx) => {
     const rv = db.one(`SELECT * FROM revisions WHERE question_id=? AND status='proposed'`, ctx.question.id);
     if (!rv) return prev ? prev(db, ctx) : null;
-    if (revisionSide(ctx.finalBody) === 'approve') {
-      applyRevision(db, { taskId: rv.task_id, revisionId: rv.id, by: 'user', userId: ctx.by, reservation: reservationOf(ctx.finalBody) });
+    // 与三台状态机同一个判读入口（留 approval_read，事项历史标"系统理解为…"）
+    const verdict = readApproval(db, { taskId: rv.task_id, questionId: ctx.question.id, body: ctx.finalBody, userId: ctx.by, kind: 'revision' });
+    if (verdict === 'approve') {
+      applyRevision(db, { taskId: rv.task_id, revisionId: rv.id, by: 'user', userId: ctx.by, reservation: reservationOf(ctx.finalBody), approvalMessageId: ctx.messageId ?? null });
       return { revision: 'applied', revisionId: rv.id };
     }
-    const why = String(ctx.finalBody ?? '').replace(/^\s*[（(]?\s*(B|驳回|reject(?:ed)?)\s*[)）]?[\s：:，,。.、]*/i, '').trim() || tl(contentLang(db), '在事项里驳回（未写理由）');
-    rejectRevision(db, { taskId: rv.task_id, revisionId: rv.id, userId: ctx.by, why });
-    return { revision: 'rejected', revisionId: rv.id };
+    const L = contentLang(db);
+    const text = redoTextOf(db, ctx);
+    if (verdict === 'abandon') {
+      rejectRevision(db, { taskId: rv.task_id, revisionId: rv.id, userId: ctx.by, why: text || tl(L, '不要这份变更') });
+      return { revision: 'rejected', revisionId: rv.id };
+    }
+    // 重出一版：这一版不用，人写的话连同原修正交回去重出一版。只回了个「B」没写怎么改的，重出也只会出同一版 —— 按不要这份变更算
+    const tokenId = ctx.messageId ? db.one(`SELECT token_id FROM messages WHERE id=?`, ctx.messageId)?.token_id ?? null : null;
+    const r = rejectRevision(db, { taskId: rv.task_id, revisionId: rv.id, userId: ctx.by, why: text || tl(L, '在事项里驳回（未写理由）'),
+      redo: text ? { text, tokenId } : null });
+    return { revision: r.redoMessageId ? 'redo' : 'rejected', revisionId: rv.id, redoMessageId: r.redoMessageId };
   };
 }

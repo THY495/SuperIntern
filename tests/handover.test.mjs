@@ -12,6 +12,7 @@ import { responsibilitiesOf, previewHandover, executeHandover, requestHandover, 
 import { applyTemplate, saveRules, rulesOf, routeQuestion, leadOf, leadOfKey, validateRules, setDutyCalendar, dutyCalendarOf, resolveRecipients, authorize } from '../src/core/routing.mjs';
 import { recordAnswer, answersOf } from '../src/core/answers.mjs';
 import { permissionsOf, renderPermissions } from '../src/core/permissions.mjs';
+import { questionsToNotify } from '../src/core/questions.mjs';
 import { setSetting } from '../src/core/settings.mjs';
 import { buildDigest, renderDigest, renderHandover, sendHandoverNotice, scheduledDigests } from '../src/core/digest.mjs';
 
@@ -147,7 +148,9 @@ section('3. 按项目交接负责人：归属、角色、user:lead；历史不�
   eq(db.one(`SELECT role FROM users WHERE id=?`, lead).role, 'lead', '交出方角色不变');
   eq([leadOf(db, tRun), leadOfKey(db, p1), leadOf(db, tOther)], [alice.id, alice.id, lead], 'leadOf / leadOfKey 按项目解析到新人，别的项目还是原来的人');
   eq(q(qOpen).to, [alice.id], '还开着的 Ⅲ 级事项转给接手人');
-  eq(q(qOpen).notified_at, null, '转交的事项清掉已通知标记（守护进程会通知接手人）');
+  // 原来靠清 notified_at 让守护进程重推（连没换的人也重推一遍）；写入收口起按"推到过谁"只补推新加进来的人
+  const due = questionsToNotify(db).find((x) => x.id === qOpen);
+  eq(due ? (due.first ? due.all : due.fresh) : null, [alice.id], '转交的事项：守护进程会通知接手人（且只通知接手人）');
   const qNew = mkQ(tRun, { type: 'structural', level: 3 });
   eq(q(qNew).to, [alice.id], '交接后新建事项的 user:lead 解析到新人');
   eq(answersOf(db, qOld).map((a) => a.user_id), [lead], '已答的答复仍挂原人');

@@ -13,24 +13,29 @@
 // "好，但是把 X 改成 Y" 不算批准，算反馈。签字这件事不交给分类器。
 
 import { withOutputLang, contentLang, tl, I18nError } from '../i18n/index.mjs';
-import { dirLikeTestArgs } from '../core/verify-argv.mjs';
+import { verifyCommandProblems } from '../core/verify-argv.mjs';
 import { markOf } from '../i18n/marks.mjs';
 import { routeQuestion, scopePathProblems, normScopePaths, renderScopePaths, SCOPE_PATHS_NOTE, scopePathsNote, specPrefixes } from '../core/routing.mjs';
 import { newId, now, audit } from '../db/db.mjs';
-import { toolCallsOf, textOf, truncatedEmpty, TruncatedEmptyError } from '../llm/canonical.mjs';
+import { writeConstitution } from '../db/constitutions.mjs';
+import { insertTask } from '../db/tasks.mjs';
+import { toolCallsOf, textOf, truncatedEmpty, TruncatedEmptyError, LLM_ROLES } from '../llm/canonical.mjs';
 import { priorAnswers } from './planner.mjs';
 import { timeoutFor } from '../core/timeouts.mjs';
 import { getParam, setParam } from '../core/params.mjs';
 import { decisionsSection, recordReservation, recordFromContract } from '../core/decisions.mjs';
 import { reservationOf, readApproval, confirmBeforeRevising, feedbackOf } from './approval.mjs';
 import { roundHistory, renderRoundHistory } from './spec-diff.mjs';
+import { transition } from '../db/state.mjs';
+import { insertQuestion } from '../core/questions.mjs';
+import { bindApproval, linkConstitutionSources } from '../core/provenance.mjs';
+import { stopwatch } from '../core/clock.mjs';
 
 // 判读搬到了 approval.mjs（回显 + 防循环）；旧的导入路径照旧能用。
 export { readVerdict, reservationOf, RESERVATION_RE } from './approval.mjs';
 
-export const DRAFT_STAGES = ['asking', 'proposed', 'approved'];
 const MAX_QUESTIONS_PER_ROUND = 3;
-const MAX_TOKENS = 16000;   // 含推理；6000 对 effort=high 太紧（规划器 8000 曾被吃光过）
+const MAX_TOKENS = 16000;   // 含推理；6000 对 effort=high 太紧（规划器 8000 实际运行被吃光过）
 
 const ASK_USER = {
   name: 'ask_user',
@@ -97,24 +102,8 @@ const SYSTEM = `你是一个长期运行的自主 agent 的"追问器"。人给�
 
 你不做规划、不拆节点、不写代码。你的产物只有问题和草案。`;
 
-/**
- * 验收命令的形状检查（护栏在模型外）：任务级验收是把命令按空白切成 argv 直接 exec，不经 shell。
- * 曾出现过草案给了一段 20 行的 bash（mktemp / printf / grep / trap），形状合法、根本跑不起来 ——
- * 与其在提示词里求它，不如在这里拒收并回灌。
- */
-export function verifyCommandProblems(raw) {
-  const s = String(raw ?? '').trim();
-  if (!s) return [];
-  const errs = [];
-  if (/[\r\n]/.test(s)) errs.push('verify_command 是多行脚本 —— 只能是一条命令；把脚本列进完成定义让实现方交付，这里只写运行它的命令');
-  const meta = s.match(/(\|\||&&|\||;|\$\(|`|>|<|\bset -e\b|\btrap\b)/);
-  if (meta) errs.push(`verify_command 含 shell 语法「${meta[1]}」—— 命令不经 shell 执行，管道 / 串联 / 重定向 / 变量都不生效`);
-  // `node --test cli/` 在 Node 22 上不展开目录（Cannot find module）。系统执行时会改写成 glob（verify-argv），
-  // 但契约里写着目录形式，执行器、签收的人都会以为它跑不通，于是提问、要求改命令，一个问题要来回好几步。
-  const dirs = dirLikeTestArgs(s.split(/\s+/));
-  if (dirs.length) errs.push(`verify_command 里 \`node --test ${dirs[0]}\` 写的是目录 —— Node 22 的 --test 不展开目录。写成 glob，例如 \`${dirs[0].replace(/\/+$/, '')}/*.test.mjs\`；规则里提到测试命令也用同样的写法`);
-  return errs;
-}
+// verifyCommandProblems 挪到 core/verify-argv.mjs（core 的项目层要用它，不该反过来依赖 agent 层）；这里照旧导出
+export { verifyCommandProblems };
 
 /** 草案渲染成人看的正文（也是 Ⅲ 级批准问题的正文）。`lang`：内容语言（调用方传 contentLang(db)；默认中文）。 */
 export function renderDraft(c, version, notes, lang = 'zh') {
@@ -152,8 +141,7 @@ export function startFromIdea(db, { userId, idea, title = null, source = null, p
   const by = { kind: 'user', id: userId };
   db.tx(() => {
     // 项目里的任务（projectId + order）—— 仓库住在项目上，不记 draft.source；批准后的工作区从项目分支起。
-    db.run(`INSERT INTO tasks (id,owner_id,title,status,created_at,project_id,project_order) VALUES (?,?,?,'planning',?,?,?)`,
-      taskId, userId, String(title ?? '').trim() || text.split('\n')[0].slice(0, 60), t, projectId, projectId ? order : null);
+    insertTask(db, { id: taskId, ownerId: userId, title: String(title ?? '').trim() || text.split('\n')[0].slice(0, 60), createdAt: t, projectId, projectOrder: projectId ? order : null });
     setParam(db, { taskId, key: 'draft.idea', value: text, by, governance: 'constitutional' });
     setParam(db, { taskId, key: 'draft.stage', value: 'asking', by, governance: 'constitutional' });
     if (source) setParam(db, { taskId, key: 'draft.source', value: String(source), by, governance: 'constitutional' });
@@ -167,7 +155,7 @@ const latestConstitution = (db, taskId) => db.one(
   `SELECT * FROM constitutions WHERE task_id=? AND superseded_at IS NULL ORDER BY version DESC LIMIT 1`, taskId);
 
 export const answerOf = (db, questionId) => db.one(
-  `SELECT m.body, m.trust_label, m.received_at, m.sender_id FROM edges e JOIN messages m ON m.id=e.from_id
+  `SELECT m.id, m.body, m.trust_label, m.received_at, m.sender_id FROM edges e JOIN messages m ON m.id=e.from_id
     WHERE e.to_id=? AND e.relation='answers' AND e.superseded_at IS NULL ORDER BY m.received_at DESC LIMIT 1`, questionId);
 
 /**
@@ -175,7 +163,7 @@ export const answerOf = (db, questionId) => db.one(
  *   client   LlmClient
  *   tier     默认 heavy
  */
-export async function draft(db, { client, taskId, tier = 'heavy', maxAttempts = 3 }) {
+export async function draft(db, { client, taskId, tier = LLM_ROLES.elicitor, maxAttempts = 3 }) {
   const task = db.one(`SELECT * FROM tasks WHERE id=?`, taskId);
   if (!task) throw new I18nError('没有这个任务：{id}', { id: taskId });
   const idea = getParam(db, taskId, 'draft.idea');
@@ -188,15 +176,16 @@ export async function draft(db, { client, taskId, tier = 'heavy', maxAttempts = 
   if (open) return { kind: 'noop', why: `还有 ${open} 个问题没答` };
 
   const startedAt = now();
+  const elapsed = stopwatch();   // 时长用单调时钟；startedAt 只作时间戳
   audit(db, { actorKind: 'agent', actorId: 'elicitor', action: 'elicitor_started', targetType: 'task', targetId: taskId,
     payload: { pid: process.pid, tier, stage } });
   const exit = (kind, extra = {}) => {
     audit(db, { actorKind: 'agent', actorId: 'elicitor', action: 'elicitor_exit', targetType: 'task', targetId: taskId,
-      payload: { pid: process.pid, kind, elapsedMs: now() - startedAt, ...extra } });
+      payload: { pid: process.pid, kind, elapsedMs: Math.round(elapsed()), ...extra } });
     return { kind, ...extra };
   };
   // 答题把任务从 waiting 翻成 running；追问阶段的任务不该以 running 示人（守护进程会当成可跑的）
-  if (task.status === 'running') db.run(`UPDATE tasks SET status='planning' WHERE id=?`, taskId);
+  if (task.status === 'running') transition(db, 'tasks', taskId, 'planning');
 
   try {
     // ── 人对上一版草案说了什么 ─────────────────────────────────────────────
@@ -209,11 +198,13 @@ export async function draft(db, { client, taskId, tier = 'heavy', maxAttempts = 
       const verdict = readApproval(db, { taskId, questionId: qid, body: a.body, userId: a.sender_id, version: current?.version ?? null });
       if (verdict === 'approve') {
         setParam(db, { taskId, key: 'draft.stage', value: 'approved', by: { kind: 'user', id: a.sender_id }, governance: 'constitutional' });
+        // 批准绑在这一版上：版本变了批准不跟着走，与签收绑 commit 同一条规矩
+        if (current) bindApproval(db, { constitutionId: current.id, messageId: a.id });
         const vc = getParam(db, taskId, 'draft.verify_command');
         if (vc) {
           setParam(db, { taskId, key: 'task.verify_command', value: String(vc).trim().split(/\s+/), by: { kind: 'user', id: a.sender_id }, governance: 'constitutional' });
         }
-        db.run(`UPDATE tasks SET title=?, status='planning' WHERE id=?`, getParam(db, taskId, 'draft.title') ?? task.title, taskId);
+        transition(db, 'tasks', taskId, 'planning', { set: { title: getParam(db, taskId, 'draft.title') ?? task.title } });
         // 批准时带的保留意见有地方放了（不改变任何规则，只是记下来 + 进下一个人的上下文）
         // 契约进决定登记：若只有整批规划那条路（createTaskFromSpec）登记契约，
         // "新建项目"单任务入口批准的草案一条都不进 —— 人在达成确认时明说"我要的是不含空格和换行的"，
@@ -232,7 +223,7 @@ export async function draft(db, { client, taskId, tier = 'heavy', maxAttempts = 
         return exit('approved', { constitution: current, version: current?.version ?? null });
       }
       if (verdict === 'abandon') {
-        db.run(`UPDATE tasks SET status='aborted' WHERE id=?`, taskId);
+        transition(db, 'tasks', taskId, 'aborted');
         audit(db, { actorKind: 'user', actorId: a.sender_id, action: 'draft_abandoned', targetType: 'task', targetId: taskId,
           payload: { questionId: qid, answer: String(a.body).slice(0, 200) } });
         return exit('abandoned');
@@ -272,7 +263,7 @@ export async function draft(db, { client, taskId, tier = 'heavy', maxAttempts = 
     const messages = [{ role: 'user', content: [{ type: 'text', text: parts.join('\n\n') }] }];
 
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-      const resp = await client.complete({ tier, system: withOutputLang(SYSTEM, contentLang(db)), messages, tools: [ASK_USER, PROPOSE], maxTokens: MAX_TOKENS, effort: 'high' });
+      const resp = await client.complete({ role: 'elicitor', tier, system: withOutputLang(SYSTEM, contentLang(db)), messages, tools: [ASK_USER, PROPOSE], maxTokens: MAX_TOKENS, effort: 'high' });
       if (truncatedEmpty(resp)) throw new TruncatedEmptyError('追问器', MAX_TOKENS);
       const calls = toolCallsOf(resp);
       const ask = calls.find((c) => c.name === 'ask_user');
@@ -328,15 +319,15 @@ function recordQuestions(db, { taskId, qs, tier }) {
   db.tx(() => {
     for (const q of qs) {
       const id = newId('q');
-      db.run(`INSERT INTO questions (id,task_id,node_id,level,level_source,text,default_action,asked_at,timeout_at,status)
-              VALUES (?,?,NULL,2,'classifier',?,?,?,?,'open')`,
-        id, taskId, `${q.text.trim()}${q.why ? `\n\n${tl(L, '（为什么问：{why}）', { why: String(q.why).trim() })}` : ''}`, q.default_action.trim(), t, ttl ? t + ttl : null);
+      insertQuestion(db, { id, taskId, level: 2, levelSource: 'classifier',
+        text: `${q.text.trim()}${q.why ? `\n\n${tl(L, '（为什么问：{why}）', { why: String(q.why).trim() })}` : ''}`,
+        defaultAction: q.default_action.trim(), askedAt: t, timeoutAt: ttl ? t + ttl : null });
       routeQuestion(db, { questionId: id, decisionType: 'spec_choice', typeSource: 'hard_rule', at: t });   // 追问器只问规格
       audit(db, { actorKind: 'agent', actorId: 'elicitor', action: 'question_raised', targetType: 'task', targetId: taskId,
         payload: { questionId: id, level: 2, tier, text: q.text.slice(0, 200), defaultAction: q.default_action.slice(0, 200) } });
       ids.push(id);
     }
-    db.run(`UPDATE tasks SET status='waiting' WHERE id=?`, taskId);
+    transition(db, 'tasks', taskId, 'waiting');
   });
   return ids;
 }
@@ -352,18 +343,17 @@ function recordProposal(db, { taskId, c, current }) {
   const verify = String(c.verify_command ?? '').trim();
   const text = renderDraft({ ...c, constraints, verify_command: verify }, version, c.notes, contentLang(db));
   db.tx(() => {
-    if (current) db.run(`UPDATE constitutions SET superseded_at=?, valid_to=? WHERE id=?`, t, t, current.id);
-    db.run(`INSERT INTO constitutions (id,task_id,version,goal,scope,scope_paths,definition_of_done,constraints,valid_from,recorded_at)
-            VALUES (?,?,?,?,?,?,?,?,?,?)`, cid, taskId, version, c.goal, c.scope, JSON.stringify(normScopePaths(c.scope_paths)), c.definition_of_done, JSON.stringify(constraints), t, t);
+    writeConstitution(db, { id: cid, taskId, version, goal: c.goal, scope: c.scope, scopePaths: normScopePaths(c.scope_paths), definitionOfDone: c.definition_of_done, constraints, supersedes: current?.id ?? null, at: t });
+    // 这一版从哪来：最初的想法、上一版以来人答的追问与批注、上一版
+    linkConstitutionSources(db, { constitutionId: cid, taskId, since: current?.recorded_at ?? 0, supersedes: current?.id ?? null, at: t });
     setParam(db, { taskId, key: 'draft.title', value: String(c.title).trim(), by, governance: 'execution' });
     setParam(db, { taskId, key: 'draft.verify_command', value: verify, by, governance: 'execution' });
     setParam(db, { taskId, key: 'draft.notes', value: String(c.notes ?? ''), by, governance: 'execution' });
     // Ⅲ 级：无默认、无超时（库层 CHECK）。签字这件事永远等人。
-    db.run(`INSERT INTO questions (id,task_id,node_id,level,level_source,text,default_action,asked_at,timeout_at,status)
-            VALUES (?,?,NULL,3,'hard_rule',?,NULL,?,NULL,'open')`, qid, taskId, text, t);
+    insertQuestion(db, { id: qid, taskId: taskId, level: 3, text: text, askedAt: t });
     routeQuestion(db, { questionId: qid, decisionType: 'contract_approval', typeSource: 'hard_rule', prefixes: specPrefixes([{ scope_paths: c.scope_paths }]).length ? specPrefixes([{ scope_paths: c.scope_paths }]) : null, at: t });
     setParam(db, { taskId, key: 'draft.approval_question', value: qid, by, governance: 'execution' });
-    db.run(`UPDATE tasks SET status='waiting' WHERE id=?`, taskId);
+    transition(db, 'tasks', taskId, 'waiting');
     audit(db, { actorKind: 'agent', actorId: 'elicitor', action: 'draft_proposed', targetType: 'task', targetId: taskId,
       payload: { constitution: cid, version, questionId: qid, title: String(c.title).slice(0, 120), verifyCommand: verify || null } });
   });

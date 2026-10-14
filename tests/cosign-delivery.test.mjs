@@ -34,9 +34,9 @@ section('① 已达成、还没交付的项目进负责人的待办，并通知�
 {
   const at = now();
   db.run(`INSERT INTO projects (id,owner_id,title,brief,repo,branch,base_ref,status,draft_version,created_at,goal,done_definition,visibility)
-          VALUES ('pj_d','${owner.userId}','待办清单','b','/r','superintern/pj_d','main','done',1,?,'g','d','team')`, at);
+          VALUES ('pj_d','${owner.userId}','藏书','b','/r','superintern/pj_d','main','done',1,?,'g','d','all')`, at);
   db.run(`INSERT INTO projects (id,owner_id,title,brief,repo,branch,base_ref,status,draft_version,created_at,goal,done_definition,visibility)
-          VALUES ('pj_a','${owner.userId}','还在做','b','/r','superintern/pj_a','main','active',1,?,'g','d','team')`, at);
+          VALUES ('pj_a','${owner.userId}','还在做','b','/r','superintern/pj_a','main','active',1,?,'g','d','all')`, at);
   db.run(`INSERT INTO tasks (id,owner_id,title,status,created_at,project_id,project_order,merged_at) VALUES ('t_1',?,'T1','done',?,'pj_d',1,?)`, owner.userId, at, at);
   let d = buildDigest(db, { userId: owner.userId });
   eq(d.toDeliver.length, 1, '达成的那个在"等你交付"里，还在做的不在');
@@ -131,6 +131,51 @@ const revision = (tag) => {
   as(lin)(r.questionId, 'B：同意负责人');
   as(zhou)(r.questionId, '驳回，不需要');
   eq(db.one(`SELECT status FROM revisions WHERE id=?`, r.revisionId).status, 'rejected', '都驳回 → 驳回');
+}
+
+section('计划变更的 B 是"要改、重出一版"，C 才是"不改了"');
+const corrections = () => db.all(`SELECT id, body, kind, consumed_at FROM messages WHERE task_id=? AND kind='correction' ORDER BY received_at`, carrier);
+{
+  const r = revision('3');
+  const q = db.one(`SELECT text FROM questions WHERE id=?`, r.questionId).text;
+  assert(/\(B\) 重出一版：回「B：要怎么改」/.test(q) && /\(C\) 不要这份变更：回「C」/.test(q), '事项正文：B = 重出一版、C = 不要这份变更');
+  assert(!/计划原样不动，修正记为已处理/.test(q), '不再有"B = 计划原样不动、修正记为已处理"这句（与 D 的说明自相矛盾）');
+  const before = corrections().length;
+  as(owner)(r.questionId, 'B：做成排序切换，不要加按钮');
+  as(lin)(r.questionId, 'B：补上 seed.py，让截图有数据');
+  const a = as(zhou)(r.questionId, 'A');
+  eq(a.resolved, true, '两人要改、一人批准：按方向归并（会签），不是冲突');
+  eq(db.one(`SELECT status FROM revisions WHERE id=?`, r.revisionId).status, 'rejected', '这一版不用');
+  const after = corrections();
+  eq(after.length, before + 1, '多了一条新修正 —— 人写的新方向没丢（原来三人写的方向全丢，任务零改动重新请签收）');
+  const m = after.at(-1);
+  assert(!m.consumed_at, '新修正还没处理：编排器下一轮会拿它去重规划');
+  assert(/做成排序切换/.test(m.body) && /补上 seed\.py/.test(m.body), '两个人要改的话都在');
+  assert(/把截图目录加进范围 3/.test(m.body), '原来那条修正也带着（重规划器要知道是在改哪一条）');
+  const read = db.one(`SELECT payload FROM audit_log WHERE action='approval_read' AND json_extract(payload,'$.questionId')=?`, r.questionId);
+  eq(read ? JSON.parse(read.payload).verdict : null, 'feedback', '留了判读痕迹：事项历史显示"系统理解为：要改"');
+}
+{
+  const r = revision('4');
+  const before = corrections().length;
+  for (const u of [owner, lin, zhou]) as(u)(r.questionId, 'C');
+  eq(db.one(`SELECT status FROM revisions WHERE id=?`, r.revisionId).status, 'rejected', '都回 C → 不改了');
+  eq(corrections().length, before, '不改了：不生新修正');
+  eq(db.one(`SELECT consumed_at IS NOT NULL AS c FROM messages WHERE body LIKE '%加进范围 4'`).c, 1, '原修正记为已处理');
+}
+{
+  const r = revision('5');
+  const before = corrections().length;
+  for (const u of [owner, lin, zhou]) as(u)(r.questionId, 'B');
+  eq(db.one(`SELECT status FROM revisions WHERE id=?`, r.revisionId).status, 'rejected', '只回了「B」');
+  eq(corrections().length, before, '没写怎么改：重出也只会出同一版，不生新修正');
+}
+{
+  const r = revision('6');
+  as(owner)(r.questionId, 'C');
+  as(lin)(r.questionId, 'B：换个做法');
+  const a = as(zhou)(r.questionId, 'A');
+  assert(!a.resolved && a.conflictId, '有人不改了、有人要改：真分歧，走冲突事项');
 }
 
 section('⑥ 签收：配了"负责人 + 阿青，都要签"，负责人一答不定案');

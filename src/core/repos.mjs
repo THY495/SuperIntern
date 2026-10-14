@@ -11,11 +11,17 @@ import { I18nError } from '../i18n/index.mjs';
 
 const looksLikeUrl = (s) => /^(https?|ssh|git|file):\/\//i.test(s) || /^[\w.-]+@[\w.-]+:/.test(s);
 
-/** 最近用过的仓库：[{ source, lastUsedAt, uses, kind: 'path'|'url', ok }]。`ok`：本机路径现在还在不在（URL 恒 true）。 */
-export function knownRepos(db, { limit = 12 } = {}) {
+/**
+ * 最近用过的仓库：[{ source, lastUsedAt, uses, kind: 'path'|'url', ok }]。`ok`：本机路径现在还在不在（URL 恒 true）。
+ * canSeeProject / canSeeTask：只列请求人看得见的项目 / 任务用过的仓库（2026-10-12：原来把"仅成员可见"项目的仓库地址
+ * 也列给所有人）。不给 = 全部（CLI 等本机场景）。
+ */
+export function knownRepos(db, { limit = 12, canSeeProject = null, canSeeTask = null } = {}) {
   const rows = [
-    ...db.all(`SELECT source AS s, created_at AS t FROM projects WHERE source IS NOT NULL AND source<>''`),
-    ...db.all(`SELECT p.value AS s, p.recorded_at AS t FROM params p WHERE p.key='draft.source' AND p.superseded_at IS NULL`)
+    ...db.all(`SELECT id, source AS s, created_at AS t FROM projects WHERE source IS NOT NULL AND source<>''`)
+      .filter((r) => !canSeeProject || canSeeProject(r.id)),
+    ...db.all(`SELECT p.task_id, p.value AS s, p.recorded_at AS t FROM params p WHERE p.key='draft.source' AND p.superseded_at IS NULL`)
+      .filter((r) => !canSeeTask || !r.task_id || canSeeTask(r.task_id))
       .map((r) => { try { return { s: JSON.parse(r.s), t: r.t }; } catch { return { s: r.s, t: r.t }; } }),
   ].filter((r) => typeof r.s === 'string' && r.s.trim())
     // 系统自己的目录不算"用过的仓库"：项目的内部克隆、任务工作区（接续出来的项目 source 就是工作区路径）。

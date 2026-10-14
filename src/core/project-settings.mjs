@@ -17,12 +17,14 @@
 import { markLike, markOf } from '../i18n/marks.mjs';
 import { tl, contentLang, N_, I18nError } from '../i18n/index.mjs';
 import { now, newId, audit, insertEdge } from '../db/db.mjs';
+import { performance } from 'node:perf_hooks';
 import { getParam, getProjectParam, setProjectParam } from './params.mjs';
 import { routeQuestion } from './routing.mjs';
-import { verifyCommandProblems } from '../agent/elicitor.mjs';
+import { verifyCommandProblems } from './verify-argv.mjs';
 import { existsSync, readFileSync } from 'node:fs';
 import { join, posix } from 'node:path';
 import { createHash } from 'node:crypto';
+import { insertQuestion } from './questions.mjs';
 
 export const BUDGET_KEY = 'project.budget_micro_usd';
 export const VERIFY_KEY = 'project.verify_command';
@@ -195,10 +197,11 @@ export async function runSetupCommands(exec, dir, argvs, lang = 'zh') {
     const fam = familyOf(argv);
     if (failed.has(fam) || failed.has('other')) { results.push({ argv, code: null, timedOut: false, tail: tl(lang, '（前面同类的一步失败了，这条没跑）'), skipped: true }); continue; }
     let r;
+    const t0 = performance.now();
     try { r = await exec.execute({ file: argv[0], args: argv.slice(1) }, dir, { mode: 'write', timeoutMs: 600_000 }); }
     catch (e) { r = { code: null, stdout: '', stderr: String(e.message), timedOut: false }; }
     const tail = `${r.stdout ?? ''}${r.stderr ?? ''}`.trim().split('\n').slice(-15).join('\n').slice(-2000);
-    results.push({ argv, code: r.code, timedOut: !!r.timedOut, tail });
+    results.push({ argv, code: r.code, timedOut: !!r.timedOut, tail, elapsedMs: Math.round(performance.now() - t0) });
     if (r.code !== 0) failed.add(fam);
   }
   return { ok: !failed.size, results };
@@ -333,8 +336,7 @@ export function raiseProjectBudget(db, { projectId, taskId = null }) {
     + `(C) ${tl(L, '撤掉闸门：node src/cli.mjs project budget {id} --clear（撤掉后自动挡会掉回提议挡）', { id: projectId })}\n\n`
     + tl(L, '已花 {spent}｜闸门 {gate}', { spent: fmtUsd(b.spent), gate: fmtUsd(b.gate) });
   return db.tx(() => {
-    db.run(`INSERT INTO questions (id,task_id,node_id,level,level_source,text,default_action,asked_at,timeout_at,status)
-            VALUES (?,?,NULL,3,'hard_rule',?,NULL,?,NULL,'open')`, id, host, text, t);
+    insertQuestion(db, { id: id, taskId: host, level: 3, text: text, askedAt: t });
     // 出处边：这条事项因为哪一行闸门而存在（连带指向设它的人）。
     const origin = db.one(`SELECT id FROM params WHERE project_id=? AND task_id IS NULL AND key=? AND superseded_at IS NULL
                            ORDER BY recorded_at DESC, rowid DESC LIMIT 1`, projectId, BUDGET_KEY)?.id;

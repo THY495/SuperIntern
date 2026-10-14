@@ -20,7 +20,7 @@ Windows 部署见 [deploy.md](deploy.md)。本页讲 Linux 主机和 WSL2 的安
 ```bash
 # 1. 代码放在 Linux 自己的文件系统上
 #    WSL2 下不要放在 /mnt/c、/mnt/d：drvfs 的属主、权限语义和性能都不对
-tar xzf superintern-v0.3.1-linux.tar.gz && cd superintern-v0.3.1
+tar xzf superintern-v0.4.0-linux.tar.gz && cd superintern-v0.4.0
 #    （或者 git clone <本仓库> ~/superintern && cd ~/superintern）
 
 # 2. 检查前置条件、生成 .env（权限 600）、构建沙箱镜像
@@ -32,7 +32,7 @@ nano .env
 # 4. 建库、签发 CLI 令牌（唯一的明文副本在 .superintern/cli-token，权限 600）、按已填的 key 选模型
 node src/cli.mjs init --name <你的名字>
 
-# 5. 跑一遍测试（container 与 egress 两套需要 docker 在跑）
+# 5. 跑一遍测试（container 与 egress 两套需要 docker 在跑；a11y 一套要有 Chromium，见下面「无障碍测试（a11y）要的浏览器」，没装就加 --without browser）
 node tests/run.mjs --all
 
 # 6. 守护进程 = systemd 用户单元：开机即起，退出 30 秒后拉起，日志在 .superintern/logs/daemon.log
@@ -43,6 +43,24 @@ scripts/daemon.sh status
 只想临时跑一下、不装单元的话，用 `scripts/start.sh` 在前台启动即可。
 
 单元文件在 `~/.config/systemd/user/superintern-daemon.service`。`install` 会顺便执行 `loginctl enable-linger`，否则注销或 SSH 断开时，用户实例会连同守护进程一起停掉。
+
+### 无障碍测试（a11y）要的浏览器
+
+a11y 一套在无头 Chromium 里打开看板检查。测试按 `/usr/bin/chromium`、`/usr/local/bin/chromium`、`google-chrome` 等常见位置找浏览器，也可以用 `SUPERINTERN_CHROME` 指定路径；没有浏览器的机器加 `--without browser` 跳过（会照实列出来，不算通过）。
+
+Ubuntu 24.04 的 `chromium` 只有 snap 版。在 WSL2 里（内核没开 AppArmor），snap 装 Chromium 会卡在"Process delayed security backend side effects"这一步。改用 Chrome for Testing：Google 给自动化测试发布的 Chromium 构建，就是一个 zip 包：
+
+```bash
+V=155.0.8059.39   # 当前稳定版见 https://googlechromelabs.github.io/chrome-for-testing/
+curl -fLO https://storage.googleapis.com/chrome-for-testing-public/$V/linux64/chrome-linux64.zip
+sudo mkdir -p /opt/chrome-for-testing && sudo unzip -q chrome-linux64.zip -d /opt/chrome-for-testing/$V
+sudo ln -sfn /opt/chrome-for-testing/$V/chrome-linux64/chrome /usr/local/bin/chromium
+# 它依赖的系统库，外加中文字体（不装字体的话，中文显示成方块，按钮尺寸也和真实情况不一样）
+sudo apt-get install -y libnss3 libasound2t64 libatk-bridge2.0-0t64 libcups2t64 libxkbcommon0 libxcomposite1 libxdamage1 libxrandr2 libgbm1 libpango-1.0-0 libcairo2 fonts-noto-cjk
+ldd /opt/chrome-for-testing/$V/chrome-linux64/chrome | grep "not found"   # 应该没有输出
+```
+
+从 storage.googleapis.com 下载太慢的话，可以从镜像下载同一个文件，再和官方的校验值对一下：`curl -sI <官方地址> | grep x-goog-hash` 给出 md5（base64），本地算 `openssl dgst -md5 -binary chrome-linux64.zip | base64`，两者应该一致。
 
 ### 主机够不着 Docker Hub 时
 
@@ -106,8 +124,4 @@ node src/cli.mjs sandbox --reap        # 清理遗留的容器
 ## 已知限制
 
 - **podman 和 rootless docker 尚未验证**。container 测试里关于 cgroup 的断言，在 rootless 下可能表现不同。
-- **代理镜像会越积越多**：出网代理镜像每个任务生成一个 `superintern/sandbox:ca-*` 标签，不会自动清理。它们共享层，每个只多几百 KB，但列表会越来越长。清理方法：
-
-  ```bash
-  docker images --format '{{.Repository}}:{{.Tag}}' superintern/sandbox | grep ':ca-' | xargs docker rmi
-  ```
+- **代理镜像会越积越多**：出网代理会为每个任务生成一个 `superintern/sandbox:ca-*` 标签，平时不会自动清理。它们共享层，每个只多几百 KB，但列表会越来越长。用 `node src/cli.mjs sandbox --reap` 清理（会一并清掉遗留的容器）。

@@ -161,7 +161,8 @@ section('5 · 迁移 v20：项目任务上的旧放行名单按项目取并集�
   raw.exec(readFileSync(resolve(import.meta.dirname, '..', 'src', 'db', 'schema.sql'), 'utf8'));
   raw.close();
   const db0 = openDb(path);                 // 会一路迁到最新；为了测 v20 的并集，手工回到 v19 的形状
-  db0.raw.exec(`DROP TABLE egress_sources; DELETE FROM params WHERE key='egress.sources'; PRAGMA user_version = 19`);
+  // 真实的 v19 库没有 params 的只增触发器（v16 重建时丢了，v23 才补回），所以这里先拿掉它再删行
+  db0.raw.exec(`DROP TRIGGER IF EXISTS trg_params_no_delete; DROP TABLE egress_sources; DELETE FROM params WHERE key='egress.sources'; PRAGMA user_version = 19`);
   const { userId } = ensureOwner(db0);
   const t = now(), pj = newId('pj');
   db0.run(`INSERT INTO projects (id,owner_id,title,brief,repo,branch,base_ref,source,status,created_at) VALUES (?,?,'老项目','',?,?,'main','src','active',?)`, pj, userId, '/r', 'b', t);
@@ -181,9 +182,15 @@ section('5 · 迁移 v20：项目任务上的旧放行名单按项目取并集�
 section('6 · 实测（真代理）：只读源拦住 POST、放过 GET；工具配置进了沙箱');
 // ═══════════════════════════════════════════════════════════════════════════
 {
-  let cli = null;
-  try { execFileSync('docker', ['version', '--format', '{{.Server.Version}}'], { stdio: 'ignore' }); cli = 'docker'; } catch { /* 没有 docker */ }
-  if (!cli) console.log('  （跳过：没有可用的 docker）');
+  let cli = null, why = null;
+  const banned = (process.env.SUPERINTERN_TEST_WITHOUT ?? '').split(',');
+  if (banned.includes('docker') || banned.includes('net')) why = `按 --without ${process.env.SUPERINTERN_TEST_WITHOUT} 不跑`;
+  else {
+    try { execFileSync('docker', ['version', '--format', '{{.Server.Version}}'], { stdio: 'ignore' }); cli = 'docker'; } catch { why = '没有可用的 docker'; }
+    // 有引擎不等于能跑：要的是 Linux 沙箱镜像（Windows 容器的引擎上没有它）
+    if (cli) { try { execFileSync('docker', ['image', 'inspect', 'superintern/sandbox:v0.1'], { stdio: 'ignore' }); } catch { cli = null; why = '没有沙箱镜像 superintern/sandbox:v0.1'; } }
+  }
+  if (!cli) console.log(`  （跳过：${why}）`);
   else {
     const { makeSandbox } = await import('../src/core/container.mjs');
     const HOME = join(TMP, 'home'); mkdirSync(HOME, { recursive: true });
@@ -196,13 +203,19 @@ section('6 · 实测（真代理）：只读源拦住 POST、放过 GET；工具
     try {
       await ctr.start(ws);
       const run = async (code) => { const r = await ctr.execute({ file: 'node', args: ['-e', code] }, ws, { timeoutMs: 45_000 }); return `${r.stdout}${r.stderr}`.trim(); };
-      const get = await run('fetch("https://api.github.com/zen").then(r=>console.log("GET",r.status)).catch(e=>console.log("GET-ERR",e.cause?.message??e.message))');
-      assert(/GET 200/.test(get), `只读源 GET 放行：${get.slice(0, 80)}`);
+      const get = await run('fetch("https://api.github.com/zen").then(async r=>console.log("GET",r.status,(await r.text()).slice(0,60))).catch(e=>console.log("GET-ERR",e.cause?.message??e.message))');
+      // GitHub 匿名 API 每小时 60 次：上游回"rate limit"的 403 同样证明代理放行了（代理拒绝回的是 egress denied）
+      assert(/GET 200/.test(get) || (/GET 403/.test(get) && /rate limit/i.test(get)), `只读源 GET 放行（到了上游${/rate limit/i.test(get) ? '，上游限流' : ''}）：${get.slice(0, 100)}`);
       const post = await run('fetch("https://api.github.com/markdown",{method:"POST",body:"{}"}).then(async r=>console.log("POST",r.status,(await r.text()).slice(0,60))).catch(e=>console.log("POST-ERR",e.message))');
       assert(/POST 403 egress denied: this source is read-only/.test(post), `只读源 POST 被代理拦下（不是 GitHub 回的）：${post.slice(0, 100)}`);
       const pe = await run('console.log("PIP_INDEX_URL="+process.env.PIP_INDEX_URL)');
       assert(pe.includes('PIP_INDEX_URL=https://mirror.example.org/simple'), `软件源的工具配置注入了沙箱：${pe}`);
-    } finally { await ctr.stop?.(); }
+    } finally {
+      await ctr.stop?.();
+      // 这次新生成的 CA 派生出的镜像：每跑一次一个新 CA，不删会越攒越多
+      const { removeCaImages } = await import('../src/core/egress.mjs');
+      removeCaImages(cli, join(HOME, 'ca'));
+    }
     f.db.close();
   }
 }

@@ -18,6 +18,7 @@ import { LlmClient } from '../src/llm/client.mjs';
 import { setEnvVar } from '../src/core/envfile.mjs';
 import { checkCatalog } from '../src/llm/catalog-check.mjs';
 import { startWeb, llmView } from '../src/web/server.mjs';
+import { fetchBoard } from '../src/web/page-scripts.mjs';
 import { addUser } from '../src/core/users.mjs';
 
 let pass = 0, fail = 0;
@@ -53,7 +54,7 @@ section('1. 默认值叠加：库空时生效值 = 代码常量');
   eq(b.missing, ['light', 'standard', 'heavy'], '三档都没写库');
   eq(bindable(cat['deepseek/deepseek-flash'], eps), null, '默认目录里的模型可绑');
   const reg = registryFor(db);
-  eq(Object.keys(reg).sort(), ['binding', 'bindingSource', 'catalog', 'tierEfforts', 'vendors'], 'registryFor 给客户端的五样');
+  eq(Object.keys(reg).sort(), ['binding', 'bindingSource', 'catalog', 'fallbacks', 'health', 'roleBinding', 'tierEfforts', 'vendors'], 'registryFor 给客户端的八样（带上角色单独绑定、备用模型与共享的熔断 / 退避）');
 }
 
 section('2. init：默认绑定显式写库；--bind 覆盖；第二次不重写');
@@ -363,7 +364,7 @@ section('10. 看板 /api/llm：读所有人、写只负责人、key 不回显、
   r = await post('/api/llm', { action: 'endpoint_remove', id: 'ark' });
   eq([r.status, r.result.reverted], [200, false], '删用户服务商');
   assert(!r.view.models.some((m) => m.vendor === 'ark'), '它的模型一起删');
-  const html = await fetch(base + '/').then((x) => x.text());
+  const html = await fetchBoard(base);
   assert(['id="bindCard"', 'id="epCard"', 'id="modelCard"', '模型分配', '服务商', '模型列表'].every((x) => html.includes(x)) && html.includes('不写入数据库，不回显'), '设置页有模型分配 / 服务商 / 模型列表三个分区；密钥不入库不回显写在界面上');
   w.close();
 }

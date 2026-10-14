@@ -29,3 +29,22 @@ export function runnableArgv(argv, dir) {
     return `${a.replace(/\/+$/, '')}/**/*.test.{cjs,mjs,js}`;
   });
 }
+
+/**
+ * 验收命令的形状检查（护栏在模型外）：任务级验收是把命令按空白切成 argv 直接 exec，不经 shell。
+ * 实际运行第一版草案给了一段 20 行的 bash（mktemp / printf / grep / trap），形状合法、根本跑不起来 ——
+ * 与其在提示词里求它，不如在这里拒收并回灌。
+ */
+export function verifyCommandProblems(raw) {
+  const s = String(raw ?? '').trim();
+  if (!s) return [];
+  const errs = [];
+  if (/[\r\n]/.test(s)) errs.push('verify_command 是多行脚本 —— 只能是一条命令；把脚本列进完成定义让实现方交付，这里只写运行它的命令');
+  const meta = s.match(/(\|\||&&|\||;|\$\(|`|>|<|\bset -e\b|\btrap\b)/);
+  if (meta) errs.push(`verify_command 含 shell 语法「${meta[1]}」—— 命令不经 shell 执行，管道 / 串联 / 重定向 / 变量都不生效`);
+  // `node --test cli/` 在 Node 22 上不展开目录（Cannot find module）。系统执行时会改写成 glob（verify-argv），
+  // 但契约里写着目录形式，执行器、签收的人都会以为它跑不通，于是提问、要求改命令。
+  const dirs = dirLikeTestArgs(s.split(/\s+/));
+  if (dirs.length) errs.push(`verify_command 里 \`node --test ${dirs[0]}\` 写的是目录 —— Node 22 的 --test 不展开目录。写成 glob，例如 \`${dirs[0].replace(/\/+$/, '')}/*.test.mjs\`；规则里提到测试命令也用同样的写法`);
+  return errs;
+}

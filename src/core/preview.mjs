@@ -10,6 +10,7 @@
 //     "pages": [{ "path": "/", "title": "首页" }, { "path": "/todos", "title": "待办列表" }]
 //   }
 // start / seed 每条一个进程（不经 shell、与验收命令同一条规矩）；url / ready 只许本机；pages 至多 6 页。
+// 系统跑 start / seed 时都带环境变量 SI_PREVIEW=1：样例数据脚本据此拒绝在别处运行，后端也可以据此换一个预览用的库。
 //
 // 截图用 chromium 自带的 `--headless --screenshot`（沙箱镜像 v0.3-python 里装着）：只看页面加载后的样子，不点、不填。
 // 失败不拦签收 —— 截不出来就在签收页上照实说为什么，人照样能签。
@@ -22,13 +23,15 @@
 //     Traceback……）或几乎是空白，就在那张图上挂一条"可能有问题"。这是提示不是判决 —— 判断仍是签收人的。
 //   - chromium 默认会在后台连 Google（会被出网代理一次次挡下）：关掉后台联网相关的功能。
 
-import { existsSync, readFileSync, readdirSync, mkdirSync, copyFileSync, rmSync } from 'node:fs';
+import { existsSync, readFileSync, readdirSync, mkdirSync, copyFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { describeChanges, discardChanges } from './workspace.mjs';
 import { tl, N_ } from '../i18n/index.mjs';
+import { stopwatch } from './clock.mjs';
 
 export const PREVIEW_FILE = 'si-preview.json';
 const OUT_DIR = '.si-preview';           // 截图先落在工作区里（容器能写的地方），再搬到 home/previews；已在 git exclude 里
+export const LIVE_DIR = OUT_DIR;          // 验收员看运行中的应用也用这个目录放驱动脚本与截图（两者不会同时跑）
 const MAX_START = 3, MAX_PAGES = 6, MAX_READY = 4, MAX_SEED = 3;
 
 const argvOf = (s) => (Array.isArray(s) ? s.map(String) : String(s).trim().split(/\s+/)).filter(Boolean);
@@ -118,52 +121,123 @@ export function pageTrouble(dom, lang = 'zh') {
 }
 
 /**
+ * 起服务：每条 start 一个后台进程组，等 url 与 ready 里每个地址都 2xx/3xx，再跑样例数据。
+ * run(argv, timeoutMs) 在沙箱里跑一条命令。返回 { ok, why?, log, warnings, probe, ready }；
+ * 失败时服务可能起了一半 —— 调用方照样要 stopServices。
+ * 截图（capturePreview）与验收员看运行中的应用（live-app.mjs）共用这一套，就绪判据只有一份。
+ */
+export async function startServices(run, spec, { readyTimeoutMs = 90_000, lang = 'zh' } = {}) {
+  const warnings = [];
+  let log = '';
+  const probe = async (u) => (await run(['curl', '-sf', '-o', '/dev/null', '-m', '3', u], 10_000)).code === 0;
+  // 每条 start 放进自己的进程组（setsid），关的时候整组杀 —— npm run dev 会再起 node / vite，只杀 npm 杀不干净
+  for (const [i, argv] of spec.start.entries()) {
+    await run(['sh', '-c', `setsid env SI_PREVIEW=1 ${argv.map(q).join(' ')} > /tmp/si-preview-${i}.log 2>&1 < /dev/null & echo $! >> /tmp/si-preview.pids`], 10_000);
+  }
+  // 就绪：每个地址都要 2xx/3xx（curl -f）。只看"有没有应答"会把后端的 500、前端的 404 都当成起来了。
+  const ready = spec.ready ?? [`${spec.url}/`];
+  const waited = stopwatch();   // 单调时钟
+  let pending = [...ready];
+  while (pending.length && waited() < readyTimeoutMs) {
+    const still = [];
+    for (const u of pending) if (!(await probe(u))) still.push(u);
+    pending = still;
+    if (pending.length) await new Promise((ok) => setTimeout(ok, 1500));
+  }
+  if (pending.length) {
+    return { ok: false, warnings, probe, ready, log: await serviceLogTail(run),
+      why: tl(lang, '{sec} 秒内这些地址一直打不开（服务没起来，或者起来了但出错）：{urls}', { sec: Math.round(readyTimeoutMs / 1000), urls: pending.join(tl(lang, '、')) }) };
+  }
+  // 样例数据：失败不拦，但照实说（空库的截图证明不了功能，签收的人得知道）
+  for (const argv of spec.seed ?? []) {
+    const r = await run(['env', 'SI_PREVIEW=1', ...argv], 60_000);
+    if (r.code !== 0) {
+      warnings.push(tl(lang, '样例数据命令「{cmd}」出错了、没跑成，截图里可能是空的', { cmd: argv.join(' ') }));
+      log += `\n[seed ${argv.join(' ')}] ${String(`${r.stdout ?? ''}${r.stderr ?? ''}`).trim().split('\n').slice(-5).join(' ')}`;
+    }
+  }
+  return { ok: true, warnings, log, probe, ready };
+}
+/**
+ * seed 命令里引用的脚本文件在工作区里不在的（越界撤掉了 seed.py，seed 还指着它，截图时库是空的）。
+ * 只认像脚本文件的参数（带常见脚本后缀、相对路径）；返回 [{ cmd, missing: [路径] }]。
+ */
+const SCRIPT_RE = /^(?!-)(?!.*:\/\/)[\w.\-/]+\.(py|js|mjs|cjs|ts|sh|sql|rb|php)$/;
+export function missingSeedFiles(dir, spec) {
+  const out = [];
+  for (const argv of spec?.seed ?? []) {
+    const missing = argv.filter((a) => SCRIPT_RE.test(a) && !a.startsWith('/') && !existsSync(join(dir, a)));
+    if (missing.length) out.push({ cmd: argv.join(' '), missing });
+  }
+  return out;
+}
+
+const serviceLogTail = async (run) => String((await run(['sh', '-c', 'tail -n 20 /tmp/si-preview-*.log 2>/dev/null'])).stdout ?? '').slice(-2000);
+
+/** 关掉 startServices 起的（以及记进同一个 pid 文件的浏览器）：整个进程组杀 */
+export async function stopServices(run) {
+  await run(['sh', '-c', 'for p in $(cat /tmp/si-preview.pids 2>/dev/null); do kill -TERM -- -$p 2>/dev/null || kill -TERM $p 2>/dev/null; done; rm -f /tmp/si-preview.pids'], 10_000).catch(() => {});
+}
+
+/**
+ * 起服务之前给工作区拍个快照，收尾时 restoreWorkspace 还原。服务会往工作区写东西（sqlite 库、上传目录、日志……）：
+ *   - 这一段新冒出来的路径：删掉（不还原，合并时就撞"工作区有未提交的改动"，链就卡死）；
+ *   - 起服务前就改着的文件（验收时执行器这一步的改动还没提交），又被应用改了的：按快照写回。
+ *     验收员会点、会填，应用改的正可能是执行器交上来的数据文件，不写回就是把验收的副作用当成产物交了。
+ *     只给 2MB 以内的文件存内容；更大的被改了就照实说（kept）。
+ */
+const SNAP_MAX = 2 * 1024 * 1024;
+export function snapshotWorkspace(dir) {
+  const paths = describeChanges(dir).map((c) => c.path);
+  const files = new Map();
+  for (const p of paths) {
+    if (p.endsWith('/')) continue;
+    try { const st = statSync(join(dir, p)); if (st.isFile()) files.set(p, { size: st.size, mtimeMs: st.mtimeMs, buf: st.size <= SNAP_MAX ? readFileSync(join(dir, p)) : null }); }
+    catch { /* 删掉的文件：没内容可存 */ }
+  }
+  return { paths: new Set(paths), files };
+}
+export function restoreWorkspace(dir, snap) {
+  const out = { removed: [], rewritten: [], kept: [] };
+  try {
+    const left = describeChanges(dir).map((c) => c.path).filter((p) => !snap.paths.has(p));
+    if (left.length) { discardChanges(dir, left); out.removed.push(...left); }
+  } catch { /* 还原失败：合并前的干净检查会把它变成一条事项 */ }
+  for (const [p, was] of snap.files) {
+    const abs = join(dir, p);
+    try {
+      if (!was.buf) {
+        const st = existsSync(abs) ? statSync(abs) : null;
+        if (!st || st.size !== was.size || st.mtimeMs !== was.mtimeMs) out.kept.push(p);
+        continue;
+      }
+      const now = existsSync(abs) ? readFileSync(abs) : null;
+      if (!now || !now.equals(was.buf)) { writeFileSync(abs, was.buf); out.rewritten.push(p); }
+    } catch { out.kept.push(p); }
+  }
+  return out;
+}
+
+/**
  * 在沙箱里起服务、截图、关服务。exec 是任务的沙箱执行器（ContainerExecutor），dir 是工作区（宿主路径）。
  * 截图搬到 outDir。返回 { ok, shots: [{ title, path, file, warnings? }], why?, log?, warnings? }。
  *   ok      = 至少截到一张（截到了 ≠ 页面是好的 —— 看 warnings）
  *   warnings = 整体的问题（样例数据没放成、截完服务已经不应答了）；每张图自己的问题在 shot.warnings
- *   restored = 截图这一段往工作区里新写出来、已经还原掉的路径
- *
- * 截图起的服务会往工作区写东西（sqlite 库、上传目录、日志……）。不还原，合并时就撞"工作区有未提交的改动" ——
- * 整条链就此卡死。只还原这一段新冒出来的，之前就有的不碰。
+ *   restored = 截图这一段往工作区里新写出来（已删掉）或改掉（已按快照写回）的路径
  */
 export async function capturePreview(exec, dir, spec, { outDir, readyTimeoutMs = 90_000, lang = 'zh' } = {}) {
   const run = (argv, timeoutMs = 30_000) => exec.execute({ file: argv[0], args: argv.slice(1) }, dir, { mode: 'write', timeoutMs });
   const shots = [], warnings = [];
   let log = '';
-  const before = new Set(describeChanges(dir).map((c) => c.path));
+  const snap = snapshotWorkspace(dir);
   const restored = [];
-  const probe = async (u) => (await run(['curl', '-sf', '-o', '/dev/null', '-m', '3', u], 10_000)).code === 0;
-  const tail = async () => String((await run(['sh', '-c', 'tail -n 20 /tmp/si-preview-*.log 2>/dev/null'])).stdout ?? '').slice(-2000);
   try {
     rmSync(join(dir, OUT_DIR), { recursive: true, force: true });
     mkdirSync(join(dir, OUT_DIR), { recursive: true });
-    // 每条 start 放进自己的进程组（setsid），关的时候整组杀 —— npm run dev 会再起 node / vite，只杀 npm 杀不干净
-    for (const [i, argv] of spec.start.entries()) {
-      await run(['sh', '-c', `setsid ${argv.map(q).join(' ')} > /tmp/si-preview-${i}.log 2>&1 < /dev/null & echo $! >> /tmp/si-preview.pids`], 10_000);
-    }
-    // 就绪：每个地址都要 2xx/3xx（curl -f）。只看"有没有应答"会把后端的 500、前端的 404 都当成起来了。
-    const ready = spec.ready ?? [`${spec.url}/`];
-    const t0 = Date.now();
-    let pending = [...ready];
-    while (pending.length && Date.now() - t0 < readyTimeoutMs) {
-      const still = [];
-      for (const u of pending) if (!(await probe(u))) still.push(u);
-      pending = still;
-      if (pending.length) await new Promise((ok) => setTimeout(ok, 1500));
-    }
-    if (pending.length) {
-      log = await tail();
-      return { restored, ok: false, shots, why: tl(lang, '{sec} 秒内这些地址一直打不开（服务没起来，或者起来了但出错）：{urls}', { sec: Math.round(readyTimeoutMs / 1000), urls: pending.join(tl(lang, '、')) }), log };
-    }
-    // 样例数据：失败不拦截图，但照实说（空库的截图证明不了功能，签收的人得知道）
-    for (const argv of spec.seed ?? []) {
-      const r = await run(argv, 60_000);
-      if (r.code !== 0) {
-        warnings.push(tl(lang, '样例数据命令「{cmd}」出错了、没跑成，截图里可能是空的', { cmd: argv.join(' ') }));
-        log += `\n[seed ${argv.join(' ')}] ${String(`${r.stdout ?? ''}${r.stderr ?? ''}`).trim().split('\n').slice(-5).join(' ')}`;
-      }
-    }
+    const s = await startServices(run, spec, { readyTimeoutMs, lang });
+    if (!s.ok) return { restored, ok: false, shots, why: s.why, log: s.log };
+    warnings.push(...s.warnings); log += s.log;
+    const { probe, ready } = s;
     for (const [i, p] of spec.pages.entries()) {
       const file = `${String(i + 1).padStart(2, '0')}.png`;
       const r = await run(['timeout', '60', 'chromium', ...CHROMIUM_FLAGS, '--window-size=1280,800', `--virtual-time-budget=${spec.waitMs}`,
@@ -181,18 +255,16 @@ export async function capturePreview(exec, dir, spec, { outDir, readyTimeoutMs =
     // 截完再查一遍：截图途中死掉的服务（常见：后端第一次查库就崩），图上看不出来
     const dead = [];
     for (const u of ready) if (!(await probe(u))) dead.push(u);
-    if (dead.length) { warnings.push(tl(lang, '服务在截图途中挂了 —— 截完再查，这些地址已经打不开：{urls}', { urls: dead.join(tl(lang, '、')) })); log = `${log}\n${await tail()}`.trim(); }
+    if (dead.length) { warnings.push(tl(lang, '服务在截图途中挂了 —— 截完再查，这些地址已经打不开：{urls}', { urls: dead.join(tl(lang, '、')) })); log = `${log}\n${await serviceLogTail(run)}`.trim(); }
     const extra = { ...(warnings.length ? { warnings } : {}), ...(log.trim() ? { log: log.trim() } : {}) };
     return shots.length ? { restored, ok: true, shots, ...extra } : { restored, ok: false, shots, why: tl(lang, '服务起来了，但一张都没截出来'), ...extra };
   } catch (e) {
     return { restored, ok: false, shots, why: tl(lang, '截图过程出错：{msg}', { msg: e.message }), log, ...(warnings.length ? { warnings } : {}) };
   } finally {
-    await run(['sh', '-c', 'for p in $(cat /tmp/si-preview.pids 2>/dev/null); do kill -TERM -- -$p 2>/dev/null || kill -TERM $p 2>/dev/null; done; rm -f /tmp/si-preview.pids'], 10_000).catch(() => {});
+    await stopServices(run);
     try { rmSync(join(dir, OUT_DIR), { recursive: true, force: true }); } catch { /* 下次开头会再清 */ }
-    try {
-      const left = describeChanges(dir).map((c) => c.path).filter((p) => !before.has(p));
-      if (left.length) { discardChanges(dir, left); restored.push(...left); }
-    } catch { /* 还原失败：合并前的干净检查会把它变成一条事项 */ }
+    const r = restoreWorkspace(dir, snap);
+    restored.push(...r.removed, ...r.rewritten);
   }
 }
 

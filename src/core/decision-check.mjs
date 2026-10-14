@@ -18,15 +18,18 @@ import { newId, now, audit, insertEdge } from '../db/db.mjs';
 import { routeQuestion, leadOf, routingKeyOf, rulesOf, matchChains, resolveRecipients, stripTransferHint } from './routing.mjs';
 import { RESOLUTION_HOOKS } from './answers.mjs';
 import { voidOne, activeDecisions, scopeHints, SOURCE_NAMES, sourceTagOf } from './decisions.mjs';
-import { textOf } from '../llm/canonical.mjs';
+import { textOf, LLM_ROLES } from '../llm/canonical.mjs';
 import { flushLedger } from './ledger.mjs';
 import { steeringFrom, releaseCheckHold } from './inbox.mjs';
+import { insertQuestion, setRecipients, setRouteParties } from './questions.mjs';
 
-export const CHECK_TIER = 'light';
+export const CHECK_TIER = LLM_ROLES['decision-check'];
 /** 低于这个置信度的命中直接丢掉：宁可漏报，也不要用一条没把握的"冲突"去打断人。 */
 export const HIT_CONFIDENCE_FLOOR = 0.6;
 /** 一次最多拿几条去问：清单长到一定程度，轻档模型读不动，也不该一次报十条。 */
 export const MAX_HITS = 3;
+/** 输出上限。推理 token 算在里面：原来的 800 在 Kimi 上会被推理吃光、正文为空；按量计费，上限放宽不多花钱 */
+export const MAX_TOKENS = 2000;
 
 export const ENTRY_NAMES = { task: '新任务描述', revision: '变更消息', answer: '对问题的答复' };
 
@@ -81,16 +84,18 @@ export async function checkDecisions(text, { decisions = [], llmClient, entry = 
   if (!llmClient) return { hits: [], considered: decisions.length, skipped: 'no_client', dropped: 0 };
   const byId = new Map(decisions.map((d) => [d.id, d]));
   const messages = [{ role: 'user', content: [{ type: 'text', text: buildPrompt(text, decisions, entry) }] }];
-  let raw = null;
+  let raw = null, maxTokens = MAX_TOKENS;
   for (let attempt = 0; attempt < 2; attempt++) {
-    const resp = await llmClient.complete({ tier: CHECK_TIER, system: withOutputLang(systemPrompt(), lang), messages, maxTokens: 800 });
+    const resp = await llmClient.complete({ role: 'decision-check', tier: CHECK_TIER, system: withOutputLang(systemPrompt(), lang), messages, maxTokens });
     raw = extractJson(textOf(resp));
     if (raw && Array.isArray(raw.hits)) break;
     raw = null;
-    if (attempt === 0) {
-      messages.push({ role: 'assistant', content: resp.content });
-      messages.push({ role: 'user', content: [{ type: 'text', text: '你上次的回复不合规。只回一个 JSON 对象，形如 {"hits":[]}。' }] });
-    }
+    if (attempt > 0) break;
+    // 推理模型把上限吃光、正文是空的：不是"不合规"，是没写完 ——
+    // 放宽上限原样再问，不把那一轮空回复塞回去（塞回去 Moonshot 直接 400）
+    if (resp.stopReason === 'max_tokens' || !textOf(resp).trim()) { maxTokens = MAX_TOKENS * 2; continue; }
+    messages.push({ role: 'assistant', content: resp.content });
+    messages.push({ role: 'user', content: [{ type: 'text', text: '你上次的回复不合规。只回一个 JSON 对象，形如 {"hits":[]}。' }] });
   }
   // 解析不出来就当作没冲突：比对是**附加**的一道检查，它自己坏掉不该变成一条打断人的事项。
   if (!raw) return { hits: [], considered: decisions.length, skipped: 'unparsable', dropped: 0 };
@@ -258,19 +263,18 @@ export function raiseDecisionConflict(db, { taskId, group, entry, by, messageIds
   for (const qid of reusedIds) linkMessages(qid);
   const { mode, parties } = groupRoute(db, fresh, by);
   const id = newId('q');
-  db.run(`INSERT INTO questions (id,task_id,node_id,level,level_source,text,default_action,asked_at,timeout_at,status)
-          VALUES (?,?,NULL,3,'hard_rule',?,NULL,?,NULL,'open')`, id, taskId, bodyOf(db, { group: fresh, entry, by, mode, held: messageIds.length > 0 }), at);
+  insertQuestion(db, { id: id, taskId: taskId, level: 3, text: bodyOf(db, { group: fresh, entry, by, mode, held: messageIds.length > 0 }), askedAt: at });
   // 出处边指向每一条旧决定 —— 结论钩子靠它们认出"这是一条决定冲突"，并知道该作废哪几条。
   for (const g of fresh) insertEdge(db, id, g.decision.id, 'derived_from', at);
   linkMessages(id);
   const r = routeQuestion(db, { questionId: id, decisionType: 'conflict', typeSource: 'hard_rule', parties, at });
-  if (parties.length) db.run(`UPDATE questions SET route=json_set(route,'$.parties',json(?)) WHERE id=?`, JSON.stringify(parties), id);
+  if (parties.length) setRouteParties(db, id, parties);
   // 兜底：解析完还是没有人 —— 那就是一条没有人会看到的事项（停等账本会把它算成缺陷）。
   // 与其让它躺一个工作日等超时，不如当场塞给负责人，并记一条审计说明是兜的。
   if (!JSON.parse(db.one(`SELECT addressed_to FROM questions WHERE id=?`, id).addressed_to || '[]').length) {
     const l = leadOf(db, taskId);
     if (l) {
-      db.run(`UPDATE questions SET addressed_to=? WHERE id=?`, JSON.stringify([l]), id);
+      setRecipients(db, id, { addressedTo: [l] });
       audit(db, { actorKind: 'system', actorId: 'decision-check', action: 'question_rerouted', targetType: 'question', targetId: id,
         payload: { why: tl(contentLang(db), '路由表解析出零个收件人，兜底改派给项目负责人'), to: [l] } });
     }
@@ -287,7 +291,7 @@ export function raiseDecisionConflict(db, { taskId, group, entry, by, messageIds
     const answering = new Set(JSON.parse(db.one(`SELECT addressed_to FROM questions WHERE id=?`, id).addressed_to || '[]'));
     const add = owners.filter((u) => !cur.has(u) && !answering.has(u));
     if (add.length) {
-      db.run(`UPDATE questions SET informed=? WHERE id=?`, JSON.stringify([...cur, ...add]), id);
+      setRecipients(db, id, { informed: [...cur, ...add] });
       audit(db, { actorKind: 'system', actorId: 'decision-check', action: 'question_informed_added', targetType: 'question', targetId: id,
         payload: { added: add, why: tl(contentLang(db), '这几条决定落在他们的范围上，按路由表该让他们知道') } });
     }
@@ -441,7 +445,15 @@ export async function afterInput(db, { taskId, text, entry, by, makeClient, sour
     const llmClient = makeClient?.() ?? null;
     if (!llmClient) return { hits: [], raised: [], skipped: 'no_client' };
     try { return await checkAndRaise(db, { taskId, projectId: pid, text, entry, by, llmClient, messageIds, at }); }
-    finally { try { flushLedger(db, llmClient, { taskId, role: 'decision-check' }); } catch { /* 记账失败不连累 */ } }
+    finally {
+      // 记账失败不连累比对本身，但**不能悄悄吞掉**：钱已经花了、账上没有，预算闸门就少算了这一笔（故障注入逐个过空 catch 时查出）
+      try { flushLedger(db, llmClient, { taskId, role: 'decision-check' }); }
+      catch (e) {
+        const micro = (llmClient.ledger ?? []).reduce((s, x) => s + (x.microUsd ?? 0), 0);
+        try { audit(db, { actorKind: 'system', actorId: 'decision-check', action: 'ledger_flush_failed', targetType: 'task', targetId: taskId, payload: { error: String(e.message).slice(0, 300), unrecordedMicroUsd: micro } }); }
+        catch { /* 库也写不进去：只能由进程的崩溃 / 错误日志兜底 */ }
+      }
+    }
   } catch (e) {
     audit(db, { actorKind: 'system', actorId: 'decision-check', action: 'decision_check_failed', targetType: 'task', targetId: taskId,
       payload: { entry, error: e.message } });

@@ -13,18 +13,39 @@ export const getParam = (db, taskId, key) => {
 };
 
 /**
- * 写一个参数（先把旧值作废）。
+ * 参数写入的唯一入口：同一作用域 + 键，先把旧现值作废、再写新值，**一个事务里做完**。
+ * 原来这两句散在 8 个文件里，一半没包事务 —— 两句之间进程死了，这个键就一行现值都没有，读的人悄悄退回默认值
+ * （上限、出网名单退回默认，就是闸门悄悄松了）。v31 起库层唯一索引保证同一作用域 + 键同一时刻只有一行现值。
+ *   作用域：{ taskId } 任务层 / { projectId } 项目层 / 两个都不给 = 部署层
+ *   by: { kind: 'user'|'agent', id }   governance: 'constitutional'|'execution'
+ *   value === undefined：只作废、不写新值（清掉这一层）
+ * @returns {string|null} 新行 id
+ */
+export function writeParam(db, { taskId = null, projectId = null, key, value, by, governance, layer = null, at = now() }) {
+  if (!by?.kind) throw new Error(`writeParam(${key})：要说明是谁写的（by.kind）`);
+  if (!governance && value !== undefined) throw new Error(`writeParam(${key})：要说明治理类别（governance）`);
+  const lay = layer ?? (taskId ? 'task' : projectId ? 'project' : 'system');
+  return db.tx(() => {
+    db.run(`UPDATE params SET superseded_at=?, valid_to=? WHERE task_id IS ? AND project_id IS ? AND key=? AND superseded_at IS NULL`, at, at, taskId, projectId, key);
+    if (value === undefined) return null;
+    const id = newId('p');
+    db.run(`INSERT INTO params (id,task_id,project_id,key,value,layer,governance_class,set_by_kind,set_by_id,valid_from,recorded_at)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?)`, id, taskId, projectId, key, JSON.stringify(value), lay, governance, by.kind, by.id ?? null, at, at);
+    return id;
+  });
+}
+
+/** 只作废、不写新值。 */
+export const clearParam = (db, { taskId = null, projectId = null, key, by = { kind: 'agent' }, at = now() }) => writeParam(db, { taskId, projectId, key, value: undefined, by, at });
+
+/**
+ * 写一个任务层参数（先把旧值作废）。
  *   by: { kind: 'user'|'agent', id }   governance: 'constitutional'|'execution'   layer: 'task'（默认）
  */
 export function setParam(db, { taskId, key, value, by, governance, layer = 'task' }) {
   if (!by?.kind) throw new Error(`setParam(${key})：要说明是谁写的（by.kind）`);
   if (!governance) throw new Error(`setParam(${key})：要说明治理类别（governance）`);
-  const t = now();
-  const id = newId('p');
-  db.run(`UPDATE params SET superseded_at=?, valid_to=? WHERE task_id=? AND key=? AND superseded_at IS NULL`, t, t, taskId, key);
-  db.run(`INSERT INTO params (id,task_id,key,value,layer,governance_class,set_by_kind,set_by_id,valid_from,recorded_at)
-          VALUES (?,?,?,?,?,?,?,?,?,?)`, id, taskId, key, JSON.stringify(value), layer, governance, by.kind, by.id ?? null, t, t);
-  return id;
+  return writeParam(db, { taskId, key, value, by, governance, layer });
 }
 
 // ── 项目层（v16）──────────────────────────────────────────────────────
@@ -43,11 +64,5 @@ export const getProjectParam = (db, projectId, key) => {
 export function setProjectParam(db, { projectId, key, value, by, governance }) {
   if (!by?.kind) throw new Error(`setProjectParam(${key})：要说明是谁写的（by.kind）`);
   if (!governance) throw new Error(`setProjectParam(${key})：要说明治理类别（governance）`);
-  const t = now();
-  db.run(`UPDATE params SET superseded_at=?, valid_to=? WHERE project_id=? AND task_id IS NULL AND key=? AND superseded_at IS NULL`, t, t, projectId, key);
-  if (value === null) return null;
-  const id = newId('p');
-  db.run(`INSERT INTO params (id,task_id,project_id,key,value,layer,governance_class,set_by_kind,set_by_id,valid_from,recorded_at)
-          VALUES (?,NULL,?,?,?,'project',?,?,?,?,?)`, id, projectId, key, JSON.stringify(value), governance, by.kind, by.id ?? null, t, t);
-  return id;
+  return writeParam(db, { projectId, key, value: value === null ? undefined : value, by, governance, layer: 'project' });
 }

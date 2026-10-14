@@ -14,13 +14,17 @@
 // 权限：任务动作 = 该任务的负责人（leadOf）；项目动作 = 项目 owner。调用方传 userId，这里判。
 
 import { now, audit, insertEdge } from '../db/db.mjs';
-import { voidOne } from './decisions.mjs';
+import { renameTask as storeTaskTitle, setTaskArchived as storeTaskArchived, setTaskOrder } from '../db/tasks.mjs';
+import { updateProject } from '../db/projects.mjs';
+import { voidOne, moveContractRules, markSupersedes } from './decisions.mjs';
 import { leadOf } from './routing.mjs';
+import { resetNotified } from './questions.mjs';
 import { createTaskFromSpec, projectTasks, chainGraph } from './project.mjs';
 import { maxOpenOf } from './project-settings.mjs';
 import { recordMessage } from './inbox.mjs';
 import { getParam } from './params.mjs';
 import { tl, contentLang, I18nError } from '../i18n/index.mjs';
+import { transition, transitionWhere } from '../db/state.mjs';
 
 const ENDED = ['done', 'aborted'];
 const ABORTABLE = ['planning', 'running', 'waiting', 'suspended'];
@@ -67,13 +71,12 @@ export function reopenTask(db, { taskId, userId, at = now() }) {
     let from = null; try { from = JSON.parse(last?.payload || '{}').from ?? null; } catch { /* 旧数据 */ }
     const stillOpen = db.one(`SELECT count(*) n FROM questions WHERE task_id=? AND status IN ('open','escalated')`, taskId).n > 0;
     const to = ['planning', 'suspended'].includes(from) ? from : stillOpen ? 'waiting' : 'running';
-    db.run(`UPDATE tasks SET status=? WHERE id=?`, to, taskId);
+    transition(db, 'tasks', taskId, to, { from: ['aborted'], audit: { action: 'task_reopened', actorKind: 'user', actorId: userId } });
     // 恢复后事项重新进待办：让守护进程再通知一次。
-    db.run(`UPDATE questions SET notified_at=NULL WHERE task_id=? AND status IN ('open','escalated')`, taskId);
-    audit(db, { actorKind: 'user', actorId: userId, action: 'task_reopened', targetType: 'task', targetId: taskId, payload: { from: 'aborted', to } });
+    resetNotified(db, { taskId });
     let projectResumed = false;
     if (project?.status === 'stalled' && t.project_order > 0) {
-      db.run(`UPDATE projects SET status='active' WHERE id=?`, project.id);
+      transition(db, 'projects', project.id, 'active');
       audit(db, { actorKind: 'user', actorId: userId, action: 'project_resumed', targetType: 'project', targetId: project.id, payload: { via: 'task_reopened', taskId, at } });
       projectResumed = true;
     }
@@ -102,16 +105,16 @@ export function redoProjectTask(db, { projectId, userId, taskId = null, note = n
   const verify = getParam(db, cur.id, 'task.verify_command');
   const verifyExtra = getParam(db, cur.id, 'task.verify_extra') ?? [];
   const dependsOn = getParam(db, cur.id, 'task.depends_on');   // 编号不变，边原样带过去；下游指向的也是编号，不用改
-  // 旧任务先退出链（createTaskFromSpec 自己开事务，不能嵌套；新建失败就放回去）。
-  db.run(`UPDATE tasks SET project_order=NULL WHERE id=?`, cur.id);
+  // 旧任务先退出链（新建失败就放回去）。不整段包事务：createTaskFromSpec 要建工作区、跑 git，攥着写锁太久。
+  setTaskOrder(db, cur.id, null);
   let created;
   try {
     // scope_paths 必须带过去（后来加的列）：漏了它，重做出来的任务越界判据是空的，悄悄退回散文启发式。
     created = createTaskFromSpec(db, { title: cur.title, goal: c.goal, scope: c.scope, scope_paths: (() => { try { return JSON.parse(c.scope_paths || '[]'); } catch { return []; } })(), definition_of_done: c.definition_of_done,
       constraints: JSON.parse(c.constraints || '[]'), verify_command: Array.isArray(verify) ? verify.join(' ') : undefined },
-    { userId: p.owner_id, projectId, order: cur.project_order, verifyExtra, dependsOn: Array.isArray(dependsOn) ? dependsOn : cur.dependsOn, batch: getParam(db, cur.id, 'task.batch') ?? null });
+    { userId: p.owner_id, projectId, order: cur.project_order, verifyExtra, dependsOn: Array.isArray(dependsOn) ? dependsOn : cur.dependsOn, batch: getParam(db, cur.id, 'task.batch') ?? null, derivedFrom: c.id });
   } catch (e) {
-    db.run(`UPDATE tasks SET project_order=? WHERE id=?`, cur.project_order, cur.id);
+    setTaskOrder(db, cur.id, cur.project_order);
     throw e;
   }
   db.tx(() => {
@@ -120,15 +123,15 @@ export function redoProjectTask(db, { projectId, userId, taskId = null, note = n
     // 可 createTaskFromSpec 只从 spec.rules 登记 —— 重做不传 rules，于是新任务的行为规则在清单上查不到，
     // 被判作废过的那几条也就没有标注可挂，而旧任务的那些仍是 active、与新任务并存成重复。
     // 行为规则整行**挪**给新任务（作废状态、裁定出处原样保留）；范围 / 验收命令新任务已经按自己的登记了，旧的作废掉。
-    db.run(`UPDATE decision_registry SET task_id=? WHERE task_id=? AND source_kind='contract' AND subject LIKE '%行为规则'`, created.taskId, cur.id);
+    moveContractRules(db, { fromTaskId: cur.id, toTaskId: created.taskId });
     // 用取代关系接上而不是直接作废：直接作废的会被当成"人判作废的条款"挂到旧任务页上。
     for (const d of db.all(`SELECT id, subject FROM decision_registry WHERE task_id=? AND source_kind='contract' AND status='active'`, cur.id)) {
       const kind = String(d.subject).split('｜').pop();
       const heir = db.one(`SELECT id FROM decision_registry WHERE task_id=? AND source_kind='contract' AND status='active' AND supersedes IS NULL AND subject LIKE ?`, created.taskId, `%${kind}`);
-      if (heir) db.run(`UPDATE decision_registry SET supersedes=? WHERE id=?`, d.id, heir.id);
+      if (heir) markSupersedes(db, { heirId: heir.id, priorId: d.id });
       voidOne(db, { id: d.id, by: userId ?? null, reason: tl(contentLang(db), '任务 #{order} 重做，由新任务 {taskId} 的契约接替', { order: cur.project_order, taskId: created.taskId }), at, supersededBy: heir?.id ?? null });
     }
-    db.run(`UPDATE projects SET status='active' WHERE id=?`, projectId);
+    transition(db, 'projects', projectId, 'active');
     audit(db, { actorKind: 'user', actorId: userId, action: 'project_task_redone', targetType: 'project', targetId: projectId,
       payload: { order: cur.project_order, oldTaskId: cur.id, newTaskId: created.taskId, note: note ? String(note).slice(0, 500) : null, at } });
   });
@@ -155,11 +158,11 @@ export function abortProject(db, { projectId, userId, why = null, at = now() }) 
     const rows = db.all(`SELECT id, status FROM tasks WHERE project_id=? AND project_order IS NOT NULL`, projectId).filter((t) => ABORTABLE.includes(t.status));
     let withdrawn = 0;
     for (const t of rows) {
-      db.run(`UPDATE tasks SET status='aborted' WHERE id=?`, t.id);
-      withdrawn += Number(db.run(`UPDATE questions SET status='withdrawn', resolved_at=? WHERE task_id=? AND status IN ('open','escalated')`, at, t.id).changes);
+      transition(db, 'tasks', t.id, 'aborted');
+      withdrawn += transitionWhere(db, 'questions', "task_id=? AND status IN ('open','escalated')", [t.id], 'withdrawn', { set: { resolved_at: at } });
       audit(db, { actorKind: 'user', actorId: userId, action: 'task_aborted', targetType: 'task', targetId: t.id, payload: { from: t.status, to: 'aborted', why: tl(contentLang(db), '所属项目已中止'), via: 'project_aborted' } });
     }
-    db.run(`UPDATE projects SET status='aborted' WHERE id=?`, projectId);
+    transition(db, 'projects', projectId, 'aborted');
     const merged = projectTasks(db, projectId).filter((t) => t.merged_at).length;
     audit(db, { actorKind: 'user', actorId: userId, action: 'project_aborted', targetType: 'project', targetId: projectId,
       payload: { from: p.status, why: why ? String(why).slice(0, 500) : null, tasksAborted: rows.map((t) => t.id), questionsWithdrawn: withdrawn, merged } });
@@ -175,7 +178,7 @@ export function renameTask(db, { taskId, title, userId }) {
   const next = cleanTitle(title);
   if (next === t.title) return { taskId, title: next, changed: false };
   db.tx(() => {
-    db.run(`UPDATE tasks SET title=? WHERE id=?`, next, taskId);
+    storeTaskTitle(db, taskId, next);
     audit(db, { actorKind: 'user', actorId: userId, action: 'task_renamed', targetType: 'task', targetId: taskId, payload: { from: t.title, to: next } });
   });
   return { taskId, title: next, changed: true };
@@ -185,7 +188,7 @@ export function renameProject(db, { projectId, title, userId }) {
   const next = cleanTitle(title);
   if (next === p.title) return { projectId, title: next, changed: false };
   db.tx(() => {
-    db.run(`UPDATE projects SET title=? WHERE id=?`, next, projectId);
+    updateProject(db, projectId, { title: next });
     audit(db, { actorKind: 'user', actorId: userId, action: 'project_renamed', targetType: 'project', targetId: projectId, payload: { from: p.title, to: next } });
   });
   return { projectId, title: next, changed: true };
@@ -198,7 +201,7 @@ export function setTaskArchived(db, { taskId, archived, userId, at = now() }) {
   if (archived && !ENDED.includes(t.status)) throw new I18nError('任务状态为 {status}，只有已结束（已完成 / 已中止）的任务能归档；进行中的请先中止', { status: t.status });
   if (!!t.archived_at === !!archived) return { taskId, archived: !!archived, changed: false };
   db.tx(() => {
-    db.run(`UPDATE tasks SET archived_at=? WHERE id=?`, archived ? at : null, taskId);
+    storeTaskArchived(db, taskId, archived ? at : null);
     audit(db, { actorKind: 'user', actorId: userId, action: archived ? 'task_archived' : 'task_unarchived', targetType: 'task', targetId: taskId, payload: {} });
   });
   return { taskId, archived: !!archived, changed: true };
@@ -208,7 +211,7 @@ export function setProjectArchived(db, { projectId, archived, userId, at = now()
   if (archived && !ENDED.includes(p.status)) throw new I18nError('项目状态为 {status}，只有已结束（已完成 / 已中止）的项目能归档；进行中的请先中止', { status: p.status });
   if (!!p.archived_at === !!archived) return { projectId, archived: !!archived, changed: false };
   db.tx(() => {
-    db.run(`UPDATE projects SET archived_at=? WHERE id=?`, archived ? at : null, projectId);
+    updateProject(db, projectId, { archivedAt: archived ? at : null });
     audit(db, { actorKind: 'user', actorId: userId, action: archived ? 'project_archived' : 'project_unarchived', targetType: 'project', targetId: projectId, payload: {} });
   });
   return { projectId, archived: !!archived, changed: true };

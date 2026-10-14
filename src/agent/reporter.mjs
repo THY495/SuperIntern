@@ -14,6 +14,7 @@
 // 散文；它挂了（厂商故障、预算触顶）就退回模板 —— 汇报永远能产生，
 // 尤其是"钱花光了"那一条，它必须在钱花光之后仍能说出口。
 
+import { LLM_ROLES } from '../llm/canonical.mjs';
 import { withOutputLang, contentLang, tl } from '../i18n/index.mjs';
 import { existsSync } from 'node:fs';
 import { runToolLoop } from '../llm/client.mjs';
@@ -46,16 +47,29 @@ export function falseDoneClaims(summary, standing) {
   return standing.filter((t) => !isFinished(t) && sentences.some((s) => claims(s) && labelsOf(t).some((l) => s.includes(l))));
 }
 
+/** 汇报窗口涉及的表（游标按它们各自的 rowid）。 */
+export const WINDOW_TABLES = ['audit_log', 'decisions', 'assumptions', 'revisions', 'questions', 'messages', 'usage_ledger'];
+
+/** 此刻各表的最大 rowid —— 下一份汇报从这里往后取（游标单调，不怕墙钟回拨）。 */
+export function windowCursor(db) {
+  return Object.fromEntries(WINDOW_TABLES.map((t) => [t, db.one(`SELECT COALESCE(MAX(rowid),0) m FROM ${t}`).m]));
+}
+
 /**
  * 自上次汇报以来发生了什么 —— **只读真相源**。返回结构化事实与其 id 清单。
- * @param {number} sinceTs 窗口起点（上次汇报 created_at；没有就是任务 created_at）
+ * @param {number|{sinceTs:number, cursor?:object}} since 窗口起点：上次汇报的游标（各表 rowid，优先）；
+ *   没有游标（第一份 / 覆盖整个任务的终版汇报 / 老汇报）就按时刻（上次汇报 created_at；没有就是任务 created_at）
  */
-export function gatherSince(db, taskId, sinceTs) {
+export function gatherSince(db, taskId, since) {
+  const { sinceTs, cursor = null } = typeof since === 'number' ? { sinceTs: since } : since;
+  // 每张表一个窗口条件：有游标按 rowid，没有按时刻列
+  const win = (table, tsCol) => (cursor && cursor[table] != null ? [`rowid>?`, cursor[table]] : [`${tsCol}>?`, sinceTs]);
   const task = db.one(`SELECT * FROM tasks WHERE id=?`, taskId);
+  const [aw, av] = win('audit_log', 'ts');
+  // ⚠️ OR 两边要括起来：原来写成 A OR B AND ts>?，按优先级是 A OR (B AND ts>?) —— 节点的事件不受窗口限制，全靠下面那行 JS 过滤兜着
   const events = db.all(`SELECT id, ts, action, target_type, target_id, payload FROM audit_log
-                          WHERE target_id IN (SELECT id FROM nodes WHERE task_id=?) OR target_id=?
-                          AND ts>? ORDER BY id`, taskId, taskId, sinceTs)
-    .filter((e) => e.ts > sinceTs)
+                          WHERE (target_id IN (SELECT id FROM nodes WHERE task_id=?) OR target_id=?)
+                          AND ${aw} ORDER BY id`, taskId, taskId, av)
     .map((e) => ({ ...e, payload: JSON.parse(e.payload || '{}') }));
   const titles = new Map(db.all(`SELECT id, title FROM nodes WHERE task_id=?`, taskId).map((n) => [n.id, n.title]));
 
@@ -71,24 +85,26 @@ export function gatherSince(db, taskId, sinceTs) {
     .includes(e.action)).map((e) => ({ action: e.action, id: e.target_id, title: titles.get(e.target_id),
     why: head(e.payload.why ?? e.payload.error ?? e.payload.message ?? e.payload.stopped, 120) }));
 
-  const decisions = db.all(`SELECT * FROM decisions WHERE task_id=? AND recorded_at>? ORDER BY recorded_at`, taskId, sinceTs);
-  const assumptions = db.all(`SELECT * FROM assumptions WHERE task_id=? AND recorded_at>? ORDER BY recorded_at`, taskId, sinceTs);
-  const revisions = db.all(`SELECT * FROM revisions WHERE task_id=? AND proposed_at>? ORDER BY proposed_at`, taskId, sinceTs);
-  const questions = db.all(`SELECT * FROM questions WHERE task_id=? AND asked_at>? ORDER BY asked_at`, taskId, sinceTs);
-  const messages = db.all(`SELECT * FROM messages WHERE task_id=? AND received_at>? AND kind<>'answer' ORDER BY received_at`, taskId, sinceTs);
+  const pick = (table, tsCol, extra = '') => { const [w, v] = win(table, tsCol); return db.all(`SELECT * FROM ${table} WHERE task_id=? AND ${w}${extra} ORDER BY ${tsCol}, rowid`, taskId, v); };
+  const decisions = pick('decisions', 'recorded_at');
+  const assumptions = pick('assumptions', 'recorded_at');
+  const revisions = pick('revisions', 'proposed_at');
+  const questions = pick('questions', 'asked_at');
+  const messages = pick('messages', 'received_at', " AND kind<>'answer'");
   const breaches = byAction('limit_breached').map((e) => ({ key: e.payload.key, human: e.payload.human, onHit: e.payload.on_hit ?? 'gate' }));
   // 超时链：审计的 target 是问题 id，不在上面那条按节点/任务取的查询里，单独取。
   // "超时 → 默认动作 → **下次汇报中标注**"：标注就是这里。
   const timeouts = db.all(`SELECT ts, action, target_id, payload FROM audit_log
-                           WHERE action IN ('question_defaulted','question_escalated','question_stuck') AND ts>?
-                           AND target_id IN (SELECT id FROM questions WHERE task_id=?) ORDER BY id`, sinceTs, taskId)
+                           WHERE action IN ('question_defaulted','question_escalated','question_stuck') AND ${aw}
+                           AND target_id IN (SELECT id FROM questions WHERE task_id=?) ORDER BY id`, av, taskId)
     .map((e) => ({ ...e, payload: JSON.parse(e.payload || '{}') }))
     .map((e) => ({ action: e.action, questionId: e.target_id, level: e.payload.level, defaultAction: e.payload.defaultAction ?? null,
       text: head(db.one(`SELECT text FROM questions WHERE id=?`, e.target_id)?.text ?? '', 120) }));
   const constitution = db.one(`SELECT version, recorded_at FROM constitutions WHERE task_id=? AND superseded_at IS NULL
                                ORDER BY version DESC LIMIT 1`, taskId);
-  const spend = db.one(`SELECT COALESCE(SUM(CASE WHEN ts>? THEN micro_usd ELSE 0 END),0) AS since,
-                               COALESCE(SUM(micro_usd),0) AS total FROM usage_ledger WHERE task_id=?`, sinceTs, taskId);
+  const [lw, lv] = win('usage_ledger', 'ts');
+  const spend = db.one(`SELECT COALESCE(SUM(CASE WHEN ${lw} THEN micro_usd ELSE 0 END),0) AS since,
+                               COALESCE(SUM(micro_usd),0) AS total FROM usage_ledger WHERE task_id=?`, lv, taskId);
   const counts = Object.fromEntries(db.all(`SELECT status, count(*) n FROM nodes WHERE task_id=? GROUP BY status`, taskId)
     .map((r) => [r.status, r.n]));
 
@@ -303,14 +319,19 @@ const SYSTEM = `你是一个长期运行的自主 agent 的**汇报生成器**�
  *
  * @param {object|null} client  null = 不调模型（预算触顶等"钱花光了还要说出口"的场合）
  */
-export async function makeReport(db, { taskId, trigger, triggerRef = null, client = null, tier = 'light' }) {
-  const prev = db.one(`SELECT id, created_at FROM reports WHERE task_id=? ORDER BY created_at DESC, rowid DESC LIMIT 1`, taskId);
+export async function makeReport(db, { taskId, trigger, triggerRef = null, client = null, tier = LLM_ROLES.reporter }) {
+  const prev = db.one(`SELECT id, created_at, cursor FROM reports WHERE task_id=? ORDER BY rowid DESC LIMIT 1`, taskId);
   // 终版汇报（task_done / verify_failed）覆盖**整个任务**，不是上一份汇报之后的几秒钟：
   // 它是签收与 PR 正文的取材口（"完成声明 + 终版报告"）。只取上一份之后的话，PR 正文会是
   // "本窗口只有一行状态" —— 因为 node_done 汇报刚写完，task_done 的窗口只剩 0.3 秒。
   const taskCreated = db.one(`SELECT created_at FROM tasks WHERE id=?`, taskId)?.created_at ?? 0;
-  const sinceTs = (trigger === 'task_done' || trigger === 'verify_failed') ? taskCreated : (prev?.created_at ?? taskCreated);
-  const f = gatherSince(db, taskId, sinceTs);
+  const whole = trigger === 'task_done' || trigger === 'verify_failed';
+  const sinceTs = whole ? taskCreated : (prev?.created_at ?? taskCreated);
+  // 窗口按上一份的游标切（各表 rowid，单调）；整任务的终版汇报、老汇报没有游标时按时刻。
+  // 游标在取材之前记：取材期间新写进来的，下一份还会再提一次 —— 宁可重提一次，不能漏。
+  const cursorNow = windowCursor(db);
+  let prevCursor = null; try { prevCursor = !whole && prev?.cursor ? JSON.parse(prev.cursor) : null; } catch { /* 坏值当没有 */ }
+  const f = gatherSince(db, taskId, { sinceTs, cursor: prevCursor });
   const lang = contentLang(db);
   const facts = renderFacts(f, lang);
   const selfDecided = renderSelfDecided(f, lang);
@@ -321,7 +342,7 @@ export async function makeReport(db, { taskId, trigger, triggerRef = null, clien
     try {
       let out = null;
       await runToolLoop(client, {
-        tier, system: withOutputLang(SYSTEM, contentLang(db)), tools: [SUBMIT_REPORT], maxTokens: 2000,
+        role: 'reporter', tier, system: withOutputLang(SYSTEM, contentLang(db)), tools: [SUBMIT_REPORT], maxTokens: 2000,
         messages: [{ role: 'user', content: [{ type: 'text',
           text: `触发：${trigger}${triggerRef ? `（${triggerRef}）` : ''}\n\n${facts}\n\n现在调用 submit_report。` }] }],
       }, {
@@ -362,9 +383,9 @@ export async function makeReport(db, { taskId, trigger, triggerRef = null, clien
   const t = now();
   db.tx(() => {
     db.run(`INSERT INTO reports (id,task_id,trigger,trigger_ref,since_report_id,since_ts,summary,body,facts,
-              generated_by,gaps,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
+              generated_by,gaps,created_at,cursor) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`,
     id, taskId, trigger, triggerRef, prev?.id ?? null, sinceTs, summary, body,
-    JSON.stringify(f.facts), generatedBy, JSON.stringify(gaps), t);
+    JSON.stringify(f.facts), generatedBy, JSON.stringify(gaps), t, JSON.stringify(cursorNow));
     // 出处：这份汇报因为哪个事件而存在；它读了哪些记录在 facts 里。
     if (triggerRef) insertEdge(db, id, triggerRef, 'derived_from', t);
     audit(db, { actorKind: 'agent', actorId: 'reporter', action: 'report_generated',
@@ -381,7 +402,7 @@ export const listReports = (db, taskId, { all = false } = {}) => db.all(
   `SELECT id, trigger, trigger_ref, summary, generated_by, gaps, read_at, created_at FROM reports
     WHERE task_id=? ${all ? '' : 'AND read_at IS NULL'} ORDER BY created_at, rowid`, taskId);
 
-export const markReportsRead = (db, ids) => {
+export const markReportsRead = (db, ids, { taskId = null } = {}) => {
   const t = now();
-  for (const id of ids) db.run(`UPDATE reports SET read_at=? WHERE id=? AND read_at IS NULL`, t, id);
+  for (const id of ids) db.run(`UPDATE reports SET read_at=? WHERE id=? AND read_at IS NULL${taskId ? ' AND task_id=?' : ''}`, t, String(id), ...(taskId ? [taskId] : []));
 };

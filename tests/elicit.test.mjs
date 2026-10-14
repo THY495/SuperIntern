@@ -20,6 +20,7 @@ import { assessTask } from '../src/core/daemon.mjs';
 import { ensureWorkspace } from '../src/core/workspace.mjs';
 import { LIMITS, limitOf } from '../src/core/limits.mjs';
 import { priorAnswers } from '../src/agent/planner.mjs';
+import { approvalOf, constitutionSources } from '../src/core/provenance.mjs';
 
 let pass = 0, fail = 0;
 const section = (t) => console.log(`\n${'─'.repeat(72)}\n${t}\n${'─'.repeat(72)}`);
@@ -121,6 +122,13 @@ section('4. 反馈 → v2；批准 → 宪法块生效、verify_command 落宪�
   eq(task(taskId).status, 'planning', '状态 planning');
   assert(db.one(`SELECT set_by_kind, governance_class FROM params WHERE task_id=? AND key='draft.stage' AND superseded_at IS NULL`, taskId).set_by_kind === 'user', '批准是人签的（set_by_kind=user）');
   eq(db.one(`SELECT count(*) n FROM audit_log WHERE action='draft_approved' AND target_id=?`, taskId).n, 1, '审计 draft_approved');
+  // 修改溯源：批准绑在 v2 上、v1 没有；v2 的来源有想法、对 v1 的批注、上一版
+  const apv = approvalOf(db, v2.id);
+  assert(apv?.kind === 'approval' && apv.by.length === 1 && apv.messageId, '批准绑在批准的那一版（v2）上，指向批准答复');
+  const v1 = db.one(`SELECT id FROM constitutions WHERE task_id=? AND version=1`, taskId);
+  eq(approvalOf(db, v1.id), null, 'v1 没被批准过 —— 批准不跨版本');
+  const srcs = constitutionSources(db, v2.id);
+  assert(srcs.ideas.length === 1 && srcs.messages.some((m) => /范围缩到只有一个文件/.test(m.body)), 'v2 出自：最初的想法 + 人对 v1 的批注');
   // 这条入口批准的契约曾经一条都不进决定登记，决定比对对它完全看不见
   const reg = db.all(`SELECT subject, statement FROM decision_registry WHERE task_id=? AND source_kind='contract' AND status='active'`, taskId);
   const cons = JSON.parse(v2.constraints || '[]');

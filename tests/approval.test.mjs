@@ -20,6 +20,7 @@ import { requestAppend, appendStateOf } from '../src/agent/project-append.mjs';
 import { createProject } from '../src/core/project.mjs';
 import { recordAnswer } from '../src/core/inbox.mjs';
 import { getParam } from '../src/core/params.mjs';
+import { insertQuestion } from '../src/core/questions.mjs';
 import { assessTask, assessProjectPlan } from '../src/core/daemon.mjs';
 import { startWeb, taskDetail } from '../src/web/server.mjs';
 
@@ -183,8 +184,10 @@ section('5. 看板：答之前实时预览、答之后回显、历史按判读�
     const pv2 = await post(`/api/tasks/${taskId}/interpret`, { questionId: q1, body: 'A，但是换个名字' });
     eq(pv2.result.reading.verdict, 'feedback', '预览接口：「A，但…」→ 要改');
     eq(db.one(`SELECT count(*) n FROM messages WHERE task_id=?`, taskId).n, 0, '预览不落库（没有任何消息）');
-    const other = await post(`/api/tasks/${taskId}/interpret`, { questionId: 'q_nope', body: 'A' });
-    eq(other.result.reading, null, '不是方案批准事项：没有预览');
+    const qPlain = insertQuestion(db, { taskId, level: 3, text: '普通事项', status: 'answered' });   // 已结的：开着的会挡住下面的重新起草
+    const other = await post(`/api/tasks/${taskId}/interpret`, { questionId: qPlain, body: 'A' });
+    eq(other.result?.reading, null, '不是方案批准事项：没有预览');
+    eq((await post(`/api/tasks/${taskId}/interpret`, { questionId: 'q_nope', body: 'A' })).status, 404, '不存在（或不属于这个任务）的事项：404');
     const an = await post(`/api/tasks/${taskId}/answer`, { questionId: q1, body: 'A，但是换个名字' });
     assert(an.ok && an.result.reading?.text.startsWith('已提交，系统理解为：要改'), '答复接口的返回里带回显：系统理解为：要改');
     d = taskDetail(db, taskId, { userId: owner.userId });

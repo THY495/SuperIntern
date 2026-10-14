@@ -14,11 +14,18 @@
 // 本文件不 import users.mjs / digest.mjs（它们反过来依赖这里）。
 
 import { newId, now, audit } from '../db/db.mjs';
-import { validateRules, leadOf, advanceRoute, QUORUM_ALL, DECISION_TYPES } from './routing.mjs';
+import { setTaskOwner, transferOpenProjectTasks } from '../db/tasks.mjs';
+import { updateUser, revokeTokens } from '../db/users.mjs';
+import { updateProject } from '../db/projects.mjs';
+import { validateRules, leadOf, advanceRoute, QUORUM_ALL, DECISION_TYPES, setRuleRecipients, setProfileBindings, setDutyUsers } from './routing.mjs';
+import { setRecipients } from './questions.mjs';
+import { revokeCredentialsOf } from './credentials.mjs';
 import { tl, contentLang, I18nError } from '../i18n/index.mjs';
+import { transition } from '../db/state.mjs';
 
 const OPEN_PROJECT = `('proposed','active','stalled')`;
-const ENDED_TASK = `('done','aborted')`;
+const ENDED_STATUSES = ['done', 'aborted'];
+const ENDED_TASK = `(${ENDED_STATUSES.map((s) => `'${s}'`).join(',')})`;
 const DRY = Symbol('handover-dry-run');
 
 export function normScope(scope) {
@@ -97,12 +104,12 @@ function apply(db, { fromUserId, toUserId, scope, note = null, byUserId, thenDis
 
   // ① 归属
   for (const p of resp.projects) {
-    db.run(`UPDATE projects SET owner_id=? WHERE id=?`, to.id, p.id);
-    db.run(`UPDATE tasks SET owner_id=? WHERE project_id=? AND owner_id=? AND status NOT IN ${ENDED_TASK}`, to.id, p.id, from.id);
+    updateProject(db, p.id, { ownerId: to.id });
+    transferOpenProjectTasks(db, { projectId: p.id, fromUserId: from.id, toUserId: to.id, endedStatuses: ENDED_STATUSES });
     ch.projects.push({ id: p.id, title: p.title, status: p.status });
   }
   for (const t of resp.soloTasks) {
-    db.run(`UPDATE tasks SET owner_id=? WHERE id=?`, to.id, t.id);
+    setTaskOwner(db, t.id, to.id);
     ch.soloTasks.push({ id: t.id, title: t.title, status: t.status });
   }
 
@@ -111,7 +118,7 @@ function apply(db, { fromUserId, toUserId, scope, note = null, byUserId, thenDis
   for (const r of resp.routing) {
     let next = [...new Set(r.recipients.map((x) => (x === `user:${from.id}` ? `user:${to.id}` : x === `inform:user:${from.id}` ? `inform:user:${to.id}` : x)))];
     if (next.includes(`user:${to.id}`)) next = next.filter((x) => x !== `inform:user:${to.id}`);
-    db.run(`UPDATE routing_rules SET recipients=? WHERE id=?`, JSON.stringify(next), r.id);
+    setRuleRecipients(db, r.id, next);
     ch.routing.push({ key: r.project_id, decisionType: r.decision_type, label: DECISION_TYPES[r.decision_type]?.label ?? r.decision_type, scope: r.scope, position: r.position,
       before: r.recipients, after: next, merged: next.length < r.recipients.length });
   }
@@ -119,7 +126,7 @@ function apply(db, { fromUserId, toUserId, scope, note = null, byUserId, thenDis
     const row = db.one(`SELECT bindings FROM routing_profiles WHERE project_id=?`, b.key);
     const obj = JSON.parse(row.bindings || '{}');
     for (const k of b.placeholders) obj[k] = to.id;
-    db.run(`UPDATE routing_profiles SET bindings=?, updated_at=? WHERE project_id=?`, JSON.stringify(obj), at, b.key);
+    setProfileBindings(db, b.key, obj, at);
     ch.bindings.push(b);
   }
   for (const key of keys) {
@@ -136,7 +143,7 @@ function apply(db, { fromUserId, toUserId, scope, note = null, byUserId, thenDis
   // ③ 值班表
   for (const d of resp.duty) {
     const next = d.users.includes(to.id) ? d.users.filter((u) => u !== from.id) : d.users.map((u) => (u === from.id ? to.id : u));
-    db.run(`UPDATE duty_calendar SET users=?, updated_at=? WHERE project_id=?`, JSON.stringify(next), at, d.key);
+    setDutyUsers(db, d.key, next, at);
     ch.duty.push({ key: d.key, before: d.users, after: next, merged: next.length < d.users.length });
   }
 
@@ -145,7 +152,7 @@ function apply(db, { fromUserId, toUserId, scope, note = null, byUserId, thenDis
     const brief = { id: q.id, taskId: q.task_id, taskTitle: q.task_title, label: DECISION_TYPES[q.decision_type]?.label ?? q.decision_type ?? tl(L, '事项'), text: oneLine(q.text) };
     if (!q.to.includes(from.id)) {            // 只是知会
       const inf = swap(q.inf, from.id, to.id).filter((u) => !q.to.includes(u));
-      db.run(`UPDATE questions SET informed=? WHERE id=?`, JSON.stringify(inf), q.id);
+      setRecipients(db, q.id, { informed: inf });
       ch.informed.push(brief); continue;
     }
     if (db.one(`SELECT 1 FROM answers WHERE question_id=? AND user_id=? AND stance='answer'`, q.id, from.id)) { ch.kept.push(brief); continue; }
@@ -157,9 +164,9 @@ function apply(db, { fromUserId, toUserId, scope, note = null, byUserId, thenDis
         const lead = leadOf(db, q.task_id);
         toWhom = lead ? [lead] : [];
         if (route?.rows) for (const r of route.rows) { r.recipients = toWhom; r.quorum = '1'; }
-        db.run(`UPDATE questions SET addressed_to=?, route=?, route_due_at=NULL WHERE id=?`, JSON.stringify(toWhom), route ? JSON.stringify(route) : q.route, q.id);
+        setRecipients(db, q.id, { addressedTo: toWhom, route: route ?? q.route, routeDueAt: null });
       }
-      db.run(`UPDATE questions SET notified_at=NULL WHERE id=?`, q.id);
+      // 新收件人由通知按"推到过谁"补推（core/questions.mjs），不用再清推送记录 —— 原来清掉会把没换的人也重推一遍
       audit(db, { actorKind: 'user', actorId: byUserId, action: 'conflict_escalated', targetType: 'question', targetId: q.id, payload: { why: tl(L, '冲突方交接'), party: from.id, to: toWhom } });
       ch.escalated.push({ ...brief, to: toWhom }); continue;
     }
@@ -177,7 +184,7 @@ function apply(db, { fromUserId, toUserId, scope, note = null, byUserId, thenDis
       route.handed_over = true;
     }
     const inf = q.inf.filter((u) => !nextTo.includes(u));
-    db.run(`UPDATE questions SET addressed_to=?, informed=?, route=?, notified_at=NULL WHERE id=?`, JSON.stringify(nextTo), JSON.stringify(inf), route ? JSON.stringify(route) : q.route, q.id);
+    setRecipients(db, q.id, { addressedTo: nextTo, informed: inf, route: route ?? q.route });
     audit(db, { actorKind: 'user', actorId: byUserId, action: 'question_transferred', targetType: 'question', targetId: q.id, payload: { from: q.to, to: nextTo, via: 'handover', quorum: dropped } });
     if (dropped) ch.quorumDrops.push({ ...brief, ...dropped });
     ch.transferred.push({ ...brief, merged: nextTo.length < q.to.length });
@@ -200,9 +207,10 @@ function apply(db, { fromUserId, toUserId, scope, note = null, byUserId, thenDis
 }
 
 function doDisable(db, { user, at }) {
-  const n = db.run(`UPDATE tokens SET revoked_at=? WHERE user_id=? AND revoked_at IS NULL`, at, user.id).changes;
-  db.run(`UPDATE users SET disabled_at=? WHERE id=?`, at, user.id);
-  return Number(n);
+  const n = revokeTokens(db, user.id, at);
+  revokeCredentialsOf(db, { userId: user.id, at });   // 他自己的连接（个人令牌、SSH 密钥）一并作废
+  updateUser(db, user.id, { disabledAt: at });
+  return n;
 }
 
 // denied：拒绝时抛的报错（按动作各写一句，英文才翻得通）
@@ -305,7 +313,7 @@ export function decideHandoverRequest(db, { requestId, decision, byUserId, note 
       audit(db, { actorKind: 'user', actorId: byUserId, action: 'handover_executed', targetType: 'user', targetId: r.from_user, payload: slim(ch, requestId) });
     }
     const status = { approve: 'approved', reject: 'rejected', withdraw: 'withdrawn' }[decision];
-    db.run(`UPDATE handover_requests SET status=?, decided_by=?, decided_at=?, decide_note=? WHERE id=?`, status, byUserId, at, note ? String(note).slice(0, 1000) : null, requestId);
+    transition(db, 'handover_requests', requestId, status, { from: ['open'], set: { decided_by: byUserId, decided_at: at, decide_note: note ? String(note).slice(0, 1000) : null } });
     audit(db, { actorKind: 'user', actorId: byUserId, action: `handover_${status}`, targetType: 'user', targetId: r.from_user, payload: { requestId, note: note ? String(note).slice(0, 300) : null } });
     return { requestId, status, changes: ch };
   }, { immediate: true });
@@ -339,7 +347,7 @@ export function enableUser(db, { userId, byUserId }) {
   if (!u) throw new I18nError('成员不存在：{id}', { id: userId });
   if (!u.disabled_at) throw new I18nError('{name} 未停用，无需启用', { name: u.display_name });
   db.tx(() => {
-    db.run(`UPDATE users SET disabled_at=NULL WHERE id=?`, userId);
+    updateUser(db, userId, { disabledAt: null });
     audit(db, { actorKind: 'user', actorId: byUserId, action: 'user_enabled', targetType: 'user', targetId: userId, payload: {} });
   });
   return { userId };

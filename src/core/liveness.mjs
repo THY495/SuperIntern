@@ -34,6 +34,7 @@ import { chainGraph } from './project.mjs';
 import { answerableQuestion, waitingOnHuman } from './addressee.mjs';
 import { maxOpenOf } from './project-settings.mjs';
 import { appendStateOf, appendPending } from '../agent/project-append.mjs';
+import { insertQuestion } from './questions.mjs';
 
 /** 合法的"静止理由"就这四种；第五种 unknown 不是理由，是缺陷。 */
 export const STALL_KINDS = {
@@ -207,8 +208,7 @@ export function livelocks(db, { threshold = REPEAT_THRESHOLD, at = now() } = {})
 // ── 出口：升成一条给负责人的事项 ─────────────────────────────────────────
 function raise(db, { taskId, text, at }) {
   const id = newId('q');
-  db.run(`INSERT INTO questions (id,task_id,node_id,level,level_source,text,default_action,asked_at,timeout_at,status)
-          VALUES (?,?,NULL,3,'hard_rule',?,NULL,?,NULL,'open')`, id, taskId, text, at);
+  insertQuestion(db, { id: id, taskId: taskId, level: 3, text: text, askedAt: at });
   // 借用 structural 这一类：它是 level3（解析后必含负责人）且禁 default（不会到期自己消失）—— 正是
   // 报警需要的两条性质。不新开第九种决策类型：那要动 routing-templates 与所有已存的路由表，代价远大于收益。
   const r = routeQuestion(db, { questionId: id, decisionType: 'ops', typeSource: 'hard_rule', at });
@@ -221,15 +221,20 @@ const ERROR_NAMES = {
   project_advance_failed: N_('合并 / 推进出错'), task_verify_failed: N_('验收没过'), env_setup_failed: N_('自动装依赖失败'),
   preview_failed: N_('页面截图没截出来'), replan_failed: N_('重新规划失败'), project_verify_failed: N_('项目验收没过'),
   project_task_integrate_verify_failed: N_('合进项目分支后重跑验收没过'), handback_raise_failed: N_('挂事项失败'),
+  orchestrator_exit: N_('执行进程出错退出'),
 };
 const ERROR_WINDOW_MS = 6 * 60 * 60_000;
 export function lastErrorOf(db, task, { at = now() } = {}) {
+  // 编排器崩溃退出（orchestrator_exit kind=crash）也算：原来只认 *_failed / *_error，崩溃的停等事项里一个字的原因都没有，人得去翻活动
   const row = db.one(`SELECT action, ts, payload FROM audit_log
-    WHERE target_id IN (?, ?) AND (action LIKE '%\\_failed' ESCAPE '\\' OR action LIKE '%\\_error' ESCAPE '\\') AND ts >= ?
+    WHERE target_id IN (?, ?) AND ts >= ?
+      AND (action LIKE '%\\_failed' ESCAPE '\\' OR action LIKE '%\\_error' ESCAPE '\\'
+        OR (action='orchestrator_exit' AND json_extract(payload, '$.kind')='crash'))
     ORDER BY id DESC LIMIT 1`, task.id, task.project_id ?? task.id, at - ERROR_WINDOW_MS);
   if (!row) return null;
   const p = parse(row.payload);
-  const msg = String(p.error ?? p.why ?? p.tail ?? '').trim().split('\n').slice(-3).join(' ').slice(0, 300);
+  const e = p.error && typeof p.error === 'object' ? p.error.message : p.error;
+  const msg = String(e ?? p.why ?? p.tail ?? '').trim().split('\n').slice(-3).join(' ').slice(0, 300);
   const L = contentLang(db);
   return { action: row.action, at: row.ts, name: ERROR_NAMES[row.action] ? tlN(L, ERROR_NAMES[row.action]) : tl(L, '出错'), msg, sig: `${row.action}:${msg.slice(0, 120)}` };
 }
@@ -237,7 +242,9 @@ export function lastErrorOf(db, task, { at = now() } = {}) {
 const stallText = (s, idleMin, err, L) => {
   const state = s.assessed ?? tl(L, '无');
   const ago = err ? Math.max(0, Math.round((s.at - err.at) / 60_000)) : 0;
-  return `${markOf(L, 'stall')}${tl(L, '任务「{title}」已经 {min} 分钟没有任何动静，而系统说不出它在等谁。', { title: s.title ?? s.taskId, min: idleMin })}\n\n`
+  const lead = idleMin >= 1 ? tl(L, '任务「{title}」已经 {min} 分钟没有任何动静，而系统说不出它在等谁。', { title: s.title ?? s.taskId, min: idleMin })
+    : tl(L, '任务「{title}」刚停下，而系统说不出它在等谁。', { title: s.title ?? s.taskId });
+  return `${markOf(L, 'stall')}${lead}\n\n`
     + `${String(s.why).includes(tl(L, '「{state}」', { state })) ? tl(L, '{why}。', { why: s.why }) : tl(L, '系统对它的判断是「{state}」——{why}。', { state, why: s.why })}\n`
     + (err ? `${err.msg ? tl(L, '最近一次出错（{min} 分钟前）：{name}：{msg}', { min: ago, name: err.name, msg: err.msg }) : tl(L, '最近一次出错（{min} 分钟前）：{name}', { min: ago, name: err.name })}\n` : '')
     + `${tl(L, '按规则，一个没结束的任务必须在等四样东西之一：它自己（有活着的进程）、一个到点的时刻、某个人（而且\n那条事项真在那个人的收件箱里）、或者另一件没完成的事。这个任务四样都不占。')}\n\n`
@@ -273,19 +280,37 @@ const loopText = (l, L) => `${markOf(L, 'loop')}${tl(L, '任务「{title}」在�
  * 去重靠判据本身：报警事项一挂上去，这个任务下一轮就解引用得到人，kind 从 unknown 变成 human，不会再报。
  * 空转那条得自己去重（任务上本来就有开着的事项），用 LOOP_MARK 前缀认。
  */
+/** 现在就违反判据的：说不出在等谁、过了宽限期、没被人回过 B。纯读库（运行期不变量的不变量与下面的扫描共用这一处判断）。 */
+export function stuckNow(db, { at = now(), graceMs = UNKNOWN_GRACE_MS, assess, all = null, ...opts } = {}) {
+  const out = [];
+  for (const s of all ?? stalls(db, { at, assess, ...opts })) {
+    if (s.kind !== 'unknown') continue;
+    const last = lastActivityAt(db, s.taskId);
+    // 宽限期是防"正常的一瞬间"被当成停摆。系统自己已经下了"要人 / 放弃了"的结论（编排器崩溃退出、退避用尽）的，
+    // 不是一瞬间：再等 30 分钟只是让人晚知道（崩溃到有人收到事项 = 30 分钟空转）
+    const settled = /^(needs_human|gave_up):/.test(String(s.assessed ?? ''));
+    if (!settled && last && at - last < graceMs) continue;
+    const task = db.one(`SELECT id, project_id FROM tasks WHERE id=?`, s.taskId);
+    const err = task ? lastErrorOf(db, task, { at }) : null;
+    if (acknowledged(db, s, err)) continue;
+    out.push({ ...s, idleMin: last ? Math.round((at - last) / 60_000) : 0, err });
+  }
+  return out;
+}
+
+/** 系统挂出的停等 / 空转事项里还开着的（人还没处理）—— 违反已经报给人、还没了结。 */
+export function openLivenessQuestions(db) {
+  const S = markLike('text', 'stall'), LL = markLike('text', 'loop');
+  return db.all(`SELECT id, task_id FROM questions WHERE status IN ('open','escalated') AND (${S.sql} OR ${LL.sql})`, ...S.params, ...LL.params);
+}
+
 export function sweepLiveness(db, { at = now(), graceMs = UNKNOWN_GRACE_MS, threshold = REPEAT_THRESHOLD, assess, onEvent = () => {}, ...opts } = {}) {
   const L = contentLang(db);
   const all = stalls(db, { at, assess, ...opts });
   const raised = [], stuck = [];
-  for (const s of all) {
-    if (s.kind !== 'unknown') continue;
-    const last = lastActivityAt(db, s.taskId);
-    if (last && at - last < graceMs) continue;
-    const idleMin = last ? Math.round((at - last) / 60_000) : 0;
-    const task = db.one(`SELECT id, project_id FROM tasks WHERE id=?`, s.taskId);
-    const err = task ? lastErrorOf(db, task, { at }) : null;
-    if (acknowledged(db, s, err)) continue;
-    stuck.push({ ...s, idleMin });
+  for (const { err, ...s } of stuckNow(db, { at, graceMs, all })) {
+    const idleMin = s.idleMin;
+    stuck.push(s);
     const r = raise(db, { taskId: s.taskId, text: stallText(s, idleMin, err, L), at });
     audit(db, { actorKind: 'system', actorId: 'liveness', action: 'stall_detected', targetType: 'task', targetId: s.taskId,
       payload: { assessed: s.assessed, why: s.why, idleMin, questionId: r.questionId, addressedTo: r.addressedTo, errSig: err?.sig ?? null, lastError: err ? tl(L, '{name}：{msg}', { name: err.name, msg: err.msg }) : null } });

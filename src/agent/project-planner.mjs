@@ -18,7 +18,9 @@ import { execFileSync } from 'node:child_process';
 import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { newId, now, audit } from '../db/db.mjs';
-import { toolCallsOf, textOf, truncatedEmpty, TruncatedEmptyError } from '../llm/canonical.mjs';
+import { insertCarrierTask } from '../db/tasks.mjs';
+import { insertProject, updateProject } from '../db/projects.mjs';
+import { toolCallsOf, textOf, truncatedEmpty, TruncatedEmptyError, LLM_ROLES } from '../llm/canonical.mjs';
 import { answerOf } from './elicitor.mjs';
 import { reservationOf, readApproval, confirmBeforeRevising, feedbackOf, REACHED_LABELS } from './approval.mjs';
 import { initProjectRepo, createProjectTasks, validateProjectSpec, renderRules, renderDeps, scopeOverlaps, renderScopeOverlaps, renderScopePaths, SCOPE_PATHS_NOTE, scopePathsNote, PROJECT_TASK_RUNTIME_MS } from '../core/project.mjs';
@@ -29,6 +31,11 @@ import { validateParallelPlan, TASK_KINDS, recordSharedPaths } from '../core/par
 import { skeletonCoverageProblems, cliCoverageProblems } from '../core/contract-coverage.mjs';
 import { getParam, setParam } from '../core/params.mjs';
 import { diffSpecs, renderSpecDiff, roundHistory, renderRoundHistory } from './spec-diff.mjs';
+import { transition, transitionWhere } from '../db/state.mjs';
+import { insertQuestion } from '../core/questions.mjs';
+import { bindApproval } from '../core/provenance.mjs';
+import { stopwatch } from '../core/clock.mjs';
+import { GIT_HARDEN } from '../core/git.mjs';
 
 const MAX_TASKS = 8;
 // 完成 token 预算含推理（DeepSeek：reasoning_tokens ⊂ completion_tokens）。effort=high 曾把 8000 吃光、回空消息。只按实际用量计费。
@@ -66,6 +73,7 @@ const PROPOSE_PROJECT = {
             },
             constraints: { type: 'array', items: { type: 'string' }, description: '约束列表。后面的任务必须含"既有测试文件一行不许改、不许删"' },
             depends_on: { type: 'array', items: { type: 'integer' }, description: '本任务依赖的任务**编号**（它要用到那些任务的产物，它们合并后本任务才开工）。编号 = 任务清单里的序号：本草案的任务从"起始编号"起依次递增，已有任务用给你的清单上的编号。只能写已有任务或本草案里排在前面的任务。**不依赖任何任务就写 []**；不写这个字段 = 依赖前一个编号（线性）。只写真实的依赖：没有依赖关系的任务不要串起来 —— 多余的边会让无关的任务互相等' },
+            requested_by: { type: 'array', items: { type: 'string' }, description: '（只在给已有项目添加任务、且提示里列了"这一轮的需求出自几个人"时填）这个任务是为谁的需求做的：填那份名单上的名字，原样照抄；一个任务同时服务了几个人的需求就都写上。系统按它叫提需求的人来签收' },
             blocks: { type: 'array', items: { type: 'integer' }, description: '（只在给已有项目添加任务时用，通常不需要）让某个**已有的、还没开工的**任务等本任务：写它的编号。只在人明确要求"先做这个再做那个"，或那个任务不先有本任务就做不成时用。不改那个任务的契约，只改先后' },
             verify_command: { type: 'string', description: '本任务自己的验收命令：**一条**命令，在工作区根目录直接执行（按空白切成 argv，不经 shell：不能有管道、&&、$( )、重定向、多行）。只写本任务新增的测试；前面任务的验收命令系统会自动累加，不要重复' },
           },
@@ -193,10 +201,8 @@ export function startProjectFromBrief(db, { userId, brief, source = null, home, 
   const t = now();
   const ttl = title?.trim() || titleFromText(text);
   const carrierId = newId('t');
-  db.run(`INSERT INTO projects (id,owner_id,title,brief,repo,branch,base_ref,source,status,draft_version,created_at) VALUES (?,?,?,?,?,?,?,?,'proposed',0,?)`,
-    projectId, userId, ttl, text, repo, branch, baseRef, (source ? String(source) : null), t);
-  db.run(`INSERT INTO tasks (id,owner_id,title,status,created_at,project_id,project_order) VALUES (?,?,?,'planning',?,?,0)`,
-    carrierId, userId, tl(contentLang(db), '项目规划：{title}', { title: ttl }), t, projectId);
+  insertProject(db, { id: projectId, ownerId: userId, title: ttl, brief: text, repo, branch, baseRef, source: source ? String(source) : null, status: 'proposed', createdAt: t });
+  insertCarrierTask(db, { id: carrierId, ownerId: userId, projectId, title: tl(contentLang(db), '项目规划：{title}', { title: ttl }), createdAt: t });
   audit(db, { actorKind: 'user', actorId: userId, action: 'project_created', targetType: 'project', targetId: projectId,
     payload: { title: ttl, repo, branch, baseRef, source: (source ? String(source) : null), proposed: true, carrier: carrierId, briefBytes: text.length } });
   applyEgressDefaults(db, { projectId, userId });   // 管理员勾过的默认放行源
@@ -208,7 +214,7 @@ export const carrierTask = (db, projectId) => db.one(`SELECT * FROM tasks WHERE 
 /** 仓库速览给模型：文件清单（最多 300 行）+ README 开头。规划器没有沙箱，看不到代码本身。 */
 function repoGlance(repo) {
   let files = '';
-  try { files = execFileSync('git', ['ls-files'], { cwd: repo, encoding: 'utf8' }).trim(); } catch { files = ''; }
+  try { files = execFileSync('git', [...GIT_HARDEN, 'ls-files'], { cwd: repo, encoding: 'utf8' }).trim(); } catch { files = ''; }
   const list = files ? files.split('\n') : [];
   const shown = list.slice(0, 300).join('\n') + (list.length > 300 ? `\n… 共 ${list.length} 个文件` : '');
   let readme = '';
@@ -264,7 +270,7 @@ export function renderProposal(spec, version, notes, { maxOpen = DEFAULT_MAX_OPE
 /**
  * 规划器的一次寿命。返回 { kind: 'proposed'|'approved'|'abandoned'|'noop'|'failed', ... }。
  */
-export async function planProject(db, { client, projectId, tier = 'heavy', maxAttempts = 3 }) {
+export async function planProject(db, { client, projectId, tier = LLM_ROLES.project_planner, maxAttempts = 3 }) {
   const p = db.one(`SELECT * FROM projects WHERE id=?`, projectId);
   if (!p) throw new I18nError('没有这个项目：{id}', { id: projectId });
   const L = contentLang(db);
@@ -274,14 +280,15 @@ export async function planProject(db, { client, projectId, tier = 'heavy', maxAt
   if (!carrier) throw new I18nError('这个项目不是从规划开始的（没有载体任务），用 project new --file');
 
   const startedAt = now();
+  const elapsed = stopwatch();   // 时长用单调时钟；startedAt 只作时间戳
   audit(db, { actorKind: 'agent', actorId: 'project_planner', action: 'project_planner_started', targetType: 'project', targetId: projectId,
     payload: { pid: process.pid, tier, version: p.draft_version } });
   const exit = (kind, extra = {}) => {
     audit(db, { actorKind: 'agent', actorId: 'project_planner', action: 'project_planner_exit', targetType: 'project', targetId: projectId,
-      payload: { pid: process.pid, kind, elapsedMs: now() - startedAt, ...extra } });
+      payload: { pid: process.pid, kind, elapsedMs: Math.round(elapsed()), ...extra } });
     return { kind, ...extra };
   };
-  if (carrier.status === 'running') db.run(`UPDATE tasks SET status='planning' WHERE id=?`, carrier.id);
+  if (carrier.status === 'running') transition(db, 'tasks', carrier.id, 'planning');
 
   try {
     if (appending) {
@@ -301,8 +308,13 @@ export async function planProject(db, { client, projectId, tier = 'heavy', maxAt
       if (!a) return exit('noop', { why: tl(L, '草案等人批，但找不到答复') });
       const verdict = readApproval(db, { taskId: carrier.id, questionId: p.draft_question, body: a.body, userId: a.sender_id, version: p.draft_version });
       if (verdict === 'approve') {
-        db.run(`UPDATE projects SET status='active' WHERE id=?`, projectId);
-        db.run(`UPDATE tasks SET status='done' WHERE id=?`, carrier.id);
+        transition(db, 'projects', projectId, 'active');
+        // 批准绑到各任务的这一版契约上：任务在出草案时就建好了，批准的就是它们此刻的契约
+        for (const t of db.all(`SELECT id FROM tasks WHERE project_id=? AND id<>? AND status<>'aborted'`, projectId, carrier.id)) {
+          const c = db.one(`SELECT id FROM constitutions WHERE task_id=? AND superseded_at IS NULL ORDER BY version DESC LIMIT 1`, t.id);
+          if (c) bindApproval(db, { constitutionId: c.id, messageId: a.id });
+        }
+        transition(db, 'tasks', carrier.id, 'done');
         // 批准时带的保留意见记进约定清单
         const resv = reservationOf(a.body);
         if (resv) recordReservation(db, { projectId, subject: tl(L, '批准项目契约草案 v{version} 时的保留意见', { version: p.draft_version }), text: resv, sourceKind: 'contract', sourceId: p.draft_question, by: a.sender_id });
@@ -311,8 +323,8 @@ export async function planProject(db, { client, projectId, tier = 'heavy', maxAt
         return exit('approved', { version: p.draft_version });
       }
       if (verdict === 'abandon') {
-        db.run(`UPDATE projects SET status='aborted' WHERE id=?`, projectId);
-        db.run(`UPDATE tasks SET status='aborted' WHERE project_id=?`, projectId);
+        transition(db, 'projects', projectId, 'aborted');
+        transitionWhere(db, 'tasks', 'project_id=?', [projectId], 'aborted');
         audit(db, { actorKind: 'user', actorId: a.sender_id, action: 'project_abandoned', targetType: 'project', targetId: projectId,
           payload: { version: p.draft_version, questionId: p.draft_question, answer: String(a.body).slice(0, 200) } });
         return exit('abandoned');
@@ -320,7 +332,7 @@ export async function planProject(db, { client, projectId, tier = 'heavy', maxAt
       // 防循环：连着两次以「A」开头却读成"要改" → 先问清楚，不出新版（旧版任务原样留着，回 A 就按它批）。
       const cf = confirmBeforeRevising(db, { taskId: carrier.id, questionId: p.draft_question, body: a.body, version: p.draft_version });
       if (cf) {
-        db.run(`UPDATE projects SET draft_question=? WHERE id=?`, cf.questionId, projectId);
+        updateProject(db, projectId, { draftQuestion: cf.questionId });
         exit('proposed', { confirm: true, questionId: cf.questionId, version: p.draft_version });
         return { kind: 'proposed', confirm: true, questionId: cf.questionId, version: p.draft_version, text: cf.text };
       }
@@ -348,7 +360,7 @@ export async function planProject(db, { client, projectId, tier = 'heavy', maxAt
 
     const parallel = parallelOf(db, projectId);
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-      const resp = await client.complete({ tier, system: withOutputLang(parallel ? SYSTEM + PARALLEL_SECTION : SYSTEM, contentLang(db)), messages, tools: [parallel ? PROPOSE_PROJECT_PARALLEL : PROPOSE_PROJECT], maxTokens: MAX_TOKENS, effort: 'high' });
+      const resp = await client.complete({ role: 'project_planner', tier, system: withOutputLang(parallel ? SYSTEM + PARALLEL_SECTION : SYSTEM, contentLang(db)), messages, tools: [parallel ? PROPOSE_PROJECT_PARALLEL : PROPOSE_PROJECT], maxTokens: MAX_TOKENS, effort: 'high' });
       if (truncatedEmpty(resp)) throw new TruncatedEmptyError('项目规划器', MAX_TOKENS);
       const call = toolCallsOf(resp).find((c) => c.name === 'propose_project');
       const errs = [];
@@ -396,18 +408,18 @@ function recordProposal(db, { project, carrier, spec, notes, prevSpec = null }) 
   if (prevSpec) { const i = text.indexOf('\n'); text = `${text.slice(0, i + 1)}${renderSpecDiff(diffSpecs(prevSpec, spec), { prevVersion: project.draft_version, lang: L })}${text.slice(i + 1)}`; }
   const old = db.all(`SELECT id FROM tasks WHERE project_id=? AND project_order>0`, project.id).map((r) => r.id);
   if (old.length) {
-    db.run(`UPDATE tasks SET status='aborted', project_id=NULL, project_order=NULL WHERE project_id=? AND project_order>0`, project.id);
+    // 旧版规划切出来的任务：作废并脱离项目（逐行走状态机，各留一条审计）
+    for (const id of old) transition(db, 'tasks', id, 'aborted', { set: { project_id: null, project_order: null } });
     audit(db, { actorKind: 'agent', actorId: 'project_planner', action: 'project_tasks_voided', targetType: 'project', targetId: project.id,
       payload: { version: project.draft_version, tasks: old } });
   }
   const taskIds = createProjectTasks(db, { projectId: project.id, userId: project.owner_id, tasks: spec.tasks });
   if (Array.isArray(spec.shared_paths)) recordSharedPaths(db, { projectId: project.id, paths: spec.shared_paths, userId: project.owner_id });
   db.tx(() => {
-    db.run(`INSERT INTO questions (id,task_id,node_id,level,level_source,text,default_action,asked_at,timeout_at,status)
-            VALUES (?,?,NULL,3,'hard_rule',?,NULL,?,NULL,'open')`, qid, carrier.id, text, t);
+    insertQuestion(db, { id: qid, taskId: carrier.id, level: 3, text: text, askedAt: t });
     routeQuestion(db, { questionId: qid, decisionType: 'contract_approval', typeSource: 'hard_rule', prefixes: specPrefixes(spec.tasks).length ? specPrefixes(spec.tasks) : null, at: t });
-    db.run(`UPDATE tasks SET status='waiting' WHERE id=?`, carrier.id);
-    db.run(`UPDATE projects SET title=?, draft_version=?, draft_question=?, draft_notes=? WHERE id=?`, spec.title, version, qid, notes, project.id);
+    transition(db, 'tasks', carrier.id, 'waiting');
+    updateProject(db, project.id, { title: spec.title, draftVersion: version, draftQuestion: qid, draftNotes: notes });
     setParam(db, { taskId: carrier.id, key: 'plan.spec', value: spec, by: { kind: 'agent', id: 'project_planner' }, governance: 'execution' });   // 下一版逐字比对用
     audit(db, { actorKind: 'agent', actorId: 'project_planner', action: 'project_proposed', targetType: 'project', targetId: project.id,
       // 报过哪几对范围重叠也进审计：这条预警**不是闸门**，所以"它有没有被略过"只能事后查 ——

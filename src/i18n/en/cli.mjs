@@ -146,7 +146,8 @@ export default {
   '  为什么要批：{gate}': '  Why it needs approval: {gate}',
   '\n看细节：node src/cli.mjs revision {taskId}': '\nDetails: node src/cli.mjs revision {taskId}',
   '批准：  node src/cli.mjs revision {taskId} --approve': 'Approve: node src/cli.mjs revision {taskId} --approve',
-  '驳回：  node src/cli.mjs revision {taskId} --reject': 'Reject:  node src/cli.mjs revision {taskId} --reject',
+  '重出一版：node src/cli.mjs revision {taskId} --redo "要怎么改"（这一版不用，连同原修正重出一版）': 'New version:  node src/cli.mjs revision {taskId} --redo "what to change" (this version is not used; a new one is produced together with the original correction)',
+  '不要这份变更：node src/cli.mjs revision {taskId} --reject': 'Don\'t want it:  node src/cli.mjs revision {taskId} --reject',
   '批了但有保留意见：在批准后面再加 --reservation "…" —— 照批，那句话进约定清单、标〔保留意见〕，不改变任何一条': 'Approve with a reservation: add --reservation "…" after approving — it is approved as is; the sentence goes into the agreed decisions marked [Reservation] and changes nothing',
   '⚠️ 重规划器几次都产不出通过校验的方案（pid {pid}）：{why}': '⚠️ The replanner could not produce a valid plan after several tries (pid {pid}): {why}',
   '  第 {i} 次被拒：{errs}': '  Attempt {i} rejected: {errs}',
@@ -214,14 +215,16 @@ export default {
   '\n逐节点影响标记（这才是真护栏 —— 每一次作废都有出处、有理由、事后查得到）：': '\nPer-step impact marks (this is the real guardrail — every void has a source and a reason, and can be traced later):',
   '\n⚠️ 要你批准：{gate}': '\n⚠️ Needs your approval: {gate}',
   '  批准：node src/cli.mjs revision {taskId} --approve': '  Approve: node src/cli.mjs revision {taskId} --approve',
-  '  驳回：node src/cli.mjs revision {taskId} --reject': '  Reject:  node src/cli.mjs revision {taskId} --reject',
+  '  重出一版：node src/cli.mjs revision {taskId} --redo "要怎么改"': '  New version:  node src/cli.mjs revision {taskId} --redo "what to change"',
+  '  不要这份变更：node src/cli.mjs revision {taskId} --reject': '  Don\'t want it:  node src/cli.mjs revision {taskId} --reject',
   '找不到 CLI 令牌 {file}。先跑 node src/cli.mjs init': 'CLI token {file} not found. Run node src/cli.mjs init first',
   '已应用 {id}：作废 {voided}｜改规格 {respecced}｜新增 {added}': 'Applied {id}: voided {voided} | respecced {respecced} | added {added}',
   '  宪法块已修订 → {id}（agent 无权自改，这一步只能由人触发）': '  Contract revised → {id} (the agent cannot change it itself; only a person can trigger this)',
   '  ⚠️ 作废的节点**产物没有被删**：git 历史里仍在，决策日志记了"因修正作废"': '  ⚠️ Output of voided steps **was not deleted**: it is still in git history, and the decision log records "voided by correction"',
   '  保留意见已记进项目的约定清单（标〔保留意见〕）：它不改变这份变更里的任何一条，只是让下一个碰这一处的人看得到。': '  The reservation was added to the project\'s agreed decisions (marked [Reservation]): it changes nothing in this change; it just lets the next person touching this spot see it.',
-  '人驳回': 'Rejected by a person',
-  '已驳回 {id}。计划原样不动，那条修正记为已处理 —— 否则下一轮又会停在同一处。': 'Rejected {id}. The plan stays as it was, and the correction is marked handled — otherwise the next cycle would stop at the same place.',
+  '{who}：{text}': '{who}: {text}',
+  '已驳回 {id}，并把你的意见连同原来那条修正交回去：下一轮 AI 重出一版，再来问你。': 'Rejected {id} and sent your comments back together with the original correction: next round the AI produces a new version and asks you again.',
+  '已驳回 {id}（不要这份变更）。计划原样不动，那条修正作罢。': 'Rejected {id} (change not wanted). The plan stays as it is and the correction is dropped.',
   '批准修正提案 {id}（经 cli revision --approve）': 'Approved revision proposal {id} (via cli revision --approve)',
   '驳回修正提案 {id}（经 cli revision --reject）': 'Rejected revision proposal {id} (via cli revision --reject)',
   '  同时答复了 {qid}': '  Also answered {qid}',
@@ -314,7 +317,7 @@ export default {
   '  ⚠ 绑定 {tier}（{key}）：{why} —— 看板"设置"里改': '  ⚠ Binding {tier} ({key}): {why} — change it under "Settings" on the board',
   // project
   '无法新建项目：{why}': 'Cannot create a project: {why}',
-  'project new --goal <文本或文件> --done <文本或文件> (--source <仓库路径或 URL> | --empty) [--plan <规划文本或文件>] [--base <ref>] [--title <标题>]': 'project new --goal <text or file> --done <text or file> (--source <repo path or URL> | --empty) [--plan <plan text or file>] [--base <ref>] [--title <title>]',
+  'project new --goal <文本或文件> --done <文本或文件> (--source <仓库路径或 URL> | --empty) [--plan <规划文本或文件>] [--base <ref>] [--title <标题>] [--visibility all|members]': 'project new --goal <text or file> --done <text or file> (--source <repo path or URL> | --empty) [--plan <plan text or file>] [--base <ref>] [--title <title>] [--visibility all|members]',
   '项目 {id}\n  仓库 {repo}\n  分支 {branch} @ {base}': 'Project {id}\n  repo {repo}\n  branch {branch} @ {base}',
   '  方案待起草（载体任务 {carrier}）。守护进程会拉规划器；没开守护进程：node src/cli.mjs project plan {id}': '  Plan to be drafted (carrier task {carrier}). Auto-run will start the planner; without auto-run: node src/cli.mjs project plan {id}',
   '  第一个任务 {taskId}（从项目目标起草，会先问你几个问题）。守护进程会自动追问；没开守护进程：node src/cli.mjs draft {taskId}': '  First task {taskId} (drafted from the project goal; it will ask you a few questions first). Auto-run asks them automatically; without auto-run: node src/cli.mjs draft {taskId}',
@@ -460,6 +463,8 @@ export default {
   '[SuperIntern] 项目完成 {pid}': '[SuperIntern] Project done {pid}',
   '全部任务已合进项目分支。交付：node src/cli.mjs project deliver {pid} --remote <url> --pr': 'All tasks are merged into the project branch. Deliver: node src/cli.mjs project deliver {pid} --remote <url> --pr',
   '✗ 项目 {pid} 推进失败（第 {n} 次，按退避等）：{err}': '✗ Advancing project {pid} failed (attempt {n}; backing off): {err}',
+  '✗ 守护进程这一轮出错（已记入审计，下一轮照常）：{err}': '✗ This daemon round failed (recorded in the audit log; the next round runs as usual): {err}',
+  '收到 {sig}，正在停止（在跑的任务进程不受影响）…': 'Received {sig}, stopping (running task processes are not affected)…',
   '守护进程 pid {pid}：每 {sec}s 扫一次；状态 running 且没在跑、且上次退出后有人动过的任务会被拉起': 'Auto-run pid {pid}: scans every {sec}s; tasks that are running, not currently executing, and touched by someone since their last exit get started',
   '；通知 {kinds}': '; notifications {kinds}',
   '  {taskId}：{due}（{reason}）': '  {taskId}: {due} ({reason})',
@@ -542,7 +547,7 @@ export default {
   '，{input}/{output} 每百万 token': ', {input}/{output} per million tokens',
   '，缺单价': ', no price',
   '\n  ⚠ 还不能用：{why}': '\n  ⚠ Not usable yet: {why}',
-  '用法：node src/cli.mjs catalog [list] | check [--probe] [--vendor <id>] | last | add|set <服务商/模型> --input <$/M> --output <$/M> [--cache-read] [--cache-write] [--window N] [--efforts low,medium,high|none] [--model <发给厂商的名>] | remove|enable|disable <键>': 'Usage: node src/cli.mjs catalog [list] | check [--probe] [--vendor <id>] | last | add|set <provider/model> --input <$/M> --output <$/M> [--cache-read] [--cache-write] [--window N] [--efforts low,medium,high|none] [--model <name sent to the provider>] | remove|enable|disable <key>',
+  '用法：node src/cli.mjs catalog [list] | check [--probe] [--vision] [--vendor <id>] | last | add|set <服务商/模型> --input <$/M> --output <$/M> [--cache-read] [--cache-write] [--window N] [--efforts low,medium,high|none] [--model <发给厂商的名>] | remove|enable|disable <键>': 'Usage: node src/cli.mjs catalog [list] | check [--probe] [--vision] [--vendor <id>] | last | add|set <provider/model> --input <$/M> --output <$/M> [--cache-read] [--cache-write] [--window N] [--efforts low,medium,high|none] [--model <name sent to the provider>] | remove|enable|disable <key>',
   // bind / endpoint
   '用法：node src/cli.mjs bind [show] | bind set <tier>=<服务商/模型>... [--effort low|medium|high|none]': 'Usage: node src/cli.mjs bind [show] | bind set <tier>=<provider/model>... [--effort low|medium|high|none]',
   '要给 tier=服务商/模型（可多个）': 'Give tier=provider/model (one or more)',
@@ -591,12 +596,11 @@ export default {
   '      名下：{text}': '      Responsible for: {text}',
   '  值班：{users}，起 {start}，每 {days} 天换': '  On-call: {users}, from {start}, rotating every {days} days',
   '只有管理员能管理成员': 'Only admins can manage members',
-  'user add <名字> --role member|observer [--tags a,b] [--out <令牌文件>]': 'user add <name> --role member|observer [--tags a,b] [--out <token file>]',
+  'user add <名字> --role member|observer [--tags a,b] [--out <令牌文件>] | user add <名字> --service [--scope read|write] [--days N]': 'user add <name> --role member|observer [--tags a,b] [--out <token file>] | user add <name> --service [--scope read|write] [--days N]',
   '已加用户 {id}（{role}）': 'Added user {id} ({role})',
   '令牌写入 {file}（库里只有哈希，这个文件是唯一副本；交给本人，本人用 --token-file 指向它）': 'Token written to {file} (the database only keeps a hash; this file is the only copy. Give it to the person, who points --token-file at it)',
   '要给用户 id': 'Give a user id',
   '标签已改': 'Tags updated',
-  'user setting <键> true|false': 'user setting <key> true|false',
   'user channel <用户 id> --ntfy <url> | --feishu <url> | --dingtalk <url> | --wecom <url> | --remove <种类>': 'user channel <user id> --ntfy <url> | --feishu <url> | --dingtalk <url> | --wecom <url> | --remove <kind>',
   '已删 {kind} 通道': 'Removed the {kind} channel',
   '已挂 {n} 条通道（审计只记种类，不记地址）': 'Added {n} channels (the audit log records only the kind, not the address)',
@@ -613,7 +617,7 @@ export default {
   '已停用，吊销令牌 {n} 枚。恢复：user enable <id>，再 user token <id> 重发令牌': 'Disabled; revoked {n} tokens. To restore: user enable <id>, then user token <id> to reissue a token',
   '已恢复。令牌在停用时已吊销：user token <id> 重发': 'Restored. Tokens were revoked when disabled: reissue with user token <id>',
   '<接手人 id>': '<new owner id>',
-  'user 子命令：list | add | tags | perms | setting | channel | role | rename | token | disable | enable': 'user subcommands: list | add | tags | perms | setting | channel | role | rename | token | disable | enable',
+  'user 子命令：list | add | tags | perms | setting | channel | git | role | rename | token | disable | enable': 'user subcommands: list | add | tags | perms | setting | channel | git | role | rename | token | disable | enable',
   // handover
   [`handover preview|run --from <id> --to <id> (--project <项目 id> | --solo | --all) [--note "<备注>"] [--disable] [--allow-quorum-drop]
   handover requests | approve <申请 id> [--allow-quorum-drop] | reject <申请 id> [--note] | withdraw <申请 id>
@@ -668,7 +672,7 @@ export default {
   '已导出 {f}': 'Exported {f}',
   '路由表没存：\n{errs}': 'Routing table not saved:\n{errs}',
   '已存 {n} 行；按它回放 {q} 条历史事项：落空 {u} 条，打断 {i}': 'Saved {n} rows; replaying {q} past items with it: {u} unaddressed, interruptions {i}',
-  'routing 子命令：show | templates | template <名> | reset | owner <类型> <解析器>... | remove <用户> | duty | preview [--template 名] | export --file | import --file': 'routing subcommands: show | templates | template <name> | reset | owner <type> <resolver>... | remove <user> | duty | preview [--template name] | export --file | import --file',
+  'routing 子命令：show | templates | template <名> | reset | owner <类型> <解析器>... | remove <用户> | duty | swap | preview [--template 名] | export --file | import --file': 'routing subcommands: show | templates | template <name> | reset | owner <type> <resolver>... | remove <user> | duty | swap | preview [--template name] | export --file | import --file',
   'question 子命令：transfer <问题 id> --to user:<id> [--to group:<标签>]': 'question subcommands: transfer <item id> --to user:<id> [--to group:<tag>]',
   '要给 --to': 'Give --to',
   '要给问题 id': 'Give an item id',
@@ -714,10 +718,11 @@ export default {
   node src/cli.mjs decisions <项目 id|任务 id> [--all] [--void <决定 id> "理由"]   # 决定登记：此刻仍然有效的约定清单（有结论的事项 / 批准过的契约与变更 / 改过的目标）
   node src/cli.mjs stalls [--raise]                          # 停等账本：每个没结束的任务在等谁（自己 / 时钟 / 某个人 / 上游）；⚠ 那几行是说不出在等谁的缺陷，--raise 升成事项
   node src/cli.mjs digest [--user <id|名字>] [--send]        # 我的待办打包：等我答的 / 等冲突结论的 / 等别人的 / 知会我的；负责人另见没人接的、任务状态、未读汇报、异议
-  node src/cli.mjs catalog check [--probe] [--vendor <id>] | last   # 模型目录漂移：还在不在、能不能调（--probe 花极少的钱）、单价与窗口对不对；只报告，目录由人改
+  node src/cli.mjs catalog check [--probe] [--vision] [--vendor <id>] | last # 模型目录漂移：还在不在、能不能调（--probe 花极少的钱）、单价与窗口对不对；只报告，目录由人改
   node src/cli.mjs endpoint [list] | set <id> --adapter … --base-url … --key-env … | enable|disable|remove|test|models <id>   # 服务商（直连厂商 / 聚合平台）；key 只在 .env
   node src/cli.mjs catalog [list] | add|set <服务商/模型> --input <$/M> --output <$/M> [--window N] [--efforts …] | remove|enable|disable <键>   # 模型目录（缺单价不能绑）
   node src/cli.mjs bind [show] | bind set <tier>=<服务商/模型>... [--effort low|medium|high|none]   # 档位绑定（进库、记审计；下一个节点起生效）
+  node src/cli.mjs bind role <角色> <服务商/模型 | tier> [--effort low|medium|high] | bind fallback <tier>=<服务商/模型 | none>   # 某个角色单独绑模型（tier = 回到档位）；档位的备用模型（那家出故障时自动换过去）
   node src/cli.mjs init [--name <管理员显示名>] [--bind <tier>=<服务商/模型>]...     # 库已存在时 --name 改显示名；首装时 --bind 写默认绑定
   node src/cli.mjs new "<标题>" --goal <目标> --dod <完成定义> [--scope <范围>]
                                 [--constraint <约束>]... [--verify "<任务级验收命令>"]
@@ -726,9 +731,10 @@ export default {
   node src/cli.mjs workspace <taskId> [--source <repo>] [--dir <路径>] [--ref <commit>] [--force]
   node src/cli.mjs run <taskId> [--cycles N] [--once] [--tier ...] [--iterations N]
                                 [--no-commit] [--no-verify] [--no-sandbox]
-  node src/cli.mjs revision <taskId> [--approve | --reject] [--reservation "批了，但这一条我保留意见：…"]
+  node src/cli.mjs revision <taskId> [--approve | --redo "要怎么改" | --reject] [--reservation "批了，但这一条我保留意见：…"]
   node src/cli.mjs sandbox [--reap] [--task <taskId>]
   node src/cli.mjs sources [add|remove]                      联网目录（管理员）：内置 5 个软件源，可加镜像 / 私有仓库 / 可信的信息源
+  node src/cli.mjs sources cred add <源 id> (--key-file <文件> | --stdin) [--basic] [--allow-write] | revoke <凭据 id>   联网源的凭据：只进出网代理、沙箱看不到，默认只在读请求上带
   node src/cli.mjs project setup <projectId> [--cmd "<命令>"]... [--clear]   环境准备命令：新工作区与项目级验收前自动先跑（装依赖用）
   node src/cli.mjs project egress <projectId> [--add <源>]... [--remove <源>]...   项目联网：从联网目录里勾选，项目下所有任务共用
   node src/cli.mjs egress <taskId> [--allow <源>]... [--deny <源>]...
@@ -739,17 +745,29 @@ export default {
   node src/cli.mjs answer <questionId> "<答复>" [--token-file <路径>]   多人时按路由表数人头；立场不同会生成冲突事项
   node src/cli.mjs answer <questionId> --agree [答复 id]                 附议已有的那条（不写新文本，计入法定人数）
   node src/cli.mjs answer <questionId> --abstain ["说明"]                弃权：这条不归我（从收件人里去掉自己，人数重算）
+  node src/cli.mjs answer <questionId> "..." --allow-tests              答复并放行这一步对任务开始前就有的测试的改动（questions 里会列出是哪几个）
   node src/cli.mjs question transfer <questionId> --to user:<id> [--reason "..."]   把一条事项转给别人（事项级，不改表；理由会显示给对方）
   node src/cli.mjs user list | add <名字> --role member|observer [--tags a,b] | tags <id> --tags a,b | channel <id> --ntfy <url> | --remove <种类>
-  node src/cli.mjs user role <id> lead|member|observer（lead = 管理员）| perms [<id>]（权限一览）| setting [<键> true|false] | rename <id> <新名字> | token <id>（重发令牌）| disable <id> | enable <id>
+  node src/cli.mjs user role <id> lead|member|observer（lead = 管理员）| perms [<id>]（权限一览）| setting [<键> <值>] | rename <id> <新名字> | token <id>（重发令牌）| disable <id> | enable <id>
+  node src/cli.mjs user add <名字> --service [--scope read|write] [--days N]   服务账户：不能登录看板，替人做事时审计记 on_behalf_of
+  node src/cli.mjs token list [--all] [--everyone] | new <名字> [--scope read|write] [--days N] | revoke <令牌 id> | revoke --all-others   自己的令牌与登录
+  node src/cli.mjs invite list | new [--role member|observer] [--name <名字>] [--hours N] [--public-url <看板地址>] | revoke <邀请 id>   邀请链接（管理员）
+  node src/cli.mjs cred list | add token|github-app|ssh --name <名字> (--key-file <文件> | --stdin) [--host github.com] [--repos acme/*] [--mine] [--app-id N] | revoke <id> | check <远端>   连接（交付用的凭据）
+  node src/cli.mjs user git <id> [--github <账号>] [--email <提交邮箱>]   成员的 GitHub 账号与提交邮箱（写进提交与 PR 的出处；- 清空）
+  node src/cli.mjs cred oauth <GitHub App 连接 id> --client-id <id> (--secret-file <文件> | --stdin) | member <GitHub 账号>   用 GitHub 登录
+  node src/cli.mjs user spend | budget <id> --usd <美元> | budget <id> --clear   每个人本月 / 上月的花费；单人月度预算
+  node src/cli.mjs calendar [--days 60] | tz <时区 | -> | holidays --file <文件> | --clear   部署日历：时区（业务日 / 值班交接 / 月度预算按它算）、节假日与调休
+  node src/cli.mjs user tz [<时区> | -]   自己的时区（只影响给你看的时刻；- = 跟部署时区）
+  node src/cli.mjs routing swap list | add <日期>[..<日期>] <成员 id> [--note 说明] | remove <序号> | clear [--project <id>]   值班代班（那几天整天由他值，不管轮换轮到谁）
+  node src/cli.mjs trace <文件:行号 | 提交号> [--repo <仓库目录>] [--task <任务 id>]   修改溯源：这行代码 / 这个提交是哪一步做的、依据契约哪几条、谁的指令、谁批准
   node src/cli.mjs handover preview|run --from <id> --to <id> (--project <id> | --solo | --all) [--note ".."] [--disable]   交接；成员 run = 申请
   node src/cli.mjs handover requests | approve|reject|withdraw <申请 id>
   node src/cli.mjs routing show | templates | template <名> [--set pm=u_x] | reset | owner <类型> <解析器>... | remove <用户> |
-                           duty --users u_a,u_b --start 日期 | preview [--template 名] | export --file f | import --file f   [--project <id>]
+                           duty --users u_a,u_b --start 日期[T09:00] | preview [--template 名] | export --file f | import --file f   [--project <id>]
   node src/cli.mjs tick [taskId] [--notify <cmd>]   扫到期的问题：Ⅰ 级走默认 / Ⅱ 级升级或退默认（给 cron 用）
   node src/cli.mjs deliver <taskId> [--remote <url>] [--branch <名>] [--pr] [--base <分支>]
   node src/cli.mjs project new --file <项目.json> --source <仓库路径或URL> [--base <ref>]   整批契约建项目（守护进程串着跑）
-  node src/cli.mjs project new --brief <规划文本或文件> (--source <仓库> | --empty) [--title <名>]   让规划器切整批契约，人批一次
+  node src/cli.mjs project new --brief <规划文本或文件> (--source <仓库> | --empty) [--title <名>] [--visibility all|members]   让规划器切整批契约，人批一次
   node src/cli.mjs project plan <projectId> [--bind …]  规划器的一次寿命（守护进程会自动拉）
   node src/cli.mjs project show <projectId>            各任务状态 / 签收 / 合并
   node src/cli.mjs project advance <projectId>         手动推进一步（没开守护进程时用）
@@ -757,11 +775,11 @@ export default {
   node src/cli.mjs project verify <projectId> [--cmd "<一条命令>" | --clear]   项目级验收命令（选填；没填时"项目达成"只能由人宣布）
   node src/cli.mjs project gear <projectId> [propose|auto]    自动化挡位；不带参数看当前挡与四条前提各自成不成立
   node src/cli.mjs project limits <projectId> [--key <项> --value <数> | --key <项> --clear]   项目默认上限（部署默认 → 项目默认 → 任务覆盖）
-  node src/cli.mjs project sandbox <projectId> [node|python]      沙箱镜像（默认只有 Node；python = 在它之上加 Python 3）
+  node src/cli.mjs project sandbox <projectId> [node|python]      沙箱镜像（默认 python = Node + Python 3，带页面点验用的 Chromium；node = 只有 Node，镜像小一些）
   node src/cli.mjs project concurrency <projectId> [--max <1-4>]   同时最多开几个任务（默认 2；只有开着的任务全都在等人时才让路）
   node src/cli.mjs project deliver <projectId> --remote <url> [--pr] [--base <分支>] [--accept-pending]
   node src/cli.mjs project signoff <projectId> [--accept-all]   后置签收：自动挡下 AI 自己加的任务攒着的签收，看清单 / 一次点掉（交付前必须清掉）
-                                    push 工作区分支；--pr 在 GitHub 开 PR（要 .env 里的 GITHUB_TOKEN；高风险任务先签收）
+                                    push 工作区分支；--pr 在 GitHub 开 PR（凭据见 cred；高风险任务先签收）
   node src/cli.mjs signoff <taskId> --accept | --reject "<理由>"   人工签收；打回 = 一条紧急修正
   node src/cli.mjs web [--port 7357] [--daemon]   看板（只绑 127.0.0.1；--daemon 同时带守护进程；不接 --bind —— 子进程自己读库里的绑定，库空时 --bind 写入一次）
   node src/cli.mjs web --team --public-url https://<内网域名> [--host 127.0.0.1] [--daemon]   团队模式：多人各自登录，放在 HTTPS 反向代理之后（docs/deploy-team.md）
@@ -769,8 +787,10 @@ export default {
   node src/cli.mjs show <taskId>
   node src/cli.mjs questions [--all]      列开放 / 已升级的问题（--all 含已答复的最近 20 条）；一眼看有没有人要答
   node src/cli.mjs limit <taskId> [--budget_micro_usd N] [--runtime_ms N] [--llm_calls N]
-                                  [--node_retries N] [--idle_cycles N] [--context_tokens N]
+                                  [--node_retries N] [--idle_cycles N] [--context_tokens N] [--compact_tokens N]
   node src/cli.mjs replay <taskId>
+  node src/cli.mjs db backup [--tag <名>] | backups | check [--full] | restore <文件> | stats   备份、恢复、完整性检查、状态库体量
+  node src/cli.mjs invariants [--run]   运行期自检：各条最近一次的结果（--run 当场查一遍）
 
 全局：--db <路径>（默认 .superintern/state.db）
       --mode live|record|replay  --cassette <路径>（录制/回放 LLM 调用）
@@ -797,10 +817,11 @@ run **默认在容器沙箱里**跑命令。
   node src/cli.mjs decisions <project id|task id> [--all] [--void <decision id> "reason"]   # decision registry: the agreed decisions still in effect (settled items / approved contracts and changes / edited goals)
   node src/cli.mjs stalls [--raise]                          # stall ledger: who each unfinished task is waiting for (itself / the clock / a person / upstream); ⚠ rows are defects where it cannot say, --raise turns them into items
   node src/cli.mjs digest [--user <id|name>] [--send]        # my to-do bundle: waiting for my answer / for a disagreement to settle / on others / FYI; owners also see unaddressed items, task status, unread reports, dissent
-  node src/cli.mjs catalog check [--probe] [--vendor <id>] | last   # model catalog drift: still there, callable (--probe spends a tiny amount), prices and windows right; report only, people edit the catalog
+  node src/cli.mjs catalog check [--probe] [--vision] [--vendor <id>] | last # model catalog drift: still there, callable (--probe spends a tiny amount), prices and windows right; report only, people edit the catalog
   node src/cli.mjs endpoint [list] | set <id> --adapter … --base-url … --key-env … | enable|disable|remove|test|models <id>   # providers (direct vendors / gateways); keys live only in .env
   node src/cli.mjs catalog [list] | add|set <provider/model> --input <$/M> --output <$/M> [--window N] [--efforts …] | remove|enable|disable <key>   # model catalog (no price = cannot bind)
   node src/cli.mjs bind [show] | bind set <tier>=<provider/model>... [--effort low|medium|high|none]   # tier bindings (stored in the database, audited; take effect from the next step)
+  node src/cli.mjs bind role <role> <provider/model | tier> [--effort low|medium|high] | bind fallback <tier>=<provider/model | none>   # a model for one role (tier = back to the tier); a tier's fallback model (used automatically while that vendor is failing)
   node src/cli.mjs init [--name <admin display name>] [--bind <tier>=<provider/model>]...     # with an existing database, --name renames; on first install, --bind writes default bindings
   node src/cli.mjs new "<title>" --goal <goal> --dod <definition of done> [--scope <scope>]
                                 [--constraint <constraint>]... [--verify "<task acceptance command>"]
@@ -809,9 +830,10 @@ run **默认在容器沙箱里**跑命令。
   node src/cli.mjs workspace <taskId> [--source <repo>] [--dir <path>] [--ref <commit>] [--force]
   node src/cli.mjs run <taskId> [--cycles N] [--once] [--tier ...] [--iterations N]
                                 [--no-commit] [--no-verify] [--no-sandbox]
-  node src/cli.mjs revision <taskId> [--approve | --reject] [--reservation "Approved, but I have a reservation on this one: …"]
+  node src/cli.mjs revision <taskId> [--approve | --redo "what to change" | --reject] [--reservation "Approved, but I have a reservation on this one: …"]
   node src/cli.mjs sandbox [--reap] [--task <taskId>]
   node src/cli.mjs sources [add|remove]                      network catalog (admins): 5 built-in package sources; add mirrors / private registries / trusted info sources
+  node src/cli.mjs sources cred add <source id> (--key-file <file> | --stdin) [--basic] [--allow-write] | revoke <credential id>   package-source credentials: only the egress proxy gets them, never the sandbox; sent on read requests only by default
   node src/cli.mjs project setup <projectId> [--cmd "<command>"]... [--clear]   setup commands: run automatically before new workspaces and project acceptance checks (for installing dependencies)
   node src/cli.mjs project egress <projectId> [--add <source>]... [--remove <source>]...   project network access: pick from the network catalog; shared by all tasks in the project
   node src/cli.mjs egress <taskId> [--allow <source>]... [--deny <source>]...
@@ -822,17 +844,29 @@ run **默认在容器沙箱里**跑命令。
   node src/cli.mjs answer <questionId> "<answer>" [--token-file <path>]   with several people, counts heads per the routing table; differing positions raise a disagreement item
   node src/cli.mjs answer <questionId> --agree [answer id]                 second an existing answer (no new text; counts toward quorum)
   node src/cli.mjs answer <questionId> --abstain ["note"]                not mine: this one is not mine (removes you from the recipients; quorum recalculated)
+  node src/cli.mjs answer <questionId> "..." --allow-tests              answer and allow this step's changes to tests that existed before the task (questions lists which ones)
   node src/cli.mjs question transfer <questionId> --to user:<id> [--reason "..."]   hand an item over to someone else (per item, no table change; the reason is shown to them)
   node src/cli.mjs user list | add <name> --role member|observer [--tags a,b] | tags <id> --tags a,b | channel <id> --ntfy <url> | --remove <kind>
-  node src/cli.mjs user role <id> lead|member|observer (lead = admin) | perms [<id>] (permissions overview) | setting [<key> true|false] | rename <id> <new name> | token <id> (reissue token) | disable <id> | enable <id>
+  node src/cli.mjs user role <id> lead|member|observer (lead = admin) | perms [<id>] (permissions overview) | setting [<key> <value>] | rename <id> <new name> | token <id> (reissue token) | disable <id> | enable <id>
+  node src/cli.mjs user add <name> --service [--scope read|write] [--days N]   service account: cannot sign in to the board; audit records on_behalf_of when it acts for someone
+  node src/cli.mjs token list [--all] [--everyone] | new <name> [--scope read|write] [--days N] | revoke <token id> | revoke --all-others   your own tokens and sign-ins
+  node src/cli.mjs invite list | new [--role member|observer] [--name <name>] [--hours N] [--public-url <board URL>] | revoke <invitation id>   invitation links (admins)
+  node src/cli.mjs cred list | add token|github-app|ssh --name <name> (--key-file <file> | --stdin) [--host github.com] [--repos acme/*] [--mine] [--app-id N] | revoke <id> | check <remote>   connections (credentials for delivery)
+  node src/cli.mjs user git <id> [--github <login>] [--email <commit email>]   a member’s GitHub login and commit email (written into commit / PR provenance; - clears)
+  node src/cli.mjs cred oauth <GitHub App connection id> --client-id <id> (--secret-file <file> | --stdin) | member <GitHub login>   GitHub login
+  node src/cli.mjs user spend | budget <id> --usd <dollars> | budget <id> --clear   each person’s spending this month / last month; one person’s monthly budget
+  node src/cli.mjs calendar [--days 60] | tz <zone | -> | holidays --file <file> | --clear   deployment calendar: time zone (business days / shift changes / monthly budgets use it), holidays and make-up workdays
+  node src/cli.mjs user tz [<zone> | -]   your own time zone (only affects times shown to you; - = follow the deployment)
+  node src/cli.mjs routing swap list | add <date>[..<date>] <member id> [--note text] | remove <n> | clear [--project <id>]   on-call swaps (that person is on call for those whole days)
+  node src/cli.mjs trace <file:line | commit> [--repo <repo dir>] [--task <task id>]   change provenance: which step made this line / commit, which contract clauses, whose instructions, who approved
   node src/cli.mjs handover preview|run --from <id> --to <id> (--project <id> | --solo | --all) [--note ".."] [--disable]   handover; for members, run = request
   node src/cli.mjs handover requests | approve|reject|withdraw <request id>
   node src/cli.mjs routing show | templates | template <name> [--set pm=u_x] | reset | owner <type> <resolver>... | remove <user> |
-                           duty --users u_a,u_b --start date | preview [--template name] | export --file f | import --file f   [--project <id>]
+                           duty --users u_a,u_b --start date[T09:00] | preview [--template name] | export --file f | import --file f   [--project <id>]
   node src/cli.mjs tick [taskId] [--notify <cmd>]   sweep due items: level Ⅰ takes the default / level Ⅱ escalates or falls back to the default (for cron)
   node src/cli.mjs deliver <taskId> [--remote <url>] [--branch <name>] [--pr] [--base <branch>]
   node src/cli.mjs project new --file <project.json> --source <repo path or URL> [--base <ref>]   create a project from a full set of contracts (auto-run runs them in sequence)
-  node src/cli.mjs project new --brief <plan text or file> (--source <repo> | --empty) [--title <name>]   let the planner split it into contracts; people approve once
+  node src/cli.mjs project new --brief <plan text or file> (--source <repo> | --empty) [--title <name>] [--visibility all|members]   let the planner split it into contracts; people approve once
   node src/cli.mjs project plan <projectId> [--bind …]  one lifetime of the planner (auto-run starts it automatically)
   node src/cli.mjs project show <projectId>            status / sign-off / merge of each task
   node src/cli.mjs project advance <projectId>         advance one step by hand (when auto-run is off)
@@ -840,11 +874,11 @@ run **默认在容器沙箱里**跑命令。
   node src/cli.mjs project verify <projectId> [--cmd "<a command>" | --clear]   project acceptance command (optional; without it "project done" can only be declared by a person)
   node src/cli.mjs project gear <projectId> [propose|auto]    automation gear; without an argument shows the current gear and whether each of the four prerequisites holds
   node src/cli.mjs project limits <projectId> [--key <item> --value <number> | --key <item> --clear]   project default limits (deployment default → project default → task override)
-  node src/cli.mjs project sandbox <projectId> [node|python]      sandbox image (Node only by default; python = Python 3 on top of it)
+  node src/cli.mjs project sandbox <projectId> [node|python]      sandbox image (default python = Node + Python 3, with Chromium for page checks; node = Node only, a smaller image)
   node src/cli.mjs project concurrency <projectId> [--max <1-4>]   how many tasks may be open at once (default 2; the next one only starts when all open tasks are waiting on people)
   node src/cli.mjs project deliver <projectId> --remote <url> [--pr] [--base <branch>] [--accept-pending]
   node src/cli.mjs project signoff <projectId> [--accept-all]   deferred sign-off: sign-offs piled up for tasks the AI added in auto gear; list them / clear them at once (must be cleared before delivery)
-                                    push the workspace branch; --pr opens a GitHub PR (needs GITHUB_TOKEN in .env; sign off high-risk tasks first)
+                                    push the workspace branch; --pr opens a GitHub PR (credentials: see cred; sign off high-risk tasks first)
   node src/cli.mjs signoff <taskId> --accept | --reject "<reason>"   manual sign-off; send back = one urgent correction
   node src/cli.mjs web [--port 7357] [--daemon]   board (binds to 127.0.0.1 only; --daemon also runs auto-run; no --bind — child processes read bindings from the database; with an empty database --bind is written once)
   node src/cli.mjs web --team --public-url https://<intranet domain> [--host 127.0.0.1] [--daemon]   team mode: everyone signs in separately, behind an HTTPS reverse proxy (docs/deploy-team.md)
@@ -852,8 +886,10 @@ run **默认在容器沙箱里**跑命令。
   node src/cli.mjs show <taskId>
   node src/cli.mjs questions [--all]      list open / escalated items (--all includes the 20 most recent answered ones); see at a glance whether anyone needs to answer
   node src/cli.mjs limit <taskId> [--budget_micro_usd N] [--runtime_ms N] [--llm_calls N]
-                                  [--node_retries N] [--idle_cycles N] [--context_tokens N]
+                                  [--node_retries N] [--idle_cycles N] [--context_tokens N] [--compact_tokens N]
   node src/cli.mjs replay <taskId>
+  node src/cli.mjs db backup [--tag <name>] | backups | check [--full] | restore <file> | stats   backups, restore, integrity checks, database size
+  node src/cli.mjs invariants [--run]   runtime self-checks: latest result of each (--run checks now)
 
 Global: --db <path> (default .superintern/state.db)
         --mode live|record|replay  --cassette <path> (record / replay LLM calls)
@@ -876,4 +912,36 @@ Network access is **fully off** by default (--network none; not even the proxy c
 (egress --allow npm); domains outside the list are refused at CONNECT before any TLS is set up,
 and every network attempt, refused ones included, goes into the audit trail. The allowlist is a contract-level parameter the agent structurally cannot change.
 `,
+  "  ⚠ Node {node} 自带的 SQLite {version} 有一个已知缺陷：多个进程同时写同一个库时，有极小概率把库写坏。建议把 Node 升级到自带 SQLite {fixed} 或更新版本的发行版": "  ⚠ The SQLite {version} bundled with Node {node} has a known defect: when several processes write the same database at once, there is a very small chance of corrupting it. Upgrade to a Node release that bundles SQLite {fixed} or newer",
+  "db 子命令：stats": "db subcommands: stats",
+  "库文件：{db} MB（{pages} 页 × {size} 字节，空闲 {free} 页）；WAL：{wal} MB": "Database file: {db} MB ({pages} pages × {size} bytes, {free} free); WAL: {wal} MB",
+  "最近一刻钟有观测的进程：{n} 个；写事务 {tx} 次，拿锁平均 {avg} ms、最长 {max} ms；撞 BUSY {busy} 次": "Processes with metrics in the last 15 minutes: {n}; {tx} write transactions, lock wait avg {avg} ms, max {max} ms; {busy} BUSY errors",
+  "慢语句（≥100 ms，最近的）：": "Slow statements (≥100 ms, most recent):",
+  "已备份并核过：{file}（{mb} MB，版本 v{v}）": "Backed up and verified: {file} ({mb} MB, version v{v})",
+  "还没有备份": "No backups yet",
+  "{kind} 检查通过；外键无违例": "{kind} check passed; no foreign-key violations",
+  "{kind} 检查发现问题：{problems}；外键违例 {fk} 条": "{kind} check found problems: {problems}; {fk} foreign-key violations",
+  "db restore <备份文件> [--force]": "db restore <backup file> [--force]",
+  "守护进程": "the daemon",
+  "已从 {file} 恢复（备份是 v{from}，现在 v{to}）；恢复前的库另存为 {saved}": "Restored from {file} (backup was v{from}, now v{to}); the previous database was saved as {saved}",
+  "db 子命令：stats | backup [--tag] | backups | check [--full] | restore <备份文件> [--force]": "db subcommands: stats | backup [--tag] | backups | check [--full] | restore <backup file> [--force]",
+  "user setting <键> <值>（布尔：true / false；整数；枚举取可选值之一；列表用逗号分隔）": "user setting <key> <value> (boolean: true / false; integer; enum: one of the allowed values; list: comma-separated)",
+  // token / invite / 服务账户
+  "令牌无效、已过期或已吊销": "Token is invalid, expired or revoked",
+  "只有管理员能看全员的令牌": "Only admins can see everyone’s tokens",
+  "到期 {d}": "expires {d}",
+  "最后使用 {d}{ip}": "last used {d}{ip}",
+  "  ← 现在用的": "  ← in use now",
+  "token new <名字> [--scope read|write] [--days N] [--out <文件>]": "token new <name> [--scope read|write] [--days N] [--out <file>]",
+  "已签发 {id}（{scope}，到期 {d}）；令牌写入 {file}（库里只有哈希，这是唯一副本）": "Issued {id} ({scope}, expires {d}); token written to {file} (the database keeps only a hash; this is the only copy)",
+  "已吊销 {n} 个（保留现在用的这枚）": "Revoked {n} (kept the one in use now)",
+  "token revoke <令牌 id> | token revoke --all-others": "token revoke <token id> | token revoke --all-others",
+  "已吊销 {n} 个（含用它登录的浏览器会话）": "Revoked {n} (including browser sign-ins made with it)",
+  "未知子命令：token {sub}（可选 list / new / revoke）": "Unknown subcommand: token {sub} (choose list / new / revoke)",
+  "只有管理员能发邀请": "Only admins can send invitations",
+  "邀请链接（只显示这一次，{date} 前有效、只能用一次；私下发给对方）：": "Invitation link (shown only this once; valid until {date}, single use; send it privately):",
+  "invite revoke <邀请 id>": "invite revoke <invitation id>",
+  "没有可撤销的（已用过、已撤销或已过期）": "Nothing to revoke (already used, revoked or expired)",
+  "未知子命令：invite {sub}（可选 list / new / revoke）": "Unknown subcommand: invite {sub} (choose list / new / revoke)",
+  "服务账户": "service account",
 };

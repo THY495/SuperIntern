@@ -22,7 +22,7 @@ import { makeFake } from '../src/llm/providers.mjs';
 import { assembleExecutor } from '../src/context/assemble.mjs';
 import { executeNode } from '../src/agent/executor.mjs';
 import { recordAnswer, openQuestions } from '../src/core/inbox.mjs';
-import { orchestrate, getParam } from '../src/core/orchestrator.mjs';
+import { orchestrate } from '../src/core/orchestrator.mjs';
 import { workspaceStatus } from '../src/core/workspace.mjs';
 import { LocalExecutor } from '../src/core/executor.mjs';
 
@@ -406,10 +406,16 @@ section('7b. 任务级验收跑在可写视图上，但不许留下改动（例�
     db.close();
     return r;
   };
-  // 验收命令往树里落了一个**未忽略**的文件 → 即便 exit=0 也判失败，并列出改动
-  let r = await runWith('ws7b1', 'require("fs").writeFileSync("leftover.txt","x")');
-  eq(r.kind, 'verify_failed', '验收命令 exit=0 但留下 leftover.txt → verify_failed');
-  eq((r.verification.mutated ?? []).join(','), 'leftover.txt', '改动清单指名道姓');
+  // 验收命令往树里落了一个**未忽略的新文件**（python 验收脚本留下 .venv-verify/）→ 动不了已提交的那一版，
+  // 删掉、照实记一行，不判失败。原来判失败，作为结构矛盾发给两个人，人只能回"接着修"。
+  let r = await runWith('ws7b1', 'require("fs").writeFileSync("leftover.txt","x");require("fs").mkdirSync(".venv-verify");require("fs").writeFileSync(".venv-verify/x","y")');
+  eq(r.kind, 'complete', '验收 exit=0、只留下新文件 → 照常通过');
+  eq((r.verification.leftovers ?? []).slice().sort().join(','), '.venv-verify/,leftover.txt', '留下的新文件照实记下');
+  assert(/验收跑完留下了新文件：/.test(r.verification.tail), '验收输出里写一行说明');
+  eq((r.verification.mutated ?? []).length, 0, '不算"改了工作区"');
+  // 删了被跟踪的文件 → 失败（动了已提交的那一版）
+  r = await runWith('ws7b4', 'require("fs").unlinkSync("README.md")');
+  eq(r.kind, 'verify_failed', '验收命令删了被跟踪的 README.md → verify_failed');
   // 写进 .gitignore 里的路径（工具缓存）→ 不算改动，照常通过
   r = await runWith('ws7b2', 'require("fs").mkdirSync("node_modules/.vite-temp",{recursive:true});require("fs").writeFileSync("node_modules/.vite-temp/c.mjs","x")', 'node_modules/\n');
   eq(r.kind, 'complete', '写进被忽略的 node_modules/ → 是工具缓存不是改动，任务 done');

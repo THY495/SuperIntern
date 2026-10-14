@@ -34,32 +34,39 @@ import { existsSync, mkdirSync, mkdtempSync, rmSync, readFileSync, writeFileSync
 import { join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 import { execFileSync } from 'node:child_process';
+import { git, gitEnv, gitRaw, safePositional } from './git.mjs';
 import { newId, now, audit, insertEdge } from '../db/db.mjs';
+import { writeConstitution } from '../db/constitutions.mjs';
+import { insertUserMessage } from '../db/messages.mjs';
+import { insertTask, markTaskMerged } from '../db/tasks.mjs';
+import { insertProject } from '../db/projects.mjs';
 import { ensureWorkspace, workspaceStatus, isBuildOutput, discardChanges, describeChanges, pinLineEndings } from './workspace.mjs';
 import { handbackHook, openHandback, raiseDirtyWorkspace } from './handback.mjs';
-import { deliverTask, signoffOf, finalReport, parseGithub, pushEnv, doneHeadOf, signoffHeadOf, raiseSignoffQuestion } from './deliver.mjs';
-import { verifyCommandProblems } from '../agent/elicitor.mjs';
+import { deliverTask, signoffOf, finalReport, parseGithub, doneHeadOf, signoffHeadOf, raiseSignoffQuestion, connectFor, connectAndPush } from './deliver.mjs';
+import { pushInitialDefault, remoteIsEmpty } from './push.mjs';
+import { verifyCommandProblems } from './verify-argv.mjs';
 import { validateRules, renderRules, normalizeQuote, foldRules } from './rules.mjs';
 import { setLimit } from './limits.mjs';
-import { getParam, setParam } from './params.mjs';
+import { getParam, setParam, writeParam } from './params.mjs';
 import { recordFromContract, recordGoalChange } from './decisions.mjs';
 import { budgetState, raiseProjectBudget, projectVerifyCommand, deferredSignoffs, maxOpenOf, parallelOf, effectiveSetupOf, runSetupCommands } from './project-settings.mjs';
 import { routeQuestion, prefixesOfScope, filesOfScope, prefixesOfPaths, filesOfPaths, scopePathProblems, normScopePaths, renderScopePaths, SCOPE_PATHS_NOTE, scopePathsNote } from './routing.mjs';
 import { waitingOnHuman } from './addressee.mjs';
 import { RESOLUTION_HOOKS } from './answers.mjs';
+import { HTTP_TIMEOUT_MS } from './http.mjs';
+import { transition } from '../db/state.mjs';
+import { acquireLease, releaseLease } from '../db/lease.mjs';
+import { insertQuestion } from './questions.mjs';
+import { bindApproval } from './provenance.mjs';
+import { taskProvenanceMarkdown } from './provenance-render.mjs';
+import { stopwatch } from './clock.mjs';
+import { pidAlive } from './proc.mjs';
 export { validateRules, renderRules, normalizeQuote };
 // 结构化范围的三个纯函数住在 routing.mjs（scope 那一族的家，且是叶子：elicitor 也要用，从这里取会成环）。
 export { scopePathProblems, normScopePaths, renderScopePaths, SCOPE_PATHS_NOTE, scopePathsNote };
 
-const gitEnv = (cwd, env, ...args) => execFileSync('git', args, {
-  cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 120_000, env,
-}).trim();
-const git = (cwd, ...args) => gitEnv(cwd, { ...process.env, GIT_TERMINAL_PROMPT: '0', GCM_INTERACTIVE: 'never' }, ...args);
 /** 原样的字节（取索引里的 blob 用）—— `git()` 会 trim，行尾一 trim 内容就变了。 */
-const gitBuf = (cwd, ...args) => execFileSync('git', args, {
-  cwd, encoding: 'buffer', stdio: ['ignore', 'pipe', 'pipe'], timeout: 120_000,
-  env: { ...process.env, GIT_TERMINAL_PROMPT: '0', GCM_INTERACTIVE: 'never' },
-});
+const gitBuf = (cwd, ...args) => gitRaw(cwd, args, { encoding: 'buffer' });
 
 export const PROJECT_TASK_RUNTIME_MS = 3 * 60 * 60 * 1000;
 export const projectDir = (home, projectId) => join(home, 'projects', projectId);
@@ -214,7 +221,7 @@ function defaultDeps(order, startOrder, existing) {
  * 从契约建一个任务（与 cli new --file 同一份落库逻辑；多了 project 三列、verify_extra、depends_on）。
  * ⚠️ cli.mjs 的 cmdNew 里还有一份同样的 INSERT —— 改这里要同步改那里（记在 开发计划 债里）。
  */
-export function createTaskFromSpec(db, spec, { userId, projectId = null, order = null, verifyExtra = [], dependsOn = null, batch = null }) {
+export function createTaskFromSpec(db, spec, { userId, projectId = null, order = null, verifyExtra = [], dependsOn = null, batch = null, approvedBy = null, derivedFrom = null }) {
   const verifyArgv = typeof spec.verify_command === 'string' ? spec.verify_command.trim().split(/\s+/) : null;
   // 规则连同出处落进完成定义：宪法块是规划器 / 执行器 / 验收员都读的那份文本，不另开字段。
   const dod = foldRules(spec.definition_of_done, spec.rules);
@@ -222,10 +229,8 @@ export function createTaskFromSpec(db, spec, { userId, projectId = null, order =
   const constId = newId('c');
   const t = now();
   db.tx(() => {
-    db.run(`INSERT INTO tasks (id,owner_id,title,status,created_at,project_id,project_order) VALUES (?,?,?,'planning',?,?,?)`,
-      taskId, userId, spec.title, t, projectId, order);
-    const param = (key, value) => db.run(`INSERT INTO params (id,task_id,key,value,layer,governance_class,set_by_kind,set_by_id,valid_from,recorded_at)
-              VALUES (?,?,?,?,'task','constitutional','user',?,?,?)`, newId('p'), taskId, key, JSON.stringify(value), userId, t, t);
+    insertTask(db, { id: taskId, ownerId: userId, title: spec.title, createdAt: t, projectId, projectOrder: order });
+    const param = (key, value) => writeParam(db, { taskId, key, value, by: { kind: 'user', id: userId }, governance: 'constitutional', at: t });
     if (verifyArgv?.length) param('task.verify_command', verifyArgv);
     if (verifyExtra.length) param('task.verify_extra', verifyExtra);
     if (projectId && Array.isArray(dependsOn)) param('task.depends_on', dependsOn);
@@ -233,9 +238,11 @@ export function createTaskFromSpec(db, spec, { userId, projectId = null, order =
     if (projectId && batch !== null) param('task.batch', batch);
     // 并行开发：骨架 / 模块 / 集成。模块任务改不得共享路径（executor 按它执法）。
     if (projectId && ['skeleton', 'module', 'integration'].includes(spec.kind)) param('task.kind', spec.kind);
-    db.run(`INSERT INTO constitutions (id,task_id,version,goal,scope,scope_paths,definition_of_done,constraints,valid_from,recorded_at)
-            VALUES (?,?,1,?,?,?,?,?,?,?)`,
-      constId, taskId, spec.goal, spec.scope ?? tl(contentLang(db), '未限定'),JSON.stringify(normScopePaths(spec.scope_paths)), dod, JSON.stringify(spec.constraints ?? []), t, t);
+    writeConstitution(db, { id: constId, taskId, version: 1, goal: spec.goal, scope: spec.scope ?? tl(contentLang(db), '未限定'), scopePaths: normScopePaths(spec.scope_paths), definitionOfDone: dod, constraints: spec.constraints ?? [], at: t });
+    // 出处：项目里的任务出自项目（批准在项目草案批准时绑）；重做出自原任务那一版；命令行直接给契约的，建任务的人就是批准人
+    if (projectId) insertEdge(db, constId, projectId, 'derived_from', t);
+    if (derivedFrom) insertEdge(db, constId, derivedFrom, 'derived_from', t);
+    if (approvedBy) bindApproval(db, { constitutionId: constId, userId: approvedBy, at: t });
     audit(db, { actorKind: 'user', actorId: userId, action: 'task_created', targetType: 'task', targetId: taskId,
       payload: { title: spec.title, constitution: constId, ...(projectId ? { projectId, order } : {}) } });
     // 决定登记：契约是人批准过的，逐条进项目的约定清单（每条行为规则、范围、验收命令）。
@@ -271,7 +278,7 @@ export function initProjectRepo({ home, projectId, source, base = null, empty = 
   const src = existsSync(source) ? resolve(source) : source;
   // 克隆 / 检出失败不留半截目录（新建项目时当场克隆，路径或 URL 不对是常见的人为错误）。
   try {
-    git(dir, '-c', 'core.autocrlf=false', 'clone', '--quiet', src, repo);
+    git(dir, '-c', 'core.autocrlf=false', 'clone', '--quiet', '--', safePositional(src, 'source'), repo);
     pinLineEndings(repo);   // 项目分支上的合并也在宿主机上做（见 workspace.mjs）
     if (base) git(repo, 'checkout', '-q', '--detach', base);
     git(repo, 'checkout', '-q', '-b', branch);
@@ -283,7 +290,8 @@ export function initProjectRepo({ home, projectId, source, base = null, empty = 
 }
 
 /**
- * 按顺序建整批契约任务，回归义务（前面任务的验收命令）自动累加。不套外层事务（db.tx 不支持嵌套）。
+ * 按顺序建整批契约任务，回归义务（前面任务的验收命令）自动累加。不套外层事务：db.tx 现在支持嵌套，但每个任务要建工作区、
+ * 跑 git，整批包进一个写事务会把写锁攥很久（别的进程等锁上限 10 s，见 db.mjs BUSY_TIMEOUT_MS）。
  * `seedExtra`（追加 / 接续）：这批任务之前已经存在的验收命令 —— 追加到在跑的项目时 = 链上此前全部任务的，接续时 = 原任务的。
  */
 export function createProjectTasks(db, { projectId, userId, tasks, startOrder = 1, seedExtra = [] }) {
@@ -302,9 +310,7 @@ export function createProjectTasks(db, { projectId, userId, tasks, startOrder = 
       const target = existing.find((e) => e.order === n);
       if (!target || target.started) continue;   // 草案定稿后它已经开工了：不再让它等
       const next = [...new Set([...target.dependsOn, order])];
-      db.run(`UPDATE params SET superseded_at=?, valid_to=? WHERE task_id=? AND key='task.depends_on' AND superseded_at IS NULL`, now(), now(), target.id);
-      db.run(`INSERT INTO params (id,task_id,key,value,layer,governance_class,set_by_kind,set_by_id,valid_from,recorded_at) VALUES (?,?,?,?,'task','constitutional','user',?,?,?)`,
-        newId('p'), target.id, 'task.depends_on', JSON.stringify(next), userId, now(), now());
+      writeParam(db, { taskId: target.id, key: 'task.depends_on', value: next, by: { kind: 'user', id: userId }, governance: 'constitutional' });
       target.dependsOn = next;
       audit(db, { actorKind: 'user', actorId: userId, action: 'project_task_blocked', targetType: 'project', targetId: projectId, payload: { order: n, taskId: target.id, waitsFor: order } });
     }
@@ -329,8 +335,7 @@ export function createProject(db, { userId, spec, source, home, base = null }) {
   const projectId = newId('pj');
   const { repo, branch, baseRef } = initProjectRepo({ home, projectId, source, base });
   const t = now();
-  db.run(`INSERT INTO projects (id,owner_id,title,brief,repo,branch,base_ref,source,status,created_at) VALUES (?,?,?,?,?,?,?,?,'active',?)`,
-    projectId, userId, spec.title.trim(), spec.brief ?? '', repo, branch, baseRef, String(source), t);
+  insertProject(db, { id: projectId, ownerId: userId, title: spec.title.trim(), brief: spec.brief ?? '', repo, branch, baseRef, source: String(source), status: 'active', createdAt: t });
   const taskIds = createProjectTasks(db, { projectId, userId, tasks: spec.tasks });
   audit(db, { actorKind: 'user', actorId: userId, action: 'project_created', targetType: 'project', targetId: projectId,
     payload: { title: spec.title, repo, branch, baseRef, source: String(source), tasks: taskIds } });
@@ -405,7 +410,21 @@ function startTask(db, { project, task, tasks, home }) {
  *   有开着的任务 → planning/running/waiting 等；done 没签收 → 等人；done + accepted → deliver 到项目仓库 → ff 合并 → merged_at，随即开下一个 ready 的。
  *   没有开着的 → 开 ready 里编号最小的；没有 ready 的：全合并了 → 项目 done；剩下的都被中止的任务卡着 → 项目 stalled 等人。
  */
-export async function advanceProject(db, { projectId, home, userId = null, makeExec = null, onEvent = () => {} }) {
+/**
+ * 推进项目（合并已签收的任务、开下一个……）。同一项目同时只许一个进程推进：守护进程、看板的「推进」、
+ * CLI 都可能来，两个同时合并同一个项目分支会互相踩 —— 推进期间持有 project:<id> 的租约，别人持有就这一轮让开。
+ */
+export async function advanceProject(db, opts) {
+  const res = `project:${opts.projectId}`;
+  let lease;
+  // 租约 30 分钟：推进的进程崩了，项目会被挡 30 分钟 —— 持有者是本机已经不在的进程，就当场接管
+  try { lease = acquireLease(db, res, { ttlMs: 30 * 60_000, meta: { pid: process.pid, op: 'advance' }, reclaimDead: opts.alive ?? pidAlive }); }
+  catch (e) { if (e.leaseHeld) return { advanced: false, reason: 'busy', holderPid: e.pid }; throw e; }
+  try { return await advanceProjectHeld(db, opts); }
+  finally { try { releaseLease(db, res, lease.epoch); } catch { /* 会自然到期 */ } }
+}
+
+async function advanceProjectHeld(db, { projectId, home, userId = null, makeExec = null, onEvent = () => {} }) {
   const p = db.one(`SELECT * FROM projects WHERE id=?`, projectId);
   if (!p) throw new I18nError('没有这个项目：{id}', { id: projectId });
   if (p.status !== 'active') return { advanced: false, reason: `status:${p.status}` };
@@ -420,7 +439,7 @@ export async function advanceProject(db, { projectId, home, userId = null, makeE
   };
   let sch = scheduleOf(db, { projectId, home });
   const finish = (extra = {}) => {
-    db.run(`UPDATE projects SET status='done' WHERE id=?`, projectId);
+    transition(db, 'projects', projectId, 'done');
     audit(db, { actorKind: 'system', action: 'project_done', targetType: 'project', targetId: projectId, payload: { tasks: sch.tasks.map((t) => t.id), ...extra } });
   };
 
@@ -444,7 +463,7 @@ export async function advanceProject(db, { projectId, home, userId = null, makeE
       const v = await runProjectVerify(db, { projectId, home });
       if (v.ok === false) {
         const q = raiseProjectVerifyFailed(db, { projectId, carrierId: st.carrierId, result: v });
-        db.run(`UPDATE projects SET status='stalled' WHERE id=?`, projectId);
+        transition(db, 'projects', projectId, 'stalled');
         audit(db, { actorKind: 'system', action: 'project_verify_failed', targetType: 'project', targetId: projectId, payload: { questionId: q.questionId, argv: v.argv, code: v.code } });
         return { advanced: true, reason: 'project_verify_failed', questionId: q.questionId };
       }
@@ -456,7 +475,7 @@ export async function advanceProject(db, { projectId, home, userId = null, makeE
     }
     if (st?.kind === 'review' && st.stage === 'abandoned') {
       // 人回了 C（先放着）。项目不是完成，也不是失败 —— 它在等人：添加任务、或中止。
-      db.run(`UPDATE projects SET status='stalled' WHERE id=?`, projectId);
+      transition(db, 'projects', projectId, 'stalled');
       audit(db, { actorKind: 'system', action: 'project_stalled', targetType: 'project', targetId: projectId,
         payload: { why: tl(L, '复盘被搁置：全部任务已合并，但没有宣布达成。项目等人：添加任务 / 宣布达成 / 中止项目') } });
       return { advanced: true, reason: 'review_abandoned' };
@@ -491,12 +510,12 @@ export async function advanceProject(db, { projectId, home, userId = null, makeE
     // 唯一的任务在草案阶段就被放弃（契约从未批准过）—— 没有可"重做"的契约，停滞的出口不成立，直接中止项目。
     const stage = getParam(db, blocker.id, 'draft.stage');
     if (stage && stage !== 'approved' && sch.tasks.length === 1) {
-      db.run(`UPDATE projects SET status='aborted' WHERE id=?`, projectId);
+      transition(db, 'projects', projectId, 'aborted');
       audit(db, { actorKind: 'system', action: 'project_aborted', targetType: 'project', targetId: projectId,
         payload: { taskId: blocker.id, why: tl(L, '唯一的任务在草案阶段被放弃') } });
       return { advanced: true, reason: 'draft_abandoned', taskId: blocker.id };
     }
-    db.run(`UPDATE projects SET status='stalled' WHERE id=?`, projectId);
+    transition(db, 'projects', projectId, 'stalled');
     audit(db, { actorKind: 'system', action: 'project_stalled', targetType: 'project', targetId: projectId,
       payload: { taskId: blocker.id, aborted: sch.aborted.map((t) => t.id), why: tl(L, '剩下的任务都被已中止的任务卡住；项目等人：恢复 / 重做该任务，或中止项目') } });
     return { advanced: true, reason: 'task_aborted', taskId: blocker.id };
@@ -546,7 +565,7 @@ export async function advanceProject(db, { projectId, home, userId = null, makeE
   }
   let d;
   try {
-    d = await deliverTask(db, { taskId: cur.id, workspace: wsDir, remote: p.repo, pr: false, userId });
+    d = await deliverTask(db, { taskId: cur.id, workspace: wsDir, remote: p.repo, pr: false, userId, internal: true });
     git(p.repo, 'checkout', '-q', p.branch);
     try {
       git(p.repo, 'merge', '--ff-only', d.branch);
@@ -558,7 +577,7 @@ export async function advanceProject(db, { projectId, home, userId = null, makeE
     throw e;
   }
   const head = git(p.repo, 'rev-parse', 'HEAD');
-  db.run(`UPDATE tasks SET merged_at=? WHERE id=?`, now(), cur.id);
+  markTaskMerged(db, cur.id);
   audit(db, { actorKind: 'system', action: 'project_task_merged', targetType: 'project', targetId: projectId,
     payload: { taskId: cur.id, order: cur.project_order, branch: d.branch, head } });
   sch = scheduleOf(db, { projectId, home });
@@ -616,7 +635,7 @@ export function deliveryEvidence(db, { projectId }) {
  * 项目交付：把项目分支推到远端；`pr` 时开一个 PR，正文 = 各任务终版汇报摘要。
  * 项目要 done；或已中止但至少合并过一个任务 —— 已合并的前缀逐个经人签收、各带累加的回归验收，是可以交付的成果。
  */
-export async function deliverProject(db, { projectId, remote, pr = false, base = null, token = process.env.GITHUB_TOKEN, fetchFn = globalThis.fetch, userId = null, acceptDeferred = false }) {
+export async function deliverProject(db, { projectId, remote, pr = false, base = null, token = undefined, env = process.env, fetchFn = globalThis.fetch, userId = null, acceptDeferred = false }) {
   const p = db.one(`SELECT * FROM projects WHERE id=?`, projectId);
   if (!p) throw new I18nError('没有这个项目：{id}', { id: projectId });
   const L = contentLang(db);
@@ -627,6 +646,7 @@ export async function deliverProject(db, { projectId, remote, pr = false, base =
     throw (partial ? new I18nError('项目已中止且没有任何已合并的任务，没有可交付的内容') : new I18nError('项目状态是 {status}，只交付已完成的项目，或已中止但有已合并任务的项目', { status: p.status }));
   }
   if (!remote) throw new I18nError('要给 --remote <url>：项目分支推到哪里。不默认取源仓库 —— 那可能是别人的仓库');
+  remote = safePositional(remote);
   // 后置签收：自动挡下 AI 自己加的任务是"验收过了就合并、签收攒着"。攒到这里必须清掉 ——
   // **交付是爆炸半径的真正边界**，草案里那句"交付永远要人点"，具体就是这一下。
   // 清掉的方式是显式的 acceptDeferred，不是看见有就自动过：一次点掉 N 个任务是一次真实的决定，
@@ -638,36 +658,40 @@ export async function deliverProject(db, { projectId, remote, pr = false, base =
   }
   if (deferred.length) acceptDeferredSignoffs(db, { projectId, userId, tasks: deferred });
   const gh = parseGithub(remote);
-  const env = pushEnv(remote, token);
-  const out = { remote, branch: p.branch, head: null, pr: null, prSkipped: null, basePushed: null, partial: partial ? { merged: mergedTasks.length, total: allTasks.length } : null };
-  // 空仓库（零分支）没有 PR 的 base：先把项目起点推成默认分支。只在要开 PR、远端是 GitHub、有 token 时查；
-  // 查不到分支列表就当不空，push 照常。
-  if (pr && gh && token) {
-    const branches = await fetchFn(`https://api.github.com/repos/${gh.owner}/${gh.repo}/branches?per_page=1`, {
-      headers: { authorization: `Bearer ${token}`, accept: 'application/vnd.github+json', 'user-agent': 'superintern' } })
-      .then((r) => (r.ok ? r.json() : null)).catch(() => null);
-    if (Array.isArray(branches) && branches.length === 0) {
-      const def = base ?? await defaultBranch(gh, token, fetchFn);
-      gitEnv(p.repo, env, 'push', remote, `${p.base_ref}:refs/heads/${def}`);
+  const out = { remote, branch: p.branch, head: null, pr: null, prSkipped: null, basePushed: null, credential: null, partial: partial ? { merged: mergedTasks.length, total: allTasks.length } : null };
+  // 空仓库（零分支）没有 PR 的 base：先把项目起点推成默认分支。只在要开 PR 时查（git ls-remote，不分托管）；
+  // 读不了远端就当不空，下面的推送会把真正的原因报出来。这是护栏唯一允许推默认分支的情形，推之前在 push.mjs 里再核一次"确实是空的"。
+  const conn = await connectFor(db, { remote, action: pr && gh ? 'pr' : 'push', actorId: userId, token, env, fetchFn });
+  out.credential = conn.credential;
+  try {
+    if (pr && gh && remoteIsEmpty(p.repo, remote, conn.gitEnv)) {
+      const def = base ?? (gh && conn.apiToken ? await defaultBranch(gh, conn.apiToken, fetchFn, conn.apiBase).catch(() => 'main') : 'main');
+      pushInitialDefault(db, { dir: p.repo, remote, src: p.base_ref, branch: def, env: conn.gitEnv, actorId: userId });
       out.basePushed = { branch: def, head: p.base_ref };
       base = def;
     }
-  }
-  gitEnv(p.repo, env, 'push', '--force-with-lease', remote, `${p.branch}:refs/heads/${p.branch}`);
+  } finally { conn.cleanup(); }
+  const pushed = await connectAndPush(db, { dir: p.repo, remote, src: p.branch, branch: p.branch, action: pr && gh ? 'pr' : 'push', actorId: userId, token, env, fetchFn });
+  pushed.cleanup();
   const head = git(p.repo, 'rev-parse', p.branch);
   out.head = head;
   if (pr) {
     if (!gh) out.prSkipped = tl(L, '远端不是 GitHub（{remote}），已推送，未创建 PR', { remote });
-    else if (!token) out.prSkipped = tl(L, '未设置 GITHUB_TOKEN：已推送，未创建 PR。在 .env 中设置后重新交付即可');
+    else if (!pushed.apiToken) out.prSkipped = tl(L, '已推送，未创建 PR：没有能调用 GitHub 接口的连接。到「设置 → 连接」加一个 GitHub App 或令牌后重新交付即可');
     else {
+      const token = pushed.apiToken;
       const tasks = mergedTasks;
       const lines = tasks.map((t) => { const r = finalReport(db, t.id); return tl(L, '{order}. **{title}**（`{id}`）\n   {summary}', { order: t.project_order, title: t.title, id: t.id, summary: r.summary }); });
-      const baseBranch = base ?? await defaultBranch(gh, token, fetchFn);
-      const res = await fetchFn(`https://api.github.com/repos/${gh.owner}/${gh.repo}/pulls`, {
+      // 溯源表：每个任务一段 —— 批准 / 发起 / 签收 + 步骤 → 条款 → 指令来源 → 提交（按项目分支上的 node: 行找）
+      const by = userId ? db.one(`SELECT display_name FROM users WHERE id=?`, userId)?.display_name ?? null : null;
+      const trace = tasks.map((t) => `### ${t.project_order}. ${t.title}\n\n${taskProvenanceMarkdown(db, t.id, { L, dir: p.repo, maxRows: 25 })}`);
+      const traceText = `${tl(L, '## 溯源')}\n\n${tl(L, '交付：{who}，所用连接：{cred}', { who: by ?? tl(L, '系统'), cred: pushed.credential?.name ?? tl(L, '无（本机仓库）') })}\n\n${trace.join('\n\n')}`.slice(0, 50_000);
+      const baseBranch = base ?? await defaultBranch(gh, token, fetchFn, pushed.apiBase);
+      const res = await fetchFn(`${pushed.apiBase}/repos/${gh.owner}/${gh.repo}/pulls`, { signal: AbortSignal.timeout(HTTP_TIMEOUT_MS),
         method: 'POST',
         headers: { authorization: `Bearer ${token}`, accept: 'application/vnd.github+json', 'content-type': 'application/json', 'user-agent': 'superintern' },
         body: JSON.stringify({ title: p.title, head: p.branch, base: baseBranch,
-          body: `${partial ? tl(L, '> 项目已中止：本次只交付已签收并合并的第 1–{merged} 个任务（共 {total} 个）。\n\n', { merged: mergedTasks.length, total: allTasks.length }) : ''}${p.brief ? `${p.brief}\n\n` : ''}${tl(L, '## 任务')}\n\n${lines.join('\n')}\n\n---\n${tl(L, '由 SuperIntern 交付：项目 `{id}`，分支 `{branch}` @ {head}。摘要取自各任务真相源里的终版汇报。', { id: projectId, branch: p.branch, head: head.slice(0, 8) })}` }),
+          body: `${partial ? tl(L, '> 项目已中止：本次只交付已签收并合并的第 1–{merged} 个任务（共 {total} 个）。\n\n', { merged: mergedTasks.length, total: allTasks.length }) : ''}${p.brief ? `${p.brief}\n\n` : ''}${tl(L, '## 任务')}\n\n${lines.join('\n')}\n\n${traceText}\n\n---\n${tl(L, '由 SuperIntern 交付：项目 `{id}`，分支 `{branch}` @ {head}。摘要取自各任务真相源里的终版汇报。', { id: projectId, branch: p.branch, head: head.slice(0, 8) })}` }),
       });
       const json = await res.json().catch(() => ({}));
       if (!res.ok) throw new I18nError('开 PR 失败：HTTP {status} {body}', { status: res.status, body: JSON.stringify(json).slice(0, 300) });
@@ -678,8 +702,8 @@ export async function deliverProject(db, { projectId, remote, pr = false, base =
   return out;
 }
 
-async function defaultBranch(gh, token, fetchFn) {
-  const res = await fetchFn(`https://api.github.com/repos/${gh.owner}/${gh.repo}`, {
+async function defaultBranch(gh, token, fetchFn, apiBase = 'https://api.github.com') {
+  const res = await fetchFn(`${apiBase}/repos/${gh.owner}/${gh.repo}`, { signal: AbortSignal.timeout(HTTP_TIMEOUT_MS),
     headers: { authorization: `Bearer ${token}`, accept: 'application/vnd.github+json', 'user-agent': 'superintern' } });
   const json = await res.json().catch(() => ({}));
   if (!res.ok) throw new I18nError('读仓库信息失败：HTTP {status} {body}', { status: res.status, body: JSON.stringify(json).slice(0, 200) });
@@ -710,7 +734,7 @@ export async function runProjectVerify(db, { projectId, home, makeExec = null, o
     ?? db.one(`SELECT id FROM tasks WHERE project_id=? ORDER BY project_order DESC LIMIT 1`, projectId);
   if (!carrier) return { ok: false, argv, code: null, tail: tl(L, '项目里没有任何任务，无处建验收工作区'), timedOut: false };
   const dir = join(home, 'verify', projectId);
-  const t0 = now();
+  const took = stopwatch();   // 单调时钟
   let exec = null;
   try {
     // force：每次都从项目分支当前头重新克隆。上一次验收留下的东西不许影响这一次。
@@ -732,13 +756,13 @@ export async function runProjectVerify(db, { projectId, home, makeExec = null, o
     if (setupArgvs.length) {
       const su = await runSetupCommands(exec, dir, setupArgvs, contentLang(db));
       audit(db, { actorKind: 'system', action: su.ok ? 'env_setup_done' : 'env_setup_failed', targetType: 'project', targetId: projectId,
-        payload: { for: 'project_verify', source: setupSource, results: su.results.map((x) => ({ cmd: x.argv.join(' '), code: x.code, timedOut: x.timedOut, tail: x.tail.slice(-600) })) } });
+        payload: { for: 'project_verify', source: setupSource, results: su.results.map((x) => ({ cmd: x.argv.join(' '), code: x.code, timedOut: x.timedOut, elapsedMs: x.elapsedMs ?? null, tail: x.tail.slice(-600) })) } });
       if (!su.ok) {
         const bad = su.results.at(-1);
         const r = { ok: false, argv, code: bad.code, timedOut: bad.timedOut, head: ws.head, setupFailed: true,
           tail: `${tl(L, '环境准备命令失败，验收命令没有跑：')}\n$ ${bad.argv.join(' ')}\n${bad.tail}` };
         audit(db, { actorKind: 'system', action: 'project_verified', targetType: 'project', targetId: projectId,
-          payload: { ok: false, argv, code: bad.code, timedOut: bad.timedOut, head: ws.head, tail: r.tail, setupFailed: true, elapsedMs: now() - t0 } });
+          payload: { ok: false, argv, code: bad.code, timedOut: bad.timedOut, head: ws.head, tail: r.tail, setupFailed: true, elapsedMs: Math.round(took()) } });
         return r;
       }
     }
@@ -769,7 +793,7 @@ export async function runProjectVerify(db, { projectId, home, makeExec = null, o
     audit(db, { actorKind: 'system', action: 'project_verified', targetType: 'project', targetId: projectId,
       // `tail` 也进审计：交付那一页要摆的一手证据就是这段输出，而交付可能发生在几小时之后、
       // 另一个进程里。不存下来，那一页就只剩"状态栏文字"—— 人不该只看状态栏就点交付。
-      payload: { argv, code: out.code, timedOut: out.timedOut, ok, head: ws.head, elapsedMs: now() - t0, tail: tail.slice(0, 12000), perTask } });
+      payload: { argv, code: out.code, timedOut: out.timedOut, ok, head: ws.head, elapsedMs: Math.round(took()), tail: tail.slice(0, 12000), perTask } });
     onEvent({ type: 'project_verify_done', ok, code: out.code });
     return { ok, argv, code: out.code, timedOut: out.timedOut, tail, head: ws.head, perTask };
   } catch (e) {
@@ -796,21 +820,21 @@ const PER_TASK_VERIFY_TIMEOUT_MS = 5 * 60 * 1000;
 async function runMergedTaskVerifies(db, { projectId, exec, dir, onEvent = () => {} }) {
   const tasks = projectTasks(db, projectId).filter((t) => t.merged_at).sort((a, b) => a.merged_at - b.merged_at);
   const out = [];
-  const t0 = now();
+  const spent = stopwatch();   // 单调时钟
   for (const t of tasks) {
     const argv = getParam(db, t.id, 'task.verify_command');
     const base = { taskId: t.id, order: t.project_order, title: t.title, argv: Array.isArray(argv) ? argv : null };
     if (!base.argv?.length) { out.push({ ...base, ok: null, why: 'no_command' }); continue; }
-    if (now() - t0 > PER_TASK_VERIFY_BUDGET_MS) { out.push({ ...base, ok: null, why: 'budget' }); continue; }
+    if (spent() > PER_TASK_VERIFY_BUDGET_MS) { out.push({ ...base, ok: null, why: 'budget' }); continue; }
     onEvent({ type: 'task_verify_start', taskId: t.id, argv: base.argv });
-    const at = now();
+    const took = stopwatch();
     try {
       const run = runnableArgv(base.argv, dir);
       const r = await exec.execute({ file: run[0], args: run.slice(1) }, dir, { mode: 'write', timeoutMs: PER_TASK_VERIFY_TIMEOUT_MS });
-      out.push({ ...base, ok: r.code === 0 && !r.timedOut, code: r.code, timedOut: !!r.timedOut, elapsedMs: now() - at,
+      out.push({ ...base, ok: r.code === 0 && !r.timedOut, code: r.code, timedOut: !!r.timedOut, elapsedMs: Math.round(took()),
         tail: (r.code === 0 && !r.timedOut) ? null : (r.stdout + r.stderr).trim().split('\n').slice(-20).join('\n').slice(0, 1200) });
     } catch (e) {
-      out.push({ ...base, ok: null, why: 'error', error: String(e.message).slice(0, 200), elapsedMs: now() - at });
+      out.push({ ...base, ok: null, why: 'error', error: String(e.message).slice(0, 200), elapsedMs: Math.round(took()) });
     }
   }
   return out;
@@ -833,8 +857,7 @@ export function raiseProjectVerifyFailed(db, { projectId, carrierId = null, resu
     + `${tl(L, '(B) 验收命令本身不对：到「项目设置 → 自动化」改项目级验收命令，然后回这条「再跑一次」—— 系统用新命令重新验收，过了就宣布完成')}\n`
     + tl(L, '(C) 这条验收不该拦：到「项目设置 → 自动化」清空项目级验收命令，然后回「再跑一次」（清空后"达成"就完全由人宣布，没有机械核实）');
   return db.tx(() => {
-    db.run(`INSERT INTO questions (id,task_id,node_id,level,level_source,text,default_action,asked_at,timeout_at,status)
-            VALUES (?,?,NULL,3,'hard_rule',?,NULL,?,NULL,'open')`, id, host, text, t);
+    insertQuestion(db, { id: id, taskId: host, level: 3, text: text, askedAt: t });
     routeQuestion(db, { questionId: id, decisionType: 'structural', typeSource: 'hard_rule', at: t });
     return { questionId: id, text };
   });
@@ -1153,7 +1176,7 @@ export async function integrateProjectBranch(db, { project, task, home, makeExec
       if (setupArgvs.length) {
         const su = await runSetupCommands(exec, wsDir, setupArgvs, L);
         audit(db, { actorKind: 'system', action: su.ok ? 'env_setup_done' : 'env_setup_failed', targetType: 'task', targetId: task.id,
-          payload: { for: 'integrate', projectId: project.id, source: setupSource, results: su.results.map((x) => ({ cmd: x.argv.join(' '), code: x.code, timedOut: x.timedOut, tail: x.tail.slice(-600) })) } });
+          payload: { for: 'integrate', projectId: project.id, source: setupSource, results: su.results.map((x) => ({ cmd: x.argv.join(' '), code: x.code, timedOut: x.timedOut, elapsedMs: x.elapsedMs ?? null, tail: x.tail.slice(-600) })) } });
         if (!su.ok) {
           const b = su.results.at(-1);
           return { argv: b.argv, code: b.code, timedOut: b.timedOut, regression: false, setupFailed: true,
@@ -1341,8 +1364,7 @@ export function raiseIntegrateBlocked(db, { project, task, result }) {
       + `${tl(L, '(B) 先看清楚：到任务页看「改动」「活动」和「日志」，看完再回来选')}\n`
       + tl(L, '(C) 这个任务不要了：在项目页中止它（它的下游会跟着停，项目会转停滞等你处理）。这一步不可逆，答复里写"中止"不算数，得你自己去点。'));
   return db.tx(() => {
-    db.run(`INSERT INTO questions (id,task_id,node_id,level,level_source,text,default_action,asked_at,timeout_at,status)
-            VALUES (?,?,NULL,3,'hard_rule',?,NULL,?,NULL,'open')`, id, task.id, text, t);
+    insertQuestion(db, { id: id, taskId: task.id, level: 3, text: text, askedAt: t });
     routeQuestion(db, { questionId: id, decisionType: 'structural', typeSource: 'hard_rule', at: t });
     // 同一个项目分支头只试一次：集成 + 重跑要起一次容器，每拍重试一遍就是在烧钱。
     // `taskHead` 是闸的第二把钥匙（见 blockedAtHead）：人打回、它改完、又 done 了一次 → 新的
@@ -1391,7 +1413,7 @@ function projectVerifyHook(db, { question, finalBody, by, at }) {
       payload: { questionId: question.id, why: tl(contentLang(db), '答复不是"再跑一次"：加任务要到项目页「添加任务」，改 / 清验收命令要到项目设置'), body: String(finalBody ?? '').slice(0, 200) } });
     return { handled: false };
   }
-  db.run(`UPDATE projects SET status='active' WHERE id=? AND status='stalled'`, pid);
+  transition(db, 'projects', pid, 'active', { from: ['stalled'], onMismatch: 'skip' });
   audit(db, { actorKind: 'user', actorId: by, action: 'project_verify_retry_requested', targetType: 'project', targetId: pid, payload: { questionId: question.id, at } });
   return { handled: true, retry: true };
 }
@@ -1436,14 +1458,13 @@ function structuralHook(db, { question, finalBody, by, messageId, at }) {
   const tok = messageId ? db.one(`SELECT token_id FROM messages WHERE id=?`, messageId)?.token_id ?? null : null;
   const mid = newId('m');
   const reason = `${markOf(L, 'integrationConflict')}${body}`;
-  db.run(`INSERT INTO messages (id,task_id,sender_id,body,kind,kind_source,urgency,urgency_source,trust_label,token_id,received_at)
-          VALUES (?,?,?,?,'correction','explicit','urgent','explicit','user-authenticated',?,?)`, mid, taskId, by, reason, tok, at);
+  insertUserMessage(db, { id: mid, taskId, senderId: by, tokenId: tok, body: reason, kind: 'correction', urgency: 'urgent', receivedAt: at });
   if (messageId) insertEdge(db, mid, messageId, 'derived_from', at);
   setParam(db, { taskId, key: 'signoff.status', value: 'rejected', by: { kind: 'user', id: by }, governance: 'constitutional' });
   // 解开集成闸：人已经给了处置，下一轮该重新试，而不是继续"同一个头不再试"。
   setParam(db, { taskId, key: 'task.rebase_blocked', value: null, by: { kind: 'agent', id: 'project' }, governance: 'execution' });
   if (db.one(`SELECT status FROM tasks WHERE id=?`, taskId)?.status === 'done') {
-    db.run(`UPDATE tasks SET status='running' WHERE id=?`, taskId);
+    transition(db, 'tasks', taskId, 'running');
     audit(db, { actorKind: 'user', actorId: by, action: 'task_resumed', targetType: 'task', targetId: taskId,
       payload: { from: 'done', to: 'running', via: 'integrate_conflict_answered' } });
   }

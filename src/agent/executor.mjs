@@ -11,18 +11,31 @@
 
 import { routeQuestion, decisionTypeOfQuestion, prefixesOf, scopeFilesOf, scopePathsOf } from '../core/routing.mjs';
 import { tl, contentLang } from '../i18n/index.mjs';
-import { writeFileSync, mkdirSync } from 'node:fs';
+import { writeFileSync, mkdirSync, existsSync, rmSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { runToolLoop } from '../llm/client.mjs';
 import { textOf } from '../llm/canonical.mjs';
 import { newId, now, audit, insertEdge } from '../db/db.mjs';
+import { insertDecision } from '../db/constitutions.mjs';
 import { assembleExecutor } from '../context/assemble.mjs';
+import { makeCompactor, fixedEstimate, OUTPUTS_DIR } from '../context/compact.mjs';
+import { compactThresholdOf } from '../core/limits.mjs';
 import { LocalExecutor, classifyCommand } from '../core/executor.mjs';
 import { raiseEgressQuestion, sourceOf, hostProblem } from '../core/egress.mjs';
 import { changedSince, nodeBaseline, clearNodeBaseline, isBuildOutput } from '../core/workspace.mjs';
 import { isInfraError } from '../core/errors.mjs';
 import { timeoutFor } from '../core/timeouts.mjs';
 import { coveredBy, lockedPathsFor, grantedSharedFor } from '../core/parallel.mjs';
+import { grepFiles, RegexTimeoutError, GREP_TIMEOUT_MS } from '../core/safe-grep.mjs';
+import { transition } from '../db/state.mjs';
+import { insertQuestion } from '../core/questions.mjs';
+import { nodeDiagnosis, describeDiagnosis, listDefects, roundsOf } from '../core/diagnose.mjs';
+import { testChanges, describeTestChanges, describeFinding, testsAllowedFor } from '../core/test-guard.mjs';
+import { baseHeadOf } from '../core/workspace.mjs';
+import { gitRaw } from '../core/git.mjs';
+import { getSetting } from '../core/settings.mjs';
+import { readPreviewSpec, PREVIEW_FILE } from '../core/preview.mjs';
+import { uiChecksOf } from '../db/nodes.mjs';
 
 // ═══════════════════════════════════════════════════════════════════════════
 // 工具
@@ -31,8 +44,10 @@ import { coveredBy, lockedPathsFor, grantedSharedFor } from '../core/parallel.mj
 export const TOOLS = [
   { name: 'list_dir', description: '列目录内容。先看再动，不要凭记忆猜工作区里有什么。',
     parameters: { type: 'object', properties: { path: { type: 'string', description: '相对工作区根的路径，默认 "."' } } } },
-  { name: 'read_file', description: '读文件全文。',
-    parameters: { type: 'object', properties: { path: { type: 'string' } }, required: ['path'] } },
+  { name: 'read_file', description: '读文件。默认从头读；长文件用 offset / limit 分段读。',
+    parameters: { type: 'object', properties: { path: { type: 'string' },
+      offset: { type: 'integer', description: '从第几行开始（1 起），默认 1' },
+      limit: { type: 'integer', description: '最多读几行，默认读到文件末尾（仍受单次字符上限约束）' } }, required: ['path'] } },
   { name: 'write_file', description: '写文件（整体覆盖）。目录不存在会自动建。',
     parameters: { type: 'object', properties: { path: { type: 'string' }, content: { type: 'string' } },
       required: ['path', 'content'] } },
@@ -40,7 +55,7 @@ export const TOOLS = [
     parameters: { type: 'object', properties: {
       pattern: { type: 'string' }, path: { type: 'string', description: '限定子目录，默认全工作区' },
       glob: { type: 'string', description: '文件名后缀过滤，如 ".mjs"' } }, required: ['pattern'] } },
-  { name: 'run_command', description: '在工作区里跑一条命令。参数是 argv 不是 shell 字符串，不做 shell 展开。',
+  { name: 'run_command', description: '在工作区里跑一条命令。参数是 argv 不是 shell 字符串，不做 shell 展开。工作区的 .git 是只读的：git status / diff / log 能用，commit / checkout / stash 不行，也不需要 —— 提交由系统做。',
     parameters: { type: 'object', properties: {
       file: { type: 'string', description: '可执行文件名，如 "node"、"git"' },
       args: { type: 'array', items: { type: 'string' } },
@@ -84,6 +99,9 @@ export const TOOLS = [
               + '或引用到的规范/文档/FINDINGS 原文。blocked：写清卡在什么上、要什么条件才能验。'
               + 'own_artifact：写清你是对着哪个自己造的文件验的。'
               + 'settled_by_me：写清你**查过哪些地方**确认没有出处、你选了什么、以及选错的代价是什么。' },
+          audience: { type: 'string', enum: ['user', 'developer'],
+            description: '（settled_by_me 必填）这个选择谁会在乎：user = 用这个软件的人看得到、碰得到的（界面上的文字与显示、排序、默认值、业务规则）；'
+              + 'developer = 只有写代码、调接口的人才在乎的（HTTP 状态码、接口字段格式、模块划分与入口、测试怎么写、依赖与构建）。系统按它把这件事交给对的人过目。' },
           must_disclose: { type: 'boolean',
             description: '这条即便不阻塞，人也必须看见吗？覆盖面缺口、与规格不符的已知偏差、'
               + '循环验证的结论，都填 true。' },
@@ -107,8 +125,16 @@ export const TOOLS = [
         + '要给的是：现有范围内可行的出路，以及（若确实只能改契约）说明要改哪一条、改成什么。' },
       default_action: { type: 'string', description: '仅 Ⅰ/Ⅱ 级填' },
       blocked_by: { type: 'string', description: '被规格/验收标准里的哪一条卡住，原文引用' },
-      kind: { type: 'string', enum: ['spec', 'structural'],
-        description: 'spec=规格没写清、要人取舍；structural=规格 / 契约 / 依赖之间自相矛盾，改一处才能继续。决定问题路由给谁' },
+      kind: { type: 'string', enum: ['spec', 'structural', 'impossible'],
+        description: 'spec=规格没写清、要人取舍；structural=规格 / 契约 / 依赖之间自相矛盾，改一处才能继续；'
+          + 'impossible=做不到：验收标准、原有测试、规格之间互相冲突（满足一条就违反另一条），或在给定约束下确实做不出来 —— '
+          + '这时**不要改原有测试去迁就实现，也不要改实现去迁就一条你认为错了的测试**，停下来问；必须同时填 conflict 与 attempts。决定问题路由给谁' },
+      conflict: { type: 'array', description: '仅 kind=impossible：冲突的各方，每方一条，**原文引用**（不要转述）。'
+        + '两方冲突就写两条；"给定约束下做不出来"写约束那一条，做不出来的证据写进 attempts。',
+        items: { type: 'object', properties: {
+          source: { type: 'string', description: '出处：验收标准第几条 / 规格哪一段 / 测试文件:行号 / 契约约束' },
+          quote: { type: 'string', description: '原文' } }, required: ['source', 'quote'] } },
+      attempts: { type: 'string', description: '仅 kind=impossible：试过哪些做法、各自的结果（命令与关键输出），说明为什么每条路都过不去。' },
       // ↓ 复工简报三段。挂起分支不冷冻上下文，这三段就是**全部**留下来的东西。
       work_done: { type: 'string',
         description: '到此刻为止真的做完了什么：读过哪些文件得出什么结论、写了哪些文件、'
@@ -139,6 +165,13 @@ export const TOOLS = [
 /** read_file 单次返回上限（字符）。约 12k token：够读任何一个源文件，读不了 lock 文件。 */
 export const READ_FILE_MAX_CHARS = 40_000;
 
+/** git 报错里最有用的一行：fatal: / error: / warning: 开头的那行（git 有时把整段用法说明打在后面），没有就取第一行。 */
+const gitErrLine = (e) => {
+  if (!e) return null;
+  const lines = String(e.stderr || e.message || e).split('\n').map((l) => l.trim()).filter(Boolean);
+  return (lines.find((l) => /^(fatal|error|warning):/i.test(l)) ?? lines[0] ?? '').slice(0, 200) || null;
+};
+
 /** 工具实现。全部经 Executor 走，路径约束落在一处。 */
 export function makeHandlers(exec, workspace, trace) {
   const log = (name, args, result) => { trace.push({ name, args, result: String(result).slice(0, 4000) }); return result; };
@@ -147,34 +180,49 @@ export function makeHandlers(exec, workspace, trace) {
     // ⚠️ 读文件有上限。曾出现过 agent 一口气 read_file 了 187 KB 的 package-lock.json，
     // 一轮吃掉约 60k token，第 19 轮撞上 limit.context_tokens（150k）整个节点作废。
     // run_command 早就有 maxOutputBytes（64 KB），read_file 没有 —— 同一个洞，另一扇门。
+    // 分段读：被截断的文件、整理时落盘的长命令输出，原来没有办法读到后半段
     read_file: async (a) => {
-      const text = exec.readFile(workspace, a.path);
-      if (text.length <= READ_FILE_MAX_CHARS) return log('read_file', a, text);
+      const full = exec.readFile(workspace, a.path);
+      const off = Number.isInteger(a.offset) && a.offset > 1 ? a.offset : 1;
+      const lim = Number.isInteger(a.limit) && a.limit > 0 ? a.limit : null;
+      const ranged = off > 1 || lim != null;
+      const lines = ranged ? full.split('\n') : null;
+      const text = ranged ? lines.slice(off - 1, lim != null ? off - 1 + lim : undefined).join('\n') : full;
+      const where = ranged ? `第 ${off}–${Math.min(lines.length, off - 1 + (lim ?? lines.length))} 行（共 ${lines.length} 行）` : null;
+      if (text.length <= READ_FILE_MAX_CHARS) return log('read_file', a, where && (off > 1 || (lim != null && off - 1 + lim < lines.length)) ? `${text}\n\n[系统] 以上是${where}。` : text);
       const head = text.slice(0, READ_FILE_MAX_CHARS);
-      return log('read_file', a, `${head}\n\n[系统] 文件共 ${text.length} 字符，只返回了前 ${READ_FILE_MAX_CHARS} 字符。`
-        + `这种体量的文件（lock 文件、生成物、数据）整读会把上下文吃光 —— 用 grep 定位，或换更小的目标。`);
+      const shownLines = head.split('\n').length - 1;
+      return log('read_file', a, `${head}\n\n[系统] ${where ? `${where}里` : '文件'}共 ${text.length} 字符，只返回了前 ${READ_FILE_MAX_CHARS} 字符（约到第 ${off + shownLines} 行）。`
+        + `要往后读就用 offset 从第 ${off + shownLines} 行接着读；lock 文件、生成物、数据这类整读会把上下文吃光 —— 先用 grep 定位。`);
     },
     write_file: async (a) => {
       exec.writeFile(workspace, a.path, a.content);
       return log('write_file', { path: a.path, bytes: a.content.length }, `已写入 ${a.path}（${a.content.length} 字节）`);
     },
     grep: async (a) => {
-      const re = new RegExp(a.pattern, 'gm');
-      const hits = [];
+      new RegExp(a.pattern, 'gm');   // 语法错当场抛（回给模型），不必先把文件读一遍
+      const files = [];
+      // 虚拟环境与缓存目录不进（与 node_modules 同理：装出来的第三方代码，搜出来只是噪音）；
+      // 显式把 path 指进去的照搜。读不了的条目（listDir 标了"读不了"）跳过
+      const SKIP = new Set(['.venv', 'venv', '__pycache__', '.pytest_cache', '.mypy_cache']);
       const walk = (rel) => {
         for (const e of exec.listDir(workspace, rel)) {
+          if (!e.endsWith('/') && !/\s\d+B$/.test(e)) continue;
           const name = e.replace(/\s+\d+B$/, '').replace(/\/$/, '');
           const child = rel === '.' ? name : `${rel}/${name}`;
-          if (e.endsWith('/')) { walk(child); continue; }
+          if (e.endsWith('/')) { if (!SKIP.has(name)) walk(child); continue; }
           if (a.glob && !name.endsWith(a.glob)) continue;
           let text; try { text = exec.readFile(workspace, child); } catch { continue; }
-          text.split('\n').forEach((line, i) => {
-            re.lastIndex = 0;
-            if (re.test(line) && hits.length < 200) hits.push(`${child}:${i + 1}:${line.trim().slice(0, 200)}`);
-          });
+          files.push({ path: child, text });
         }
       };
       walk(a.path || '.');
+      // 匹配在工作线程里跑、有时限：一条灾难性回溯的正则原来能把整个编排器卡死
+      let hits;
+      try { hits = await grepFiles(a.pattern, files); } catch (e) {
+        if (!(e instanceof RegexTimeoutError)) throw e;
+        return log('grep', a, `[系统] 这条正则在 ${GREP_TIMEOUT_MS / 1000} 秒内没跑完，已中止 —— 多半是嵌套的量词（如 (a+)+、(.*)*）在长行上灾难性回溯。换一个更简单、更具体的写法再搜。`);
+      }
       return log('grep', a, hits.join('\n') || '(无匹配)');
     },
     run_command: async (a) => {
@@ -221,8 +269,15 @@ export const MECHANICAL_REPEAT_STOP = 3;
 export const alwaysInScope = (p) => ALWAYS_IN_SCOPE.has(p)
   || /(^|\/)(requirements[^/]*\.txt|pyproject\.toml|package\.json|package-lock\.json|\.gitignore)$/.test(p)
   || isBuildOutput(p);   // 把已提交的构建产物从跟踪里摘掉（git rm --cached）也是仓库卫生
-export function validateHandoff(args, { exec, workspace, changed, scopePrefixes = null, scopeFiles = [], scopeStructured = false, lockedPaths = [], grantedPaths = [], lang = 'zh' }) {
-  const errs = [];
+export function validateHandoff(args, opts) { return validateHandoffDetailed(args, opts).errs; }
+
+/**
+ * 同一份校验，另给结构化的缺陷：类别 + 涉及的路径 / 字段 + 那句话。诊断层按它判"同一条缺陷还在不在"——
+ * 文字随内容语言变、路径不变，按文字比会被语言切换骗。
+ */
+export function validateHandoffDetailed(args, { exec, workspace, changed, scopePrefixes = null, scopeFiles = [], scopeStructured = false, lockedPaths = [], grantedPaths = [], lang = 'zh' }) {
+  const errs = [], defects = [];
+  const add = (category, locations, text) => { errs.push(text); defects.push({ category, summary: text, locations }); };
   // 拒收理由按内容语言写：它进审计、活动记录，系统代提的问题（同一条拒收重复出现时）里也原样给人看
   const L = lang;
   const list = (xs) => xs.map((p) => `\`${p}\``).join(tl(L, '、'));
@@ -232,7 +287,7 @@ export function validateHandoff(args, { exec, workspace, changed, scopePrefixes 
     // 人批准过的契约变更点名放行的共享路径不算（grantedSharedFor）
     const hit = [...changed].filter((p) => coveredBy(p, lockedPaths) && !(grantedPaths.length && coveredBy(p, grantedPaths))).sort();
     if (hit.length) {
-      errs.push(tl(L, '改了共享路径：{paths}。这些是骨架任务定下的共享文件（接口契约、根依赖清单与锁文件、根验收脚本……），几个模块任务同时在开发，对模块任务只读 —— 撤销这些改动（例如 git checkout -- <文件>；装依赖改写了锁文件也一样撤销）。确实要改接口或共享文件（缺一个依赖、契约里少一个字段），用 raise_question 说明要改什么、为什么：那是计划变更，由人批准', { paths: list(hit) }));
+      add('shared', hit, tl(L, '改了共享路径：{paths}。这些是骨架任务定下的共享文件（接口契约、根依赖清单与锁文件、根验收脚本……），几个模块任务同时在开发，对模块任务只读 —— 撤销这些改动（例如 git checkout -- <文件>；装依赖改写了锁文件也一样撤销）。确实要改接口或共享文件（缺一个依赖、契约里少一个字段），用 raise_question 说明要改什么、为什么：那是计划变更，由人批准', { paths: list(hit) }));
     }
   }
   // scope 机械执法（写边界的任务级形式）：宪法块 scope 里抽得出目录前缀时，相对基线的每一处改动
@@ -250,20 +305,20 @@ export function validateHandoff(args, { exec, workspace, changed, scopePrefixes 
     const inScope = (p) => alwaysInScope(p) || (scopePrefixes ?? []).some((s) => p === s || p.startsWith(`${s}/`)) || scopeFiles.includes(p);   // 范围里点名的文件（package.json 之类）
     const out = [...changed].filter((p) => !inScope(p)).sort();
     if (out.length) {
-      errs.push(tl(L, '越界改动：{paths} 不在宪法块 scope 划定的范围（{scope}）里 —— 撤销这些改动；确实必须动它们的话用 raise_question 说明，由人改 scope，你无权自己扩',
+      add('scope', out, tl(L, '越界改动：{paths} 不在宪法块 scope 划定的范围（{scope}）里 —— 撤销这些改动；确实必须动它们的话用 raise_question 说明，由人改 scope，你无权自己扩',
         { paths: list(out), scope: [...(scopePrefixes ?? []).map((x) => `${x}/`), ...scopeFiles].join(tl(L, '、')) }));
     }
   }
   const arts = args?.artifacts;
-  if (!Array.isArray(arts) || !arts.length) errs.push(tl(L, 'artifacts 为空 —— 没有产物的节点不算完成'));
+  if (!Array.isArray(arts) || !arts.length) add('artifact', ['artifacts'], tl(L, 'artifacts 为空 —— 没有产物的节点不算完成'));
   else for (const [i, a] of arts.entries()) {
-    if (!a?.path) { errs.push(tl(L, 'artifacts[{i}].path 缺失', { i })); continue; }
+    if (!a?.path) { add('artifact', [`artifacts[${i}]`], tl(L, 'artifacts[{i}].path 缺失', { i })); continue; }
     const p = String(a.path).replace(/\\/g, '/').replace(/\/+$/, '');
     if (exec && !exec.exists(workspace, p)) {
-      errs.push(tl(L, 'artifacts[{i}] 声称产出了 `{path}`，但工作区里没有这个东西', { i, path: a.path })); continue;
+      add('artifact', [p], tl(L, 'artifacts[{i}] 声称产出了 `{path}`，但工作区里没有这个东西', { i, path: a.path })); continue;
     }
     if (exec?.isDir(workspace, p)) {
-      errs.push(tl(L, 'artifacts[{i}] `{path}` 是个目录 —— 目录不是产物，列具体文件', { i, path: a.path })); continue;
+      add('artifact', [p], tl(L, 'artifacts[{i}] `{path}` 是个目录 —— 目录不是产物，列具体文件', { i, path: a.path })); continue;
     }
     // "存在" ≠ "是你产出的"。工作区是 git repo，正是为了能机械地问后一个问题。
     //
@@ -276,20 +331,20 @@ export function validateHandoff(args, { exec, workspace, changed, scopePrefixes 
     if (changed && !changed.has(p)) {
       if (a.already_done === true) {
         if (!String(a.produced_by ?? '').trim()) {
-          errs.push(tl(L, 'artifacts[{i}] `{path}` 标了 already_done 但没说 produced_by —— 是哪个节点 / 哪次提交做的，要写出来', { i, path: a.path }));
+          add('artifact', [p], tl(L, 'artifacts[{i}] `{path}` 标了 already_done 但没说 produced_by —— 是哪个节点 / 哪次提交做的，要写出来', { i, path: a.path }));
         }
       } else {
-        errs.push(tl(L, 'artifacts[{i}] `{path}` 相对基线没有任何改动 —— 本节点没有产出它，不要把现成的东西算作自己的产物。若它确实是本节点该交的东西、而上游节点已经做掉了：加 already_done: true 与 produced_by 说明，不要为了凑 diff 去做规格没要求的改动', { i, path: a.path }));
+        add('artifact', [p], tl(L, 'artifacts[{i}] `{path}` 相对基线没有任何改动 —— 本节点没有产出它，不要把现成的东西算作自己的产物。若它确实是本节点该交的东西、而上游节点已经做掉了：加 already_done: true 与 produced_by 说明，不要为了凑 diff 去做规格没要求的改动', { i, path: a.path }));
       }
     }
   }
-  if (!args?.interface_contract?.trim()) errs.push(tl(L, 'interface_contract 为空 —— 下游没法照着用'));
-  if (!args?.acceptance_evidence?.trim()) errs.push(tl(L, 'acceptance_evidence 为空 —— 验收标准是机械判定的，要给出跑了什么、结果如何'));
+  if (!args?.interface_contract?.trim()) add('field', ['interface_contract'], tl(L, 'interface_contract 为空 —— 下游没法照着用'));
+  if (!args?.acceptance_evidence?.trim()) add('field', ['acceptance_evidence'], tl(L, 'acceptance_evidence 为空 —— 验收标准是机械判定的，要给出跑了什么、结果如何'));
   for (const [i, d] of (args?.key_decisions ?? []).entries()) {
-    if (!d?.summary?.trim() || !d?.rationale?.trim()) errs.push(tl(L, 'key_decisions[{i}] 缺 summary 或 rationale', { i }));
+    if (!d?.summary?.trim() || !d?.rationale?.trim()) add('field', [`key_decisions[${i}]`], tl(L, 'key_decisions[{i}] 缺 summary 或 rationale', { i }));
   }
-  errs.push(...validateAssumptions(args?.assumptions ?? []));
-  return errs;
+  for (const [i, e] of validateAssumptions(args?.assumptions ?? []).entries()) add('assumption', [`assumptions[${i}]`], e);
+  return { errs, defects };
 }
 
 /** 对着真相源查证过的四类。own_artifact（循环）与 blocked（够不着）不在其中。 */
@@ -409,10 +464,7 @@ export function persistHandoff(db, { taskId, nodeId, args, narrativeRef }) {
       JSON.stringify(args.known_issues ?? []), args.downstream_notes ?? '', narrativeRef, t, t);
 
     for (const d of args.key_decisions ?? []) {
-      const did = newId('d');
-      db.run(`INSERT INTO decisions (id,task_id,node_id,summary,rationale,actor_kind,actor_id,layer,
-                narrative_ref,valid_from,recorded_at) VALUES (?,?,?,?,?,'agent','executor','execution',?,?,?)`,
-        did, taskId, nodeId, d.summary, d.rationale, narrativeRef, t, t);
+      const did = insertDecision(db, { taskId, nodeId, summary: d.summary, rationale: d.rationale, actorKind: 'agent', actorId: 'executor', layer: 'execution', narrativeRef, at: t });
       insertEdge(db, did, nodeId, 'derived_from', t);   // 出处与决策同事务
     }
 
@@ -430,16 +482,17 @@ export function persistHandoff(db, { taskId, nodeId, args, narrativeRef }) {
       //    两条互相矛盾的"已验证"比两条互相矛盾的假设更值得看。
       const cls = classifyAssumption(a);
       db.run(`INSERT INTO assumptions (id,task_id,node_id,subject_key,statement,status,
-                verified_against,verification,must_disclose,valid_from,recorded_at)
-              VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
+                verified_against,verification,must_disclose,audience,valid_from,recorded_at)
+              VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
         aid, taskId, nodeId, a.subject_key, a.statement, prior ? 'conflicted' : cls.status,
-        a.verified_against ?? null, a.verification ?? null, cls.mustDisclose ? 1 : 0, t, t);
+        a.verified_against ?? null, a.verification ?? null, cls.mustDisclose ? 1 : 0,
+        ['user', 'developer'].includes(a.audience) ? a.audience : null, t, t);
       insertEdge(db, aid, nodeId, 'asserted_by', t);
       if (prior) conflicts.push({ subjectKey: a.subject_key, priorId: prior.id, newId: aid });
     }
 
     // ← 库层触发器在这一行执法：没有 validated_at 的交接记录，这句会被 ABORT
-    db.run(`UPDATE nodes SET status='done', finished_at=? WHERE id=?`, t, nodeId);
+    transition(db, 'nodes', nodeId, 'done', { set: { finished_at: t } });
 
     audit(db, {
       actorKind: 'agent', actorId: 'executor', action: 'node_done',
@@ -485,30 +538,45 @@ export function persistHandoff(db, { taskId, nodeId, args, narrativeRef }) {
 // 按内容语言写（0.2.0）：L = contentLang(db)
 const SCOPE_NOTE = (L) => '\n\n——\n' + tl(L, '**系统附注（不由模型生成）**：如果这条矛盾的出路是**改契约**（范围 scope / 行为规则 / 验收标准），请注意**在这条事项里答复改不了契约**。执行方仍然受宪法块里那份 scope 的机械校验：照你的授权去做，交接时会被判越界并撤销，于是又回到这条问题上。要真正改，**这条得由你来发**（做这个任务的 AI 只能改代码，改不了自己的契约）：答复时勾上答复框下的「同时作为计划变更提交」，写清楚把范围 / 规则改成什么（也可以到任务页「发送」，类别选「修正」）。系统会给出影响评估与计划变更；触及契约的要按路由表批准后才生效。如果不想改契约，就在答复里给一条**在现有范围内可行**的出路。');
 
+/**
+ * "做不到"事项的系统附注：冲突各方原文、试过的路，**机械拼接**，不经模型改写 ——
+ * 人要据此决定改哪一方（规格、验收标准还是测试），看到的得是原文。
+ * 这一步同时改弱了原有测试的，单独标红：说"做不到"又动了验收依据，先看那些改动该不该撤回。
+ */
+function impossibleNote(args, L) {
+  const sides = (args.conflict ?? []).map((c) => `- 〔${c.source || tl(L, '出处没填')}〕${String(c.quote).trim()}`).join('\n');
+  const tests = (args.testChanges ?? []).map((c) => `- \`${c.path}\`：${c.findings.map((f) => describeFinding(f, L)).join(tl(L, '；'))}`).join('\n');
+  // 改了原有测试的警告放最前（走查：排在后面会被卡片的滚动截掉，而它恰恰最要紧）
+  return '\n\n——\n' + (tests ? tl(L, '⚠ **这一步同时改了任务开始前就有的测试**（说做不到，却又动了验收依据 —— 先看这些改动该不该撤回）：') + '\n' + tests + '\n\n' : '')
+    + tl(L, '**冲突的各方（原文）**') + '\n' + (sides || tl(L, '（没填）'))
+    + '\n\n' + tl(L, '**试过的做法**') + '\n' + (String(args.attempts ?? '').trim() || tl(L, '（没填）'));
+}
+
 function recordQuestion(db, { taskId, nodeId, args, narrativeRef, contextTokens }) {
   const id = newId('q');
   const t = now();
   const def = args.level === 3 ? null : (args.default_action ?? null);
   const kind = decisionTypeOfQuestion({ kind: args.kind, text: args.text });
+  if (args.kind === 'impossible') args = { ...args, text: `${args.text}${impossibleNote(args, contentLang(db))}` };
   if (kind.decisionType === 'structural') args = { ...args, text: `${args.text}${SCOPE_NOTE(contentLang(db))}` };
   // 超时链：Ⅰ/Ⅱ 级从提出那一刻起计时；Ⅲ 级 NULL（库层 CHECK 也不许它有）。
   const ttl = timeoutFor(db, taskId, args.level);
   let bid;
   db.tx(() => {
-    db.run(`INSERT INTO questions (id,task_id,node_id,level,level_source,text,default_action,asked_at,timeout_at,status)
-            VALUES (?,?,?,?,'classifier',?,?,?,?,'open')`, id, taskId, nodeId, args.level, args.text, def, t, ttl ? t + ttl : null);
+    insertQuestion(db, { id, taskId, nodeId, level: args.level, levelSource: 'classifier', text: args.text, defaultAction: def, askedAt: t, timeoutAt: ttl ? t + ttl : null });
     insertEdge(db, id, nodeId, 'about_node', t);
     // 路由：模型自报 kind 决定决策类型（structural 一律采信）；没报的按正文硬规则单向兜底，否则规格取舍。收件人在此刻解析并写回。
     routeQuestion(db, { questionId: id, ...kind, at: t });
 
     bid = recordBriefing(db, { taskId, nodeId, questionId: id, args, narrativeRef, contextTokens });
 
-    db.run(`UPDATE nodes SET status='blocked' WHERE id=?`, nodeId);
-    db.run(`UPDATE tasks SET status='waiting' WHERE id=?`, taskId);
+    transition(db, 'nodes', nodeId, 'blocked');
+    transition(db, 'tasks', taskId, 'waiting');
     audit(db, { actorKind: 'agent', actorId: 'executor', action: 'question_raised',
       targetType: 'node', targetId: nodeId,
       payload: { questionId: id, briefingId: bid, level: args.level,
-        blockedBy: args.blocked_by ?? null, contextTokens: contextTokens ?? null, pid: process.pid } });
+        blockedBy: args.blocked_by ?? null, contextTokens: contextTokens ?? null, pid: process.pid,
+        ...(args.kind === 'impossible' ? { impossible: { conflict: args.conflict ?? [], attempts: args.attempts ?? null, testsTouched: (args.testChanges ?? []).map((c) => c.path) } } : {}) } });
   });
   return { id, briefingId: bid, level: args.level, text: args.text,
     default_action: def, blocked_by: args.blocked_by ?? null, contextTokens };
@@ -551,13 +619,15 @@ export async function executeNode(db, {
 }) {
   const node = db.one(`SELECT * FROM nodes WHERE id=?`, nodeId);
   const asm = assembleExecutor(db, { taskId, nodeId, tier, vendorId, maxIterations });
-  db.run(`UPDATE nodes SET status='running', started_at=? WHERE id=?`, now(), nodeId);
+  transition(db, 'nodes', nodeId, 'running', { set: { started_at: now() } });
   // 本节点的产物基线：开跑这一刻的 HEAD。非 git 工作区（离线测试）时为 null，
   // 校验退化为只查"存在且不是目录"。
   // ⚠️ 基线**落库**（nodeBaseline）：复工/重试是新进程，但不是新的一段工作 ——
   // 取"这个进程开跑时的 HEAD"会把挂起前已提交的产物判成"相对基线没改动"。
-  let baseRef = null;
-  try { baseRef = nodeBaseline(db, { taskId, nodeId, workspace }).base; } catch { /* 非 git 工作区 */ }
+  let baseRef = null, baseErr = null;
+  // 是不是 git 工作区，看的是目录本身，不是"基线取没取到"：取不到基线正是要拒收的情形之一（见 submit_handoff）。
+  const gitWorkspace = existsSync(join(workspace, '.git'));
+  try { baseRef = nodeBaseline(db, { taskId, nodeId, workspace }).base; } catch (e) { baseErr = e; /* 非 git 工作区：正常 */ }
   // scope 机械执法用的前缀：与路由表的"触及范围"同一份抽取（routing.prefixesOfScope）。
   const scopePrefixes = prefixesOf(db, taskId);
   const scopeFiles = scopeFilesOf(db, taskId);
@@ -571,19 +641,68 @@ export async function executeNode(db, {
   let outcome = null;
   const rejections = [];
   let lastMechanical = null, sameMechanical = 0;
+  // 改过的测试文件与这一步开跑时比；"原有测试" = 任务工作区建立时就有的（别的任务写的 / 仓库原有的）
+  const taskBase = baseHeadOf(db, taskId);
+  let lastTestSig = null;
+  const testsChangedSince = (changed) => {
+    if (!baseRef) return [];
+    try {
+      // 人放行过的（答复时勾了"允许这一步改这些原有测试"）带上 allowed —— reject 模式不再打回，验收员与看板看得见
+      const allowed = testsAllowedFor(db, nodeId);
+      return testChanges({ changed, base: baseRef,
+        read: (p, ref) => (ref ? gitRaw(workspace, ['show', `${ref}:${p}`]) : exec.readFile(workspace, p)),
+        baselineHas: (p) => { if (!taskBase) return false; try { gitRaw(workspace, ['cat-file', '-e', `${taskBase}:${p}`]); return true; } catch { return false; } } })
+        .map((c) => (c.baseline && allowed.has(c.path) ? { ...c, allowed: true } : c));
+    } catch { return []; }   // 证据取不到不挡交接：这是标注，不是校验
+  };
 
   // 出口两个都挂在 handler 上：runToolLoop 只认"工具调用 → 结果"，
   // 所以出口也走工具，收尾由 stopReason 之外的这个 outcome 标记决定。
   handlers.submit_handoff = async (args) => {
     // 每次校验现取一次改动清单：执行器随时可能又写了文件，缓存住会判错。
     // 非 git 工作区（离线测试）时退化为只查存在性与"不是目录"。
-    let changed = null;
-    if (baseRef) { try { changed = changedSince(workspace, baseRef); } catch { /* 忽略 */ } }
-    const errs = validateHandoff(args, { exec, workspace, changed, scopePrefixes, scopeFiles, scopeStructured, lockedPaths, grantedPaths, lang: contentLang(db) });
+    let changed = null, changeErr = baseErr;
+    if (baseRef) { try { changed = changedSince(workspace, baseRef); } catch (e) { changeErr = e; } }
+    // ⚠️ git 工作区却算不出改动清单 → 拒收，不放行。原来这里吞掉错误、changed 留空，
+    // validateHandoff 里范围与只读路径两道校验都以 `changed &&` 开头 —— 整个跳过。工作区的 .git 归执行器管
+    // （残留的 index.lock、改坏的 ref 都能让 git 报错），等于它能让自己的边界失效。连续三次一样 → 照常转成问题给人。
+    const L = contentLang(db);
+    const checked = gitWorkspace && changed === null ? null : validateHandoffDetailed(args, { exec, workspace, changed, scopePrefixes, scopeFiles, scopeStructured, lockedPaths, grantedPaths, lang: L });
+    const errs = !checked
+      ? [tl(L, '算不出这一步改动了哪些文件（git 报错：{err}），范围与只读路径校验做不了，交接不能受理。先把工作区的 git 状态修好（例如删掉残留的 .git/index.lock、不要改动 .git 里的东西），再交。',
+        { err: gitErrLine(changeErr) ?? tl(L, '没有基线记录') })]
+      : checked.errs;
+    const defects = checked ? checked.defects : [{ category: 'git', summary: errs[0], locations: [] }];
+    // 这一步对测试做了什么（删了、跳过、用例 / 断言变少、改期望值）。默认只当证据（给验收员、记审计、看板标出来）；
+    // 部署设成 reject 时，原有测试被改弱直接按机械校验打回 —— 规格真要求改的，用 raise_question 说明，由人放行
+    const tests = checked && changed ? testsChangedSince(changed) : [];
+    if (tests.length) {
+      const sig = JSON.stringify(tests);
+      if (sig !== lastTestSig) { lastTestSig = sig; audit(db, { actorKind: 'system', action: 'handoff_test_changes', targetType: 'node', targetId: nodeId, payload: { changes: tests } }); }
+      if (getSetting(db, 'deploy.test_guard') === 'reject') for (const c of tests.filter((x) => x.baseline && !x.allowed)) {
+        const what = c.findings.map((f) => describeFinding(f, L)).join(tl(L, '；'));
+        errs.push(tl(L, '改弱了原有测试 `{path}`：{what}。原有测试是验收的依据，不能为了让实现通过去改它；规格确实要求改的，用 raise_question 说明哪条规格、为什么，由人放行', { path: c.path, what }));
+        defects.push({ category: 'test', summary: tl(L, '改弱了原有测试：{what}', { what }), locations: [c.path] });
+      }
+    }
+    // 有界面条目的步骤，验收员要照 si-preview.json 把应用起起来逐条点验 —— 没有它（或写坏了）验收员只能读代码判界面。
+    // 只在真沙箱里查（本地执行器起不了服务，查了也白查）；并行模块任务里这份文件归骨架、只读，不查。
+    if (checked && exec?.isolated && uiChecksOf(node).length && !coveredBy(PREVIEW_FILE, lockedPaths)) {
+      const pv = readPreviewSpec(workspace, L);
+      if (!pv) {
+        errs.push(tl(L, '这一步有界面条目，验收员要照仓库根的 {file} 把应用起起来、在页面上逐条点验，但现在没有这份文件。写一份：start（起后端 / 前端的命令，每条一个后台进程、监听 127.0.0.1）、url（前端地址）、ready（后端一个返回 200 的地址）、seed（可选：样例数据命令）、pages（要看的页）', { file: PREVIEW_FILE }));
+        defects.push({ category: 'spec', summary: tl(L, '缺 {file}：验收员起不了应用', { file: PREVIEW_FILE }), locations: [PREVIEW_FILE] });
+      } else if (pv.error) {
+        errs.push(tl(L, '这一步有界面条目，验收员要照 {file} 把应用起起来，但它写得不对：{error}', { file: PREVIEW_FILE, error: pv.error }));
+        defects.push({ category: 'spec', summary: pv.error, locations: [PREVIEW_FILE] });
+      }
+    }
     if (errs.length) {
       rejections.push(errs);
       audit(db, { actorKind: 'agent', actorId: 'executor', action: 'handoff_rejected',
-        targetType: 'node', targetId: nodeId, payload: { errs, artifacts: args?.artifacts } });
+        targetType: 'node', targetId: nodeId, payload: { errs, defects, artifacts: args?.artifacts } });
+      const stuck = diagnoseAfterRejection();
+      if (stuck) return stuck;
       // 机械校验是确定性的：同一份改动重交，拒收一字不差。放任不管，执行器会把同一条越界拒收重交到 20 轮上限，
       // 节点被收回后再来 20 轮（一路撞到调用上限），最后还是得提问题。
       // 第二次一样 → 说清只剩两条路；第三次一样 → 不再等，系统替它把问题提给人。
@@ -614,12 +733,24 @@ export async function executeNode(db, {
     // 与产物，不看这个循环里的任何东西。打回走与 schema 拒回**同一条路** ——
     // 执行器看到的是理由，改完再交；几次都过不了就是 stalled，与现在一样。
     if (verifier) {
-      const v = await verifier({ args, changed });
+      const v = await verifier({ args, changed, testChanges: tests });
+      if (v.verdict !== 'accept' && v.noVerdict) {
+        // 验收员自己没给出结论（环境问题）：不是这份改动的问题，不算一轮缺陷、不进停滞判断；原样再交即可
+        const L = contentLang(db);
+        const errs = [tl(L, '验收员这次没能给出结论（{why}）—— 与你的改动无关', { why: v.stopped ?? '?' })];
+        rejections.push(errs);
+        audit(db, { actorKind: 'agent', actorId: 'verifier', action: 'handoff_rejected',
+          targetType: 'node', targetId: nodeId, payload: { errs, defects: [{ category: 'environment', summary: errs[0], locations: [] }], env: true, artifacts: args?.artifacts, by: 'verifier' } });
+        diagnoseAfterRejection();
+        return `${errs[0]}。交接记录不用改，原样再调用一次 submit_handoff。`;
+      }
       if (v.verdict !== 'accept') {
         const errs = v.reasons.map((r) => `[验收员] ${r}`);
         rejections.push(errs);
         audit(db, { actorKind: 'agent', actorId: 'verifier', action: 'handoff_rejected',
-          targetType: 'node', targetId: nodeId, payload: { errs, artifacts: args?.artifacts, by: 'verifier' } });
+          targetType: 'node', targetId: nodeId, payload: { errs, defects: v.defects ?? [], artifacts: args?.artifacts, by: 'verifier' } });
+        const stuck = diagnoseAfterRejection();
+        if (stuck) return stuck;
         return `交接记录被**独立验收员**打回。它只看你的产物与交接记录，不看你的过程：\n- ${errs.join('\n- ')}\n`
           + `按理由改，改完再交。若理由指向的是人该拍板的取舍，用 raise_question 问人，不要自己定。`;
       }
@@ -627,7 +758,41 @@ export async function executeNode(db, {
     outcome = { kind: 'done', args };
     return '交接记录已受理。不要再调用任何工具。';
   };
+  /**
+   * 每次打回之后判一次，判词进审计（看板步骤卡上显示）。停滞 / 反复到了门槛（core/diagnose.mjs）就替执行器
+   * 把问题提给人 —— 与"同一条机械拒收三次"同一条路：节点挂起，问题里附诊断与还剩的缺陷。返回非空 = 已转人。
+   */
+  function diagnoseAfterRejection() {
+    const L = contentLang(db);
+    const d = nodeDiagnosis(db, nodeId);
+    audit(db, { actorKind: 'system', action: 'node_diagnosed', targetType: 'node', targetId: nodeId,
+      payload: { state: d.state, round: d.round, rejections: d.rejections, streak: d.streak, returns: d.returns, open: d.open.length, resolved: d.resolved, added: d.added, escalate: d.escalate } });
+    if (!d.escalate || outcome) return null;
+    outcome = { kind: 'question', args: {
+      level: 2, kind: 'structural',
+      text: tl(L, '这一步被打回了 {n} 次，没有在收敛：{what}。再让它自己改下去多半还是这样，需要人看一下卡在哪。', { n: d.rejections, what: describeDiagnosis(d, L) }),
+      default_action: tl(L, '按还剩的缺陷逐条改完再交'),
+      blocked_by: listDefects(d.open, L),
+      work_done: tl(L, '（系统代填）本步的改动还在工作区里、没有提交；每一轮被打回的理由见这一步的执行叙事与活动记录。'),
+      plan_after_answer: tl(L, '按你的答复处理：指出该怎么改，或说明哪条缺陷其实不成立（那是规格或验收标准要改，走计划变更）。'),
+    } };
+    return '这一步的打回没有在收敛，系统已把它转成问题交人，本节点挂起。不要再调用任何工具。';
+  }
+  let impossibleNagged = false;
   handlers.raise_question = async (args) => {
+    if (args?.kind === 'impossible') {
+      // 说"做不到"要拿出冲突双方的原文和试过的路 —— 人要据此决定改哪一方，转述和"试了不行"给不了依据。
+      // 缺了退回补一次；第二次还缺照收（问题比假完成好），缺的那栏写"没填"
+      const sides = (Array.isArray(args.conflict) ? args.conflict : []).filter((c) => String(c?.quote ?? '').trim());
+      if ((!sides.length || !String(args.attempts ?? '').trim()) && !impossibleNagged) {
+        impossibleNagged = true;
+        return 'kind=impossible 要同时填 conflict（冲突各方的出处与原文引用，至少一条）和 attempts（试过的做法与结果）。补上再调用一次 raise_question。';
+      }
+      // 这一步此刻对原有测试做过什么（测试保护的同一份比对）：说做不到、却又动了原有测试，人要先看到
+      let changed = null;
+      if (baseRef) { try { changed = changedSince(workspace, baseRef); } catch { changed = null; } }
+      args = { ...args, conflict: sides, testChanges: changed ? testsChangedSince(changed).filter((c) => c.baseline) : [] };
+    }
     outcome = { kind: 'question', args };
     return '问题已记录，本节点挂起。不要再调用任何工具。';
   };
@@ -646,15 +811,40 @@ export async function executeNode(db, {
   // ⚠️ 崩溃也要留下叙事。曾出现过厂商余额耗尽，异常从 runToolLoop 里穿出去，
   // 20 轮工具调用的记录**一条都没落盘** —— 而复盘要求只凭真相源。
   // 所以 loop 包在 try 里，叙事归档无论成败都写。
+  // 上下文整理（托底）。整理线 = min(人设的, 生效的上下文上限 × 0.8)，见 limits.compactThresholdOf
+  const L = contentLang(db);
+  let window = null;
+  try { window = client.catalog?.[client.entryFor(tier, 'executor').key]?.contextWindow ?? null; } catch { window = null; }
+  const compactAt = compactThresholdOf(db, taskId, { contextWindow: window });
+  // 上一段工作留下的落盘输出不再有人引用（新的一段从装配重新开始）
+  if (workspace) { try { rmSync(join(workspace, OUTPUTS_DIR), { recursive: true, force: true }); } catch { /* 尽力 */ } }
+  const compactor = compactAt.at ? makeCompactor(db, { client, taskId, nodeId, tier, role: 'executor', workspace, baseRef, at: compactAt.at,
+    levels: [1, 2], fixed: fixedEstimate(asm.system, TOOLS), maxIterations,
+    // 同一步骤用模型整理到顶了还不够：这一步多半太大。与 诊断层"打回不收敛"同一条路 —— 替执行器把问题提给人
+    escalate: ({ n, at }) => {
+      audit(db, { actorKind: 'system', action: 'compaction_escalated', targetType: 'node', targetId: nodeId, payload: { n, at } });
+      outcome = { kind: 'question', args: {
+        level: 2, kind: 'structural',
+        text: tl(L, '这一步的上下文又撞到了自动整理线（{at}k token）：已经整理过 {n} 次，还是不够用。这一步多半太大了，建议拆成两步。', { n, at: Math.round(at / 1000) }),
+        default_action: tl(L, '让它接着做：从最近一次整理的简报接着做，整理次数重新计'),
+        blocked_by: tl(L, '上下文反复撞整理线（{n} 次）', { n }),
+        work_done: tl(L, '（系统代填）本步的改动还在工作区里、没有提交；做到哪一步见最近一次整理的简报（执行叙事与活动记录里都有）。'),
+        plan_after_answer: tl(L, '按你的答复处理：要拆，就走计划变更把这一步拆开；让它接着做，就从简报接着做。'),
+      } };
+      return 'compaction_escalated';
+    } }) : null;
+  let lastRequestTokens = null;   // 挂起那一刻的上下文体量（复工简报的分母）。账本每轮被 onStep 清空，所以在这里自己记
+
   let crashed = null;
   let loop;
   try {
     loop = await runToolLoop(client, {
-      tier, system: asm.system, messages: asm.messages, tools: TOOLS,
+      role: 'executor', tier, system: asm.system, messages: asm.messages, tools: TOOLS,
       maxTokens: 16000, effort: 'high',
       cacheSystem: asm.cacheStable, cacheKey: `node:${nodeId}`,
     }, handlers, {
-      maxIterations, onStep, abort, shouldStop: () => outcome !== null,
+      maxIterations, abort, shouldStop: () => outcome !== null, compactor,
+      onStep: (i, resp) => { const u = resp?.usage; if (u) lastRequestTokens = (u.inputTokens ?? 0) + (u.cacheReadTokens ?? 0) + (u.cacheWriteTokens ?? 0); onStep?.(i, resp); },
       // 剩 5 轮开始报数。不是催它快点做完 —— 是逼它在"做不完"和"假装做完了"
       // 之外看见第三条路：还有 raise_question。
       iterationNote: (i, max) => {
@@ -671,12 +861,20 @@ export async function executeNode(db, {
     loop = { trace: [], stopped: `crashed: ${e.message}` };
   }
 
+  // 没收尾时工作区里留下的改动（相对这一步的基线；依赖目录不算）：下一次重开时告诉执行器这是它自己上一次留下的
+  const leftover = () => {
+    if (!baseRef) return null;
+    try { return [...changedSince(workspace, baseRef)].filter((p) => !isBuildOutput(p)).sort().slice(0, 40); } catch { return null; }
+  };
+
   // 叙事归档（兜底）：交接记录是摘要，原文永远可达。
   // 复盘也靠它——只凭真相源复盘，进程日志不算。
   const narrativeRef = join(narrativeDir, `${nodeId}.md`);
   mkdirSync(dirname(narrativeRef), { recursive: true });
   writeFileSync(narrativeRef, renderNarrative({ node, asm, trace, loop, outcome, rejections, crashed }));
 
+  // 租约被接管：这个进程已经无权再写这个任务 —— 不收拾状态（收拾本身就是写，会被防护挡下、还会盖掉新主人的结果），原样上抛
+  if (crashed?.leaseLost) throw crashed;
   if (crashed) {
     // 崩溃**不是**没收尾，是根本没跑完。退回 pending，理由进审计轨，
     // 然后把异常原样抛给上层 —— 崩溃就该以非零退出码表现，不能伪装成正常收尾。
@@ -685,12 +883,10 @@ export async function executeNode(db, {
     // 由编排器记 —— 厂商挂了不计、OOM 计一次；这里只收拾状态，不留 running。
     // 别的崩溃（真 bug）照旧在这里计一次。原来这里一律 +1，编排器接住 infra 错误
     // 之后再记一次，就双计了。
-    db.run(isInfraError(crashed)
-      ? `UPDATE nodes SET status='pending' WHERE id=?`
-      : `UPDATE nodes SET status='pending', retry_count=retry_count+1 WHERE id=?`, nodeId);
+    transition(db, 'nodes', nodeId, 'pending', { setSql: isInfraError(crashed) ? null : 'retry_count=retry_count+1' });
     audit(db, { actorKind: 'system', action: 'node_crashed', targetType: 'node', targetId: nodeId,
       payload: { error: String(crashed.message).slice(0, 600), toolCalls: trace.length,
-        llmCalls: client.ledger?.length ?? null, narrativeRef, pid: process.pid } });
+        llmCalls: client.ledger?.length ?? null, narrativeRef, pid: process.pid, left: leftover() } });
     throw crashed;
   }
 
@@ -704,14 +900,14 @@ export async function executeNode(db, {
     // 复工简报仍然要写 —— 挂起就是挂起，不因为问题是系统生成的就少留一份交代。
     const a = outcome.args;
     const last = client.ledger?.at?.(-1);
-    const contextTokens = last ? last.inputTokens + last.cacheReadTokens + last.cacheWriteTokens : null;
+    const contextTokens = lastRequestTokens ?? (last ? last.inputTokens + last.cacheReadTokens + last.cacheWriteTokens : null);
     const blockedBy = tl(contentLang(db), '联网未放行 `{group}`（沙箱默认断网）', { group: String(a.group) });
     const q = raiseEgressQuestion(db, { taskId, nodeId, group: a.group, why: a.why,
       auditFile: exec?.egress?.auditFile ?? null });
     const briefingId = recordBriefing(db, { taskId, nodeId, questionId: q.questionId, args: {
       work_done: a.work_done, plan_after_answer: a.plan_after_answer, blocked_by: blockedBy,
     }, narrativeRef, contextTokens });
-    db.run(`UPDATE nodes SET status='blocked' WHERE id=?`, nodeId);
+    transition(db, 'nodes', nodeId, 'blocked');
     audit(db, { actorKind: 'agent', actorId: 'executor', action: 'question_raised',
       targetType: 'node', targetId: nodeId,
       payload: { questionId: q.questionId, briefingId, level: 3, levelSource: 'hard_rule',
@@ -726,7 +922,7 @@ export async function executeNode(db, {
     // 缓存只影响价钱不影响体量）。它是丈量"丢弃了多少"的分母——设计假设说
     // 丢弃后能无损重建，那就得先知道丢的是多少。fake/无账本时为 null。
     const last = client.ledger?.at?.(-1);
-    const contextTokens = last ? last.inputTokens + last.cacheReadTokens + last.cacheWriteTokens : null;
+    const contextTokens = lastRequestTokens ?? (last ? last.inputTokens + last.cacheReadTokens + last.cacheWriteTokens : null);
     const question = recordQuestion(db, { taskId, nodeId, args: outcome.args, narrativeRef, contextTokens });
     return { kind: 'question', question, trace, rejections, assemblyId: asm.assemblyId, narrativeRef, meta: asm.meta };
   }
@@ -736,21 +932,24 @@ export async function executeNode(db, {
   // 记在它头上会让加额重跑的人凭空少一次机会，还会把 limit.node_retries 那一维污染成
   // "谁先撞上预算谁先被判死"。
   if (loop.stopped?.startsWith('aborted:')) {
-    db.run(`UPDATE nodes SET status='pending' WHERE id=?`, nodeId);
+    transition(db, 'nodes', nodeId, 'pending');
     audit(db, { actorKind: 'system', action: 'node_aborted', targetType: 'node', targetId: nodeId,
       payload: { reason: loop.stopped.slice(9), iterations: loop.trace.length,
-        toolCalls: trace.length, narrativeRef, pid: process.pid } });
+        toolCalls: trace.length, narrativeRef, pid: process.pid, left: leftover() } });
     return { kind: 'aborted', stopped: loop.stopped, trace, rejections,
       assemblyId: asm.assemblyId, narrativeRef, meta: asm.meta };
   }
 
   // 既没交接也没提问就跑到头了。**不置 done，也不当成功**——
   // 节点回 pending 等重试，失败原因进审计。伪装成正常收尾是最坏的处理。
-  db.run(`UPDATE nodes SET status='pending', retry_count=retry_count+1 WHERE id=?`, nodeId);
+  // 最近一轮是环境问题（验收员没给出结论之类）→ 不是这一步做不好，不计重试；
+  // 一直这样会被空转检测（同一步骤同样的停法连续三次）转成事项，不会无声地循环。
+  const env = roundsOf(db, nodeId).at(-1)?.kind === 'env';
+  transition(db, 'nodes', nodeId, 'pending', env ? {} : { setSql: 'retry_count=retry_count+1' });
   audit(db, { actorKind: 'agent', actorId: 'executor', action: 'node_stalled',
     targetType: 'node', targetId: nodeId,
-    payload: { stopped: loop.stopped, iterations: loop.trace.length, rejections,
-      say: textOf(loop.resp ?? { content: [] }).slice(0, 600) || null } });
+    payload: { stopped: loop.stopped, iterations: loop.trace.length, rejections, environment: env,
+      say: textOf(loop.resp ?? { content: [] }).slice(0, 600) || null, narrativeRef, left: leftover() } });
   return { kind: 'stalled', stopped: loop.stopped, trace, rejections, assemblyId: asm.assemblyId, narrativeRef, meta: asm.meta };
 }
 

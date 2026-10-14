@@ -14,6 +14,7 @@
 //     所以升档一定留审计（node_escalated），人能看见"钱是这么花上去的"。
 
 import { now, audit } from '../db/db.mjs';
+import { escalateNodeTier } from '../db/nodes.mjs';
 import { limitOf, priorRuntimeMs } from './limits.mjs';
 import { taskSpendMicroUsd } from './ledger.mjs';
 import { tl, contentLang, N_ } from '../i18n/index.mjs';
@@ -74,7 +75,7 @@ export function escalationFor(db, { taskId, node, binding, catalog, ctx = {}, at
 /** 升档落库：节点档位改成目标档（下次重试也沿用），记时间戳与审计。 */
 export function recordEscalation(db, { taskId, node, esc }) {
   const t = now();
-  db.run(`UPDATE nodes SET model_tier=?, tier_escalated_at=? WHERE id=?`, esc.tier, t, node.id);
+  escalateNodeTier(db, node.id, esc.tier, t);
   audit(db, { actorKind: 'system', action: 'node_escalated', targetType: 'node', targetId: node.id,
     payload: { taskId, from: esc.from, to: esc.tier, retryCount: node.retry_count,
       estimateMicro: esc.estimateMicro, remainingMicro: esc.remainingMicro, pid: process.pid } });

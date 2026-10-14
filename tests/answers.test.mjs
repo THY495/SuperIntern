@@ -205,7 +205,7 @@ section('6. 轮值（latest）：任一收件人答即生效；已决事项被�
   eq(db.one(`SELECT m.body FROM messages m JOIN edges e ON e.from_id=m.id AND e.to_id=? AND e.relation='answers' AND e.superseded_at IS NULL`, q).body, 'B', '生效的 answers 边指向 B');
   const sup = db.one(`SELECT payload FROM audit_log WHERE action='answer_superseded' AND target_id=?`, q);
   assert(sup && JSON.parse(sup.payload).notify.includes(lead), '审计 answer_superseded，通知负责人');
-  throwsWith(() => recordAnswer(db, { questionId: q, body: 'C', plaintextToken: bob.plaintext }), /不接受答复/, '不当班的不能改');
+  throwsWith(() => recordAnswer(db, { questionId: q, body: 'C', plaintextToken: bob.plaintext }), /已由 .+ 于 .+ 答复，不再接受答复/, '不当班的不能改：报错写明已由谁、何时答复');
   applyTemplate(db, { key: '', name: 'peer_review', userId: lead });
 }
 
@@ -305,7 +305,7 @@ section('10. 先答生效，迟到的异议留痕；冲突正文的影响段是�
   eq(db.one(`SELECT count(*) n FROM edges WHERE to_id=? AND relation='answers' AND superseded_at IS NULL`, q).n, 1, '生效的 answers 边只有一条');
   const agree = recordAnswer(db, { questionId: q, body: ' a ', plaintextToken: bob.plaintext });
   eq(agree.stance, 'comment', '迟到但一致：记附议');
-  throwsWith(() => recordAnswer(db, { questionId: q, body: 'C', plaintextToken: owner.plaintext }), /不接受答复.*修正流程/, '负责人要改结论走修正流程，不是迟到答复');
+  throwsWith(() => recordAnswer(db, { questionId: q, body: 'C', plaintextToken: owner.plaintext }), /不再接受答复.*修正流程/, '负责人要改结论走修正流程，不是迟到答复');
   throwsWith(() => recordAnswer(db, { questionId: q, body: 'C', plaintextToken: carol.plaintext }), /旁观者不能答复/, '旁观者仍不能答');
 
   // 冲突正文：卡住的步骤、传递下游、任务状态

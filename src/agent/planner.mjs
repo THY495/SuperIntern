@@ -13,11 +13,18 @@ import { withOutputLang, contentLang, tl, I18nError } from '../i18n/index.mjs';
 import { routeQuestion, decisionTypeOfQuestion } from '../core/routing.mjs';
 import { overruledContractRules, renderOverruled } from '../core/decisions.mjs';
 import { stripTransferHint } from '../core/routing.mjs';
-import { textOf, toolCallsOf, truncatedEmpty, TruncatedEmptyError } from '../llm/canonical.mjs';
+import { textOf, toolCallsOf, truncatedEmpty, TruncatedEmptyError, LLM_ROLES } from '../llm/canonical.mjs';
 import { validateRules, foldRules } from '../core/rules.mjs';
+import { clausesOf, recordCoverage } from '../core/provenance.mjs';
+import { annotateDone } from '../core/clauses.mjs';
 import { newId, now, insertEdge, audit } from '../db/db.mjs';
+import { insertDecision } from '../db/constitutions.mjs';
+import { insertNode, UI_CHECKS_MAX } from '../db/nodes.mjs';
 import { getParam } from '../core/params.mjs';
 import { parallelText } from '../core/parallel.mjs';
+import { transition } from '../db/state.mjs';
+import { insertQuestion } from '../core/questions.mjs';
+import { stopwatch } from '../core/clock.mjs';
 
 const RISK_TIERS = ['low', 'normal', 'high'];
 const MODEL_TIERS = ['light', 'standard', 'heavy'];
@@ -59,8 +66,13 @@ const SUBMIT_PLAN = {
               type: 'array', items: { type: 'string' },
               description: '本方案内其他节点的 key。无依赖填 []',
             },
+            covers: {
+              type: 'array', items: { type: 'string' },
+              description: '这个节点落实宪法块里的哪几条：填条款编号（宪法块每条前面的 [C3] 里的 C3）。只填它真正负责的；说不清就给空数组',
+            },
             risk_tier: { type: 'string', enum: RISK_TIERS },
             model_tier: { type: 'string', enum: MODEL_TIERS, description: '这个节点该用哪一档模型执行' },
+            ui_checks: { type: 'array', items: { type: 'string' }, description: '有界面的节点：这一步做完后，要在**运行起来的页面上**看到或点到才算数的事项，每条一句，写清在哪页、做什么、应看到什么（如"在 /todos 填标题点添加，列表多出这一条"）。验收员会把应用起起来逐条点验。没有界面的节点（后端、命令行、测试、文档）不填。至多 8 条' },
           },
           required: ['key', 'title', 'spec', 'acceptance', 'rules', 'depends_on', 'risk_tier', 'model_tier'],
         },
@@ -134,11 +146,12 @@ n2 的验收命令包含 n3 函数的错误路径、同时又写"n2 不得登记
   "可空 / 可不填"两种写法都要测：请求里**省略**这个字段，和显式传 null。
 - **验收不许断言别的节点的产物不存在**（例如用 \`test ! -e docs/API.md\` 证明本节点没抢跑写文档）：没有依赖关系的兄弟节点可能先完成，那之后这条验收永远不可能成立，除非删掉别人的产物。"本节点不做 X"写进 spec 的边界；只有那个产物的节点**依赖本节点**时，这种断言才成立。
 - acceptance 与 spec 里的行为样例必须带**精确的期望输出**，期望值要能在宪法块或规格原文里找到出处；不要让执行者自己算期望 —— 它会从自己的实现推出来。
+- 做界面的节点填 ui_checks：页面上要看到 / 点到的事项（哪页、做什么、应看到什么）。读代码判不了界面对不对，验收员会把应用起起来逐条点验；命令能测的仍写进 acceptance。
 
 你不设置节点状态、不分配执行者、不改任何参数——那些不属于规划。`;
 
 /** 库层拒绝之前，先在应用层拦掉 SQL 表达不了的部分（唯一性、引用完整性、无环）。 */
-export function validatePlan(plan, { constitutionText = null } = {}) {
+export function validatePlan(plan, { constitutionText = null, clauseKeys = null } = {}) {
   const nodes = plan?.nodes;
   if (!Array.isArray(nodes)) return ['nodes 不是数组'];
   // ⚠️ 节点数区间是**整份计划**的规则，不是节点集合本身的规则 —— 它说的是
@@ -147,7 +160,21 @@ export function validatePlan(plan, { constitutionText = null } = {}) {
   // （replan 若直接复用 validatePlan，加一个节点就会报"节点数必须是 2~4"。）
   const errs = (nodes.length < 2 || nodes.length > 4)
     ? [`节点数必须是 2~4，收到 ${nodes.length}`] : [];
-  return [...errs, ...validateNodeSet(nodes, { constitutionText })];
+  return [...errs, ...validateNodeSet(nodes, { constitutionText }), ...coversErrors(nodes, clauseKeys)];
+}
+
+/** covers 里的编号必须是这一版契约的（修改溯源：编错了出处就指向不存在的条款）。不填不算错。 */
+function coversErrors(nodes, clauseKeys) {
+  if (!clauseKeys) return [];
+  const keys = new Set(clauseKeys);
+  const errs = [];
+  nodes.forEach((n, i) => {
+    if (n?.covers === undefined) return;
+    if (!Array.isArray(n.covers)) { errs.push(`nodes[${i}].covers 要是数组`); return; }
+    const bad = n.covers.filter((k) => !keys.has(String(k)));
+    if (bad.length) errs.push(`nodes[${i}].covers 里的 ${bad.join('、')} 不是宪法块里的条款编号（有：${[...keys].join('、')}）`);
+  });
+  return errs;
 }
 
 /**
@@ -182,6 +209,8 @@ export function validateNodeSet(nodes, { constitutionText = null } = {}) {
       keys.add(n.key);
     }
     if (!RISK_TIERS.includes(n?.risk_tier)) errs.push(`${at}.risk_tier 非法：${n?.risk_tier}`);
+    if (n?.ui_checks !== undefined && (!Array.isArray(n.ui_checks) || n.ui_checks.some((x) => typeof x !== 'string'))) errs.push(`${at}.ui_checks 要是字符串数组（每条一句）`);
+    else if (Array.isArray(n?.ui_checks) && n.ui_checks.length > UI_CHECKS_MAX) errs.push(`${at}.ui_checks 至多 ${UI_CHECKS_MAX} 条，收到 ${n.ui_checks.length} 条：挑最要紧的，或把节点拆小`);
     if (!MODEL_TIERS.includes(n?.model_tier)) errs.push(`${at}.model_tier 非法：${n?.model_tier}`);
     if (!Array.isArray(n?.depends_on)) errs.push(`${at}.depends_on 不是数组`);
     // 规划器不该知道 status 这个字段存在；出现即说明它在越权，值对不对都要拦
@@ -260,7 +289,7 @@ export function absenceAssertionErrs(nodes) {
  *
  * @returns {{nodes:object[], attempts:number, rejections:string[][], rationale:string}}
  */
-export async function plan(db, { client, taskId, constitution, tier = 'heavy', maxAttempts = 3 }) {
+export async function plan(db, { client, taskId, constitution, tier = LLM_ROLES.planner, maxAttempts = 3 }) {
   // ── 进程寿命的括号 ────────────────────────────────────────────────────
   // 规划也是一个**会花钱的进程**，所以它也得在审计轨里留下起止与 pid。
   //
@@ -268,12 +297,13 @@ export async function plan(db, { client, taskId, constitution, tier = 'heavy', m
   // 它的花费就落在所有区间之外。规划器崩在半路的话，审计轨说不出是哪个进程、跑了多久。
   // 松开那条检查是最容易的做法，也是错的：它问的问题是对的。
   const startedAt = now();
+  const elapsed = stopwatch();   // 时长用单调时钟；startedAt 只作时间戳
   audit(db, { actorKind: 'agent', actorId: 'planner', action: 'planner_started',
     targetType: 'task', targetId: taskId, payload: { pid: process.pid, tier, maxAttempts } });
   const exit = (kind, extra = {}) => {
     audit(db, { actorKind: 'agent', actorId: 'planner', action: 'planner_exit',
       targetType: 'task', targetId: taskId,
-      payload: { pid: process.pid, kind, elapsedMs: now() - startedAt, ...extra } });
+      payload: { pid: process.pid, kind, elapsedMs: Math.round(elapsed()), ...extra } });
   };
 
   // ⚠️ 规划器的上下文里若**只有宪法块** —— 它提的问题被回答之后，
@@ -287,7 +317,7 @@ export async function plan(db, { client, taskId, constitution, tier = 'heavy', m
   const driftNote = getParam(db, taskId, 'task.drift_note') ?? null;
   const messages = [{
     role: 'user',
-    content: [{ type: 'text', text: constitutionBlock(constitution)
+    content: [{ type: 'text', text: constitutionBlock(constitution, clausesOf(db, constitution.id))
       + (answered ? `\n\n${answered}` : '')
       // 契约里已被人判作废的条目 —— 不挂上，规划器会把作废的规则原样切进节点规格与验收标准。
       + ((ov) => (ov ? `\n\n${ov}` : ''))(renderOverruled(db, overruledContractRules(db, taskId)))
@@ -301,7 +331,7 @@ export async function plan(db, { client, taskId, constitution, tier = 'heavy', m
   try {
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     const resp = await client.complete({
-      tier, system: withOutputLang(SYSTEM, contentLang(db)), messages, tools: [SUBMIT_PLAN, RAISE_QUESTION], maxTokens: MAX_TOKENS, effort: 'high',
+      role: 'planner', tier, system: withOutputLang(SYSTEM, contentLang(db)), messages, tools: [SUBMIT_PLAN, RAISE_QUESTION], maxTokens: MAX_TOKENS, effort: 'high',
     });
     if (truncatedEmpty(resp)) throw new TruncatedEmptyError('规划器', MAX_TOKENS);
     const calls = toolCallsOf(resp);
@@ -320,7 +350,7 @@ export async function plan(db, { client, taskId, constitution, tier = 'heavy', m
       errs = [`既没调用 submit_plan 也没调用 raise_question（stopReason=${resp.stopReason}）。`
         + `能规划就提交方案，不能规划就提问，不要只输出文字。`];
     } else {
-      errs = validatePlan(call.args, { constitutionText: constitutionText(constitution) });
+      errs = validatePlan(call.args, { constitutionText: constitutionText(constitution), clauseKeys: clausesOf(db, constitution.id).map((c) => c.key) });
     }
 
     audit(db, {
@@ -379,11 +409,9 @@ function recordQuestion(db, { taskId, args, tier, attempt }) {
   // Ⅲ 级无默认动作是库层硬规则；模型给了也不传，让它以"提了个不合法的问题"暴露
   const def = args.level === 3 ? null : (args.default_action ?? null);
   db.tx(() => {
-    db.run(`INSERT INTO questions (id,task_id,node_id,level,level_source,text,default_action,asked_at,status)
-            VALUES (?,?,NULL,?,'classifier',?,?,?,'open')`,
-      id, taskId, args.level, args.text, def, t);
+    insertQuestion(db, { id, taskId, level: args.level, levelSource: 'classifier', text: args.text, defaultAction: def, askedAt: t });
     routeQuestion(db, { questionId: id, ...decisionTypeOfQuestion({ kind: args.kind, text: args.text }), at: t });
-    db.run(`UPDATE tasks SET status='waiting' WHERE id=?`, taskId);
+    transition(db, 'tasks', taskId, 'waiting');
     audit(db, {
       actorKind: 'agent', actorId: 'planner', action: 'question_raised',
       targetType: 'task', targetId: taskId,
@@ -427,17 +455,21 @@ export function priorAnswers(db, taskId) {
 const NODE_RULES_HEADER = '本节点的行为规则（每条带出处：〔规格〕后是宪法块原文，是最高依据，实现与它矛盾时提问；〔规划器假设〕是宪法没写、规划器定的，按字面执行，拿不准就提问）：';
 /** 引文核对用的宪法块全文（与 constitutionBlock 同一份内容，去掉标题） */
 export const constitutionText = (c) => [c.goal, c.scope, c.definition_of_done, ...(JSON.parse(c.constraints || '[]'))].join('\n');
-const constitutionBlock = (c) => `## 目标
-${c.goal}
+// 每条条款前标 [Cn]：规划器在 covers 里按编号说这一步落实哪几条
+const constitutionBlock = (c, clauses = []) => {
+  const tag = (kind, text) => { const k = clauses.find((x) => x.kind === kind && x.text === String(text ?? '').trim())?.key; return k ? `[${k}] ${text}` : text; };
+  return `## 目标
+${tag('goal', c.goal)}
 
 ## 范围
-${c.scope}
+${tag('scope', c.scope)}
 
 ## 完成定义
-${c.definition_of_done}
+${annotateDone(c.definition_of_done, clauses)}
 
 ## 约束
-${(JSON.parse(c.constraints || '[]')).map((x) => `- ${x}`).join('\n') || '（无）'}`;
+${(JSON.parse(c.constraints || '[]')).map((x) => `- ${tag('constraint', x)}`).join('\n') || '（无）'}`;
+};
 
 /**
  * 方案落库。**一个事务**：节点、依赖边、出处边、决策记录、审计一起成立或一起不成立。
@@ -452,20 +484,17 @@ export function persistPlan(db, { taskId, constitutionId, nodes, rationale }) {
 
     for (const n of nodes) {
       const id = idOf.get(n.key);
-      db.run(`INSERT INTO nodes (id,task_id,title,spec,acceptance,status,risk_tier,model_tier,created_at)
-              VALUES (?,?,?,?,?,'pending',?,?,?)`,
-        id, taskId, n.title, n.spec, n.acceptance, n.risk_tier, n.model_tier, t);
+      insertNode(db, { id, taskId, title: n.title, spec: n.spec, acceptance: n.acceptance, riskTier: n.risk_tier, modelTier: n.model_tier, uiChecks: n.ui_checks, createdAt: t });
       // 出处：每个节点都源自这一版宪法块。这是"当时依据什么"的锚点
       insertEdge(db, id, constitutionId, 'derived_from', t);
+      // 落实的是哪几条条款：covers ∪ 规则引文落在哪条
+      recordCoverage(db, { nodeId: id, constitutionId, covers: n.covers, rules: n.rules, at: t });
     }
     for (const n of nodes) {
       for (const d of n.depends_on) insertEdge(db, idOf.get(n.key), idOf.get(d), 'depends_on', t);
     }
 
-    const decisionId = newId('d');
-    db.run(`INSERT INTO decisions (id,task_id,summary,rationale,actor_kind,actor_id,layer,valid_from,recorded_at)
-            VALUES (?,?,?,?,'agent','planner','execution',?,?)`,
-      decisionId, taskId, tl(contentLang(db), '任务分解为 {n} 个节点', { n: nodes.length }), rationale, t, t);
+    const decisionId = insertDecision(db, { taskId, summary: tl(contentLang(db), '任务分解为 {n} 个节点', { n: nodes.length }), rationale, actorKind: 'agent', actorId: 'planner', layer: 'execution', at: t });
     insertEdge(db, decisionId, constitutionId, 'derived_from', t);
 
     audit(db, {

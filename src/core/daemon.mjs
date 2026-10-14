@@ -17,7 +17,9 @@
 
 import { existsSync, writeFileSync, readFileSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
+import { performance } from 'node:perf_hooks';
 import { audit, now } from '../db/db.mjs';
+import { pidAlive } from './proc.mjs';
 import { sweepTimeouts } from './timeouts.mjs';
 import { notifyPendingQuestions, notifyPendingDeliveries } from './users.mjs';
 import { handoverDigests, scheduledDigests } from './digest.mjs';
@@ -27,14 +29,23 @@ import { firstAdmin } from './routing.mjs';
 import { readyNodes } from '../context/assemble.mjs';
 import { heldSteering, hasSteering } from './inbox.mjs';
 import { channelsForUsers } from './users.mjs';
-import { notify, channelsFromEnv } from './notify.mjs';
+import { notify, channelsFromEnv, llmHealthNotice, invariantNotice } from './notify.mjs';
 import { getParam } from './params.mjs';
 import { advanceProject } from './project.mjs';
 import { appendStateOf, appendPending } from '../agent/project-append.mjs';
 import { sweepLiveness, UNKNOWN_GRACE_MS, REPEAT_THRESHOLD } from './liveness.mjs';
+import { sweepInvariants } from './invariants.mjs';
 import { makeRuntimeHealth } from './health.mjs';
 import { raiseAdvanceFailed } from './handback.mjs';
 import { tl, contentLang } from '../i18n/index.mjs';
+import { getSetting } from './settings.mjs';
+import { LIFECYCLE } from './lifetimes.mjs';
+import { leaseOf } from '../db/lease.mjs';
+import { sweepCrashes } from './crashes.mjs';
+import { dbMaintenance } from './db-maintenance.mjs';
+import { newTrace } from './log.mjs';
+import { housekeeping } from './housekeeping.mjs';
+import { fairOrder } from './spend.mjs';
 
 /** 上次退出之后出现其中任一审计动作 → 任务可以接着跑。question_* 挂在问题上，其余挂在任务上。 */
 export const RESUME_ACTIONS = ['question_answered', 'question_defaulted', 'message_received', 'message_released', 'limit_set',
@@ -47,12 +58,8 @@ export const RETRY_BACKOFF_MS = [5, 15, 45, 90].map((m) => m * 60_000);
 /** 能修好"配置问题"的注册表动作（部署级审计）。 */
 const CONFIG_FIX_ACTIONS = ['binding_set', 'binding_seeded', 'endpoint_saved', 'model_saved', 'key_set'];
 
-export const LIFECYCLE = {
-  run: { start: 'orchestrator_started', exit: 'orchestrator_exit' },
-  draft: { start: 'elicitor_started', exit: 'elicitor_exit' },
-  plan: { start: 'planner_started', exit: 'planner_exit' },
-  'project-plan': { start: 'project_planner_started', exit: 'project_planner_exit' },   // 目标是项目 id
-};
+// 起止审计动作的表在 lifetimes.mjs（复盘也用它）；这里照旧导出，原有的引用不用改
+export { LIFECYCLE };
 
 /**
  * 项目规划器该不该拉：项目 proposed；批准问题没开着（没提过 / 已答）；没在跑；上次是 proposed 则要有人答过；
@@ -100,11 +107,7 @@ export function assessProjectPlan(db, project, { at = now(), isLive = () => null
 
 const parse = (s) => { try { return JSON.parse(s ?? '{}'); } catch { return {}; } };
 
-/** pid 还活着吗。⚠️ 只查存在，不查是不是编排器；pid 被系统复用会误判"还活着"，那种情形靠人看看板。 */
-export function pidAlive(pid) {
-  if (!pid) return false;
-  try { process.kill(pid, 0); return true; } catch (e) { return e.code === 'EPERM'; }
-}
+export { pidAlive };
 
 const marks = () => RESUME_ACTIONS.map(() => '?').join(',');
 
@@ -137,11 +140,21 @@ function assessPhase(db, taskId, verb, { at, alive, retryKinds, continueIf = () 
   if (!lastExit || lastStart.id > lastExit.id) {
     // 起了没退：要么还在跑，要么死在半路（断电 / Ctrl-C / OOM）—— 没有 *_exit 这一行
     const pid = parse(lastStart.payload).pid;
-    if (alive(pid)) return { due: false, verb, reason: 'live_foreign', pid };
+    // 编排器有租约：按租约判 —— 没过期 = 还在跑；过期了 = 当它死了（哪怕 pid 还在：卡死的僵尸，接替者拉起来后它写不进去）。
+    // 没有租约行（老版本起的）或别的阶段，照旧看 pid。
+    const lease = verb === 'run' ? leaseOf(db, `task:${taskId}`, at) : null;
+    if (lease ? lease.live : alive(pid)) return { due: false, verb, reason: 'live_foreign', pid: lease?.pid ?? pid };
     lastExit = { id: lastStart.id, ts: lastStart.ts, payload: lastStart.payload };
     kind = 'crashed';
   }
 
+  // 因部署级急停退出的：急停一解除（走到这里说明守护进程已经不在暂停态）就接着拉，不算失败、不走退避
+  if (kind === 'deploy_paused') return { due: true, verb, reason: `${verb}:resume_after_deploy_pause`, kind };
+  // 被接管而退出的：接替它的那个还持有租约就不拉（上面已经按 live_foreign 挡了）；没人持有 = 接替者也没了，接着拉
+  if (kind === 'lease_lost') {
+    const l = leaseOf(db, `task:${taskId}`, at);
+    return l?.live ? { due: false, verb, reason: 'live_foreign', pid: l.pid, kind } : { due: true, verb, reason: `${verb}:resume_after_lease_lost`, kind };
+  }
   const trig = lastTrigger(db, taskId, lastExit.id);
   if (trig) return { due: true, verb, reason: `${verb}:trigger:${trig.action}`, kind };
 
@@ -150,6 +163,12 @@ function assessPhase(db, taskId, verb, { at, alive, retryKinds, continueIf = () 
   // 配置问题退出的（ConfigError）：注册表在那之后改过（改绑 / 启用 / 填 key）就立刻再拉，不等退避、也不受"放弃"限制 ——
   // 那几条审计是部署级的，不挂在任务上，lastTrigger 看不到。手改 .env 没有审计，仍靠下面的退避兜。
   const rejected = payload.error?.retryable === false && !payload.error?.config;   // 401 / 403 这类：厂商明确拒绝，重试不会好
+  // 厂商暂时不可用（重试用尽 / 熔断开着）退出的，人在那之后给这一档配了备用或改了绑定：也立刻再拉，不等退避
+  const unavailable = kind === 'provider_error' && payload.error?.retryable === true;
+  if (unavailable) {
+    const fix = db.one(`SELECT id, action FROM audit_log WHERE id>? AND action IN ('binding_fallback_set','binding_set') ORDER BY id DESC LIMIT 1`, lastExit.id);
+    if (fix) return { due: true, verb, reason: `${verb}:config_fixed:${fix.action}`, kind };
+  }
   if (payload.error?.config || rejected) {
     const fix = db.one(`SELECT id, action FROM audit_log WHERE id>? AND action IN (${CONFIG_FIX_ACTIONS.map(() => '?').join(',')}) ORDER BY id DESC LIMIT 1`, lastExit.id, ...CONFIG_FIX_ACTIONS);
     if (fix) return { due: true, verb, reason: `${verb}:config_fixed:${fix.action}`, kind };
@@ -222,7 +241,7 @@ export function assessTask(db, task, { at = now(), isLive = () => null, hasWorks
   const waitingWork = task.status === 'waiting' && (hasSteering(db, taskId, { at }) || readyNodes(db, taskId).length > 0);
   if (task.status !== 'running' && !waitingWork) return { due: false, verb: 'run', reason: `status:${task.status}` };
   if (!hasWorkspace(taskId)) return { due: false, verb: 'run', reason: 'no_workspace' };
-  return assessPhase(db, taskId, 'run', { at, alive, retryKinds: ['provider_error', 'crashed'],
+  return assessPhase(db, taskId, 'run', { at, alive, retryKinds: ['provider_error', 'sandbox_error', 'crashed'],
     // 上一轮因为修正被挡着而退出、现在已经不挡了：放行时如果没有触发动作（待比对到点自己放行、
     // 冲突事项被撤回），不在这里认它，这个任务就再也没人拉 —— 正是停等账本抓的那一族。
     // 编排器的 why 按内容语言写（orchestrator.mjs 的「到达 maxCycles={n}」）：中英两种开头都认
@@ -262,10 +281,23 @@ export function daemonStatus(home, { at = Date.now() } = {}) {
  * 轮询循环：每 intervalMs 扫一次超时链，再把该拉的拉起来。返回 { tick, stop }。
  * 通知与打印都交给 onEvent，守护进程本身不知道通道。
  */
-export function startDaemon(db, { home, launcher, intervalMs = 15_000, iterations = null, onEvent = () => {}, alive = pidAlive, clock = now, notifyOpts = null, liveness = null, runtime = makeRuntimeHealth({ lang: () => contentLang(db) }) }) {
+export function startDaemon(db, { home, launcher, intervalMs = 15_000, iterations = null, onEvent = () => {}, alive = pidAlive, clock = now, notifyOpts = null, liveness = null, runtime = makeRuntimeHealth({ lang: () => contentLang(db) }), dbPath = null, invariants = true }) {
   // 容器运行时的状态：不在的时候不拉要用沙箱的那几步（run、项目推进里的变基验收 / 项目级验收），
   // 不烧退避表的重试次数；起草、规划照常。状态变化各记一条审计，看板与活动流据此说话。
   let runtimeWasOk = true;
+  let pausedWas = false;
+  // 熔断 / 换用备用 / 恢复审计的水位，启动时取当前最大 id —— 守护进程重启不把旧事再报一遍
+  const HEALTH_ACTIONS = ['llm_breaker_opened', 'llm_breaker_closed', 'llm_fallback_used'];
+  const healthSql = `action IN (${HEALTH_ACTIONS.map(() => '?').join(',')})`;
+  // 部署级的事告诉管理员：个人通道，没有就退到部署级（.env 里的）。不抛
+  const notifyLead = async ({ kind, title, text, ref }) => {
+    const { env = process.env, extraCmd = null, fetchFn = globalThis.fetch } = notifyOpts;
+    const lead = firstAdmin(db);
+    let channels = lead ? channelsForUsers(db, [lead]) : [];
+    if (!channels.length) channels = channelsFromEnv(env, extraCmd);
+    if (channels.length) await notify(db, { taskId: null, kind, title, text, ref, channels, fetchFn }).catch(() => {});
+  };
+  let healthSeen = db.one(`SELECT COALESCE(MAX(id), 0) AS m FROM audit_log WHERE ${healthSql}`, ...HEALTH_ACTIONS).m;
   const hasWorkspace = (taskId) => existsSync(join(home, 'workspaces', taskId));
   audit(db, { actorKind: 'system', action: 'daemon_started', targetType: 'daemon', targetId: String(process.pid),
     payload: { pid: process.pid, intervalMs } });
@@ -289,6 +321,13 @@ export function startDaemon(db, { home, launcher, intervalMs = 15_000, iteration
     const wait = RETRY_BACKOFF_MS[l.failures - 1];
     if (wait === undefined) return `gave_up:launch_failed#${l.failures}`;
     return at < l.failedAt + wait ? `backoff:launch_failed#${l.failures}` : null;
+  };
+  // 子进程当场就没起来（spawn 同步抛 EMFILE / EAGAIN 之类的系统错误）：同样计一次失败、进退避 ——
+  // 原来只有"起了但没活"才进退避，当场起不来的每一拍都重试一次（故障注入查出）。暂停、已有子进程这类不算。
+  const spawnFailed = (taskId, verb, e, at) => {
+    if (!/^E[A-Z]+$/.test(String(e?.code ?? ''))) return;
+    const prev = launches.get(taskId);
+    launches.set(taskId, { auditId: null, verb, failures: (prev?.failures ?? 0) + 1, failedAt: at });
   };
   // 项目推进（project.mjs）：每拍先推进一步再看该拉谁。推进失败（deliver 推不上去、ff 合不了）按同一张退避表等，
   // 不然每 15 s 往审计轨写一条一样的错。
@@ -329,9 +368,12 @@ export function startDaemon(db, { home, launcher, intervalMs = 15_000, iteration
     if (busy) return null;
     busy = true;
     beat(home, intervalMs);
+    newTrace();   // 每一拍一条新的因果链：这一拍拉起的子进程经环境变量继承它，两边日志按 trace 对得上
     try {
       const at = clock();
       const swept = sweepTimeouts(db, { onEvent: (e) => onEvent({ type: 'sweep', event: e }) });
+      // 被硬杀的进程：起了没退、进程已经不在 → 补收尾（kind=crashed，写明是守护进程查出来的）+ 一条给人看的 process_crashed
+      sweepCrashes(db, { at, alive, onEvent });
       // 通知按人：事项创建时解析出的收件人各发各的；没配通道的人只能看看板 / CLI。
       const notified = notifyOpts ? await notifyPendingQuestions(db, notifyOpts).catch((e) => { onEvent({ type: 'notify_failed', error: e.message }); return []; }) : [];
       for (const n of notified) onEvent({ type: 'notified', ...n });
@@ -384,6 +426,37 @@ export function startDaemon(db, { home, launcher, intervalMs = 15_000, iteration
 ${rt.why ?? ''}`, ref: 'runtime', channels, fetchFn }).catch(() => {});
         }
       }
+      // 模型服务商熔断：编排器子进程写的审计，守护进程按水位捡起来告诉管理员（个人通道，退到部署级）
+      {
+        const rows = db.all(`SELECT id, action, target_id, payload FROM audit_log WHERE id > ? AND ${healthSql} ORDER BY id`, healthSeen, ...HEALTH_ACTIONS);
+        if (rows.length) {
+          healthSeen = rows.at(-1).id;
+          const L = contentLang(db);
+          const n = llmHealthNotice(rows.map((r) => ({ action: r.action, targetId: r.target_id, payload: (() => { try { return JSON.parse(r.payload); } catch { return {}; } })() })), L);
+          onEvent({ type: 'llm_health', events: rows.length, lines: n?.lines ?? [] });
+          if (n && notifyOpts) await notifyLead({ kind: 'llm_health', ...n });
+        }
+      }
+      // 运行期不变量：各条按自己的周期查，结果进 invariant_state（健康卡读）；从对到错 / 从错到对告诉管理员。
+      // 放在急停判断之前：急停时别的几条照查（停等那条自己会跳过）。出错不连累这一拍
+      if (invariants !== false) {
+        try {
+          const t0 = performance.now();
+          const inv = sweepInvariants(db, { at, home, alive, assess: (d2, t, o) => assessTask(d2, t, o), assessOpts: { isLive: launcher.running, hasWorkspace, alive } });
+          db.timing?.('invariants_sweep', performance.now() - t0);
+          const tr = inv.transitions.filter((t) => !t.advice);   // 重查提醒只在健康卡上显示，不推通知
+          if (tr.length) {
+            const n = invariantNotice(tr, contentLang(db));
+            onEvent({ type: 'invariants', transitions: tr, lines: n?.lines ?? [] });
+            if (n && notifyOpts) await notifyLead({ kind: 'invariants', ...n });
+          }
+        } catch (e) { onEvent({ type: 'notify_failed', error: tl(contentLang(db), '运行期自检：{msg}', { msg: e.message }) }); }
+      }
+      // 部署级急停：不推进项目、不拉起任何进程；停等账本也不扫 —— 那时所有任务都"静止"，
+      // 扫了会把管理员的暂停误判成停摆、给负责人挂报警事项。超时、通知、摘要照常（那些是给人的，不花模型钱）。
+      const paused = !!getSetting(db, 'deploy.paused');
+      if (paused !== pausedWas) { pausedWas = paused; onEvent({ type: paused ? 'deploy_paused' : 'deploy_resumed' }); }
+      if (paused) return { swept, projects: [], launched: [], skipped: [], liveness: null, paused: true };
       const sandboxOk = !rt || rt.ok !== false;
       const projects = sandboxOk ? await advanceProjects(at) : [];
       // 项目规划器：proposed 的项目按 assessProjectPlan 拉 `project plan <id>`；起不来走同一张退避表。
@@ -401,11 +474,15 @@ ${rt.why ?? ''}`, ref: 'runtime', channels, fetchFn }).catch(() => {});
           launched.push({ taskId: p.id, verb: 'project-plan', reason: a.reason, ...r });
           onEvent({ type: 'launched', taskId: p.id, verb: 'project-plan', reason: a.reason, ...r });
         } catch (e) {
+          spawnFailed(p.id, 'project-plan', e, at);
           onEvent({ type: 'launch_failed', taskId: p.id, reason: a.reason, error: e.message });
         }
       }
-      for (const d of dueTasks(db, { at, isLive: launcher.running, hasWorkspace, alive })) {
-        if (!d.due) continue;
+      // 公平调度：按归属人交错拉起；每人同时在跑的任务数到上限的，这一拍不拉
+      const perPersonCap = Number(getSetting(db, 'deploy.max_running_per_person'));
+      const fair = fairOrder(db, dueTasks(db, { at, isLive: launcher.running, hasWorkspace, alive }).filter((d) => d.due), { at });
+      for (const d of fair.ordered) {
+        if (perPersonCap > 0 && d.payerId !== '(project)' && (fair.running.get(d.payerId) ?? 0) >= perPersonCap) { skipped.push({ taskId: d.taskId, reason: `fair_share:${perPersonCap}` }); continue; }
         if (!sandboxOk && (d.verb ?? 'run') === 'run') { skipped.push({ taskId: d.taskId, reason: 'runtime_down' }); continue; }
         const gate = launchGate(d.taskId, at);
         if (gate) { skipped.push({ taskId: d.taskId, reason: gate }); continue; }
@@ -416,8 +493,10 @@ ${rt.why ?? ''}`, ref: 'runtime', channels, fetchFn }).catch(() => {});
           const prev = launches.get(d.taskId);
           launches.set(d.taskId, { auditId, verb, failures: prev?.failures ?? 0, failedAt: prev?.failedAt ?? null });
           launched.push({ taskId: d.taskId, verb, reason: d.reason, ...r });
+          fair.running.set(d.payerId, (fair.running.get(d.payerId) ?? 0) + 1);   // 这一拍刚拉起的也算在跑
           onEvent({ type: 'launched', taskId: d.taskId, verb, reason: d.reason, ...r });
         } catch (e) {
+          spawnFailed(d.taskId, d.verb ?? 'run', e, at);
           onEvent({ type: 'launch_failed', taskId: d.taskId, reason: d.reason, error: e.message });
         }
       }
@@ -427,7 +506,19 @@ ${rt.why ?? ''}`, ref: 'runtime', channels, fetchFn }).catch(() => {});
         : sweepLiveness(db, { at, assess: (d2, t, o) => assessTask(d2, t, o), isLive: launcher.running, hasWorkspace, alive,
           graceMs: liveness?.graceMs ?? UNKNOWN_GRACE_MS, threshold: liveness?.threshold ?? REPEAT_THRESHOLD,
           onEvent: (e) => onEvent(e) });
-      return { swept, projects, launched, skipped, liveness: live };
+      // 状态库例行维护：到点的检查 / 备份 / 检查点。放在最后：该拉的都拉了再做；出错不连累这一拍
+      const maintenance = dbPath ? await dbMaintenance(db, dbPath, { at, onEvent }).catch((e) => ({ error: e.message })) : null;
+      // 日常清理：旧日志、daemon.log 截断、已合并任务的依赖目录。每天一次
+      let housework = null;
+      try { housework = housekeeping(db, home, { at, onEvent }); } catch (e) { housework = { error: e.message }; }
+      return { swept, projects, launched, skipped, liveness: live, maintenance, housework };
+    } catch (e) {
+      // 一拍出错不能带走整个进程：tick 由 setInterval 调、没有人 await 它，
+      // 这里抛出去就是未处理的 rejection —— Node 默认直接退出，`web --daemon` 时看板也跟着没了。
+      // 记进审计（看板与复盘看得见）、报给事件流，下一拍照常再来；同一个错连着出也只是每拍一行，不会刷爆。
+      try { audit(db, { actorKind: 'system', action: 'daemon_tick_failed', payload: { error: String(e?.message ?? e).slice(0, 500), stack: String(e?.stack ?? '').split('\n').slice(1, 6).map((l) => l.trim()) } }); } catch { /* 库本身出错时只剩事件流 */ }
+      onEvent({ type: 'tick_failed', error: String(e?.message ?? e) });
+      return null;
     } finally { busy = false; }
   };
   const timer = setInterval(tick, intervalMs);

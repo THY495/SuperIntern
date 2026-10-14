@@ -34,6 +34,7 @@ import { setProjectBudget, setProjectVerify, setGear, deferSignoff, deferredSign
 import { acceptDeferredSignoffs } from '../src/core/project.mjs';
 import { raiseSignoffQuestion } from '../src/core/deliver.mjs';
 import { buildDigest, renderDigest } from '../src/core/digest.mjs';
+import { approvalOf } from '../src/core/provenance.mjs';
 import { record } from '../src/core/decisions.mjs';
 
 let pass = 0, fail = 0;
@@ -123,6 +124,12 @@ section('3. 反馈 → 作废旧契约、出 v2；批准 → active → advanceP
   answer(Q2, 'A。\n保留：TTL 那条我不太认同，先这么做，等上线看了再说。');
   const ok2 = await planProject(db, { client: client([]), projectId: P.projectId });
   eq(ok2.kind, 'approved', '批准（不调模型）');
+  {
+    // 修改溯源：项目批准绑到这一轮各任务的契约上
+    const live = db.all(`SELECT c.id FROM tasks t JOIN constitutions c ON c.task_id=t.id AND c.superseded_at IS NULL WHERE t.project_id=? AND t.status<>'aborted' AND t.project_order>0`, P.projectId);
+    assert(live.length > 0 && live.every((c) => approvalOf(db, c.id)?.kind === 'approval'), '项目批准绑到这一轮每个任务的契约上（批准答复 = 那条 A）');
+    assert(oldIds.every((id) => { const c = db.one(`SELECT id FROM constitutions WHERE task_id=?`, id); return !c || approvalOf(db, c.id) === null; }), '被作废的上一轮任务没有批准');
+  }
   {
     const resv = activeDecisions(db, { projectId: P.projectId }).filter((d) => d.reservation);
     eq(resv.length, 1, '保留意见落进约定清单');
@@ -310,6 +317,10 @@ section('8. 追加：给在跑的项目加尾部任务 —— 批准前不建任
   r = await planProject(db, { client: client([]), projectId: X.projectId });
   eq(r.kind, 'approved', '批准不调模型');
   const chain = projectTasks(db, X.projectId);
+  {
+    const c3 = db.one(`SELECT id FROM constitutions WHERE task_id=? AND superseded_at IS NULL`, chain[2].id);
+    eq(approvalOf(db, c3.id)?.kind, 'approval', '追加批准绑到新任务的契约上');
+  }
   eq(chain.map((t) => `${t.project_order}:${t.title}`).join(','), '1:T1 库,2:T2 CLI,3:T3 dump', '新任务接在末尾');
   eq(JSON.stringify(getParam(db, chain[2].id, 'task.verify_extra')), JSON.stringify([['node', '--test', 'tests/a.test.mjs'], ['node', '--test', 'tests/b.test.mjs']]), '新任务的回归义务 = 此前全部任务的验收命令，按序');
   eq(JSON.stringify(db.all(`SELECT * FROM constitutions WHERE task_id IN (?,?) ORDER BY id`, ...X.taskIds)), before, '已有任务的契约逐字节不变');
@@ -613,6 +624,7 @@ section('11d. 自动挡：草案直接开工、事后通知、签收后置；与
   eq(db.one(`SELECT count(*) n FROM questions WHERE task_id=? AND status='open'`, appendStateOf(db, S.projectId).carrierId).n, 0, '没有开着的批准事项');
   const t3 = projectTasks(db, S.projectId).find((t) => t.project_order === 3);
   eq(getParam(db, t3.id, 'task.auto_added'), true, '打上"AI 自己加的"标记 —— 后置签收凭它区分人加的与 AI 加的');
+  eq(approvalOf(db, db.one(`SELECT id FROM constitutions WHERE task_id=? AND superseded_at IS NULL`, t3.id).id), null, '自动挡落的契约没有人批 —— 溯源照实说没批，不冒名');
   eq(JSON.stringify(getParam(db, appendStateOf(db, S.projectId).carrierId, 'append.spec')?.tasks?.length), '1', '草案原文仍存着：没有批准事项就没有那份正文');
   const au = db.one(`SELECT payload FROM audit_log WHERE action='project_auto_batch' AND target_id=? ORDER BY id DESC LIMIT 1`, S.projectId);
   assert(!!au && JSON.parse(au.payload).review === true, '留一条审计，标明是复盘给出的');

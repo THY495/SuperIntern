@@ -90,7 +90,8 @@ export function validateRules(rules, { brief = null, at = 'rules' } = {}) {
     const p = `${at}[${i}]`;
     if (!r || typeof r !== 'object') { errs.push(`${p} 要是对象 {rule, quote | assumption}`); return; }
     if (!String(r.rule ?? '').trim()) errs.push(`${p} 缺 rule`);
-    const q = String(r.quote ?? '').trim(), a = String(r.assumption ?? '').trim();
+    // 引文里带了条款编号（"[C3] …"，规划器看到的宪法块每条前面有）：核对时去掉，编号不是原文
+    const q = String(r.quote ?? '').replace(/\[C\d+\]\s*/g, '').trim(), a = String(r.assumption ?? '').trim();
     if (!q && !a) errs.push(`${p}「${String(r.rule ?? '').slice(0, 40)}」没有出处：要么 quote 逐字引规划 / 规格原文，要么 assumption 说明规格没写、你怎么定的`);
     else if (q && a) errs.push(`${p} quote 与 assumption 只能给一个`);
     // 太短的引文定位不到出处。但拆条（下面 ①）会把「测试须覆盖：①正常转换；②…」拆出只有几个字的原文 ——

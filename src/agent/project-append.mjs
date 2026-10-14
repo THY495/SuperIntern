@@ -19,8 +19,10 @@
 import { withOutputLang, contentLang, tl, I18nError } from '../i18n/index.mjs';
 import { markOf } from '../i18n/marks.mjs';
 import { newId, now, audit } from '../db/db.mjs';
+import { insertCarrierTask } from '../db/tasks.mjs';
+import { updateProject } from '../db/projects.mjs';
 import { getParam, setParam } from '../core/params.mjs';
-import { routeQuestion, specPrefixes, wholeProjectPrefixes } from '../core/routing.mjs';
+import { routeQuestion, specPrefixes, wholeProjectPrefixes, rulesOf } from '../core/routing.mjs';
 import { cliCoverageProblems } from '../core/contract-coverage.mjs';
 import { createProjectTasks, validateProjectSpec, projectTasks, chainGraph, renderRules, renderDeps, scopeOverlaps, renderScopeOverlaps, renderScopePaths, scopePathsNote, SCOPE_PATHS_NOTE, PROJECT_TASK_RUNTIME_MS } from '../core/project.mjs';
 import { canAddTasks } from '../core/project-members.mjs';
@@ -30,17 +32,18 @@ import { checkDecisions } from '../core/decision-check.mjs';
 import { decisionsSection } from '../core/decisions.mjs';
 import { answerOf } from './elicitor.mjs';
 import { reservationOf, readApproval, readVerdict, confirmBeforeRevising, feedbackOf, REACHED_LABELS, REVIEW_LABELS } from './approval.mjs';
-import { schedLine } from './project-planner.mjs';
+import { schedLine, carrierTask as carrierOf } from './project-planner.mjs';
 import { diffSpecs, renderSpecDiff, roundHistory, renderRoundHistory } from './spec-diff.mjs';
-import { toolCallsOf, textOf, truncatedEmpty, TruncatedEmptyError } from '../llm/canonical.mjs';
-import { PRE_HOOKS } from '../core/answers.mjs';
+import { toolCallsOf, textOf, truncatedEmpty, TruncatedEmptyError, LLM_ROLES } from '../llm/canonical.mjs';
+import { PRE_HOOKS, insertAnswer } from '../core/answers.mjs';
 import { answerChoices } from '../core/choices.mjs';
+import { transition } from '../db/state.mjs';
+import { bindApproval } from '../core/provenance.mjs';
+import { insertQuestion } from '../core/questions.mjs';
 
 export const MAX_APPEND_TASKS = 6;
 const MAX_TOKENS = 24000;
 const BY = (userId) => ({ kind: 'user', id: userId });
-
-const carrierOf = (db, projectId) => db.one(`SELECT * FROM tasks WHERE project_id=? AND project_order=0`, projectId);
 
 /** 追加的当前状态；没有进行中的追加 → null。 */
 export function appendStateOf(db, projectId) {
@@ -50,7 +53,42 @@ export function appendStateOf(db, projectId) {
   if (!stage) return null;
   return { stage, kind: getParam(db, c.id, 'append.kind') ?? 'append', carrierId: c.id, brief: getParam(db, c.id, 'append.brief'), version: getParam(db, c.id, 'append.version') ?? 0,
     questionId: getParam(db, c.id, 'append.question'), sinceAuditId: getParam(db, c.id, 'append.since') ?? 0, seed: getParam(db, c.id, 'append.seed') ?? [], continued: getParam(db, c.id, 'append.seed') !== null,
-    requestedBy: getParam(db, c.id, 'append.requested_by') ?? null, queue: getParam(db, c.id, 'append.queue') ?? [] };
+    requestedBy: getParam(db, c.id, 'append.requested_by') ?? null, requesters: getParam(db, c.id, 'append.requesters') ?? null, queue: getParam(db, c.id, 'append.queue') ?? [] };
+}
+/**
+ * 这一轮的需求出自谁：添加任务 → 提的那一个人；达成确认里几个人各写了"还差东西" → 这几个人。
+ * 原来只记第一个写"还差东西"的人，一条确认里两个人各提一件，派生的两个任务都记在第一个人名下，第二个人没被叫来签他自己的需求。
+ */
+export const requestersOf = (st) => (st?.requesters?.length ? st.requesters : st?.requestedBy ? [st.requestedBy] : []);
+const asList = (v) => (Array.isArray(v) ? v : v == null || v === '' ? [] : [v]).map((x) => String(x).trim()).filter(Boolean);
+/** 几个人的需求并成一轮时，规划器要给每个任务标"为谁做的"（名单上的名字）。一个人时不用标，全记在他名下。 */
+function requesterSection(db, st) {
+  const ids = requestersOf(st);
+  if (ids.length < 2) return null;
+  const names = ids.map((id) => db.one(`SELECT display_name FROM users WHERE id=?`, id)?.display_name ?? id);
+  return `## 这一轮的需求出自 ${ids.length} 个人：${names.join('、')}\n他们各自在反馈里写了要什么（反馈里按名字署了）。每个新任务都要在 requested_by 里写它是为谁的需求做的：填这几个名字，原样照抄；一个任务同时服务了几个人的需求就都写上。系统按它叫提需求的人来签收、做完时告诉他们 —— 写错了就会叫错人签收。`;
+}
+function requesterProblems(db, st, spec) {
+  const ids = requestersOf(st);
+  if (ids.length < 2) return [];
+  const names = ids.map((id) => db.one(`SELECT display_name FROM users WHERE id=?`, id)?.display_name ?? id);
+  const errs = [];
+  spec.tasks.forEach((t, i) => {
+    const rb = asList(t?.requested_by);
+    if (!rb.length) errs.push(`任务 ${i + 1}「${t?.title ?? ''}」缺 requested_by：这一轮的需求出自 ${names.join('、')}，写明它是为谁的需求做的`);
+    for (const n of rb) if (!names.includes(n) && !ids.includes(n)) errs.push(`任务 ${i + 1}「${t?.title ?? ''}」的 requested_by 里「${n}」不在名单上（只能写：${names.join('、')}）`);
+  });
+  return errs;
+}
+/** 新建的任务记在提出人名下（task.requested_by）：一个人记 id，几个人记 id 数组。规划器没标的（老草案）记在这一轮所有提出人名下。 */
+function tagRequesters(db, { taskIds, tasks, requesters }) {
+  if (!requesters.length) return;
+  const byName = new Map(requesters.map((id) => [db.one(`SELECT display_name FROM users WHERE id=?`, id)?.display_name ?? id, id]));
+  taskIds.forEach((id, i) => {
+    const named = requesters.length > 1 ? [...new Set(asList(tasks[i]?.requested_by).map((n) => (requesters.includes(n) ? n : byName.get(n))).filter(Boolean))] : [];
+    const who = requesters.length === 1 ? requesters : named.length ? named : requesters;
+    setParam(db, { taskId: id, key: 'task.requested_by', value: who.length === 1 ? who[0] : who, by: BY(who[0]), governance: 'constitutional' });
+  });
 }
 export const appendPending = (st) => !!st && ['drafting', 'proposed'].includes(st.stage);
 
@@ -84,15 +122,15 @@ export function requestReview(db, { projectId }) {
   return db.tx(() => {
     if (!carrier) {
       const id = newId('t');
-      db.run(`INSERT INTO tasks (id,owner_id,title,status,created_at,project_id,project_order) VALUES (?,?,?,'planning',?,?,0)`, id, p.owner_id, tl(L, '项目规划：{title}', { title: p.title }), t, projectId);
+      insertCarrierTask(db, { id, ownerId: p.owner_id, projectId, title: tl(L, '项目规划：{title}', { title: p.title }), createdAt: t });
       carrier = { id };
-    } else db.run(`UPDATE tasks SET status='planning' WHERE id=?`, carrier.id);
+    } else transition(db, 'tasks', carrier.id, 'planning');
     const since = db.one(`SELECT COALESCE(MAX(id),0) m FROM audit_log`).m;
     const set = (key, value) => setParam(db, { taskId: carrier.id, key, value, by: { kind: 'agent', id: 'project' }, governance: 'execution' });
     // 与 REVIEW_BRIEF 同一句（中文逐字相同），按内容语言写
     set('append.kind', 'review'); set('append.brief', `${markOf(L, 'review')}${tl(L, '项目的全部任务都已完成并合并。对照项目目标与完成定义判断：还差什么，或者已经达成。')}`); set('append.stage', 'drafting'); set('append.version', 0);
     set('append.question', null); set('append.spec', null); set('append.notes', null); set('append.since', since);
-    set('append.reached', null); set('append.seed', null); set('append.requested_by', null);   // 复盘不是谁提的需求；上一轮的出处别带过来
+    set('append.reached', null); set('append.seed', null); set('append.requested_by', null); set('append.requesters', null);   // 复盘不是谁提的需求；上一轮的出处别带过来
     audit(db, { actorKind: 'system', action: 'project_review_requested', targetType: 'project', targetId: projectId, payload: { carrier: carrier.id } });
     return { projectId, carrierId: carrier.id };
   });
@@ -111,7 +149,7 @@ export function reviewAgain(db, { projectId, userId }) {
   if (db.one(`SELECT 1 FROM tasks WHERE project_id=? AND project_order>0 AND merged_at IS NULL AND status<>'aborted'`, projectId)) throw new I18nError('还有没合并的任务，先把它们做完');
   if (db.one(`SELECT 1 FROM tasks WHERE project_id=? AND project_order>0 AND merged_at IS NULL AND status='aborted'`, projectId)) throw new I18nError('有已中止的任务：先在项目页恢复或重做它');
   const r = requestReview(db, { projectId });
-  db.run(`UPDATE projects SET status='active' WHERE id=?`, projectId);
+  transition(db, 'projects', projectId, 'active');
   audit(db, { actorKind: 'user', actorId: userId, action: 'project_review_again', targetType: 'project', targetId: projectId, payload: { carrier: r.carrierId } });
   return r;
 }
@@ -152,9 +190,9 @@ function beginAppend(db, { project: p, userId, brief: text, seed = null, fromQue
   return db.tx(() => {
     if (!carrier) {
       const id = newId('t');
-      db.run(`INSERT INTO tasks (id,owner_id,title,status,created_at,project_id,project_order) VALUES (?,?,?,'planning',?,?,0)`, id, p.owner_id, tl(L, '项目规划：{title}', { title: p.title }), t, projectId);
+      insertCarrierTask(db, { id, ownerId: p.owner_id, projectId, title: tl(L, '项目规划：{title}', { title: p.title }), createdAt: t });
       carrier = { id };
-    } else db.run(`UPDATE tasks SET status='planning' WHERE id=?`, carrier.id);
+    } else transition(db, 'tasks', carrier.id, 'planning');
     const since = db.one(`SELECT COALESCE(MAX(id),0) m FROM audit_log`).m;
     const set = (key, value) => setParam(db, { taskId: carrier.id, key, value, by: BY(userId), governance: 'constitutional' });
     set('append.brief', text); set('append.stage', 'drafting'); set('append.version', 0); set('append.question', null); set('append.spec', null); set('append.notes', null);
@@ -162,7 +200,7 @@ function beginAppend(db, { project: p, userId, brief: text, seed = null, fromQue
     // 上一轮若是复盘，kind / reached 会原样留着 —— 下一次人加的任务就被当成复盘走了 planReview。
     // seed 同理：不清掉，continued 永远为真。
     set('append.kind', 'append'); set('append.reached', null); set('append.seed', seed ?? null);
-    set('append.requested_by', userId);          // 需求出处：这一轮建出来的任务记在提出人名下（task.requested_by）
+    set('append.requested_by', userId); set('append.requesters', null);          // 需求出处：这一轮建出来的任务记在提出人名下（task.requested_by）
     audit(db, { actorKind: 'user', actorId: userId, action: 'project_append_requested', targetType: 'project', targetId: projectId,
       payload: { carrier: carrier.id, briefBytes: text.length, ...(fromQueue ? { fromQueue } : {}) } });
     return { projectId, carrierId: carrier.id };
@@ -178,8 +216,7 @@ function enqueueAppend(db, { projectId, userId, brief, cur, viaQuestion = null }
     setParam(db, { taskId: cur.carrierId, key: 'append.queue', value: queue, by: BY(userId), governance: 'constitutional' });
     const q = cur.questionId ? db.one(`SELECT id, status FROM questions WHERE id=?`, cur.questionId) : null;
     if (q && ['open', 'escalated'].includes(q.status)) {
-      db.run(`INSERT INTO answers (id,question_id,user_id,message_id,body,stance,created_at) VALUES (?,?,?,NULL,?,'comment',?)`,
-        newId('a'), q.id, userId, `${tl(L, '（添加任务，已排队）')}${brief}\n${cur.kind === 'review' ? tl(L, '—— 这条会在这一轮复盘结束后单独起草、单独批准；不影响你现在这条怎么答。') : tl(L, '—— 这条会在这一轮添加结束后单独起草、单独批准；不影响你现在这条怎么答。')}${cur.kind === 'review' ? tl(L, '要是这条需求没做完就不该算达成，就别回「确认达成」，把它写进"还差什么"。') : ''}`, item.at);
+      insertAnswer(db, { questionId: q.id, userId, stance: 'comment', at: item.at, body: `${tl(L, '（添加任务，已排队）')}${brief}\n${cur.kind === 'review' ? tl(L, '—— 这条会在这一轮复盘结束后单独起草、单独批准；不影响你现在这条怎么答。') : tl(L, '—— 这条会在这一轮添加结束后单独起草、单独批准；不影响你现在这条怎么答。')}${cur.kind === 'review' ? tl(L, '要是这条需求没做完就不该算达成，就别回「确认达成」，把它写进"还差什么"。') : ''}` });
     }
     audit(db, { actorKind: 'user', actorId: userId, action: 'project_append_queued', targetType: 'project', targetId: projectId,
       payload: { queueId: item.id, position: queue.length, behind: cur.kind, stage: cur.stage, human: brief.slice(0, 200) } });
@@ -256,10 +293,16 @@ function existingContracts(db, projectId) {
 
 export function renderAppendProposal(db, { project, spec, version, notes, startOrder, seedCount, continued = false, review = false }) {
   const lg = contentLang(db);
+  const signsOff = rulesOf(db, project.id).some((r) => r.decision_type === 'signoff' && (r.recipients ?? []).includes('requester'));
   const L = [markOf(lg, 'appendDraft', { version }), tl(lg, '项目：{title}（现有任务编号到 #{last}，以下从 #{first} 起；已有任务的契约不变）', { title: project.title, last: startOrder - 1, first: startOrder }), ''];
   spec.tasks.forEach((t, i) => {
     // 行首的几个键与项目契约草案（project-planner renderProposal）共用，译文在 content-5
     L.push(`${startOrder + i}. ${t.title}`, tl(lg, '   依赖：{v}', { v: renderDeps(t, startOrder + i, startOrder, lg) }), tl(lg, '   目标：{v}', { v: t.goal }), tl(lg, '   范围：{v}', { v: t.scope }), tl(lg, '   可动路径（判据）：{v}', { v: renderScopePaths(t.scope_paths, lg) }), tl(lg, '   完成定义：{v}', { v: t.definition_of_done }));
+    if (asList(t.requested_by).length) {
+      // 写实际会发生的事（走查：原来笼统写"做完由提的人签收"，但只有签收那一行配了「需求提出人」才会叫他签）
+      const v = asList(t.requested_by).join(tl(lg, '、'));
+      L.push(signsOff ? tl(lg, '   为谁做：{v} —— 做完要{v}本人签收（标错了在反馈里说）', { v }) : tl(lg, '   为谁做：{v} —— 做完会告诉{v}（标错了在反馈里说）', { v }));
+    }
     if (t.rules?.length) L.push(tl(lg, '   规则：{v}', { v: renderRules(t.rules, lg).map((r) => `\n     - ${r}`).join('') }));
     if (t.constraints?.length) L.push(tl(lg, '   约束：{v}', { v: t.constraints.map((c) => `\n     - ${c}`).join('') }));
     L.push(tl(lg, '   验收命令：{v}{extra}', { v: t.verify_command, extra: tl(lg, '（开工时系统会再累加当时已合并的全部任务的验收命令）') }), '');
@@ -302,7 +345,7 @@ const SYSTEM_APPEND = (max) => `你是一个长期运行的自主 agent 的"项�
  * 追加规划的一次寿命（由 planProject 在项目不是 proposed 时转过来）。返回 { kind: 'proposed'|'approved'|'abandoned'|'noop', ... }。
  * `tool`：propose_project 的工具定义（由 project-planner 传入，避免循环 import）；`repoGlance(repo)` 同理。
  */
-export async function planAppend(db, { client, project, tier = 'heavy', maxAttempts = 3, tool, doneTool = null, repoGlance }) {
+export async function planAppend(db, { client, project, tier = LLM_ROLES.project_planner, maxAttempts = 3, tool, doneTool = null, repoGlance }) {
   const st = appendStateOf(db, project.id);
   if (!appendPending(st)) return { kind: 'noop', why: `项目 ${project.status}，没有进行中的追加` };
   const review = st.kind === 'review';
@@ -310,7 +353,7 @@ export async function planAppend(db, { client, project, tier = 'heavy', maxAttem
   const lg = contentLang(db);
   // 与追问器同一条规矩：规划器写的流程状态记 agent / execution；人的批准 / 放弃记人的名字。
   const set = (key, value, userId = null) => setParam(db, { taskId: carrierId, key, value, ...(userId ? { by: BY(userId), governance: 'constitutional' } : { by: { kind: 'agent', id: 'project_planner' }, governance: 'execution' }) });
-  if (db.one(`SELECT status FROM tasks WHERE id=?`, carrierId).status === 'running') db.run(`UPDATE tasks SET status='planning' WHERE id=?`, carrierId);
+  if (db.one(`SELECT status FROM tasks WHERE id=?`, carrierId).status === 'running') transition(db, 'tasks', carrierId, 'planning');
   // 上一版：下面判读答复时 append.reached 会被清掉，先把上一版原样留一份 —— 出新版时逐字比对要用它
   const prevVer = st.version > 0 ? { version: st.version, spec: getParam(db, carrierId, 'append.spec'), reached: getParam(db, carrierId, 'append.reached') } : null;
 
@@ -329,7 +372,7 @@ export async function planAppend(db, { client, project, tier = 'heavy', maxAttem
       db.tx(() => {
         set('append.reached', { reason: tl(lg, '人判定已达成：复盘提出的任务都不需要'), unverified: [] });
         set('append.stage', 'reached', a.sender_id);
-        db.run(`UPDATE tasks SET status='done' WHERE id=?`, carrierId);
+        transition(db, 'tasks', carrierId, 'done');
         audit(db, { actorKind: 'user', actorId: a.sender_id, action: 'project_goal_declared', targetType: 'project', targetId: project.id,
           payload: { version: st.version, questionId: st.questionId, unverified: [], via: 'review_tasks_declined' } });
       });
@@ -343,7 +386,7 @@ export async function planAppend(db, { client, project, tier = 'heavy', maxAttem
       if (verdict === 'approve') {
         db.tx(() => {
           set('append.stage', 'reached', a.sender_id);
-          db.run(`UPDATE tasks SET status='done' WHERE id=?`, carrierId);
+          transition(db, 'tasks', carrierId, 'done');
           audit(db, { actorKind: 'user', actorId: a.sender_id, action: 'project_goal_declared', targetType: 'project', targetId: project.id,
             payload: { version: st.version, questionId: st.questionId, unverified: reached.unverified ?? [] } });
         });
@@ -352,7 +395,7 @@ export async function planAppend(db, { client, project, tier = 'heavy', maxAttem
       if (verdict === 'abandon') {
         db.tx(() => {
           set('append.stage', 'abandoned', a.sender_id);
-          db.run(`UPDATE tasks SET status='done' WHERE id=?`, carrierId);
+          transition(db, 'tasks', carrierId, 'done');
           audit(db, { actorKind: 'user', actorId: a.sender_id, action: 'project_review_abandoned', targetType: 'project', targetId: project.id, payload: { version: st.version, questionId: st.questionId } });
         });
         return { kind: 'abandoned' };
@@ -362,24 +405,27 @@ export async function planAppend(db, { client, project, tier = 'heavy', maxAttem
     if (verdict === 'feedback') {
       const cf = confirmBeforeRevising(db, { taskId: carrierId, questionId: st.questionId, body: a.body, version: st.version, reached: reachedNow });
       if (cf) {
-        db.tx(() => { set('append.question', cf.questionId); db.run(`UPDATE tasks SET status='waiting' WHERE id=?`, carrierId); });
+        db.tx(() => { set('append.question', cf.questionId); transition(db, 'tasks', carrierId, 'waiting'); });
         return { kind: 'proposed', confirm: true, reached: reachedNow, questionId: cf.questionId, version: st.version, text: cf.text };
       }
     }
     if (reached) set('append.reached', null);     // 人说"还差东西" → 下一版按反馈重来，别再拿着旧的达成结论
     // 需求出处：在达成确认里回"还差东西"并写了要什么的那个人，就是这一轮建出来的任务的提出人 ——
     // 否则建出来的任务不记在提需求的人名下，"你提的需求做完了"就发不到他。
-    // 会签合并出来的那条答复署的是最后一个答复人，所以按各人自己写的答复找第一个"还差东西"的。
-    if (reached && verdict === 'feedback' && !st.requestedBy) {
-      const who = db.all(`SELECT user_id, body FROM answers WHERE question_id=? AND stance='answer' ORDER BY created_at, rowid`, st.questionId)
-        .find((x) => readVerdict(x.body, REACHED_LABELS) === 'feedback')?.user_id ?? a.sender_id;
-      set('append.requested_by', who);
+    // 会签合并出来的那条答复署的是最后一个答复人，所以按各人自己写的答复找"还差东西"的 —— **每一个**（原来只取第一个）。
+    if (reached && verdict === 'feedback' && !requestersOf(st).length) {
+      const whoAll = [...new Set(db.all(`SELECT user_id, body FROM answers WHERE question_id=? AND stance='answer' ORDER BY created_at, rowid`, st.questionId)
+        .filter((x) => x.user_id && readVerdict(x.body, REACHED_LABELS) === 'feedback').map((x) => x.user_id))];
+      if (!whoAll.length) whoAll.push(a.sender_id);
+      const who = whoAll[0];
+      set('append.requested_by', who); set('append.requesters', whoAll);
+      st.requestedBy = who; st.requesters = whoAll;     // 下面这一轮的规划器要按名单标注
       // 同一条需求可能走两条路 —— 发到已合并任务上的那句进了队列，提需求的人又在达成确认里回"还差这个"；
       // 这一版按他的反馈切进了新任务，批准后队里那条再出队、又会起草一轮。所以他自己排着的需求并进这一轮，一起交给规划器，从队里拿掉。
       const q = st.queue ?? [];
-      mergedQueue = q.filter((x) => x.userId === who);
+      mergedQueue = q.filter((x) => whoAll.includes(x.userId));
       if (mergedQueue.length) {
-        setParam(db, { taskId: carrierId, key: 'append.queue', value: q.filter((x) => x.userId !== who), by: { kind: 'agent', id: 'project' }, governance: 'execution' });
+        setParam(db, { taskId: carrierId, key: 'append.queue', value: q.filter((x) => !whoAll.includes(x.userId)), by: { kind: 'agent', id: 'project' }, governance: 'execution' });
         audit(db, { actorKind: 'system', action: 'project_append_queue_merged', targetType: 'project', targetId: project.id,
           payload: { by: who, items: mergedQueue.map((x) => x.id), human: tl(lg, '{n} 条排着的需求并进这一轮（提需求的人在达成确认里回了"还差东西"）', { n: mergedQueue.length }) } });
       }
@@ -387,21 +433,26 @@ export async function planAppend(db, { client, project, tier = 'heavy', maxAttem
     if (verdict === 'approve') {
       const spec = getParam(db, carrierId, 'append.spec');
       const p = db.one(`SELECT * FROM projects WHERE id=?`, project.id);
-      if (!['active', 'stalled', 'done'].includes(p.status)) { set('append.stage', 'abandoned', a.sender_id); db.run(`UPDATE tasks SET status='done' WHERE id=?`, carrierId); return { kind: 'abandoned', why: `项目已 ${p.status}` }; }
+      if (!['active', 'stalled', 'done'].includes(p.status)) { set('append.stage', 'abandoned', a.sender_id); transition(db, 'tasks', carrierId, 'done'); return { kind: 'abandoned', why: `项目已 ${p.status}` }; }
       const chain = projectTasks(db, project.id);
       const startOrder = (chain.at(-1)?.project_order ?? 0) + 1;
       const seedExtra = [...(st.seed ?? []), ...chainVerify(db, project.id)];
       const taskIds = createProjectTasks(db, { projectId: project.id, userId: p.owner_id, tasks: spec.tasks, startOrder, seedExtra });
       db.tx(() => {
         // 需求出处：谁提的 → 签收路由里的「需求提出人」、合并后的完成通知都认它
-        if (st.requestedBy) for (const id of taskIds) setParam(db, { taskId: id, key: 'task.requested_by', value: st.requestedBy, by: BY(st.requestedBy), governance: 'constitutional' });
+        tagRequesters(db, { taskIds, tasks: spec.tasks, requesters: requestersOf(st) });
         set('append.stage', 'approved', a.sender_id);
-        db.run(`UPDATE tasks SET status='done' WHERE id=?`, carrierId);
-        // 批准时带的保留意见单独记下
+        // 批准绑到新建任务的契约上
+        for (const id of taskIds) {
+          const c = db.one(`SELECT id FROM constitutions WHERE task_id=? AND superseded_at IS NULL ORDER BY version DESC LIMIT 1`, id);
+          if (c) bindApproval(db, { constitutionId: c.id, messageId: a.id });
+        }
+        transition(db, 'tasks', carrierId, 'done');
+        // 批准时带的保留意见有地方放了
         const resv = reservationOf(a.body);
         if (resv) recordReservation(db, { projectId: project.id, subject: tl(lg, '批准追加草案 v{version} 时的保留意见', { version: st.version }), text: resv, sourceKind: 'contract', sourceId: st.questionId, by: a.sender_id });
-        if (['done', 'stalled'].includes(p.status)) db.run(`UPDATE projects SET status='active' WHERE id=?`, project.id);     // 全部合并完 / 停滞的项目：追加后重新有事可做（停滞的原来不放回 active，新任务永远不开工）
-        db.run(`UPDATE projects SET brief=? WHERE id=?`, `${p.brief ?? ''}\n\n${tl(lg, '---- 追加（{date}）----', { date: new Date(now()).toISOString().slice(0, 10) })}\n${st.brief}`, project.id);
+        if (['done', 'stalled'].includes(p.status)) transition(db, 'projects', project.id, 'active');     // 全部合并完 / 停滞的项目：追加后重新有事可做（停滞的原来不放回 active，新任务永远不开工）
+        updateProject(db, project.id, { brief: `${p.brief ?? ''}\n\n${tl(lg, '---- 追加（{date}）----', { date: new Date(now()).toISOString().slice(0, 10) })}\n${st.brief}` });
         audit(db, { actorKind: 'user', actorId: a.sender_id, action: 'project_appended', targetType: 'project', targetId: project.id,
           payload: { version: st.version, questionId: st.questionId, startOrder, tasks: taskIds, reopened: p.status === 'done' } });
       });
@@ -410,7 +461,7 @@ export async function planAppend(db, { client, project, tier = 'heavy', maxAttem
     if (verdict === 'abandon') {
       db.tx(() => {
         set('append.stage', 'abandoned', a.sender_id);
-        db.run(`UPDATE tasks SET status='done' WHERE id=?`, carrierId);
+        transition(db, 'tasks', carrierId, 'done');
         audit(db, { actorKind: 'user', actorId: a.sender_id, action: 'project_append_abandoned', targetType: 'project', targetId: project.id, payload: { version: st.version, questionId: st.questionId } });
       });
       return { kind: 'abandoned' };
@@ -441,12 +492,13 @@ export async function planAppend(db, { client, project, tier = 'heavy', maxAttem
   if (dsec) parts.push(`## 已经定下的约定\n${dsec}`);
   parts.push(...sideInput(db, { st, carrierId }));
   { const h = renderRoundHistory(hist); if (h) parts.push(h); }
+  { const r = requesterSection(db, st); if (r) parts.push(r); }
   if (feedback) parts.push(`## 人对上一版草案的反馈（经认证通道，具指令效力）\n${feedback}\n\n按反馈出下一版。`);
   const messages = [{ role: 'user', content: [{ type: 'text', text: parts.join('\n\n') }] }];
   const quoteSource = `${project.brief ?? ''}\n${st.brief}`;
 
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-    const resp = await client.complete({ tier, system: withOutputLang(SYSTEM_APPEND(MAX_APPEND_TASKS), contentLang(db)), messages, tools: [tool], maxTokens: MAX_TOKENS, effort: 'high' });
+    const resp = await client.complete({ role: 'project_append', tier, system: withOutputLang(SYSTEM_APPEND(MAX_APPEND_TASKS), contentLang(db)), messages, tools: [tool], maxTokens: MAX_TOKENS, effort: 'high' });
     if (truncatedEmpty(resp)) throw new TruncatedEmptyError('项目规划器（追加）', MAX_TOKENS);
     const call = toolCallsOf(resp).find((c) => c.name === 'propose_project');
     const errs = [];
@@ -458,6 +510,7 @@ export async function planAppend(db, { client, project, tier = 'heavy', maxAttem
         deps: { startOrder, existing: chainGraph(db, project.id).map((t) => ({ order: t.order, started: t.started, dependsOn: t.dependsOn })) } }));
       // 这次追加说明里写死的命令行用法，负责那个脚本的新任务要写到（只核这次的说明：原规格里的由当初的任务负责）
       errs.push(...cliCoverageProblems(spec, st.brief));
+      errs.push(...requesterProblems(db, st, spec));
       if (spec.tasks.length > MAX_APPEND_TASKS) errs.push(`任务数 ${spec.tasks.length} 超过 ${MAX_APPEND_TASKS}`);
     }
     if (!errs.length) {
@@ -468,10 +521,9 @@ export async function planAppend(db, { client, project, tier = 'heavy', maxAttem
         set, carrierId, version, notes, gate, attempt, review: false });
       const text = autoFallbackNote(gate, lg) + withDiff(renderAppendProposal(db, { project, spec, version, notes, startOrder, seedCount, continued: st.continued }), prevVer, { tasks: spec.tasks }, lg);
       db.tx(() => {
-        db.run(`INSERT INTO questions (id,task_id,node_id,level,level_source,text,default_action,asked_at,timeout_at,status)
-                VALUES (?,?,NULL,3,'hard_rule',?,NULL,?,NULL,'open')`, qid, carrierId, text, t);
+        insertQuestion(db, { id: qid, taskId: carrierId, level: 3, text: text, askedAt: t });
         routeQuestion(db, { questionId: qid, decisionType: 'contract_approval', typeSource: 'hard_rule', prefixes: specPrefixes(spec.tasks).length ? specPrefixes(spec.tasks) : null, at: t });
-        db.run(`UPDATE tasks SET status='waiting' WHERE id=?`, carrierId);
+        transition(db, 'tasks', carrierId, 'waiting');
         set('append.spec', spec); set('append.notes', notes); set('append.version', version); set('append.question', qid); set('append.stage', 'proposed');
         audit(db, { actorKind: 'agent', actorId: 'project_planner', action: 'project_append_proposed', targetType: 'project', targetId: project.id,
           // 报过哪几对范围重叠也进审计：预警不是闸门，"有没有被略过"只能事后拿它对着批准答复查。
@@ -565,13 +617,14 @@ async function planReview(db, { client, project, tier, maxAttempts, tool, doneTo
   }
   parts.push(...sideInput(db, { st, carrierId }));
   { const h = renderRoundHistory(hist); if (h) parts.push(h); }
+  { const r = requesterSection(db, st); if (r) parts.push(r); }
   if (feedback) parts.push(`## 人对上一版的反馈（经认证通道，具指令效力）\n${feedback}\n\n按反馈重来。`);
   const messages = [{ role: 'user', content: [{ type: 'text', text: parts.join('\n\n') }] }];
   const tools = doneTool ? [tool, doneTool] : [tool];
   const quoteSource = `${project.brief ?? ''}\n${project.goal ?? ''}\n${project.done_definition ?? ''}`;
 
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-    const resp = await client.complete({ tier, system: withOutputLang(SYSTEM_REVIEW(MAX_APPEND_TASKS), contentLang(db)), messages, tools, maxTokens: MAX_TOKENS, effort: 'high' });
+    const resp = await client.complete({ role: 'project_append_review', tier, system: withOutputLang(SYSTEM_REVIEW(MAX_APPEND_TASKS), contentLang(db)), messages, tools, maxTokens: MAX_TOKENS, effort: 'high' });
     if (truncatedEmpty(resp)) throw new TruncatedEmptyError('项目规划器（复盘）', MAX_TOKENS);
     const calls = toolCallsOf(resp);
     const done = doneTool ? calls.find((c) => c.name === doneTool.name) : null;
@@ -587,6 +640,7 @@ async function planReview(db, { client, project, tier, maxAttempts, tool, doneTo
       spec = { title: project.title, tasks: Array.isArray(call.args?.tasks) ? call.args.tasks : [] };
       errs.push(...validateProjectSpec(spec, { brief: quoteSource, requireRules: true,
         deps: { startOrder, existing: graph.map((t) => ({ order: t.order, started: t.started, dependsOn: t.dependsOn })) } }));
+      errs.push(...requesterProblems(db, st, spec));
       if (spec.tasks.length > MAX_APPEND_TASKS) errs.push(`任务数 ${spec.tasks.length} 超过 ${MAX_APPEND_TASKS}`);
     }
     if (!errs.length) {
@@ -595,14 +649,14 @@ async function planReview(db, { client, project, tier, maxAttempts, tool, doneTo
         const reached = { reason: String(done.args.reason).trim(), unverified: (done.args.unverified ?? []).map(String) };
         const text = withDiff(renderReached(db, { project, ...reached, version }), prevVer, { reached }, contentLang(db));
         db.tx(() => {
-          db.run(`INSERT INTO questions (id,task_id,node_id,level,level_source,text,default_action,asked_at,timeout_at,status)
-                  VALUES (?,?,NULL,3,'hard_rule',?,NULL,?,NULL,'open')`, qid, carrierId, text, t);
+          insertQuestion(db, { id: qid, taskId: carrierId, level: 3, text: text, askedAt: t });
           // 与"下一批任务"同一条路由（方案批准类，收件人必含负责人）：复盘的两条出路该落在同一张桌上，
           // 人才能在同一个地方决定"收工"还是"再加一批"。达成确认覆盖整个项目 → 按"碰到了每个目录"路由，
           // 管各目录的人都能说"还差什么"（只落到负责人的话，成员的需求出不来）。
+          // 但只是**顺带**：不计法定人数，计数的是整个项目那一段（按目录分段要齐人，三个人都得表态才生效）。
           const whole = wholeProjectPrefixes(db, carrierId, 'contract_approval');
-          routeQuestion(db, { questionId: qid, decisionType: 'contract_approval', typeSource: 'hard_rule', prefixes: whole.length ? whole : null, at: t });
-          db.run(`UPDATE tasks SET status='waiting' WHERE id=?`, carrierId);
+          routeQuestion(db, { questionId: qid, decisionType: 'contract_approval', typeSource: 'hard_rule', prefixes: whole.length ? whole : null, advisory: whole, at: t });
+          transition(db, 'tasks', carrierId, 'waiting');
           set('append.reached', reached); set('append.spec', null); set('append.version', version); set('append.question', qid); set('append.stage', 'proposed');
           audit(db, { actorKind: 'agent', actorId: 'project_planner', action: 'project_goal_reached_proposed', targetType: 'project', targetId: project.id,
             payload: { version, questionId: qid, unverified: reached.unverified.length } });
@@ -616,12 +670,13 @@ async function planReview(db, { client, project, tier, maxAttempts, tool, doneTo
         set, carrierId, version, notes, gate, attempt, review: true });
       const text = autoFallbackNote(gate, contentLang(db)) + withDiff(renderAppendProposal(db, { project, spec, version, notes, startOrder, seedCount, continued: false, review: true }), prevVer, { tasks: spec.tasks }, contentLang(db));
       db.tx(() => {
-        db.run(`INSERT INTO questions (id,task_id,node_id,level,level_source,text,default_action,asked_at,timeout_at,status)
-                VALUES (?,?,NULL,3,'hard_rule',?,NULL,?,NULL,'open')`, qid, carrierId, text, t);
+        insertQuestion(db, { id: qid, taskId: carrierId, level: 3, text: text, askedAt: t });
         // 复盘的这条出路（还差这些）与达成确认同一张桌：碰到的目录 ∪ 整个项目
-        const pf = [...new Set([...specPrefixes(spec.tasks), ...wholeProjectPrefixes(db, carrierId, 'contract_approval')])];
-        routeQuestion(db, { questionId: qid, decisionType: 'contract_approval', typeSource: 'hard_rule', prefixes: pf.length ? pf : null, at: t });
-        db.run(`UPDATE tasks SET status='waiting' WHERE id=?`, carrierId);
+        // 任务碰到的目录照常要齐人；只是"顺带整个项目"的那几段不计数
+        const touched = specPrefixes(spec.tasks);
+        const pf = [...new Set([...touched, ...wholeProjectPrefixes(db, carrierId, 'contract_approval')])];
+        routeQuestion(db, { questionId: qid, decisionType: 'contract_approval', typeSource: 'hard_rule', prefixes: pf.length ? pf : null, advisory: pf.filter((p) => !touched.includes(p)), at: t });
+        transition(db, 'tasks', carrierId, 'waiting');
         set('append.reached', null); set('append.spec', spec); set('append.notes', notes); set('append.version', version); set('append.question', qid); set('append.stage', 'proposed');
         audit(db, { actorKind: 'agent', actorId: 'project_planner', action: 'project_review_proposed', targetType: 'project', targetId: project.id,
           payload: { version, questionId: qid, startOrder, tasks: spec.tasks.map((x) => String(x.title).slice(0, 80)) } });
@@ -700,11 +755,10 @@ function landAuto(db, { project, spec, startOrder, seedExtra, set, carrierId, ve
   const taskIds = createProjectTasks(db, { projectId: project.id, userId: p.owner_id, tasks: spec.tasks, startOrder, seedExtra });
   db.tx(() => {
     for (const id of taskIds) setParam(db, { taskId: id, key: 'task.auto_added', value: true, by: { kind: 'agent', id: 'project_planner' }, governance: 'execution' });
-    const requestedBy = getParam(db, carrierId, 'append.requested_by');
-    if (requestedBy) for (const id of taskIds) setParam(db, { taskId: id, key: 'task.requested_by', value: requestedBy, by: BY(requestedBy), governance: 'constitutional' });
+    tagRequesters(db, { taskIds, tasks: spec.tasks, requesters: requestersOf({ requesters: getParam(db, carrierId, 'append.requesters'), requestedBy: getParam(db, carrierId, 'append.requested_by') }) });
     set('append.spec', spec); set('append.notes', notes); set('append.version', version); set('append.question', null); set('append.stage', 'approved'); set('append.reached', null);
-    db.run(`UPDATE tasks SET status='done' WHERE id=?`, carrierId);
-    if (['done', 'stalled'].includes(p.status)) db.run(`UPDATE projects SET status='active' WHERE id=?`, project.id);
+    transition(db, 'tasks', carrierId, 'done');
+    if (['done', 'stalled'].includes(p.status)) transition(db, 'projects', project.id, 'active');
     audit(db, { actorKind: 'agent', actorId: 'project_planner', action: 'project_auto_batch', targetType: 'project', targetId: project.id,
       payload: { version, startOrder, tasks: taskIds, titles: spec.tasks.map((x) => String(x.title).slice(0, 80)), review, considered: gate.considered ?? 0 } });
   });

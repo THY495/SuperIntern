@@ -5,7 +5,7 @@
 SuperIntern is a self-hosted autonomous coding agent that runs for long periods on your own machine or server. You hand it an idea. It asks about anything that is unclear, breaks the work into steps, writes code in a container sandbox and runs the acceptance checks. Then it brings the result to you for sign-off. **You only do four things: answer its questions, make trade-offs, request changes and stop it.** When several people work together, a *decision routing table* decides who gets the final say on each kind of decision.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-![version](https://img.shields.io/badge/version-0.3.1-orange)
+![version](https://img.shields.io/badge/version-0.4.0-orange)
 ![node](https://img.shields.io/badge/node-%E2%89%A5%2022.13-green)
 ![deps](https://img.shields.io/badge/npm%20dependencies-0-brightgreen)
 
@@ -43,7 +43,7 @@ See [docs/known-limits.en.md](docs/known-limits.en.md) for known gaps.
 - **Projects and tasks.** A project has a goal and a definition of done. Its tasks form a dependency graph, and a task starts only after the tasks it depends on are merged. Delivered projects can keep adding tasks and iterating.
 - **Parallel development (experimental).** Available when you create a project from a written plan. The system first runs a skeleton task that fixes the interface contract between modules, a stub for each module and the shared files. Once it is merged, the module tasks are developed at the same time, each changing only its own directory; shared files are read-only for them (changing one needs a plan change approved by a person). A final integration task connects the real modules and runs end to end. At planning time the system checks that the skeleton task names every interface in the spec, and it checks the contract file again when the skeleton is done. Off by default; you can turn it off later in project settings (back to one task at a time), but once off it cannot be turned on again.
 - **Sandboxed execution.** Every step runs in a Docker container with no network by default. Network access is granted per project, to allow-listed domains only (npm, PyPI and so on; mirrors can be added). Node and Python projects are supported.
-- **Mechanical checks plus a model reviewer.** Each step hands over a record that the system checks mechanically: did it touch only allowed paths, and does the acceptance command really pass? A second model then scores the step and sends it back if needed.
+- **Mechanical checks plus a model reviewer.** Each step hands over a record that the system checks mechanically: did it touch only allowed paths, and does the acceptance command really pass? A second model then scores the step and sends it back if needed. By default the reviewer comes from a different vendor than the model that did the work. For steps that change the UI, the reviewer starts the app, clicks and types through the page and checks each item, and the person signing off sees the screens it went through. Weakened existing tests (deleted, skipped, fewer assertions) are flagged for the reviewer and the sign-off (or, if you choose, sent straight back).
 - **Asks instead of guessing.** When the spec is silent on a trade-off, the agent raises a question and suspends only the affected branch. Questions carry a default answer and a deadline. The small decisions it makes on its own are collected into an "AI decided a few things for you" review for the right person.
 - **Shows the result.** The task page shows the step graph, a screenshot of the built page taken inside the sandbox, and a line-by-line diff (unified or side by side).
 - **Multi-user collaboration.** The decision routing table sets, for each kind of decision (spec trade-off, structural conflict, plan approval, sign-off, limit raise, network access, delivery…):
@@ -53,13 +53,13 @@ See [docs/known-limits.en.md](docs/known-limits.en.md) for known gaps.
   - what happens on timeout.
 
   It ships with six templates. People can second an answer, abstain ("not mine") or hand an item over. Sign-off can go to the person who asked for the feature, or require everyone.
-- **Hard limits on money and time.** Cost, wall time, call count and retries all have hard limits. At a limit, it stops and asks a human. It never quietly dies and never quietly continues.
+- **Hard limits on money and time.** Cost, wall time, call count and retries all have hard limits, plus monthly budgets per person and per deployment. At a limit, it stops and asks a human. It never quietly dies and never quietly continues. An admin can pause all automatic work with one click.
 - **A checklist before delivery.** Before pushing, it lists the commits, the changes each task brought in, and risks (for example, no project-level acceptance command). It pushes to any git remote and can open a GitHub PR. **Delivery is the one step a human must always click.**
-- **Multiple model vendors.** DeepSeek, Anthropic, OpenAI, Gemini and OpenRouter are built in, and you can add any OpenAI-compatible endpoint. Three tiers (light / standard / heavy) can each be bound to any model. A catalog check detects price and context-window drift.
+- **Multiple model vendors.** DeepSeek, Anthropic, OpenAI, Gemini and OpenRouter are built in, and you can add any OpenAI-compatible endpoint. Three tiers (light / standard / heavy) can each be bound to any model, a role such as the reviewer can get its own model, and each tier can have a fallback model that takes over while a vendor is failing. A catalog check detects price and context-window drift.
 - **Auditable.** All state lives in one SQLite database, and every action is audited. The process can die at any time and resume. `replay` reconstructs a task from the audit log alone.
 - **Notifications.** ntfy, Feishu, DingTalk, WeCom or any shell command, sent per person, plus periodic to-do digests.
 - **English and Chinese.** Interface language per person; content language (items, reports, what the AI writes for people) per team. Answers are understood in either language.
-- **Zero npm dependencies.** It uses only Node built-ins, including `node:sqlite`. The web UI is a single page with no build step.
+- **Zero npm dependencies.** It uses only Node built-ins, including `node:sqlite`. The web UI needs no build step.
 
 ## Quick start
 
@@ -67,12 +67,12 @@ See [docs/known-limits.en.md](docs/known-limits.en.md) for known gaps.
 
 | Need | Notes |
 |---|---|
-| Node.js **≥ 22.13** | Needs the built-in `node:sqlite`. Tested on 24.x |
+| Node.js **≥ 22.13** | Needs the built-in `node:sqlite`. Tested on 24.x and 26.x. Prefer Node 24.15.0 or a later 24.x, or 26.x; these bundle SQLite ≥ 3.51.3 (checked and reported at startup) |
 | git | |
 | Docker (running) | Docker Desktop on Windows, in its default Linux-containers mode (if you switched to Windows containers, right-click the tray icon → Switch to Linux containers); docker-ce on Linux. **Without a container runtime, tasks will not run.** SuperIntern never falls back to running code on the host |
 | An API key for at least one model vendor | [DeepSeek](https://platform.deepseek.com/) / [Anthropic](https://console.anthropic.com/) / [OpenAI](https://platform.openai.com/) / [Gemini](https://aistudio.google.com/) / [OpenRouter](https://openrouter.ai/), or any OpenAI-compatible endpoint |
 
-**Download:** get `superintern-v0.3.1-windows.zip` or `superintern-v0.3.1-linux.tar.gz` from [Releases](../../releases) and extract it, or `git clone` this repo. No `npm install` needed.
+**Download:** get `superintern-v0.4.0-windows.zip` or `superintern-v0.4.0-linux.tar.gz` from [Releases](../../releases) and extract it, or `git clone` this repo. No `npm install` needed.
 
 > Run every command from the extracted directory. Runtime state (database, tokens, logs, workspaces) lives in `.superintern/` inside it.
 
@@ -165,7 +165,7 @@ Each task has a cost limit ($5 by default). A project can also have an overall b
 ## Security notes
 
 - **It executes AI-generated code.** That code runs only inside Docker containers, with no network by default, hard limits on memory, process count and time, and no API keys inside. Still, run SuperIntern only on a machine where you accept that risk.
-- **API keys live only in `.env`.** The database stores variable names only, and the web UI shows only "set / not set".
+- **Model API keys live only in `.env`.** The database stores variable names only, and the web UI shows only "set / not set". Delivery connections and package-source credentials are stored encrypted in the database; the master key is `.superintern/master.key` (take it with you when moving machines).
 - **A token is an identity.** The admin token is in `.superintern/cli-token`. Do not paste it into chats or issues.
 - **Network access is off by default.** It is granted per project, to allow-listed domains only. Other domains are refused when the connection is set up.
 - **Delivery is always a human click,** and it shows everything that will be pushed first.
@@ -177,6 +177,7 @@ To report a vulnerability, see [SECURITY.md](SECURITY.md).
 
 ```bash
 npm test                  # = node tests/run.mjs --all; offline regression suites, no API cost
+node tests/run.mjs --all --without browser   # skip the accessibility suite (a11y) on machines without Chrome / Edge / Chromium
 npm run test:no-docker    # skip the two suites that need containers (container, egress)
 ```
 
@@ -190,7 +191,8 @@ Without Docker, those two suites **fail** rather than silently "pass by skipping
 | `src/agent/` | Model roles: elicitor, planner, executor, verifier, replanner, reporter |
 | `src/llm/` | Vendor adapters, default providers / model catalog / tier bindings, drift check |
 | `src/db/` | SQLite schema and migrations; `audit_log` is the single source for replay |
-| `src/web/` | Zero-dependency web UI (one HTML file + Node http server) |
+| `src/context/` | Builds the context for each model call and compacts it when it grows too long |
+| `src/web/` | Zero-dependency web UI (one HTML page plus the scripts in `src/web/app/`, Node http server) |
 | `sandbox/` | Sandbox images (Node; Python + Chromium for screenshots) and egress proxy |
 | `scripts/` | Setup, start, and run-permanently scripts (Windows Task Scheduler / Linux systemd) |
 | `tests/` | Offline regression suites; `tests/live/` holds paid live-model scripts |

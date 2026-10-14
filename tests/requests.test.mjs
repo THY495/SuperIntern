@@ -25,6 +25,9 @@ import { addUser } from '../src/core/users.mjs';
 import { setMember } from '../src/core/project-members.mjs';
 import { routeQuestion, validateRules, rulesOf, saveRules } from '../src/core/routing.mjs';
 import { buildDigest, renderDigest } from '../src/core/digest.mjs';
+import { voteRulesOf } from '../src/core/answers.mjs';
+import { taskDetail } from '../src/web/server.mjs';
+import { setProjectBudget } from '../src/core/project-settings.mjs';
 
 let pass = 0, fail = 0;
 const section = (t) => console.log(`\n${'─'.repeat(72)}\n${t}\n${'─'.repeat(72)}`);
@@ -196,15 +199,24 @@ section('5b. 在达成确认里回"还差东西"并写了要什么的人 = 新�
   db.run(`UPDATE tasks SET merged_at=? WHERE project_id=? AND project_order>0`, now(), S.projectId);
   await advanceProject(db, { projectId: S.projectId, home: HOME });
   const r = await planProject(db, { client: client([call('project_goal_reached', { reason: '都有了', unverified: [] })]), projectId: S.projectId });
-  recordAnswer(db, { questionId: r.questionId, body: 'B\n还差一个：每条待办显示优先级标签', plaintextToken: lin.plaintext });
+  recordAnswer(db, { questionId: r.questionId, body: 'B\n还差一个：每本书显示评分标签', plaintextToken: lin.plaintext });
   answer(r.questionId, 'B 同意阿青，加上标签');
-  const r2 = await planProject(db, { client: client([propose([loose('T3 标签')])]), projectId: S.projectId });
+  // 负责人那句"同意阿青"也读成"还差东西" → 名单是阿青 + 负责人；规划器按反馈把 T3 标给阿青
+  const r2 = await planProject(db, { client: client([propose([{ ...loose('T3 标签'), requested_by: ['阿青'] }])]), projectId: S.projectId });
   eq(appendStateOf(db, S.projectId).requestedBy, lin.userId, '这一轮记在阿青名下（不是会签合并那条的署名人）');
   recordAnswer(db, { questionId: r2.questionId, body: 'A', plaintextToken: lin.plaintext });
   answer(r2.questionId, 'A');
   const done = await planProject(db, { client: client([]), projectId: S.projectId });
   eq(done.kind, 'approved', '追加方案批准');
   eq(getParam(db, done.tasks[0], 'task.requested_by'), lin.userId, '新任务的 task.requested_by = 阿青 → "你提的需求做完了"会发给她');
+  // 任一人答即可的事项被别人答掉，另一人要看得出是谁答的
+  const carrierQ = taskDetail(db, appendStateOf(db, S.projectId).carrierId).questions.find((q) => q.id === r2.questionId);
+  eq([carrierQ.status, carrierQ.answer?.byName].join('|'), 'answered|local-owner', '已定的事项带生效答复的作者名');
+  // 任务页要看得到项目预算闸（原来只写任务自己的上限，项目设 $7 的人看到"上限 $5"）
+  eq(taskDetail(db, done.tasks[0]).projectBudget, null, '项目没设预算闸 → 不写');
+  setProjectBudget(db, { projectId: S.projectId, microUsd: 7_000_000, userId: owner.userId });
+  const pb = taskDetail(db, done.tasks[0]).projectBudget;
+  eq([pb?.gate, pb?.over].join('|'), '7000000|false', '设了 $7 → 任务详情里带着闸门、还剩多少');
 }
 
 section('5c. 排着需求的人又在达成确认里回"还差东西" → 她排着的那条并进这一轮，不再单独起草一遍');
@@ -219,14 +231,62 @@ section('5c. 排着需求的人又在达成确认里回"还差东西" → 她排
   db.run(`UPDATE tasks SET merged_at=? WHERE project_id=? AND project_order>0`, now(), S.projectId);
   await advanceProject(db, { projectId: S.projectId, home: HOME });
   const r = await planProject(db, { client: client([call('project_goal_reached', { reason: '都有了', unverified: [] })]), projectId: S.projectId });
-  const q1 = requestAppend(db, { projectId: S.projectId, userId: lin.userId, brief: '每条待办显示优先级标签' });
+  const q1 = requestAppend(db, { projectId: S.projectId, userId: lin.userId, brief: '每本书显示评分标签' });
   eq(q1.queued, true, '复盘期间阿青加的需求：排队');
-  recordAnswer(db, { questionId: r.questionId, body: 'B\n还差：优先级标签', plaintextToken: lin.plaintext });
+  recordAnswer(db, { questionId: r.questionId, body: 'B\n还差：评分标签', plaintextToken: lin.plaintext });
   answer(r.questionId, 'B 同意阿青');
-  const c = client([propose([loose('T3 标签')])]);
+  const c = client([propose([{ ...loose('T3 标签'), requested_by: ['阿青'] }])]);
   await planProject(db, { client: c, projectId: S.projectId });
   eq(appendStateOf(db, S.projectId).queue.length, 0, '她排着的那条从队里拿掉了（原来批准后会出队、再起草一轮）');
-  assert(/同一个人之前排着的需求/.test(c.seen[0]) && /每条待办显示优先级标签/.test(c.seen[0]), '并进了这一版交给规划器的反馈里，内容不丢');
+  assert(/同一个人之前排着的需求/.test(c.seen[0]) && /每本书显示评分标签/.test(c.seen[0]), '并进了这一版交给规划器的反馈里，内容不丢');
+}
+
+section('5d. 一条达成确认里阿青、阿明各提一件 → 两个任务各记在各自名下，各自签收（两个都记成了阿青）');
+{
+  const S = startProject(db, { userId: owner.userId, goal: '做一个 kv 库', doneDefinition: '库有 get/set', plan: `# 规划\n${Q}`, source: SRC, home: join(HOME, 's5d') });
+  { const r = await planProject(db, { client: client([propose([task('T1 库'), task('T2 CLI')])]), projectId: S.projectId });
+    answer(r.questionId, 'A'); await planProject(db, { client: client([]), projectId: S.projectId }); }
+  const rows = rulesOf(db, S.projectId).map(({ id, project_id, template, ...r }) => r);
+  for (const r of rows) if (r.decision_type === 'contract_approval') { r.recipients = ['user:lead', `user:${lin.userId}`, `user:${zhou.userId}`]; r.quorum = 'all'; }
+  const sig = rows.find((r) => r.decision_type === 'signoff' && r.scope === '*');
+  sig.recipients = ['requester', 'user:lead']; sig.quorum = 'all';
+  saveRules(db, { key: S.projectId, rules: rows, userId: owner.userId });
+  db.run(`UPDATE tasks SET merged_at=? WHERE project_id=? AND project_order>0`, now(), S.projectId);
+  await advanceProject(db, { projectId: S.projectId, home: HOME });
+  const r = await planProject(db, { client: client([call('project_goal_reached', { reason: '都有了', unverified: [] })]), projectId: S.projectId });
+  recordAnswer(db, { questionId: r.questionId, body: 'B\n还差：每本书显示评分标签', plaintextToken: lin.plaintext });
+  recordAnswer(db, { questionId: r.questionId, body: 'B\n还差：导出 CSV', plaintextToken: zhou.plaintext });
+  answer(r.questionId, 'B 两样都要');
+  const two = [loose('T3 标签'), loose('T4 导出')];
+  const c = client([propose(two), propose([{ ...two[0], requested_by: ['阿青'] }, { ...two[1], requested_by: ['阿明'] }])]);
+  const r2 = await planProject(db, { client: c, projectId: S.projectId });
+  eq(appendStateOf(db, S.projectId).requesters?.slice().sort().join(','), [lin.userId, zhou.userId, owner.userId].sort().join(','), '这一轮的提出人是写了"还差东西"的每一个人（原来只记第一个）');
+  assert(/这一轮的需求出自 3 个人：阿青、阿明、/.test(c.seen[0]) && /requested_by/.test(c.seen[0]), '规划器拿到名单，要它给每个任务标为谁做');
+  const rej = db.all(`SELECT payload FROM audit_log WHERE action='project_plan_attempt' AND target_id=? ORDER BY id`, S.projectId).map((x) => JSON.parse(x.payload));
+  assert(rej.some((p) => (p.rejections ?? []).some((e) => /缺 requested_by/.test(e))), '没标的草案被拒回去重出（不猜，也不全记在第一个人名下）');
+  assert(/为谁做：阿青 —— 做完要阿青本人签收/.test(r2.text) && /为谁做：阿明 —— 做完要阿明本人签收/.test(r2.text), '草案上给人看：每个任务为谁做、做完谁签（签收行配了需求提出人），标错了能在反馈里改');
+  for (const who of [lin, zhou]) recordAnswer(db, { questionId: r2.questionId, body: 'A', plaintextToken: who.plaintext });
+  answer(r2.questionId, 'A');
+  const done = await planProject(db, { client: client([]), projectId: S.projectId });
+  eq(done.kind, 'approved', '追加方案批准');
+  const [t3, t4] = done.tasks;
+  eq([getParam(db, t3, 'task.requested_by'), getParam(db, t4, 'task.requested_by')].join('|'), [lin.userId, zhou.userId].join('|'), 'T3 记在阿青名下、T4 记在阿明名下');
+  const signoff = (tid) => {
+    const qid = newId('q');
+    db.run(`INSERT INTO questions (id,task_id,node_id,level,level_source,text,default_action,asked_at,timeout_at,status) VALUES (?,?,NULL,3,'hard_rule','【签收】x',NULL,?,NULL,'open')`, qid, tid, now());
+    routeQuestion(db, { questionId: qid, decisionType: 'signoff', typeSource: 'hard_rule' });
+    return db.one(`SELECT * FROM questions WHERE id=?`, qid);
+  };
+  const q4 = signoff(t4);
+  eq(JSON.parse(q4.addressed_to).slice().sort().join(','), [zhou.userId, owner.userId].sort().join(','), '阿明提的 T4：签收送阿明 + 负责人（原来送的是阿青）');
+  eq(voteRulesOf(db, q4).mustSign.join(','), zhou.userId, '必须阿明本人签');
+  // 一个任务同时服务了两个人的需求：记 id 数组，两个人都要签，"做完了"两个人都收到
+  db.run(`UPDATE params SET value=? WHERE task_id=? AND key='task.requested_by' AND superseded_at IS NULL`, JSON.stringify([lin.userId, zhou.userId]), t3);
+  const q3 = signoff(t3);
+  eq(JSON.parse(q3.addressed_to).slice().sort().join(','), [lin.userId, zhou.userId, owner.userId].sort().join(','), '两个人的需求：签收送两位 + 负责人');
+  eq(voteRulesOf(db, q3).mustSign.slice().sort().join(','), [lin.userId, zhou.userId].sort().join(','), '两位都必须本人签');
+  db.run(`UPDATE tasks SET merged_at=? WHERE id=?`, now(), t3);
+  for (const who of [lin, zhou]) assert(buildDigest(db, { userId: who.userId }).requestsDone.some((x) => x.taskId === t3), `合并后 ${who === lin ? '阿青' : '阿明'}的摘要里有"你提的需求做完了"`);
 }
 
 section('6. 排着的人后来没权限了 → 出队时丢掉并留痕，不静默吞');

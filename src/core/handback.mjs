@@ -14,14 +14,15 @@
 // 认证链与 RESOLUTION_HOOKS.signoff / 集成卡住那条同理：修正消息复用这条答复的令牌（同一人、同一决策、系统代拟）。
 
 import { newId, now, audit, insertEdge } from '../db/db.mjs';
+import { insertUserMessage, markMessageConsumed } from '../db/messages.mjs';
 import { routeQuestion } from './routing.mjs';
 import { getParam, setParam } from './params.mjs';
 import { tl, contentLang } from '../i18n/index.mjs';
 import { markOf } from '../i18n/marks.mjs';
+import { transition } from '../db/state.mjs';
+import { insertQuestion } from './questions.mjs';
 
 export const HANDBACK_KEY = 'task.handback';
-export const VERIFY_FAILED_MARK = '【验收没过】';
-export const DIRTY_MARK = '【合并卡住】';
 
 const BY = { kind: 'agent', id: 'handback' };
 const HOW_TO_ABORT = (L) => tl(L, '不要这个任务了：到任务页点「中止」。这一步不可逆，答复里写"中止"不算数，得你自己去点。');
@@ -40,8 +41,7 @@ function raise(db, { taskId, kind, text, detail, at, extra = {} }) {
   if (cur) return { questionId: cur.questionId, reused: true };
   const id = newId('q');
   return db.tx(() => {
-    db.run(`INSERT INTO questions (id,task_id,node_id,level,level_source,text,default_action,asked_at,timeout_at,status)
-            VALUES (?,?,NULL,3,'hard_rule',?,NULL,?,NULL,'open')`, id, taskId, text, at);
+    insertQuestion(db, { id: id, taskId: taskId, level: 3, text: text, askedAt: at });
     // 验收没过是代码的事 → 结构矛盾（必含负责人）；其余是系统卡住 → 运维（负责人可以只派给管代码的人）。都禁 default，不会到期自己消失。
     const r = routeQuestion(db, { questionId: id, decisionType: kind === 'verify_failed' ? 'structural' : 'ops', typeSource: 'hard_rule', at });
     setParam(db, { taskId, key: HANDBACK_KEY, value: { kind, questionId: id, at, detail, ...extra }, by: BY, governance: 'execution' });
@@ -87,8 +87,6 @@ export function raiseDirtyWorkspace(db, { taskId, files, at = now() }) {
   return raise(db, { taskId, kind: 'dirty_workspace', text, detail, at });
 }
 
-export const ADVANCE_FAILED_MARK = '【合并出错】';
-
 /**
  * 项目推进（合并 / 开下一个任务）按退避表连试几次都失败了。原来退避表用完就 `?? Infinity` —— **永远不再试，也不告诉任何人**。
  * 这类错多半不是 AI 能修的（服务器、磁盘、git 状态），所以答复不转成修正：人回一句 = 再试一次（守护进程看到答复就清掉退避）。
@@ -111,7 +109,6 @@ export function raiseAdvanceFailed(db, { projectId, taskId = null, error, attemp
   return raise(db, { taskId: host, kind: 'advance_failed', text, detail, at });
 }
 
-export const REPLAN_FAILED_MARK = '【改计划没成】';
 // 改计划没成时人回"算了"= 撤回那条修正、照原计划做（中英都认）
 const DROP_RE = /^(算了|不改了|不用了|never ?mind|forget it|drop it|leave it)/i;
 
@@ -161,7 +158,7 @@ export function handbackHook(db, { question, finalBody, by, messageId, at }) {
   }
   if (h.kind === 'replan_failed' && h.messageId) {
     // 原来那条不再处理：标成已消费（不删 —— 审计与出处边都还指着它）。
-    db.run(`UPDATE messages SET consumed_at=? WHERE id=? AND consumed_at IS NULL`, at, h.messageId);
+    markMessageConsumed(db, h.messageId, at);
     audit(db, { actorKind: 'user', actorId: by, action: 'messages_consumed', targetType: 'task', targetId: taskId,
       payload: { messageIds: [h.messageId], why: tl(L, '改计划没成，人{what}（事项 {id}）', { what: DROP_RE.test(body) ? tl(L, '撤回了这条') : tl(L, '换了个说法'), id: question.id }) } });
     if (DROP_RE.test(body)) {
@@ -175,12 +172,11 @@ export function handbackHook(db, { question, finalBody, by, messageId, at }) {
   const tok = messageId ? db.one(`SELECT token_id FROM messages WHERE id=?`, messageId)?.token_id ?? null : null;
   const mid = newId('m');
   const reason = `${mark}${body || tl(L, '（没有补充）')}\n\n${tl(L, '—— 系统附（不由模型生成）——')}\n${h.detail ?? ''}`;
-  db.run(`INSERT INTO messages (id,task_id,sender_id,body,kind,kind_source,urgency,urgency_source,trust_label,token_id,received_at)
-          VALUES (?,?,?,?,'correction','explicit','urgent','explicit','user-authenticated',?,?)`, mid, taskId, by, reason, tok, at);
+  insertUserMessage(db, { id: mid, taskId, senderId: by, tokenId: tok, body: reason, kind: 'correction', urgency: 'urgent', receivedAt: at });
   if (messageId) insertEdge(db, mid, messageId, 'derived_from', at);
   // 合并卡住的那一档任务是 done + 已签收：放回 running，否则守护进程不拉它，这条修正就没人处理。
   if (db.one(`SELECT status FROM tasks WHERE id=?`, taskId)?.status === 'done') {
-    db.run(`UPDATE tasks SET status='running' WHERE id=?`, taskId);
+    transition(db, 'tasks', taskId, 'running');
     audit(db, { actorKind: 'user', actorId: by, action: 'task_resumed', targetType: 'task', targetId: taskId,
       payload: { from: 'done', to: 'running', via: `handback:${h.kind}` } });
   }

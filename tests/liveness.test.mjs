@@ -233,6 +233,24 @@ section('5 · 宽限期与升事项');
   assert(!r2.stuck.some((x) => x.taskId === t), '第二轮不再重复报');
   eq(db.all(`SELECT id FROM questions WHERE task_id=? AND status='open'`, t).length, 1, '只有一条报警事项');
 }
+{
+  // 编排器崩溃退出，守护进程判 needs_human:crash —— 系统已经下了结论，不是"一瞬间"，
+  // 原来照样等 30 分钟宽限才报，而且报的事项里没有崩溃原因（只认 *_failed / *_error）
+  const t = mkTask('running', { title: '崩溃退出' });
+  workspaceMade(t);
+  started(t, 4242, T0);
+  audit(db, { actorKind: 'system', action: 'orchestrator_exit', targetType: 'task', targetId: t, at: T0 + 1000,
+    payload: { pid: 4242, kind: 'crash', error: { name: 'TypeError', message: "Cannot read properties of null (reading 'choices')", capability: false } } });
+  const s = one(t, T0 + 2000);
+  eq(s.assessed, 'needs_human:crash', '前提：崩溃退出后守护进程不拉、判要人');
+  const r = sweepLiveness(db, { at: T0 + 5000, assess, hasWorkspace: () => true, alive: dead });
+  assert(r.stuck.some((x) => x.taskId === t), '几秒后的下一拍就报：系统自己说了要人，不再等 30 分钟宽限');
+  const q = db.one(`SELECT text FROM questions WHERE task_id=? AND status='open'`, t);
+  assert(/刚停下/.test(q?.text ?? ''), '停了不到一分钟：不写"已经 0 分钟没有任何动静"');
+  assert(/执行进程出错退出：Cannot read properties of null/.test(q?.text ?? ''), '正文带着崩溃原因（原来要人自己去翻活动）');
+  const p = JSON.parse(db.one(`SELECT payload FROM audit_log WHERE action='stall_detected' AND target_id=?`, t).payload);
+  assert(/Cannot read properties of null/.test(p.lastError ?? ''), '审计里的 lastError 也有');
+}
 
 section('6 · 空转：系统在没有新信息时重复自己');
 

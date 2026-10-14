@@ -72,6 +72,8 @@ export default {
   '   范围：{v}': '   Scope: {v}',
   '   可动路径（判据）：{v}': '   Allowed paths (what is enforced): {v}',
   '   完成定义：{v}': '   Definition of done: {v}',
+  '   为谁做：{v} —— 做完要{v}本人签收（标错了在反馈里说）': '   Requested by: {v} — when it’s done, {v} must sign off in person (if this is wrong, say so in your feedback)',
+  '   为谁做：{v} —— 做完会告诉{v}（标错了在反馈里说）': '   Requested by: {v} — {v} will be told when it’s done (if this is wrong, say so in your feedback)',
   '   规则：{v}': '   Rules: {v}',
   '   约束：{v}': '   Constraints: {v}',
   '   验收命令：{v}{extra}': '   Acceptance command: {v}{extra}',

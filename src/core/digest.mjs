@@ -13,10 +13,15 @@ import { DECISION_TYPES, leadOf, dutyCalendarOf, onDutyAt, dueAfter, isValidAfte
 import { channelsForUsers } from './users.mjs';
 import { notify, channelsFromEnv } from './notify.mjs';
 import { answersOf } from './answers.mjs';
+import { signoffExceptions, stripExceptions } from './signoff-exceptions.mjs';
+import { approvalHabits, HABIT } from './approval-habits.mjs';
 import { lastCatalogCheck } from '../llm/catalog-check.mjs';
 import { listHandoverRequests, canDecideHandover } from './handover.mjs';
 import { projectsToDeliver } from './delivery-due.mjs';
+import { expiringCredentials } from './credentials.mjs';
 import { tl, userLang, I18nError, CATALOGS } from '../i18n/index.mjs';
+import { viewerTz } from './calendar.mjs';
+import { fmtAt } from './tz.mjs';
 
 // 摘要是按人发的（0.2.0）：用这个人的界面语言 userLang(db, userId)。buildDigest 把语言放进结果（d.lang），渲染照它写。
 /** 目录里查一条原文（决策类型的 label 这类由 N_ 登记、在别处定义的原文）。 */
@@ -58,11 +63,13 @@ export function buildDigest(db, { userId, at = now(), since = null, projectId = 
     return { questionId: q.id, taskId: q.task_id, taskTitle: q.task_title, nodeId: q.node_id, decisionType: q.decision_type,
       projectId: q.project_id ?? null, projectTitle: q.project_title ?? null, carrier: q.project_order === 0,
       tag, headline: oneLine(first, 90),
-      label: (typeLabel ? byCatalog(lang, typeLabel) : null) ?? q.decision_type ?? tl(lang, '事项'), level: q.level, text: oneLine(q.text),
+      label: (typeLabel ? byCatalog(lang, typeLabel) : null) ?? q.decision_type ?? tl(lang, '事项'), level: q.level, text: oneLine(q.decision_type === 'signoff' ? stripExceptions(q.text) : q.text),
       askedAt: q.asked_at, ageMs: at - q.asked_at, dueAt: dues.length ? Math.min(...dues) : null, defaultAction: q.default_action ?? null,
       // 轮到你的时候，先看得见别人已经说了什么 —— 不然只能各写各的，然后被系统判成"不一致"。
       answers: answersOf(db, q.id).filter((a) => ['answer', 'agree'].includes(a.stance))
-        .map((a) => ({ name: nm(a.user_id), stance: a.stance, text: oneLine(a.body).slice(0, 120) })) };
+        .map((a) => ({ name: nm(a.user_id), stance: a.stance, text: oneLine(a.body).slice(0, 120) })),
+      // 签收事项带上各条例外的档（收件箱只露各档条数，细节在任务页的签收卡上）
+      ...(q.decision_type === 'signoff' && q.task_id ? { exceptions: signoffExceptions(db, q.task_id).map((e) => (e.appDown ? 'app_down' : e.tier)) } : {}) };
   };
   const waitingOnMe = [], inConflict = [], waitingOnOthers = [], informed = [], unaddressed = [];
   const leadCache = new Map();
@@ -138,6 +145,10 @@ export function buildDigest(db, { userId, at = now(), since = null, projectId = 
   const daemonOff = (daemonAlive === false && u.role === 'lead' && projectId === null)
     ? { unfinished: db.one(`SELECT count(*) n FROM tasks WHERE status IN ('planning','running','waiting') AND archived_at IS NULL`).n } : null;
   const daemonOffItem = daemonOff?.unfinished ? daemonOff : null;
+  // 可能在走过场的人（管理员的总摘要才有；只是提醒，不拦任何操作。细节在设置 → 成员的「批准习惯」）
+  const rubberStamps = u.role === 'lead' && projectId === null
+    ? approvalHabits(db, { at }).filter((h) => h.flagged).map((h) => ({ userId: h.userId, name: h.name, streak: h.streak, medianOpenMs: h.medianOpenMs, fastWithExceptions: h.fastWithExceptions }))
+    : [];
   // 停滞的项目（剩下的任务都被已中止的任务卡住；取编号最小的那个已中止任务）：等负责人三选一 —— 恢复 / 重做 / 中止项目。不是事项（没有自由文本要解析），但要进待办。
   const stalledProjects = projectId !== null ? [] : db.all(`SELECT id, title FROM projects WHERE status='stalled' AND owner_id=? AND archived_at IS NULL ORDER BY created_at`, userId)
     .map((p) => { const cur = db.one(`SELECT id, title FROM tasks WHERE project_id=? AND project_order>0 AND merged_at IS NULL AND status='aborted' ORDER BY project_order LIMIT 1`, p.id);
@@ -163,13 +174,15 @@ export function buildDigest(db, { userId, at = now(), since = null, projectId = 
     `SELECT t.id, t.title, t.merged_at, t.project_id, p.title AS project_title FROM tasks t
        JOIN params pr ON pr.task_id=t.id AND pr.key='task.requested_by' AND pr.superseded_at IS NULL
        JOIN projects p ON p.id=t.project_id
-      WHERE pr.value=? AND p.owner_id<>? AND t.merged_at IS NOT NULL AND t.merged_at > ? AND t.merged_at <= ? ORDER BY t.merged_at`,
-    JSON.stringify(userId), userId, since ?? at - 7 * 86_400_000, at)
+      WHERE EXISTS (SELECT 1 FROM json_each(pr.value) j WHERE j.value=?) AND p.owner_id<>? AND t.merged_at IS NOT NULL AND t.merged_at > ? AND t.merged_at <= ? ORDER BY t.merged_at`,
+    userId, userId, since ?? at - 7 * 86_400_000, at)
     .filter((t) => projectId === null || t.project_id === projectId)
     .map((t) => ({ taskId: t.id, title: t.title, at: t.merged_at, projectId: t.project_id, projectTitle: t.project_title }));
-  const total = requestsDone.length + waitingOnMe.length + inConflict.length + waitingOnOthers.length + informed.length + unaddressed.length + tasksWaiting.length + dissents.length + (unreadReports ? 1 : 0) + (catalog ? 1 : 0) + handoverRequests.length + stalledProjects.length + toDeliver.length + (daemonOffItem ? 1 : 0) + autoBatches.length;
-  return { userId, name: u.display_name, role: u.role, lang, at, since, projectId, waitingOnMe, inConflict, waitingOnOthers, informed, unaddressed,
-    tasksWaiting, unreadReports, unreadReportTasks, dissents, catalog, handoverRequests, stalledProjects, toDeliver, autoBatches, requestsDone, daemonOff: daemonOffItem, total, actionable: waitingOnMe.length + inConflict.length + unaddressed.length + hrActionable + stalledProjects.length + toDeliver.length + (daemonOffItem ? 1 : 0) };
+  // 连接快到期：7 天内到期或已过期的，提醒主人（部署级的提醒管理员）。到期之后交付会推不上去，要在那之前换。
+  const credentialsExpiring = projectId !== null ? [] : expiringCredentials(db, { userId, at });
+  const total = credentialsExpiring.length + requestsDone.length + waitingOnMe.length + inConflict.length + waitingOnOthers.length + informed.length + unaddressed.length + tasksWaiting.length + dissents.length + (unreadReports ? 1 : 0) + (catalog ? 1 : 0) + handoverRequests.length + stalledProjects.length + toDeliver.length + (daemonOffItem ? 1 : 0) + autoBatches.length + rubberStamps.length;
+  return { userId, name: u.display_name, role: u.role, lang, tz: viewerTz(db, userId), at, since, projectId, waitingOnMe, inConflict, waitingOnOthers, informed, unaddressed,
+    tasksWaiting, unreadReports, unreadReportTasks, dissents, catalog, handoverRequests, stalledProjects, toDeliver, autoBatches, requestsDone, credentialsExpiring, daemonOff: daemonOffItem, rubberStamps, total, actionable: credentialsExpiring.length + waitingOnMe.length + inConflict.length + unaddressed.length + hrActionable + stalledProjects.length + toDeliver.length + (daemonOffItem ? 1 : 0) };
 }
 
 /** 任务在等什么（文本与看板同一句）："做完了，等 alice 签收" / "停着，等你、bob 答" / "已暂停"。 */
@@ -188,9 +201,14 @@ export function renderDigest(d, { at = d.at } = {}) {
   const bar = en ? ' | ' : '｜', colon = en ? ': ' : '：';
   const list = (xs) => xs.join(en ? ', ' : '、');
   const line = (x) => `- ${x.label}${bar}${x.taskTitle}${bar}${tl(lang, '{age}前提出', { age: age(at - x.askedAt) })}${x.dueAt ? (x.dueAt > at ? tl(lang, '，{age}后到期', { age: age(x.dueAt - at) }) : tl(lang, '，已到期')) : tl(lang, '，一直等到有人答')}\n  ${x.text}\n  → node src/cli.mjs answer ${x.questionId} "..."${x.defaultAction && x.dueAt ? tl(lang, '（到期没人答就按默认：{action}）', { action: oneLine(x.defaultAction, 60) }) : ''}`;
-  L.push(tl(lang, '{name} 的待办（{time} UTC）', { name: d.name, time: new Date(at).toISOString().slice(0, 16).replace('T', ' ') }));
+  // 时刻按收的人的时区写（带 UTC+8 这样的标记，原来一律 UTC）
+  L.push(tl(lang, '{name} 的待办（{time}）', { name: d.name, time: fmtAt(at, d.tz ?? 'UTC') }));
   if (!d.total) { L.push(tl(lang, '没有等你的事。')); return L.join('\n'); }
   if (d.daemonOff) L.push(`\n${tl(lang, '自动运行未开启：有 {n} 个未结束的任务不会自动推进，超时与通知也不会处理。启动：node src/cli.mjs web --daemon（或 daemon）', { n: d.daemonOff.unfinished })}`);
+  if (d.credentialsExpiring?.length) {
+    L.push(`\n${tl(lang, '快到期的连接 {n} 个（到期后交付会推不上去；在「设置 → 连接」加一份新的，再吊销旧的）：', { n: d.credentialsExpiring.length })}`);
+    d.credentialsExpiring.forEach((c) => L.push(`- ${c.name}${bar}${c.expired ? tl(lang, '已过期') : tl(lang, '{age}后到期', { age: age(c.expiresAt - at) })}`));
+  }
   if (d.stalledProjects?.length) {
     L.push(`\n${tl(lang, '已停滞的项目 {n} 个（等你决定）：', { n: d.stalledProjects.length })}`);
     d.stalledProjects.forEach((p) => L.push(p.kind === 'review_shelved'
@@ -225,6 +243,10 @@ export function renderDigest(d, { at = d.at } = {}) {
     for (const x of d.catalog.lines.slice(0, 8)) L.push(`- ${x}`);
     if (d.catalog.lines.length > 8) L.push(`- ${tl(lang, '…还有 {n} 行', { n: d.catalog.lines.length - 8 })}`);
     L.push(`  → ${tl(lang, '全文：node src/cli.mjs catalog check；目录只由人改（src/llm/canonical.mjs）')}`);
+  }
+  if ((d.rubberStamps ?? []).length) {
+    L.push(`\n${tl(lang, '可能在走过场（只是提醒；细节在看板 设置 → 成员 →「批准习惯」）：')}`);
+    d.rubberStamps.forEach((x) => L.push(`- ${tl(lang, '{name}：最近 {n} 次签收 / 方案批准都是批准，打开后中位数 {s} 秒就答', { name: x.userId === d.userId ? tl(lang, '你') : x.name, n: HABIT.streak, s: Math.round((x.medianOpenMs ?? 0) / 1000) })}`));
   }
   if (d.dissents.length) { L.push(`\n${tl(lang, '{when}的不同意见 {n} 条（已记录，不改结论）：', { when: d.since ? tl(lang, '上次摘要以来') : tl(lang, '最近 7 天'), n: d.dissents.length })}`); d.dissents.forEach((x) => L.push(`- ${tl(lang, '{by} 对「{question}」的结论：{text}', { by: x.by, question: x.questionText, text: x.text })}`)); }
   return L.join('\n');

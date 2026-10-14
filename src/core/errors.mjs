@@ -24,9 +24,11 @@ export class ProviderError extends InfraError {
   kind = 'provider';
   /** @returns 给审计与 CLI 用的平铺字段 */
   summary() {
-    const { vendor, model, tier, status, retryable, attempts } = this;
+    const { vendor, model, tier, status, retryable, attempts, blocked, fallback, malformed } = this;
     return { vendor, model, tier, status: status ?? null, retryable: !!retryable,
-      attempts: attempts ?? 1, message: String(this.message).slice(0, 400) };
+      attempts: attempts ?? 1, message: String(this.message).slice(0, 400),
+      // 熔断 / 共享退避挡下的（没真打）、换用过备用档仍失败的、2xx 回包坏了的
+      ...(blocked ? { blocked } : {}), ...(fallback ? { fallback } : {}), ...(malformed ? { malformed } : {}) };
   }
 }
 
@@ -49,6 +51,16 @@ export class ConfigError extends InfraError {
 /** 硬边界（on_hit='hard_fail'）：容器被 OOM / pids-limit 掐死。携带 breach。 */
 export class HardLimitError extends InfraError {
   kind = 'hard_limit';
+}
+
+/**
+ * 沙箱侧：容器运行时的管理命令（inspect / run / start / rm）失败 —— Docker 中途停了、镜像没了、容器被别人删了。
+ * 原来抛普通错误，被工具循环吞成工具报错回给模型，模型接着跑、对着一个起不来的沙箱打转。不是模型能修的，也不是这一步的错：
+ * 穿过工具循环，编排器退回 pending、不计重试，守护进程隔一阵再拉（运行时整个掉了的那种由守护进程每轮的运行时检查接住）。
+ */
+export class SandboxError extends InfraError {
+  kind = 'sandbox';
+  summary() { return { cmd: this.cmd ?? null, message: String(this.message).slice(0, 400) }; }
 }
 
 export const isInfraError = (e) => e?.infra === true;

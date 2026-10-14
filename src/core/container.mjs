@@ -23,15 +23,19 @@
 // （Firecracker/gVisor）或托管沙箱（E2B）时换的也应该只是这个类。
 
 import { execFileSync } from 'node:child_process';
+import { statSync } from 'node:fs';
 import { resolve, join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { HostFileOps, spawnCapped, DEFAULT_LIMITS, classifyCommand } from './executor.mjs';
-import { ingestEgressAudit, egressGroupsOf, ensureCa, ensureCaImage, EgressProxy, allowlistOf, toolEnvOf } from './egress.mjs';
+import { ingestEgressAudit, egressGroupsOf, ensureCa, ensureCaImage, EgressProxy, allowlistOf, toolEnvOf, withheldToolEnv } from './egress.mjs';
+import { credentialInjection } from './egress-creds.mjs';
+import { sandboxCaps, narrowForCredentials, assertRuleOfTwo } from './capabilities.mjs';
 import { LIMITS, limitOf } from './limits.mjs';
 import { audit } from '../db/db.mjs';
-import { HardLimitError } from './errors.mjs';
+import { HardLimitError, SandboxError } from './errors.mjs';
 import { sandboxFlavorOf } from './project-settings.mjs';
 import { I18nError } from '../i18n/index.mjs';
+import { maybeFault } from './faults.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 
@@ -40,6 +44,13 @@ export const SANDBOX_IMAGE = 'superintern/sandbox:v0.1';
 /** 容器里工作区的两个视图。read-only 模式的命令跑在 ro 那个上，写进去由内核拒。 */
 const MOUNT_RW = '/workspace';
 const MOUNT_RO = '/workspace-ro';
+
+// 沙箱挂载规矩的版本。改了挂载 / 写边界就加一：已有的容器（复用、重启都不重新挂载）标签对不上就删了重建 ——
+// rootfs 只读、/tmp 是 tmpfs，重建丢的东西和重启一样多。
+// 2：工作区的 .git 只读。原来整个工作区可写，沙箱里的代码（执行器、依赖的安装脚本）能往 .git 里写钩子或
+//    core.fsmonitor，宿主上下一次系统提交 / git status 就在宿主上执行它，带着宿主的环境（模型 key、主密钥、库）。
+export const SANDBOX_POLICY = '2';
+const isDir = (p) => { try { return statSync(p).isDirectory(); } catch { return false; } };
 
 // 内存 / PID 上限不再写死在这里：从宪法层 params（limits 解析后的有效上限）取值。
 // 只有 CPU 这一维不在 LIMITS 表里，仍留一个常量。
@@ -120,8 +131,11 @@ export class ContainerExecutor extends HostFileOps {
       return execFileSync(this.cli, args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
     } catch (e) {
       if (allowFail) return null;
-      throw new I18nError('{cmd} 失败：{detail}',
-        { cmd: `${this.cli} ${args.slice(0, 2).join(' ')}`, detail: String(e.stderr || e.message).trim().split('\n').slice(0, 3).join(' / ') });
+      // 管理命令失败是基础设施的事（运行时掉了、镜像 / 容器没了），穿过工具循环交给编排器，不回给模型
+      const cmd = `${this.cli} ${args.slice(0, 2).join(' ')}`;
+      // 带上模板，translateError 能按人的语言翻
+      const t = new I18nError('{cmd} 失败：{detail}', { cmd, detail: String(e.stderr || e.message).trim().split('\n').slice(0, 3).join(' / ') });
+      throw new SandboxError(t.message, { cmd, tpl: t.tpl, params: t.params });
     }
   }
 
@@ -191,7 +205,11 @@ export class ContainerExecutor extends HostFileOps {
       await this.egress.waitReady();
     }
 
-    const state = this.#cli(['inspect', '-f', '{{.State.Status}}', this.name], { allowFail: true });
+    let state = this.#cli(['inspect', '-f', '{{.State.Status}}', this.name], { allowFail: true });
+    if (state && this.#cli(['inspect', '-f', '{{index .Config.Labels "superintern.policy"}}', this.name], { allowFail: true }) !== SANDBOX_POLICY) {
+      this.#cli(['rm', '-f', this.name], { allowFail: true });   // 按旧规矩挂载的：删了按新规矩重建
+      state = '';
+    }
 
     let how;
     if (state === 'running') {
@@ -237,9 +255,9 @@ export class ContainerExecutor extends HostFileOps {
     return [
       'run', '-d', '--name', this.name,
       '--label', 'superintern.task=' + this.taskId,       // 供 `cli sandbox` 清扫遗留容器
+      '--label', 'superintern.policy=' + SANDBOX_POLICY,
       // ⚠️ `--init` 不是可选项。没有它，PID 1 是 `sleep infinity`，而 sleep 从不
       // 调 wait() —— 每一条被超时杀掉的命令都会在容器里留下一个**永久僵尸**
-      // （实测：4 次超时 = 4 个 Z 状态进程，只增不减）。
       // 更坏的是它与下面的 `--pids-limit` 相互作用：僵尸占着 PID 槽位，
       // 攒够 512 个之后容器里**什么都跑不起来**，而报错会是 fork 失败，
       // 指不到"超时太多次"这个真实原因。一道资源护栏把一个慢泄漏变成了一次总停摆。
@@ -272,6 +290,12 @@ export class ContainerExecutor extends HostFileOps {
       '-e', 'GIT_AUTHOR_NAME=superintern-sandbox', '-e', 'GIT_AUTHOR_EMAIL=sandbox@superintern.local',
       '-e', 'GIT_COMMITTER_NAME=superintern-sandbox', '-e', 'GIT_COMMITTER_EMAIL=sandbox@superintern.local',
       '-v', `${ws}:${MOUNT_RW}`,
+      // 工作区的 .git 只读（挂在可写视图的子路径上，盖住它）：仓库配置和钩子只有宿主能写。
+      // 宿主上的 git 会读它们（core.fsmonitor、钩子、过滤器驱动……都能执行命令），沙箱改得了就等于能在宿主上跑命令。
+      // 系统自己在宿主上提交；沙箱里 git status / log / diff 照样能用，只是不能 commit / checkout / 改配置
+      ...(isDir(join(ws, '.git')) ? ['-v', `${join(ws, '.git')}:${MOUNT_RW}/.git:ro`] : []),
+      // husky 之类的 prepare 脚本会往 .git/config 写 core.hooksPath（正是上面防的事）：装依赖时别让它试
+      '-e', 'HUSKY=0',
       // 同一份工作区的只读视图。声明为 read-only 的命令跑在这上面，
       // **misclassify 会当场 EROFS 报错，而不是安静地写下去**。
       '-v', `${ws}:${MOUNT_RO}:ro`,
@@ -302,6 +326,7 @@ export class ContainerExecutor extends HostFileOps {
    * 换一个工作区意味着换一个容器。传错了要吵，不能默默在旧挂载上跑。
    */
   async execute(cmd, workspace, limits = {}) {
+    maybeFault('exec', { file: cmd.file, args: cmd.args });   // 故障注入点
     const lim = { ...this.defaults, ...limits };
     const { file, args = [] } = cmd;
     if (!file) throw new Error('execute: cmd.file 必填');
@@ -407,17 +432,27 @@ export async function makeSandbox(db, { taskId, home, cli = null, onNote = () =>
     dockerfile: join(HERE, '..', '..', 'sandbox', 'Dockerfile.ca') });
   if (img.built) onNote(`已构建含 CA 的派生镜像 ${img.tag}`);
 
+  // 最小权限注入：管理员给源配的凭据（sources cred add）只进代理容器，沙箱里看不到；默认只在读请求上带。
+  // 像凭据的工具配置（最小权限注入以前只能这么配）不再注入沙箱：记审计，健康卡提示管理员移走。
+  const { credRules, credEnv, injected } = credentialInjection(db, groups);
+  const withheld = withheldToolEnv(db, groups);
+  // Rule of Two：沙箱总在读不可信输入；带了凭据就把"能往外写"拿掉 —— 所有地址只读，管理员允许写的凭据覆盖的地址除外
+  const { allow, narrowed, humanApproved } = narrowForCredentials({ allow: allowlistOf(db, groups), injected });
+  assertRuleOfTwo(sandboxCaps({ allow, injected }), { humanApproved });
+  if (injected.length || withheld.length) {
+    audit(db, { actorKind: 'system', action: 'sandbox_credentials', targetType: 'task', targetId: taskId,
+      payload: { injected: injected.map(({ sourceId, credentialId, header, hosts, allowWrite }) => ({ sourceId, credentialId, header, hosts, allowWrite })),
+        narrowedToReadOnly: narrowed, withheldToolEnv: withheld } });
+  }
   const egress = new EgressProxy({
     taskId, cli: rt.cli, caDir,
     addonPath: join(HERE, '..', '..', 'sandbox', 'proxy', 'guard.py'),
     auditDir: join(home, 'egress', taskId),
     groups,
-    allow: allowlistOf(db, groups),        // 联网目录解析出的域名（带只读标记，v20）
-    toolEnv: toolEnvOf(db, groups),        // 软件源的工具配置（镜像地址等）注入沙箱
-    // 凭证注入规则：机制在 guard.py 里，**默认为空**。
-    // 填它意味着往代理容器里塞真令牌，那是一次涉凭证的动作，该由人显式配置，
-    // 不该由这个装配函数替人决定。规则里只存环境变量名，值另走 credEnv。
-    credRules: [], credEnv: {},
+    allow,                                 // 联网目录解析出的域名（带只读标记，v20；带凭据时收窄过）
+    toolEnv: toolEnvOf(db, groups),        // 软件源的工具配置（镜像地址等）注入沙箱；像凭据的已滤掉
+    // 凭据注入规则：规则里只有环境变量名，值另走 credEnv，只进代理容器
+    credRules, credEnv,
   });
   return new ContainerExecutor({ taskId, db, cli: rt.cli, image: img.tag, egress });
 }

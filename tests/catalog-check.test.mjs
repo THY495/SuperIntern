@@ -7,7 +7,8 @@
 // 调用时的代答检测（servedModelDrift）与 flushLedger 落 model_drift；负责人摘要里带目录一栏。
 
 import { openDb, ensureOwner, now } from '../src/db/db.mjs';
-import { checkCatalog, renderCatalogCheck, recordCatalogCheck, lastCatalogCheck, catalogCheckDue, normId } from '../src/llm/catalog-check.mjs';
+import { checkCatalog, renderCatalogCheck, recordCatalogCheck, lastCatalogCheck, catalogCheckDue, normId, redPng, probeVision } from '../src/llm/catalog-check.mjs';
+import { inflateSync } from 'node:zlib';
 import { servedModelDrift, LlmClient } from '../src/llm/client.mjs';
 import { flushLedger } from '../src/core/ledger.mjs';
 import { buildDigest, renderDigest } from '../src/core/digest.mjs';
@@ -161,6 +162,37 @@ section('5. 负责人摘要带"模型目录"一栏');
   const carolId = 'u_obs';
   db.run(`INSERT INTO users (id,display_name,role,domain_tags,created_at) VALUES (?,?,'observer','[]',?)`, carolId, 'carol', at);
   eq(buildDigest(db, { userId: carolId, at }).catalog, null, '非负责人没有这一栏');
+}
+
+section('6. --vision 收图实测：走工具结果带图这条路（和验收员看截图同一条），与目录标记对照');
+{
+  // 图本身：合法 PNG、64×64、纯红
+  const png = Buffer.from(redPng(), 'base64');
+  const ihdr = png.subarray(16, 24);
+  assert(png.subarray(1, 4).toString() === 'PNG' && ihdr.readUInt32BE(0) === 64 && ihdr.readUInt32BE(4) === 64, '现做的探测图是合法 PNG（64×64）');
+  const idatLen = png.readUInt32BE(33);
+  const pix = inflateSync(png.subarray(41, 41 + idatLen));
+  assert(pix[0] === 0 && pix[1] === 255 && pix[2] === 0 && pix[3] === 0, '像素是红的（行首过滤字节 0，后面 RGB = 255,0,0）');
+  const bodies = [];
+  const fakeFetch = (reply) => async (url, init) => { bodies.push(JSON.parse(init.body)); return reply(); };
+  const okText = (text) => () => ({ ok: true, status: 200, json: async () => ({ choices: [{ message: { role: 'assistant', content: text }, finish_reason: 'stop' }], usage: { prompt_tokens: 300, completion_tokens: 2 } }) });
+  const ds = { ...catalog['deepseek/deepseek-flash'] };
+  eq(await probeVision(ds, { vendors, env: { DEEPSEEK_API_KEY: 'k' }, fetchFn: fakeFetch(okText('Red.')) }), 'yes', '答"Red." → 看得懂');
+  const sent = JSON.stringify(bodies.at(-1));
+  assert(/data:image\/png;base64,/.test(sent) && /screenshot/.test(sent), '请求里真带了图（data URI），而且是挂在 screenshot 工具结果后面');
+  assert((await probeVision(ds, { vendors, env: { DEEPSEEK_API_KEY: 'k' }, fetchFn: fakeFetch(okText('I cannot view images.')) })).startsWith('blind'), '收了但没看出颜色 → blind');
+  const rej = () => ({ ok: false, status: 400, json: async () => ({ error: { message: 'image_url is not supported' } }) });
+  assert((await probeVision(ds, { vendors, env: { DEEPSEEK_API_KEY: 'k' }, fetchFn: fakeFetch(rej) })).startsWith('rejected: HTTP 400'), '服务商拒收 → rejected');
+  eq(await probeVision(ds, { vendors, env: {}, fetchFn: fakeFetch(rej) }), 'no-key', '没 key 不打');
+  // 与目录对照：没标 vision 却看得懂 → INFO（不算告警）；标了却看不了 → WARN
+  const r1 = await checkCatalog({ catalog: { 'deepseek/deepseek-flash': ds }, vendors, env: { DEEPSEEK_API_KEY: 'k' }, vision: true, only: 'deepseek',
+    fetchFn: async (url, init) => (init?.method === 'POST' ? okText('red')() : { ok: false, status: 503, json: async () => ({}) }) });
+  const f1 = r1.entries[0].findings.find((x) => /收图实测/.test(x.msg));
+  assert(f1?.level === 'INFO' && r1.vision === true, `目录没标、实测看得懂 → INFO（${f1?.level}）`);
+  const r2 = await checkCatalog({ catalog: { 'deepseek/deepseek-flash': { ...ds, vision: true } }, vendors, env: { DEEPSEEK_API_KEY: 'k' }, vision: true, only: 'deepseek',
+    fetchFn: async (url, init) => (init?.method === 'POST' ? rej() : { ok: false, status: 503, json: async () => ({}) }) });
+  const f2 = r2.entries[0].findings.find((x) => /收图实测/.test(x.msg));
+  assert(f2?.level === 'WARN' && r2.warnings >= 1, `目录标了 vision、实测看不了 → WARN（${f2?.level}）`);
 }
 
 console.log(`\n${pass} 通过，${fail} 失败`);

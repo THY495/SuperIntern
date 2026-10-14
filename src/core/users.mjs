@@ -3,13 +3,15 @@
 // 令牌明文只在签发那一刻返回一次，库里只有哈希（与 ensureOwner 同一规矩）。CLI 把它写进文件不打印；看板把它显示一次。
 // 通知按人：user_channels。旁观者不收通知 —— 解析器根本不把旁观者放进收件人。
 
-import { randomBytes } from 'node:crypto';
 import { newId, now, audit, sha256 } from '../db/db.mjs';
+import { insertUser, updateUser, revokeTokens } from '../db/users.mjs';
+import { issueToken } from './sessions.mjs';
 import { notify, channelsFromEnv } from './notify.mjs';
 import { responsibilitiesOf, responsibilitiesText } from './handover.mjs';
 import { DECISION_TYPES } from './routing.mjs';
+import { questionsToNotify, markNotified } from './questions.mjs';
 import { projectsToDeliver } from './delivery-due.mjs';
-import { tl, contentLang, I18nError, CATALOGS } from '../i18n/index.mjs';
+import { tl, contentLang, I18nError, CATALOGS, N_ } from '../i18n/index.mjs';
 
 export const ROLES = ['lead', 'member', 'observer'];
 /** user_channels.channel 的 CHECK 值 → notify.mjs 的通道种类。 */
@@ -22,15 +24,13 @@ export function addUser(db, { name, role, tags = [], byUserId }) {
   if (!['member', 'observer'].includes(role)) throw new I18nError('角色只能是成员（member）或旁观者（observer）；管理员角色请在添加后由管理员授予');
   if (db.one(`SELECT id FROM users WHERE display_name=?`, display)) throw new I18nError('名称 {name} 已被使用', { name: display });
   const id = newId('u');
-  const tokenId = newId('tk');
-  const plaintext = randomBytes(24).toString('base64url');
   const t = now();
-  db.tx(() => {
-    db.run(`INSERT INTO users (id,display_name,role,domain_tags,created_at) VALUES (?,?,?,?,?)`, id, display, role, JSON.stringify([].concat(tags).map(String).filter(Boolean)), t);
-    db.run(`INSERT INTO tokens (id,user_id,token_hash,issued_by,issued_at) VALUES (?,?,?,?,?)`, tokenId, id, sha256(plaintext), byUserId, t);
-    audit(db, { actorKind: 'user', actorId: byUserId, action: 'user_added', targetType: 'user', targetId: id, payload: { name: display, role, tags, tokenId } });
+  return db.tx(() => {
+    insertUser(db, { id, displayName: display, role, domainTags: [].concat(tags).map(String).filter(Boolean), createdAt: t });
+    const { tokenId, plaintext, expiresAt } = issueToken(db, { userId: id, by: byUserId, name: N_('管理员添加时签发'), at: t });
+    audit(db, { actorKind: 'user', actorId: byUserId, action: 'user_added', targetType: 'user', targetId: id, payload: { name: display, role, tags, tokenId, expiresAt } });
+    return { userId: id, tokenId, plaintext, expiresAt };
   });
-  return { userId: id, tokenId, plaintext };
 }
 
 export function listUsers(db) {
@@ -55,7 +55,9 @@ export function usersView(db) {
   return listUsers(db).map((u) => {
     const resp = responsibilitiesOf(db, u.id, { all: true });
     const tk = db.one(`SELECT max(issued_at) AS issued_at FROM tokens WHERE user_id=? AND revoked_at IS NULL`, u.id);
+    const gi = db.one(`SELECT github_login, commit_email, github_id FROM users WHERE id=?`, u.id);
     return { id: u.id, name: u.display_name, role: u.role, tags: u.domain_tags, createdAt: u.created_at, disabledAt: u.disabled_at ?? null,
+      github: gi?.github_login ?? null, commitEmail: gi?.commit_email ?? null, githubBound: gi?.github_id != null,
       tokens: u.tokens, tokenIssuedAt: tk?.issued_at ?? null,
       channels: db.all(`SELECT channel, target FROM user_channels WHERE user_id=? AND enabled=1 ORDER BY priority, channel`, u.id).map((c) => ({ kind: KIND_LABEL[c.channel] ?? c.channel, host: channelHost(c.target) })),
       responsibilities: { projects: resp.projects.length, soloTasks: resp.soloTasks.length, routingRows: resp.routing.length, routingKeys: new Set(resp.routing.map((r) => r.project_id)).size,
@@ -63,7 +65,7 @@ export function usersView(db) {
   });
 }
 
-const mustUser = (db, userId) => db.one(`SELECT id, display_name, role, disabled_at FROM users WHERE id=?`, userId) ?? (() => { throw new I18nError('成员不存在：{id}', { id: userId }); })();
+const mustUser = (db, userId) => db.one(`SELECT id, display_name, role, kind, disabled_at FROM users WHERE id=?`, userId) ?? (() => { throw new I18nError('成员不存在：{id}', { id: userId }); })();
 // 决策类型名（DECISION_TYPES 的 label 是中文原文）按语言取；目录里没有就原样
 const labelIn = (lang, s) => CATALOGS[lang]?.[s] ?? s;
 
@@ -78,6 +80,8 @@ export function setUserRole(db, { userId, role, byUserId }) {
     const u = mustUser(db, userId);
     if (u.disabled_at) throw new I18nError('{name} 已停用，请先启用再修改角色', { name: u.display_name });
     if (u.role === role) return { userId, role, changed: false };
+    // 服务账户与人分开：它不能登录看板，当管理员（负责人）就成了一个没人能替它拍板的负责人
+    if (u.kind === 'service' && role === 'lead') throw new I18nError('服务账户不能当管理员');
     const resp = responsibilitiesOf(db, userId, { all: true });
     if (u.role === 'lead' && !db.one(`SELECT id FROM users WHERE role='lead' AND disabled_at IS NULL AND id<>?`, userId)) throw new I18nError('不能更改最后一位管理员的角色');
     if (role === 'observer' && resp.count) {
@@ -86,7 +90,7 @@ export function setUserRole(db, { userId, role, byUserId }) {
       throw new I18nError('旁观者不能作为接收人，而 {name} {what}{rows}。请先交接，或先调整决策路由', { name: u.display_name, what: responsibilitiesText(resp, L),
         rows: rows.length ? tl(L, '（{list}{more}）', { list: rows.slice(0, 6).join(tl(L, '；')), more: rows.length > 6 ? ' …' : '' }) : '' });
     }
-    db.run(`UPDATE users SET role=? WHERE id=?`, role, userId);
+    updateUser(db, userId, { role });
     audit(db, { actorKind: 'user', actorId: byUserId, action: 'user_role_set', targetType: 'user', targetId: userId, payload: { from: u.role, to: role } });
     return { userId, role, changed: true };
   }, { immediate: true });
@@ -99,7 +103,7 @@ export function renameUser(db, { userId, name, byUserId }) {
     const u = mustUser(db, userId);
     if (u.display_name === display) return { userId, name: display, changed: false };
     if (db.one(`SELECT id FROM users WHERE display_name=? AND id<>?`, display, userId)) throw new I18nError('名称 {name} 已被使用', { name: display });
-    db.run(`UPDATE users SET display_name=? WHERE id=?`, display, userId);
+    updateUser(db, userId, { displayName: display });
     audit(db, { actorKind: 'user', actorId: byUserId, action: 'user_renamed', targetType: 'user', targetId: userId, payload: { from: u.display_name, to: display } });
     return { userId, name: display, changed: true };
   }, { immediate: true });
@@ -107,16 +111,14 @@ export function renameUser(db, { userId, name, byUserId }) {
 
 /** 重发令牌：旧的全部吊销、签发一枚新的。明文只在这里返回一次。 */
 export function reissueToken(db, { userId, byUserId }) {
-  const tokenId = newId('tk');
-  const plaintext = randomBytes(24).toString('base64url');
   const t = now();
   return db.tx(() => {
     const u = mustUser(db, userId);
     if (u.disabled_at) throw new I18nError('{name} 已停用，请先启用再重新生成令牌', { name: u.display_name });
-    const revoked = Number(db.run(`UPDATE tokens SET revoked_at=? WHERE user_id=? AND revoked_at IS NULL`, t, userId).changes);
-    db.run(`INSERT INTO tokens (id,user_id,token_hash,issued_by,issued_at) VALUES (?,?,?,?,?)`, tokenId, userId, sha256(plaintext), byUserId, t);
-    audit(db, { actorKind: 'user', actorId: byUserId, action: 'token_reissued', targetType: 'user', targetId: userId, payload: { tokenId, revoked } });
-    return { userId, tokenId, plaintext, revoked };
+    const revoked = revokeTokens(db, userId, t);
+    const { tokenId, plaintext, expiresAt } = issueToken(db, { userId, by: byUserId, name: N_('管理员重发'), kind: u.kind === 'service' ? 'service' : 'cli', at: t });
+    audit(db, { actorKind: 'user', actorId: byUserId, action: 'token_reissued', targetType: 'user', targetId: userId, payload: { tokenId, revoked, expiresAt } });
+    return { userId, tokenId, plaintext, revoked, expiresAt };
   }, { immediate: true });
 }
 
@@ -134,8 +136,31 @@ export function removeUserChannel(db, { userId, kind, byUserId }) {
 
 export function setUserTags(db, { userId, tags, byUserId }) {
   if (!db.one(`SELECT id FROM users WHERE id=?`, userId)) throw new I18nError('成员不存在：{id}', { id: userId });
-  db.run(`UPDATE users SET domain_tags=? WHERE id=?`, JSON.stringify([].concat(tags).map(String).filter(Boolean)), userId);
+  updateUser(db, userId, { domainTags: [].concat(tags).map(String).filter(Boolean) });
   audit(db, { actorKind: 'user', actorId: byUserId, action: 'user_tags_set', targetType: 'user', targetId: userId, payload: { tags } });
+}
+
+/**
+ * 成员的 GitHub 账号与提交邮箱（提交 trailer、PR 溯源表、可选的 Co-authored-by）。本人或管理员可改；给 null / 空串 = 清掉。
+ * 只核格式，不联网核账号是否存在（GitHub 登录做好之后由登录那一步写入核过的账号）。
+ */
+export function setGitIdentity(db, { userId, github = undefined, email = undefined, byUserId }) {
+  const u = mustUser(db, userId);
+  const by = db.one(`SELECT role FROM users WHERE id=? AND disabled_at IS NULL`, byUserId);
+  if (byUserId !== userId && by?.role !== 'lead') throw new I18nError('只能改自己的 GitHub 账号；改别人的要管理员');
+  const gh = github === undefined ? undefined : (String(github ?? '').trim().replace(/^@/, '') || null);
+  if (gh && !/^[A-Za-z0-9](?:[A-Za-z0-9]|-(?=[A-Za-z0-9])){0,38}$/.test(gh)) throw new I18nError('GitHub 账号格式不对：只能是字母、数字和单个连字符，最长 39 个字符（{v}）', { v: gh });
+  const em = email === undefined ? undefined : (String(email ?? '').trim() || null);
+  if (em && !/^[^\s@<>]+@[^\s@<>]+\.[^\s@<>]+$/.test(em)) throw new I18nError('提交邮箱格式不对：{v}', { v: em });
+  if (gh && db.one(`SELECT id FROM users WHERE lower(github_login)=lower(?) AND id<>?`, gh, userId)) throw new I18nError('GitHub 账号 {v} 已经对应了另一位成员', { v: gh });
+  // 换了账号就解绑 GitHub 登录（按数字 id 认人）：不然原来那个账号照样能以这个人的身份登录
+  const old = db.one(`SELECT github_login, github_id FROM users WHERE id=?`, userId);
+  const unbind = gh !== undefined && old?.github_id != null && (gh ?? '').toLowerCase() !== (old.github_login ?? '').toLowerCase();
+  db.tx(() => {
+    updateUser(db, userId, { githubLogin: gh, commitEmail: em, githubId: unbind ? null : undefined });
+    audit(db, { actorKind: 'user', actorId: byUserId, action: 'user_git_identity_set', targetType: 'user', targetId: userId, payload: { github: gh === undefined ? undefined : gh ?? null, email: em === undefined ? undefined : !!em, byAdmin: by?.role === 'lead', ...(unbind ? { githubLoginUnbound: true } : {}) } });
+  });
+  return { userId, name: u.display_name, github: gh, email: em };
 }
 
 /** 挂一条通道。同种通道覆盖（一人一种一条）。URL 里可能带密钥：审计只记种类。 */
@@ -193,12 +218,16 @@ export async function notifyPendingDeliveries(db, { env = process.env, extraCmd 
 }
 
 export async function notifyPendingQuestions(db, { env = process.env, extraCmd = null, fetchFn = globalThis.fetch, spawn } = {}) {
-  const due = db.all(`SELECT q.*, t.title FROM questions q JOIN tasks t ON t.id=q.task_id WHERE q.status IN ('open','escalated') AND q.notified_at IS NULL ORDER BY q.asked_at LIMIT 50`);
+  // 只推还没推过的人：第一次推给全部收件人与知会人；之后换了人（转交、超时转下一行、全员弃权转负责人、交接），只补推新加进来的
+  const due = questionsToNotify(db);
   const sent = [];
   const L = contentLang(db);
   for (const q of due) {
-    const to = [...JSON.parse(q.addressed_to || '[]'), ...JSON.parse(q.informed || '[]')];
-    const channels = [...channelsForUsers(db, to), ...channelsFromEnv(env, extraCmd)];
+    const to = q.fresh;
+    const personal = channelsForUsers(db, to);
+    // 部署级通道（.env）：第一次推照旧带上；之后只在新加的人里有没配个人通道的时才带（不然那个人就谁也通知不到）
+    const fallback = q.first || to.some((u) => !channelsForUsers(db, [u]).length);
+    const channels = [...personal, ...(fallback ? channelsFromEnv(env, extraCmd) : [])];
     const lvl = ['', 'Ⅰ', 'Ⅱ', 'Ⅲ'][q.level] ?? q.level;
     const title = `[SuperIntern] ${tl(L, '{what}：{title}', { what: q.decision_type === 'conflict' ? tl(L, '冲突事项') : q.decision_type === 'signoff' ? tl(L, '等你签收') : tl(L, '{lvl} 级问题在等你', { lvl }), title: String(q.title).slice(0, 40) })}`;
     const text = `${String(q.text).slice(0, 400)}\n\n${tl(L, '回答：node src/cli.mjs answer {id} "..."（任务 {taskId}）', { id: q.id, taskId: q.task_id })}`;
@@ -206,7 +235,7 @@ export async function notifyPendingQuestions(db, { env = process.env, extraCmd =
       const receipts = await notify(db, { taskId: q.task_id, kind: 'question', title, text, ref: q.id, channels, fetchFn, ...(spawn ? { spawn } : {}) });
       sent.push({ questionId: q.id, to, receipts });
     }
-    db.run(`UPDATE questions SET notified_at=? WHERE id=?`, now(), q.id);
+    markNotified(db, q.id, { to: q.all, at: now() });
   }
   return sent;
 }

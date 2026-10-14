@@ -5,8 +5,11 @@
 // 管界面的成员可能整场 0 条事项，路由给她的"规格取舍"一次都不出现。协作要的是"每个角色在自己的领域做过决定"，
 // 而这些正是该她 / 他定的事。
 //
-// 做法：任务做完时，把这一轮新出现的 settled_by_me 按主题分两堆 ——
-//   依赖 / 构建 / 仓库结构 / 启动方式 → 结构矛盾（structural）那一行的人；其余（界面、接口行为、业务规则）→ 规格取舍（spec_choice）
+// 做法：任务做完时，把这一轮新出现的 settled_by_me 按"谁会在乎"分两堆 ——
+//   只有写代码的人在乎（状态码、接口格式、模块划分、测试写法、依赖 / 构建 / 仓库结构 / 启动方式）→ 结构矛盾（structural）那一行的人；
+//   用的人看得到（界面、显示、排序、默认值、业务规则）→ 规格取舍（spec_choice）。
+//   谁会在乎由执行器交接时标（assumptions.audience）；没标的按主题正则兜底。
+//   原来"接口行为"整个归规格，HTTP 200/204、模块入口发给了管产品的人，她只能回「都行」。
 // —— 每堆合成**一条**事项（不是一条一件，否则事项数翻倍），走项目的路由表。
 //   · Ⅱ 级、带默认"沿用 AI 的选择"：不挡签收、不挡合并；没人答就在超时后按默认了结。
 //   · 回 A / 都行 → 这几件记进项目的约定清单（署答复人的名）。
@@ -18,10 +21,13 @@
 import { hasMark, markOf } from '../i18n/marks.mjs';
 import { tl, contentLang } from '../i18n/index.mjs';
 import { newId, now, audit, insertEdge } from '../db/db.mjs';
+import { insertUserMessage } from '../db/messages.mjs';
 import { getParam, setParam } from './params.mjs';
 import { routeQuestion, leadOf } from './routing.mjs';
 import { timeoutFor } from './timeouts.mjs';
 import { record } from './decisions.mjs';
+import { transition } from '../db/state.mjs';
+import { insertQuestion, setRecipients } from './questions.mjs';
 
 export const CHOICES_MARK = '【AI 替你定了几件事】';
 const REVIEWED_KEY = 'task.choices_reviewed';
@@ -29,8 +35,9 @@ const MAX_ITEMS = 8;
 const BY = { kind: 'agent', id: 'choices' };
 
 // 依赖 / 构建 / 仓库结构 / 启动方式：这些是写代码的人的领域
-const STRUCT_RE = /依赖|requirements|package\.json|pyproject|lockfile|lock 文件|gitignore|\bdist\b|构建|打包|目录结构|仓库结构|uvicorn|\bpip\b|\bnpm\b|\bvenv\b|node_modules|测试框架|pytest|vitest|jest|启动命令|端口|\bport\b|si-preview|\bbuild\b|\bdeps?\b|dependency|dependencies|migration|迁移|数据库文件|\.db\b|sqlite|directory (structure|layout)|repo(sitory)? (structure|layout)|project layout|startup command|start command|test framework|packaging/i;
-export const domainOf = (a) => (STRUCT_RE.test(`${a.subject_key}\n${a.statement}`) ? 'structural' : 'spec_choice');
+const STRUCT_RE = /状态码|响应码|成功码|(返回|响应)\s*[1-5]\d\d\b|status code|\bHTTP\b|模块|入口|re-export|\bimport\b|测试(断言|按此|假定)|\bassert|依赖|requirements|package\.json|pyproject|lockfile|lock 文件|gitignore|\bdist\b|构建|打包|目录结构|仓库结构|uvicorn|\bpip\b|\bnpm\b|\bvenv\b|node_modules|测试框架|pytest|vitest|jest|启动命令|端口|\bport\b|si-preview|\bbuild\b|\bdeps?\b|dependency|dependencies|migration|迁移|数据库文件|\.db\b|sqlite|directory (structure|layout)|repo(sitory)? (structure|layout)|project layout|startup command|start command|test framework|packaging/i;
+export const domainOf = (a) => (a.audience === 'developer' ? 'structural' : a.audience === 'user' ? 'spec_choice'
+  : STRUCT_RE.test(`${a.subject_key}\n${a.statement}`) ? 'structural' : 'spec_choice');
 // 提到的顶层目录 → 路由表的范围前缀（frontend/ 的规格取舍可以派给管界面的人）
 const prefixesIn = (text) => [...new Set([...String(text).matchAll(/(?:^|[\s`'"（(])((?:frontend|backend|client|server|web|api|ui|app)\/)/gi)].map((m) => m[1].toLowerCase().replace(/\/+$/, '')))];
 
@@ -44,7 +51,7 @@ export function raiseChoiceReviews(db, { taskId, at = now() }) {
   const task = db.one(`SELECT id, title FROM tasks WHERE id=?`, taskId);
   if (!task) return [];
   const seen = new Set(getParam(db, taskId, REVIEWED_KEY) ?? []);
-  const all = db.all(`SELECT id, node_id, subject_key, statement, verification, recorded_at FROM assumptions
+  const all = db.all(`SELECT id, node_id, subject_key, statement, verification, audience, recorded_at FROM assumptions
                       WHERE task_id=? AND verified_against='settled_by_me' AND superseded_at IS NULL AND status<>'confirmed' ORDER BY recorded_at, rowid`, taskId);
   // 同一步重做过（返工 / 计划变更）：只认它最近一次交接里的说法 —— 前一次的已被取代（例：
   // AI 早先说"冒烟不清理"，后来改成了备份还原，事项不能还摘着旧的）。
@@ -61,7 +68,7 @@ export function raiseChoiceReviews(db, { taskId, at = now() }) {
       if (!items.length) continue;
       const qid = newId('q');
       const shown = items.slice(0, MAX_ITEMS);
-      const what = domain === 'structural' ? tl(L, '依赖、构建或仓库结构上') : tl(L, '规格没写、界面或行为上');
+      const what = domain === 'structural' ? tl(L, '实现细节上（接口格式、代码结构、依赖或构建）') : tl(L, '规格没写、界面或行为上');
       const text = [
         `${markOf(L, 'choices')}${tl(L, '任务「{title}」做的时候，{what}有 {n} 件事是 AI 自己定的（规格里没写，它查过之后自己选了一个）。下面是它交接时的原话，系统原样摘出来，没有改写：', { title: task.title, what, n: items.length })}`,
         '',
@@ -75,8 +82,7 @@ export function raiseChoiceReviews(db, { taskId, at = now() }) {
         tl(L, '- 不答：到期按"沿用 AI 的选择"了结。'),
       ].join('\n');
       const ttl = timeoutFor(db, taskId, 2);
-      db.run(`INSERT INTO questions (id,task_id,node_id,level,level_source,text,default_action,asked_at,timeout_at,status)
-              VALUES (?,?,NULL,2,'hard_rule',?,?,?,?,'open')`, qid, taskId, text, tl(L, '沿用 AI 的选择，不改'), at, ttl ? at + ttl : null);
+      insertQuestion(db, { id: qid, taskId, level: 2, text, defaultAction: tl(L, '沿用 AI 的选择，不改'), askedAt: at, timeoutAt: ttl ? at + ttl : null });
       // 主题键的开头也算（frontend.priority.label → frontend）：原话里常常没有路径（只看原话，界面上的取舍会落不到管界面的人手上）
       const keyDirs = items.map((a) => String(a.subject_key).match(/^(frontend|backend|client|server|web|api|ui|app)[._/-]/i)?.[1]?.toLowerCase()).filter(Boolean);
       const pf = [...new Set([...prefixesIn(items.map((a) => `${a.subject_key} ${a.statement}`).join('\n')), ...keyDirs])];
@@ -104,7 +110,7 @@ function leadOnlyInformed(db, { questionId, taskId }) {
   const rows = JSON.parse(q.route || 'null')?.rows ?? [];
   if (!lead || !to.includes(lead) || !to.some((u) => u !== lead) || !rows.every((r) => String(r.quorum) === '1')) return;
   const informed = [...new Set([...JSON.parse(q.informed || '[]'), lead])];
-  db.run(`UPDATE questions SET addressed_to=?, informed=? WHERE id=?`, JSON.stringify(to.filter((u) => u !== lead)), JSON.stringify(informed), questionId);
+  setRecipients(db, questionId, { addressedTo: to.filter((u) => u !== lead), informed });
 }
 
 /**
@@ -162,12 +168,11 @@ export function answerChoices(db, { question, finalBody, by, messageId, at = now
   // 还没合并：一条修正交给 AI 改这个任务（与"交回给人"那几种同一个形状：答复原文 + 系统附上的原委）
   const tok = messageId ? db.one(`SELECT token_id FROM messages WHERE id=?`, messageId)?.token_id ?? null : null;
   const mid = newId('m');
-  db.run(`INSERT INTO messages (id,task_id,sender_id,body,kind,kind_source,urgency,urgency_source,trust_label,token_id,received_at)
-          VALUES (?,?,?,?,'correction','explicit','urgent','explicit','user-authenticated',?,?)`,
-  mid, taskId, by, `${markOf(L, 'choices')}${tl(L, '{who}对 AI 替人定的事要改：', { who })}\n${body}\n\n${tl(L, '—— 系统附（不由模型生成）：当时 AI 定的 ——')}\n${listing}`, tok, at);
+  insertUserMessage(db, { id: mid, taskId, senderId: by, tokenId: tok, kind: 'correction', urgency: 'urgent', receivedAt: at,
+    body: `${markOf(L, 'choices')}${tl(L, '{who}对 AI 替人定的事要改：', { who })}\n${body}\n\n${tl(L, '—— 系统附（不由模型生成）：当时 AI 定的 ——')}\n${listing}` });
   if (messageId) insertEdge(db, mid, messageId, 'derived_from', at);
   if (task.status === 'done') {
-    db.run(`UPDATE tasks SET status='running' WHERE id=?`, taskId);
+    transition(db, 'tasks', taskId, 'running');
     audit(db, { actorKind: 'user', actorId: by, action: 'task_resumed', targetType: 'task', targetId: taskId, payload: { from: 'done', to: 'running', via: 'choices_review' } });
   }
   audit(db, { actorKind: 'user', actorId: by, action: 'message_received', targetType: 'task', targetId: taskId,

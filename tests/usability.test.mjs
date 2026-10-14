@@ -140,11 +140,21 @@ section('⑤ 截图说明接了后端却没写 seed → 补一步放样例数据
   assert(!!db.one(`SELECT 1 FROM audit_log WHERE action='preview_seed_node_added' AND target_id=?`, a.tid), '接了后端、没写 seed → 系统补了一步"给截图放样例数据"');
   eq(db.all(`SELECT status FROM nodes WHERE task_id=?`, a.tid).map((n) => n.status).join(','), 'done,done', '两步都做完（原来那步 + 补的那步）');
   assert(!!db.one(`SELECT value FROM params WHERE task_id=? AND key=?`, a.tid, PREVIEW_SEED_NODE_KEY), '记下补过了（每个任务只补一次）');
+  const withSeedFile = (tid, ws) => { mkdirSync(join(ws, 'backend'), { recursive: true }); writeFileSync(join(ws, 'backend', 'seed.py'), 'print(1)\n'); };
   const b = await run('withseed', [
     call('write_file', { path: 'frontend/index.html', content: '<h1>待办</h1>\n' }), call('submit_handoff', H('frontend/index.html')),
-  ], spec(['python backend/seed.py']));
+  ], spec(['python backend/seed.py']), undefined, withSeedFile);
   eq(b.r.kind, 'complete', '写了 seed 的照常做完');
   assert(!db.one(`SELECT 1 FROM audit_log WHERE action='preview_seed_node_added' AND target_id=?`, b.tid), '写了 seed → 不补');
+  // seed 指着的脚本不在了（越界被撤回）→ 与没写 seed 同样补一步，并说清是哪个文件
+  const b2 = await run('brokenseed', [
+    call('write_file', { path: 'frontend/index.html', content: '<h1>待办</h1>\n' }), call('submit_handoff', H('frontend/index.html')),
+    call('write_file', { path: 'frontend/seed_preview.py', content: 'print(1)\n' }), call('write_file', { path: 'si-preview.json', content: spec(['python frontend/seed_preview.py']) }), call('submit_handoff', H('si-preview.json')),
+  ], spec(['python backend/seed.py']));
+  eq(b2.r.kind, 'complete', 'seed 指着不存在的脚本：照常做完');
+  const seedAdded = db.one(`SELECT payload FROM audit_log WHERE action='preview_seed_node_added' AND target_id=?`, b2.tid);
+  eq(JSON.parse(seedAdded?.payload ?? '{}').missing, ['backend/seed.py'], '补了一步"给截图放样例数据"，审计记下哪个文件不在');
+  assert(/backend\/seed\.py 在仓库里不存在/.test(db.one(`SELECT spec FROM nodes WHERE task_id=? ORDER BY created_at DESC, rowid DESC LIMIT 1`, b2.tid).spec), '补的那一步开头说清是哪个文件不在了');
   // 并行开发的骨架任务只有桩，列表接口没数据：不补 seed 那步（桩接口给不出数据，那步验收不可能过）
   const c = await run('skeleton', [
     call('write_file', { path: 'frontend/index.html', content: '<h1>stub</h1>\n' }), call('submit_handoff', H('frontend/index.html')),
@@ -193,6 +203,7 @@ section('⑤ 截图说明接了后端却没写 seed → 补一步放样例数据
     eq(h.r.kind, 'complete', '后端任务照常做完');
     assert(db.one(`SELECT 1 FROM audit_log WHERE action='preview_skipped' AND target_id=?`, h.tid), '只改了后端 → 记下"没碰界面，不截"');
     assert(!db.one(`SELECT 1 FROM audit_log WHERE action IN ('preview_captured','preview_failed') AND target_id=?`, h.tid), '没有去截图');
+    assert(!db.one(`SELECT 1 FROM audit_log WHERE action='preview_seed_node_added' AND target_id=?`, h.tid), 'seed 指着不存在的脚本、但只改了后端 → 不补样例数据那一步（样例数据只由碰界面的任务接手）');
   }
 
   section('⑦ 并行骨架做完、契约与规格对不上 → 补一步让骨架补上（只补一次），不提事项给人');

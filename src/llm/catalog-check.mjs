@@ -16,6 +16,8 @@ import { headersFor, listEndpointModels, ADAPTER_DEFAULTS } from './registry.mjs
 import { audit, now } from '../db/db.mjs';
 import { dueAfter, isValidAfter } from '../core/routing.mjs';
 import { I18nError, tl, N_ } from '../i18n/index.mjs';
+import { withTimeout } from '../core/http.mjs';
+import { deflateSync, crc32 } from 'node:zlib';
 
 /** 归一化模型名用于跨表匹配：去掉日期后缀与 ./- 差异 */
 export const normId = (s) => String(s).replace(/-?20\d{6}$/, '').replace(/[.-]/g, '').toLowerCase();
@@ -36,7 +38,7 @@ export async function listVendorModels(vendorId, { vendors = VENDORS, env = proc
 /** OpenRouter 公开表（无需 key）：normId → { id, input, output, cacheRead, cacheWrite（$/M token）, expires, efforts, context } */
 export async function openRouterTable({ fetchFn = globalThis.fetch } = {}) {
   try {
-    const j = await jsonOf(await fetchFn('https://openrouter.ai/api/v1/models'));
+    const j = await jsonOf(await fetchFn('https://openrouter.ai/api/v1/models', withTimeout()));
     const map = new Map();
     const per = (x) => (x == null ? null : Number(x) * 1e6);
     for (const m of j.data ?? []) {
@@ -56,10 +58,50 @@ export async function probeModel(entry, { vendors = VENDORS, env = process.env, 
   const adapter = PROVIDERS[entry.adapter ?? v.adapter];
   const canon = { tier: 'x', maxTokens: 16, messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }] };
   try {
-    const res = await fetchFn(adapter.endpoint(entry.model, v.baseUrl), { method: 'POST', headers: headersFor(adapter, v, key), body: JSON.stringify(adapter.buildRequest(canon, entry.model)) });
+    const res = await fetchFn(adapter.endpoint(entry.model, v.baseUrl), withTimeout({ method: 'POST', headers: headersFor(adapter, v, key), body: JSON.stringify(adapter.buildRequest(canon, entry.model)) }));
     if (res.ok) return 'ok';
     const j = await res.json().catch(() => ({}));
     return `HTTP ${res.status}: ${String(j.error?.message ?? '').slice(0, 90)}`;
+  } catch (e) { return `ERR: ${e.message}`; }
+}
+
+/** 64×64 纯红 PNG（base64）：收图实测用。现做，不往仓库里放二进制。 */
+export function redPng(size = 64) {
+  const row = Buffer.concat([Buffer.from([0]), Buffer.alloc(size * 3, Buffer.from([255, 0, 0]))]);   // 每行：过滤字节 0 + RGB
+  const chunk = (type, data) => {
+    const len = Buffer.alloc(4); len.writeUInt32BE(data.length);
+    const crc = Buffer.alloc(4); crc.writeUInt32BE(crc32(Buffer.concat([Buffer.from(type), data])) >>> 0);
+    return Buffer.concat([len, Buffer.from(type), data, crc]);
+  };
+  const ihdr = Buffer.alloc(13); ihdr.writeUInt32BE(size, 0); ihdr.writeUInt32BE(size, 4); ihdr[8] = 8; ihdr[9] = 2;   // 8 位、真彩色
+  return Buffer.concat([Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]), chunk('IHDR', ihdr),
+    chunk('IDAT', deflateSync(Buffer.concat(Array(size).fill(row)))), chunk('IEND', Buffer.alloc(0))]).toString('base64');
+}
+
+/**
+ * 收图实测（应用验收验收员看截图的前提）：走和验收员截图**同一条路** —— 图挂在工具结果上 —— 问图是什么颜色。
+ * 返回 'yes'（看懂了）| 'blind: …'（收了但没看出来：多半被网关 / 适配层换成了文字）| 'rejected: …'（服务商拒收图片）| 'no-key' | 'ERR: …'。
+ * 花费：一次几百 token。
+ */
+export async function probeVision(entry, { vendors = VENDORS, env = process.env, fetchFn = globalThis.fetch } = {}) {
+  const v = vendors[entry.vendor];
+  const key = env[v?.keyEnv];
+  if (!key) return 'no-key';
+  const adapter = PROVIDERS[entry.adapter ?? v.adapter];
+  const canon = { tier: 'x', maxTokens: 1024, effort: 'low',
+    tools: [{ name: 'screenshot', description: 'Take a screenshot of the page.', parameters: { type: 'object', properties: {} } }],
+    messages: [
+      { role: 'user', content: [{ type: 'text', text: 'Take a screenshot, then tell me the dominant color of the screenshot. Answer with one English word.' }] },
+      { role: 'assistant', content: [{ type: 'tool_call', id: 'probe1', name: 'screenshot', args: {} }] },
+      { role: 'tool_results', results: [{ callId: 'probe1', name: 'screenshot', content: 'Screenshot attached.', images: [{ mediaType: 'image/png', data: redPng() }] }] },
+    ] };
+  try {
+    const res = await fetchFn(adapter.endpoint(entry.model, v.baseUrl), withTimeout({ method: 'POST', headers: headersFor(adapter, v, key),
+      body: JSON.stringify(adapter.buildRequest({ ...canon, gateway: v.gateway, providerPrefs: entry.providerPrefs }, entry.model)) }));
+    const j = await res.json().catch(() => ({}));
+    if (!res.ok) return `rejected: HTTP ${res.status}: ${String(j.error?.message ?? JSON.stringify(j)).slice(0, 120)}`;
+    const text = (adapter.parseResponse(j).content ?? []).filter((b) => b.type === 'text').map((b) => b.text).join(' ').trim();
+    return /\bred\b/i.test(text) ? 'yes' : `blind: ${text.slice(0, 80) || '(没有文字回答)'}`;
   } catch (e) { return `ERR: ${e.message}`; }
 }
 
@@ -68,7 +110,7 @@ export async function probeModel(entry, { vendors = VENDORS, env = process.env, 
  * level：OK / SKIP / INFO / WARN / FAIL；warnings 只数 WARN + FAIL。`only`：只查某个 vendor。
  */
 // 发现写进审计、给所有人看：按部署的内容语言写（调用方传 contentLang(db)）
-export async function checkCatalog({ catalog = MODEL_CATALOG, vendors = VENDORS, env = process.env, fetchFn = globalThis.fetch, probe = false, only = null, at = now(), lang = 'zh' } = {}) {
+export async function checkCatalog({ catalog = MODEL_CATALOG, vendors = VENDORS, env = process.env, fetchFn = globalThis.fetch, probe = false, vision = false, only = null, at = now(), lang = 'zh' } = {}) {
   const fetchErrors = [];
   const vendorIds = [...new Set(Object.values(catalog).map((e) => e.vendor))].filter((v) => !only || v === only);
   const lists = Object.fromEntries(await Promise.all(vendorIds.map(async (v) => {
@@ -86,6 +128,14 @@ export async function checkCatalog({ catalog = MODEL_CATALOG, vendors = VENDORS,
     const findings = [];
     const say = (level, tpl, params) => { const msg = tl(lang, tpl, params); if (level === 'WARN' || level === 'FAIL') warnings++; findings.push({ level, msg }); };
     const v = vendors[entry.vendor];
+    // E. 收图（--vision，实调）：和目录里的 vision 标记对照。只报告，不改目录
+    if (vision) {
+      const r = await probeVision(entry, { vendors, env, fetchFn });
+      if (r === 'no-key') say('SKIP', N_('无 key，跳过收图实测'));
+      else if (r === 'yes') say(entry.vision ? 'OK' : 'INFO', entry.vision ? N_('收图实测：看得懂截图，与目录一致') : N_('收图实测：看得懂截图，但目录没标 vision —— 验收员现在只拿得到文字版页面；核实后可在目录里标上'));
+      else if (r.startsWith('rejected') || r.startsWith('blind')) say(entry.vision ? 'WARN' : 'OK', entry.vision ? N_('收图实测：目录标了 vision，实际看不了图 —— {r}') : N_('收图实测：看不了图，与目录一致（{r}）'), { r });
+      else say('FAIL', N_('收图实测失败 —— {r}'), { r });
+    }
     if (v?.gateway) {
       say('SKIP', N_('网关服务商：按回报计费，不做模型级单价漂移检查'));
       if (entry.providerPrefs) say('OK', N_('已钉上游偏好 {prefs}'), { prefs: JSON.stringify(entry.providerPrefs) });
@@ -136,7 +186,7 @@ export async function checkCatalog({ catalog = MODEL_CATALOG, vendors = VENDORS,
     if (declaredEfforts !== orRow.efforts) say('WARN', N_('推理强度支持声明不一致：目录={mine}，OpenRouter={theirs}'), { mine: yn(declaredEfforts), theirs: yn(orRow.efforts) });
     entries.push({ key, model: entry.model, vendor: entry.vendor, findings });
   }
-  return { checkedAt: at, probe, keys: entries.map((e) => e.key), entries, warnings, fetchErrors };
+  return { checkedAt: at, probe, vision, keys: entries.map((e) => e.key), entries, warnings, fetchErrors };
 }
 
 /** 纯文本报告。`onlyProblems`：只列有 WARN / FAIL 的模型（通知与摘要用）。 */
@@ -159,7 +209,7 @@ export function recordCatalogCheck(db, r, { by = 'daemon', actorKind = 'system',
   for (const e of r.entries) for (const f of e.findings) if (f.level === 'WARN' || f.level === 'FAIL') lines.push(`${e.key}：${f.msg}`);
   for (const e of r.fetchErrors) lines.push(tl(lang, '拉取失败：{e}', { e }));   // 排最后：摘要只截前几行，真发现要在前面
   audit(db, { actorKind, actorId: by, action: 'catalog_checked', targetType: 'catalog', targetId: 'model_catalog',
-    payload: { checkedAt: r.checkedAt, probe: r.probe, keys: r.keys, warnings: r.warnings, fetchErrors: r.fetchErrors.length, lines: lines.slice(0, 60) } });
+    payload: { checkedAt: r.checkedAt, probe: r.probe, vision: !!r.vision, keys: r.keys, warnings: r.warnings, fetchErrors: r.fetchErrors.length, lines: lines.slice(0, 60) } });
 }
 export function lastCatalogCheck(db) {
   const row = db.one(`SELECT ts, payload FROM audit_log WHERE action='catalog_checked' ORDER BY id DESC LIMIT 1`);

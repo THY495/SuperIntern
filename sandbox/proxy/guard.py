@@ -65,6 +65,14 @@ def allowed_group(host):
 READ_METHODS = {"GET", "HEAD", "OPTIONS"}
 
 
+def is_read(method, path):
+    """算不算读。git 走 HTTPS 拉取（clone / fetch）是 POST …/git-upload-pack：请求体只是"我要哪些、我已有哪些"，
+    语义是读 —— 只读的源（以及带凭据时被收窄成只读的源）上要放行它，不然 git clone 不了。推送是 git-receive-pack，照拦。"""
+    if method.upper() in READ_METHODS:
+        return True
+    return method.upper() == "POST" and path.split("?", 1)[0].endswith("/git-upload-pack")
+
+
 def read_only(host):
     """这个域是否只读。同一个域出现在多个源里时，只要有一个源允许写，就算可写。"""
     hits = [r for r in ALLOW if match_host(host, r.get("host", ""))]
@@ -79,6 +87,9 @@ def cred_rule_for(host, path, method):
             continue
         methods = r.get("methods")
         if methods and method.upper() not in [m.upper() for m in methods]:
+            continue
+        # 只在读请求上带（含 git 拉取的 POST …/git-upload-pack；推送不带）
+        if r.get("readOnly") and not is_read(method, path):
             continue
         return i, r
     return None, None
@@ -127,11 +138,11 @@ class EgressGuard:
             )
             return
 
-        if read_only(host) and method.upper() not in READ_METHODS:
+        if read_only(host) and not is_read(method, path):
             audit(phase="request", host=host, method=method, path=path,
                   allowed=False, group=group, action="denied_method")
             flow.response = http.Response.make(
-                403, b"egress denied: this source is read-only (GET/HEAD/OPTIONS only)\n", {"Content-Type": "text/plain"}
+                403, b"egress denied: this source is read-only (GET/HEAD/OPTIONS and git fetch only)\n", {"Content-Type": "text/plain"}
             )
             return
 

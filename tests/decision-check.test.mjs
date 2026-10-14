@@ -113,6 +113,19 @@ section('2 · 命中与不命中');
     llmClient: client(resp('前面一段废话 ```json\n{"hits":[]}\n``` 后面一段'), resp({ hits: [] })) });
   eq(r.skipped, null, '包在代码块里的 JSON 抠得出来');
 }
+{
+  // Kimi 的推理把 800 的上限吃光、正文为空；重试时把空回复塞回去，Moonshot 回 400 → 这道检查等于没做
+  const ds = [{ id: 'dr_a', subject: 'x', statement: 'y', source_kind: 'question' }];
+  const seen = [];
+  const replies = [{ stopReason: 'max_tokens', content: [{ type: 'thinking', text: '想了很久……' }], usage: { inputTokens: 10, outputTokens: 2000 } }, resp({ hits: [] })];
+  const c = new LlmClient({ mode: 'fake', fake: { respond: (canon) => { seen.push(canon); return replies.shift(); } } });
+  const r = await checkDecisions('说点别的', { decisions: ds, llmClient: c });
+  eq(r.skipped, null, '推理吃光上限、正文为空：放宽上限再问一次就拿到了');
+  eq(seen.length, 2, '问了两次');
+  assert(seen[1].maxTokens > seen[0].maxTokens, `第二次放宽了上限（${seen[0].maxTokens} → ${seen[1].maxTokens}）`);
+  assert(!seen[1].messages.some((m) => m.role === 'assistant'), '没把空回复塞回对话里');
+  assert(seen[0].maxTokens >= 2000, `上限不再是 800（${seen[0].maxTokens}）`);
+}
 
 section('3 · 命中之后找谁（三个特例）');
 

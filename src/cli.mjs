@@ -9,18 +9,20 @@ import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { openDb, ensureOwner, newId, now, audit, authenticate } from './db/db.mjs';
+import { updateUser } from './db/users.mjs';
 import { recordAnswer, sayWithClassifier } from './core/inbox.mjs';
-import { orchestrate, getParam } from './core/orchestrator.mjs';
+import { orchestrate } from './core/orchestrator.mjs';
 import { LlmClient, loadEnv } from './llm/client.mjs';
 import { sweepTimeouts } from './core/timeouts.mjs';
 import { createProject, advanceProject, deliverProject, projectTasks, createTaskFromSpec, acceptDeferredSignoffs, deliveryEvidence } from './core/project.mjs';
 import { planProject, carrierTask, renderPlanOutcome } from './agent/project-planner.mjs';
 import { deliverTask, signOff, signoffOf } from './core/deliver.mjs';
-import { notify, channelsFromEnv, outcomeNotice } from './core/notify.mjs';
+import { notify, channelsFromEnv, outcomeNotice, INVARIANT_NAMES, INVARIANT_PROBLEMS } from './core/notify.mjs';
 import { startWeb } from './web/server.mjs';
 import { makeLauncher } from './core/launcher.mjs';
 import { startDaemon, dueTasks, daemonStatus, assessTask } from './core/daemon.mjs';
 import { stalls, livelocks, sweepLiveness, STALL_KINDS } from './core/liveness.mjs';
+import { sweepInvariants, invariantsView, invariantLine } from './core/invariants.mjs';
 import { activeDecisions, renderDecisions, voidOne as voidDecision, revisionCheckText } from './core/decisions.mjs';
 import { afterInput } from './core/decision-check.mjs';
 import { checkRepoSource } from './core/repos.mjs';
@@ -30,9 +32,10 @@ import { listMembers, setMember, removeMember, setVisibility, editProjectGoal, V
 import { draft } from './agent/elicitor.mjs';
 import { getParam as getTaskParam } from './core/params.mjs';
 import { makeFake } from './llm/providers.mjs';
-import { fmtUsd, toolCallsOf, TIERS } from './llm/canonical.mjs';
-import { registryFor, bindingOf, seedBinding, pickDefaultBinding, setBinding, bindingProblems, endpointsOf, catalogOf, saveEndpoint, setEndpointEnabled, removeEndpoint,
-  testEndpoint, listEndpointModels, keyPresence, bindable, saveModel, removeModel, checkableCatalog } from './llm/registry.mjs';
+import { fmtUsd, toolCallsOf, TIERS, LLM_ROLES } from './llm/canonical.mjs';
+import { registryFor, bindingOf, seedBinding, pickDefaultBinding, setBinding, setFallback, bindingProblems, endpointsOf, catalogOf, saveEndpoint, setEndpointEnabled, removeEndpoint,
+  testEndpoint, listEndpointModels, keyPresence, bindable, saveModel, removeModel, checkableCatalog,
+  rolesView, setRoleBinding, pickVerifierModel } from './llm/registry.mjs';
 import { spawnSync, execFileSync } from 'node:child_process';
 import { listReports, markReportsRead } from './agent/reporter.mjs';
 import { flushLedger, taskSpendMicroUsd } from './core/ledger.mjs';
@@ -44,21 +47,59 @@ import { replay, renderReplay } from './core/replay.mjs';
 import { pendingRevision, nodesForReplan, gateOf, renderDiff, applyRevision,
   rejectRevision } from './core/revision.mjs';
 import { ContainerExecutor, makeSandbox, listSandboxes, detectRuntime, SANDBOX_IMAGE } from './core/container.mjs';
-import { egressGroupsOf, setEgressGroups, allowlistOf, sourceOf, sourceForHost, egressSources, addSource, removeSource,
+import { addSourceCredential, revokeSourceCredential, sourceCredentials } from './core/egress-creds.mjs';
+import { egressGroupsOf, setEgressGroups, allowlistOf, sourceOf, sourceForHost, egressSources, addSource, removeSource, secretLike,
   projectEgressOf, setProjectEgress, openEgressQuestions, deniedHosts } from './core/egress.mjs';
 import { DECISION_TYPES, loadTemplates, rulesOf, profileOf, knobsOf, setKnobs, applyTemplate, saveRules, diffFromTemplate, previewRouting,
-  dutyCalendarOf, setDutyCalendar, transferQuestion, leadOfKey, validateRules } from './core/routing.mjs';
-import { addUser, usersView, setUserTags, setUserChannel, removeUserChannel, setUserRole, renameUser, reissueToken, notifyPendingQuestions } from './core/users.mjs';
+  dutyCalendarOf, dutyView, setDutyCalendar, dutyStartAt, setDutyOverrides, transferQuestion, leadOfKey, validateRules } from './core/routing.mjs';
+import { deployTz, calendarOf, viewerTz } from './core/calendar.mjs';
+import { fmtAt, validDayKey, zonedTime, validTz, dayKey, addDaysKey, isBusinessDay, weekdayOfKey, systemTz } from './core/tz.mjs';
+// 命令行里的时刻：按部署时区写、带 UTC+8 这样的标记（原来是不标时区的 UTC）
+const when = (db, ms, o) => fmtAt(ms, deployTz(db), o);
+import { addUser, usersView, setUserTags, setUserChannel, removeUserChannel, setUserRole, renameUser, setGitIdentity, reissueToken, notifyPendingQuestions } from './core/users.mjs';
+import { issueToken, tokensOf, activeTokens, revokeTokenBy, revokeAllOf, createInvite, invitesList, revokeInviteBy, addServiceAccount } from './core/sessions.mjs';
+import { spendByPerson, setPersonBudget } from './core/spend.mjs';
+import { listCredentials, addCredential, revokeCredential, checkAccess, setAppOAuth } from './core/credentials.mjs';
+import { githubLoginConfig, isOrgMember } from './core/github-login.mjs';
+import { safePositional } from './core/git.mjs';
 import { buildDigest, renderDigest, sendDigest, renderHandover, sendHandoverNotice } from './core/digest.mjs';
 import { canCreate, getSetting, setSetting, SETTINGS } from './core/settings.mjs';
+import { sqliteAdvice } from './core/sqlite-check.mjs';
+import { dbHealth } from './db/health.mjs';
+import { healthView } from './llm/health.mjs';
+import { backupNow, listBackups, checkDb, restoreFile } from './db/backup.mjs';
+import { PROC_ENV } from './core/lifetimes.mjs';
+import { installLogSink, setLogBase } from './core/log.mjs';
+import { flushSpans } from './core/otel.mjs';
 import { permissionsOf, renderPermissions } from './core/permissions.mjs';
 import { reopenTask, redoProjectTask, abortProject, renameTask, renameProject, setTaskArchived, setProjectArchived } from './core/lifecycle.mjs';
 import { previewHandover, executeHandover, requestHandover, listHandoverRequests, decideHandoverRequest, canDecideHandover, disableUser, enableUser } from './core/handover.mjs';
 import { checkCatalog, renderCatalogCheck, recordCatalogCheck, lastCatalogCheck } from './llm/catalog-check.mjs';
 import { tl, translateError, userLang, contentLang, normLang, CATALOGS } from './i18n/index.mjs';
+import { parseTraceQuery, traceCommit, traceLine, renderTrace } from './core/trace.mjs';
+import { transition } from './db/state.mjs';
+import { useEnvProxy } from './core/net-proxy.mjs';
+import { allowTestChanges, testsAllowedFor, latestTestChanges } from './core/test-guard.mjs';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 loadEnv(join(ROOT, '.env'));
+// 出网走 HTTPS_PROXY / HTTP_PROXY（与 git 一致；.env 里写的也算，所以放在 loadEnv 之后）。见 core/net-proxy.mjs
+const PROXY = useEnvProxy();
+// 看板 / 守护进程启动时说一次的提示：出网代理、数据目录（看板带着守护进程时只说一次）
+let proxySaid = false;
+function sayStartupNotes() {
+  if (proxySaid) return;
+  proxySaid = true;
+  const line = PROXY.enabled ? tl(lang(), '  出网走代理 {proxy}（HTTPS_PROXY / HTTP_PROXY；本机地址与 NO_PROXY 里的直连）', { proxy: PROXY.proxy })
+    : PROXY.why === 'unsupported' ? tl(lang(), '  ⚠ 设了 HTTPS_PROXY，但这个 Node 不支持让 fetch 走代理：GitHub 登录、模型调用会直连。升级 Node，或启动时加 --use-env-proxy') : null;
+  if (line) console.log(line);
+  // --db 指到数据目录外、又没设 SUPERINTERN_HOME：心跳、日志、工作区仍写在默认数据目录（多半是另一个部署的）。
+  // 2026-10-13 走查时测试看板就这样把守护进程心跳写进了真部署的目录
+  const norm = (p) => (process.platform === 'win32' ? resolve(p).toLowerCase() : resolve(p));
+  if (flags.db && !process.env.SUPERINTERN_HOME && norm(dirname(String(flags.db))) !== norm(HOME)) {
+    console.log(tl(lang(), '  ⚠ 库在 {db}，但数据目录仍是 {home}（守护进程心跳、日志、任务工作区写在那里）。这是另一个部署的目录的话，请设 SUPERINTERN_HOME 指向自己的目录', { db: String(flags.db), home: HOME }));
+  }
+}
 
 const HOME = process.env.SUPERINTERN_HOME ?? join(process.cwd(), '.superintern');
 const TOKEN_FILE = join(HOME, 'cli-token');
@@ -131,7 +172,7 @@ function cmdInit(db, flags = {}) {
     say();
   } else {
     if (name) {
-      db.run(`UPDATE users SET display_name=? WHERE id=?`, name, userId);
+      updateUser(db, userId, { displayName: name });
       audit(db, { actorKind: 'user', actorId: userId, action: 'user_renamed', targetType: 'user', targetId: userId, payload: { name } });
       console.log(tl(lang(), '库已就绪，管理员 {userId} 显示名改为 {name}', { userId, name }));
     } else {
@@ -173,7 +214,7 @@ function cmdNew(db, { flags, positional }) {
 
   // 落库与项目层同一份函数（project.mjs createTaskFromSpec）：宪法块 v1 是"当时被要求什么"这一层出处的根，
   // 验收命令进 constitutional 参数 —— 库层 CHECK 保证 agent 永远改不了它。
-  const { taskId, constId } = createTaskFromSpec(db, { ...spec, verify_command: verifyArgv ? verifyArgv.join(' ') : undefined }, { userId });
+  const { taskId, constId } = createTaskFromSpec(db, { ...spec, verify_command: verifyArgv ? verifyArgv.join(' ') : undefined }, { userId, approvedBy: userId });
   console.log(tl(lang(), '任务 {taskId}  宪法块 {constId}\n  {title}', { taskId, constId, title: spec.title }));
   if (verifyArgv?.length) console.log(tl(lang(), '  任务级验收命令：{cmd}（宪法层参数，agent 不可自改）', { cmd: verifyArgv.join(' ') }));
   else console.log(tl(lang(), '  ⚠️ 没给 --verify —— 全部节点完成后没有任务级机械判据，任务会直接置 done'));
@@ -245,7 +286,7 @@ async function cmdPlan(db, taskId, flags) {
   const nodeIds = persistPlan(db, {
     taskId, constitutionId: constitution.id, nodes: result.nodes, rationale: result.rationale,
   });
-  db.run(`UPDATE tasks SET status='running' WHERE id=?`, taskId);
+  transition(db, 'tasks', taskId, 'running');
 
   console.log(tl(lang(), '\n规划成功：{n} 个节点，第 {attempts} 次尝试通过', { n: nodeIds.length, attempts: result.attempts }));
   if (result.rejections.length) {
@@ -371,14 +412,37 @@ async function bindForLongRunner(db, flags, who) {
   printBinding(db, r);
 }
 
+// 一个服务商（网关按模型）眼下的状况，一句话
+const healthLine = (h) => [
+  h.state === 'open' ? tl(lang(), '连着出错，系统暂时不调用它；{t} 之后第一个要用它的步骤会先试一次', { t: new Date(h.reopenAt).toLocaleTimeString() }) : h.state === 'half_open' ? tl(lang(), '连着出错，系统暂时不调用它；下一个要用它的步骤会先试一次') : null,
+  h.backoffUntil ? tl(lang(), '被限流，所有进程一起等到 {t}', { t: new Date(h.backoffUntil).toLocaleTimeString() }) : null,
+  h.recentFails ? tl(lang(), '最近 5 分钟 {f}/{n} 次出错', { f: h.recentFails, n: h.recentTotal }) : null,
+  h.fallbackSince ? tl(lang(), '换用过备用模型') : null,
+  h.lastStatus || h.lastError ? tl(lang(), '最近一次：{e}', { e: `${h.lastStatus ? `HTTP ${h.lastStatus} ` : ''}${String(h.lastError ?? '').slice(0, 80)}` }) : null,
+].filter(Boolean).join(tl(lang(), '；'));
+
 function printBinding(db, b = bindingOf(db)) {
   const reg = registryFor(db);
   console.log(b.source === 'db' ? tl(lang(), '档位绑定（库）：') : tl(lang(), '档位绑定（代码默认值，库里还没写）：'));
   for (const t of TIERS) {
     const m = reg.catalog[b.binding[t]];
-    console.log(`  ${t.padEnd(8)} ${b.binding[t]}${b.efforts?.[t] ? tl(lang(), '  推理强度 {effort}', { effort: b.efforts[t] }) : ''}${m ? `  → ${m.vendor} · ${m.model}` : tl(lang(), '  （不在目录里）')}`);
+    console.log(`  ${t.padEnd(8)} ${b.binding[t]}${b.efforts?.[t] ? tl(lang(), '  推理强度 {effort}', { effort: b.efforts[t] }) : ''}${m ? `  → ${m.vendor} · ${m.model}` : tl(lang(), '  （不在目录里）')}`
+      + (b.fallbacks?.[t] ? tl(lang(), '  备用 {key}', { key: b.fallbacks[t] }) : ''));
   }
+  // 没合上的熔断、正在退避的、换用过备用的
+  for (const h of healthView(db)) console.log(tl(lang(), '  ⚠ {key}：{state}', { key: h.key, state: healthLine(h) }));
   for (const p of bindingProblems(db, { env: process.env })) console.log(tl(lang(), '  ⚠ {tier}：{why}', { tier: p.tier, why: dyn(p.why) }));
+  // 各角色（单独绑了的标出来）与验收员的异厂商策略
+  console.log(tl(lang(), '角色（没单独绑的跟着档位）：'));
+  for (const r of rolesView(db)) {
+    console.log(`  ${r.role.padEnd(16)} ${r.override ? `${r.override.key}${r.override.effort ? tl(lang(), '  推理强度 {effort}', { effort: r.override.effort }) : ''}${tl(lang(), '  （单独绑定）')}` : r.tier ? tl(lang(), '跟着 {tier} 档', { tier: r.tier }) : tl(lang(), '跟着各步骤的档位（规划器定）')}`);
+  }
+  const policy = getSetting(db, 'deploy.verifier_vendor');
+  console.log(tl(lang(), '验收员：{policy}；高风险步骤会签：{cosign}', { policy: policy === 'different' ? tl(lang(), '与执行器落在同一家时换一家') : tl(lang(), '不强求换一家'), cosign: getSetting(db, 'deploy.verifier_cosign') === 'high_risk' ? tl(lang(), '两家各验一次') : tl(lang(), '不用') }));
+  for (const k of [...new Set(TIERS.map((t) => reg.roleBinding.executor?.key ?? b.binding[t]))]) {
+    const v = pickVerifierModel(reg, { executorKey: k, policy });
+    console.log(tl(lang(), '  执行用 {exec} 时，验收用 {v}{note}', { exec: k, v: v.key, note: v.source === 'policy' ? tl(lang(), '（换了一家）') : v.note === 'only_maker' ? tl(lang(), '（同一家：没有第二家可用）') : v.sameMaker ? tl(lang(), '（同一家）') : '' }));
+  }
 }
 
 async function cmdRun(db, taskId, flags) {
@@ -604,6 +668,13 @@ async function cmdRun(db, taskId, flags) {
     console.log(tl(lang(), '  这一维**不支持加额**。节点已退回 pending（计一次重试）。'));
     console.log(tl(lang(), '  先看它在干什么：node src/cli.mjs replay {taskId}', { taskId }));
     process.exitCode = 1;
+  } else if (r.kind === 'sandbox_error') {
+    // 沙箱侧：容器运行时的管理命令失败。**不是节点的错**，不计重试。
+    console.log(tl(lang(), '⛔ 沙箱出了问题，编排器停止（pid {pid}）。完成 {n} 个节点。', { pid: r.pid, n: r.completed.length }));
+    console.log(`  ${r.error?.message ?? ''}`);
+    console.log(tl(lang(), '\n节点已退回 pending，**不计重试** —— 这不是节点的错。'));
+    console.log(tl(lang(), '  看看容器运行时：docker info / docker images（镜像在不在、容器起不起得来），好了再跑：node src/cli.mjs run {taskId}', { taskId }));
+    process.exitCode = 1;
   } else if (r.kind === 'provider_error') {
     // 厂商侧：403 / 重试耗尽的 5xx / 网络。**不是节点的错**，不计重试。
     // 档位是抽象槽 —— 换一家接着跑，业务代码一个字不用动。
@@ -632,7 +703,8 @@ async function cmdRun(db, taskId, flags) {
     console.log(tl(lang(), '  为什么要批：{gate}', { gate: dyn(r.gate) }));
     console.log(tl(lang(), '\n看细节：node src/cli.mjs revision {taskId}', { taskId }));
     console.log(tl(lang(), '批准：  node src/cli.mjs revision {taskId} --approve', { taskId }));
-    console.log(tl(lang(), '驳回：  node src/cli.mjs revision {taskId} --reject', { taskId }));
+    console.log(tl(lang(), '重出一版：node src/cli.mjs revision {taskId} --redo "要怎么改"（这一版不用，连同原修正重出一版）', { taskId }));
+    console.log(tl(lang(), '不要这份变更：node src/cli.mjs revision {taskId} --reject', { taskId }));
     console.log(tl(lang(), '批了但有保留意见：在批准后面再加 --reservation "…" —— 照批，那句话进约定清单、标〔保留意见〕，不改变任何一条'));
     process.exitCode = 1;
   } else if (r.kind === 'replan_failed') {
@@ -666,7 +738,7 @@ function cmdReports(db, taskId, flags) {
     const r = db.one(`SELECT * FROM reports WHERE id=? AND task_id=?`, flags.show, taskId) ?? die(tl(lang(), '没有这份汇报：{id}', { id: flags.show }));
     console.log(r.body);
     console.log(tl(lang(), '\n—— {by}｜装配自 {n} 条真相源记录', { by: r.generated_by === 'llm' ? tl(lang(), '模型生成摘要') : tl(lang(), '模板'), n: Object.values(JSON.parse(r.facts)).flat().length })
-      + `｜${new Date(r.created_at).toISOString().slice(0, 19)}${r.read_at ? tl(lang(), '｜已读') : ''}`);
+      + `｜${when(db, r.created_at, { seconds: true })}${r.read_at ? tl(lang(), '｜已读') : ''}`);
     if (!r.read_at) markReportsRead(db, [r.id]);
     return;
   }
@@ -674,7 +746,7 @@ function cmdReports(db, taskId, flags) {
   if (!rows.length) { console.log(flags.all ? tl(lang(), '任务 {taskId} 没有任何汇报。', { taskId }) : tl(lang(), '任务 {taskId} 没有未读汇报。（--all 看全部）', { taskId })); return; }
   for (const r of rows) {
     const gaps = JSON.parse(r.gaps);
-    console.log(`${r.read_at ? '  ' : '● '}${r.id}　${new Date(r.created_at).toISOString().slice(5, 16)}　[${r.trigger}${r.generated_by === 'template' ? tl(lang(), '/模板') : ''}]　${r.summary}`
+    console.log(`${r.read_at ? '  ' : '● '}${r.id}　${when(db, r.created_at)}　[${r.trigger}${r.generated_by === 'template' ? tl(lang(), '/模板') : ''}]　${r.summary}`
       + `${gaps.length ? `　⚠️${gaps.length}` : ''}`);
   }
   if (flags.read) { markReportsRead(db, rows.map((r) => r.id)); console.log(tl(lang(), '\n已标 {n} 份为已读。', { n: rows.length })); }
@@ -751,12 +823,17 @@ function cmdEgress(db, taskId, flags) {
 /** 联网目录（部署级，管理员维护）：看 / 加 / 删。 */
 function cmdSources(db, sub, args, flags) {
   if (!sub || sub === 'list') {
+    const creds = sourceCredentials(db);
     for (const s of egressSources(db)) {
       console.log(`${s.id}　${s.name}　[${dyn(s.kindName)}${s.readOnly ? tl(lang(), '·只读') : ''}${s.builtin ? tl(lang(), '·内置') : ''}]`);
-      console.log(`    ${s.hosts.join(', ')}${Object.keys(s.toolEnv).length ? `\n    ${tl(lang(), '工具配置：{env}', { env: Object.entries(s.toolEnv).map(([k, v]) => `${k}=${v}`).join('  ') })}` : ''}${s.note ? `\n    ${dyn(s.note)}` : ''}`);
+      // 带凭据的工具配置（最小权限注入以前录入的）不回显凭据：凭据部分不再注入沙箱，提示改用源的凭据
+      const env = Object.entries(s.toolEnv).map(([k, v]) => (secretLike(k, v) ? tl(lang(), '{k}=（带着凭据，凭据部分没有注入沙箱：改用 sources cred add）', { k }) : `${k}=${v}`));
+      const c = creds[s.id];
+      console.log(`    ${s.hosts.join(', ')}${env.length ? `\n    ${tl(lang(), '工具配置：{env}', { env: env.join('  ') })}` : ''}${c ? `\n    ${tl(lang(), '凭据：{id}　出口代理替工具带上 {header}（{hint}），{scope}', { id: c.id, header: c.header, hint: c.hint, scope: c.allowWrite ? tl(lang(), '读写请求都带') : tl(lang(), '只在读取的请求上带（下载包、查元数据）') })}` : ''}${s.note ? `\n    ${dyn(s.note)}` : ''}`);
     }
     console.log(tl(lang(), '\n加：node src/cli.mjs sources add --name "清华 PyPI 镜像" --host pypi.tuna.tsinghua.edu.cn [--kind package|info] [--read-only|--writable] [--env PIP_INDEX_URL=https://…]'));
     console.log(tl(lang(), '删：node src/cli.mjs sources remove <id>'));
+    console.log(tl(lang(), '凭据：node src/cli.mjs sources cred add <源 id> (--key-file <文件> | --stdin) [--basic] [--header Authorization] [--allow-write] | cred revoke <凭据 id>'));
     return;
   }
   const { userId } = cliIdentity(db, flags);
@@ -770,7 +847,27 @@ function cmdSources(db, sub, args, flags) {
     } else if (sub === 'remove') {
       const r = removeSource(db, { id: args[0] ?? die('sources remove <id>'), userId });
       console.log(tl(lang(), '已从联网目录删掉：{name}', { name: r.removed.name }) + (r.usedBy.length ? tl(lang(), '\n  ⚠ 这些项目原来勾着它，现在访问不了了：{list}', { list: r.usedBy.map((p) => `${p.title}${tl(lang(), '（{name}）', { name: p.id })}`).join(tl(lang(), '、')) }) : ''));
-    } else die('sources [list] | add | remove <id>');
+    } else if (sub === 'cred') {
+      // 源的凭据只进出口代理，沙箱里看不到。值从文件或标准输入读（不接受写在命令行上），内容是整个请求头的值，例如 Bearer xxx
+      const L = lang();
+      if (args[0] === 'revoke') {
+        const done = revokeSourceCredential(db, { id: args[1] ?? die('sources cred revoke <凭据 id>'), byUserId: userId });
+        console.log(done ? tl(L, '已吊销。之后起的沙箱不再带它（已经在跑的沙箱要等下一次起）') : tl(L, '这份凭据早就吊销了'));
+        return;
+      }
+      if (args[0] !== 'add') die(tl(L, 'sources cred add <源 id> (--key-file <文件> | --stdin) [--basic] [--header Authorization] [--allow-write] | sources cred revoke <凭据 id>'));
+      const sourceId = args[1] ?? die(tl(L, 'sources cred add <源 id> …：先用 sources 看源的 id'));
+      const secret = typeof flags['key-file'] === 'string' ? readSecretFile(flags['key-file'], L) : flags.stdin ? readFileSync(0, 'utf8')
+        : die(tl(L, '凭据从文件（--key-file <路径>）或标准输入（--stdin）读；不接受写在命令行上（会留在 shell 历史和进程列表里）'));
+      // --basic：输入的是"用户名:密码"（私有镜像常见），这里拼成 Basic 认证头的值；不带就是整个请求头的值（例如 Bearer 加令牌）
+      const value = flags.basic ? `Basic ${Buffer.from(String(secret).trim()).toString('base64')}` : secret;
+      if (flags.basic && !/^[^:\s]+:\S+$/.test(String(secret).trim())) die(tl(L, '--basic 要的是 用户名:密码'));
+      const r = addSourceCredential(db, { sourceId, header: typeof flags.header === 'string' ? flags.header : 'Authorization', secret: value, allowWrite: !!flags['allow-write'], byUserId: userId });
+      console.log(tl(L, '已配好：{id}（{hint}）。之后起的沙箱经出口代理访问这个源时带上它；沙箱里的代码看不到值。', r));
+      if (r.dropped.length) console.log(tl(L, '  工具配置 {keys} 里的凭据已清掉（不再注入沙箱，改由这份凭据代替）', { keys: r.dropped.join(', ') }));
+      console.log(flags['allow-write'] ? tl(L, '  ⚠ 读写请求都带：沙箱里的代码能用它改这个源上的东西（例如发布）。这是你显式允许的，已记审计。')
+        : tl(L, '  只在读请求（GET / HEAD）上带；用到这份凭据的沙箱里，其余地址也只能读 —— 防止拿它读到的东西被送出去改别处。'));
+    } else die('sources [list] | add | remove <id> | cred add|revoke');
   } catch (e) { die(translateError(e, lang())); }
 }
 
@@ -792,7 +889,7 @@ async function cmdRevision(db, taskId, flags) {
     if (!rows.length) { console.log(tl(lang(), '任务 {taskId} 没有任何修正提案。', { taskId })); return; }
     for (const r of rows) {
       const m = db.one(`SELECT body,kind FROM messages WHERE id=?`, r.message_id);
-      console.log(`\n${r.id}　${r.status}　${new Date(r.proposed_at).toISOString().slice(0, 19)}`
+      console.log(`\n${r.id}　${r.status}　${when(db, r.proposed_at, { seconds: true })}`
         + `　${r.gate ? tl(lang(), '门：{gate}', { gate: dyn(r.gate) }) : tl(lang(), '门未触发（自动生效）')}`);
       console.log(tl(lang(), '  修正（{kind}）：{body}', { kind: String(m?.kind), body: String(m?.body ?? '').slice(0, 160) }));
       const imp = JSON.parse(r.impact);
@@ -820,7 +917,7 @@ async function cmdRevision(db, taskId, flags) {
   };
   const msg = db.one(`SELECT * FROM messages WHERE id=?`, rv.message_id);
 
-  if (!flags.approve && !flags.reject) {
+  if (!flags.approve && !flags.reject && !flags.redo) {
     console.log(tl(lang(), '修正提案 {id}　状态 {status}', { id: rv.id, status: rv.status }));
     console.log(tl(lang(), '\n人发来的修正（{kind}{urgent}）：', { kind: msg.kind, urgent: msg.urgency === 'urgent' ? tl(lang(), '/紧急') : '' }));
     console.log('  ' + String(msg.body).split('\n').join('\n  '));
@@ -834,7 +931,8 @@ async function cmdRevision(db, taskId, flags) {
     if (rv.gate) {
       console.log(tl(lang(), '\n⚠️ 要你批准：{gate}', { gate: dyn(rv.gate) }));
       console.log(tl(lang(), '  批准：node src/cli.mjs revision {taskId} --approve', { taskId }));
-      console.log(tl(lang(), '  驳回：node src/cli.mjs revision {taskId} --reject', { taskId }));
+      console.log(tl(lang(), '  重出一版：node src/cli.mjs revision {taskId} --redo "要怎么改"', { taskId }));
+      console.log(tl(lang(), '  不要这份变更：node src/cli.mjs revision {taskId} --reject', { taskId }));
       console.log(`  ${tl(lang(), '批了但有保留意见：在批准后面再加 --reservation "…" —— 照批，那句话进约定清单、标〔保留意见〕，不改变任何一条')}`);
     }
     return;
@@ -853,8 +951,10 @@ async function cmdRevision(db, taskId, flags) {
       if (r.voided.length) console.log(tl(lang(), '  ⚠️ 作废的节点**产物没有被删**：git 历史里仍在，决策日志记了"因修正作废"'));
       if (flags.reservation) console.log(tl(lang(), '  保留意见已记进项目的约定清单（标〔保留意见〕）：它不改变这份变更里的任何一条，只是让下一个碰这一处的人看得到。'));
     } else {
-      rejectRevision(db, { taskId, revisionId: rv.id, userId, why: tl(contentLang(db), '人驳回') });
-      console.log(tl(lang(), '已驳回 {id}。计划原样不动，那条修正记为已处理 —— 否则下一轮又会停在同一处。', { id: rv.id }));
+      const redo = typeof flags.redo === 'string' ? flags.redo.trim() : '';
+      rejectRevision(db, { taskId, revisionId: rv.id, userId, why: redo || tl(contentLang(db), '不要这份变更'), redo: redo ? { text: redo } : null });
+      console.log(redo ? tl(lang(), '已驳回 {id}，并把你的意见连同原来那条修正交回去：下一轮 AI 重出一版，再来问你。', { id: rv.id })
+        : tl(lang(), '已驳回 {id}（不要这份变更）。计划原样不动，那条修正作罢。', { id: rv.id }));
     }
   } catch (e) { die(translateError(e, lang())); }
 
@@ -863,6 +963,7 @@ async function cmdRevision(db, taskId, flags) {
       // 答复正文写进库：按部署的内容语言
       const a = recordAnswer(db, { questionId: rv.question_id, plaintextToken: plaintext,
         body: flags.approve ? tl(contentLang(db), '批准修正提案 {id}（经 cli revision --approve）', { id: rv.id })
+          : typeof flags.redo === 'string' && flags.redo.trim() ? tl(contentLang(db), 'B：{why}', { why: flags.redo.trim() })
           : tl(contentLang(db), '驳回修正提案 {id}（经 cli revision --reject）', { id: rv.id }) });
       console.log(tl(lang(), '  同时答复了 {qid}', { qid: rv.question_id }) + (a.stillOpen ? tl(lang(), '，另有 {n} 个问题还开着', { n: a.stillOpen }) : tl(lang(), '，任务解冻')));
     } catch (e) { console.log(tl(lang(), '⚠️ 状态已改，但答复 {qid} 失败：{err}', { qid: rv.question_id, err: translateError(e, lang()) })); }
@@ -1025,6 +1126,9 @@ export function cmdQuestions(db, flags = {}) {
       const label = { answer: tl(lang(), '答复'), agree: tl(lang(), '附议'), abstain: tl(lang(), '弃权') }[a.stance];
       console.log(`   · ${a.display_name ?? tl(lang(), '系统')} ${label}${a.stance === 'answer' ? tl(lang(), '（{name}）', { name: a.id }) : ''}${tl(lang(), '：')}${String(a.body).replace(/\s+/g, ' ').slice(0, 100)}`);
     }
+    // 所在步骤改了任务开始前就有的测试、还没放行 —— 列出来，并说明怎么在答复时一并放行
+    const tp = open && q.node_id ? (() => { const al = testsAllowedFor(db, q.node_id); return latestTestChanges(db, q.node_id).filter((c) => c.baseline && !al.has(c.path)).map((c) => c.path); })() : [];
+    if (tp.length) console.log(tl(lang(), '   ⚠ 这一步改了任务开始前就有的测试：{paths}（答复时加 --allow-tests 一并放行）', { paths: tp.join(tl(lang(), '、')) }));
     if (open) console.log(`   → node src/cli.mjs answer ${q.id} "..."`
       + `${ans.some((a) => a.stance === 'answer') ? tl(lang(), '   ｜同意已有那条：--agree [答复 id]') : ''}${tl(lang(), '   ｜不归你：--abstain')}`
       + `${q.default_action ? tl(lang(), '   （默认：{a}）', { a: String(q.default_action).slice(0, 60) }) : ''}`);
@@ -1049,6 +1153,11 @@ async function cmdAnswer(db, questionId, body, flags) {
     r = recordAnswer(db, { questionId: q.id, body, stance,
       agreesWith: typeof flags.agree === 'string' ? flags.agree : null, plaintextToken: plaintext });
   } catch (e) { die(translateError(e, lang())); }
+  // 答复时一并放行这一步对原有测试的改动（路径取系统比对出的那几个，见 questions 列表）
+  if (flags['allow-tests'] && stance === 'answer') {
+    const paths = allowTestChanges(db, { questionId: q.id, userId: r.userId ?? null, answerId: r.answerId ?? null });
+    console.log(paths.length ? tl(lang(), '已放行这一步对原有测试的改动：{paths}', { paths: paths.join(tl(lang(), '、')) }) : tl(lang(), '这一步没有待放行的原有测试改动，--allow-tests 没起作用'));
+  }
 
   const pendingText = () => (r.pending ?? []).map((p) => `${p.scope}${tl(lang(), '：')}${p.have}/${p.need}`).join(tl(lang(), '，'));
   if (stance === 'abstain') {
@@ -1112,11 +1221,41 @@ async function cmdWeb(db, flags) {
   if (!team && flags.host && !['127.0.0.1', 'localhost', '::1'].includes(String(flags.host))) die(tl(lang(), '只有团队模式才能监听本机以外的地址（本机模式不带令牌 = 负责人）：加 --team --public-url …'));
   const w = await startWeb(db, { home: HOME, port: Number(flags.port ?? 7357), host: flags.host ? String(flags.host) : '127.0.0.1', tokenPlain: plaintext, launcher, daemon: !!flags.daemon, envFile: join(ROOT, '.env'),
     team, publicUrl: team ? flags['public-url'] : null });
+  sayStartupNotes();
   console.log(team ? tl(lang(), '看板（团队模式）：监听 http://{host}:{port}/，对外地址 {url}；每个人用自己的令牌登录（Ctrl-C 停）', { host: w.host, port: w.port, url: flags['public-url'] })
     : tl(lang(), '看板：http://{host}:{port}/   （只绑本机；Ctrl-C 停）', { host: w.host, port: w.port }));
   for (const p of bindingProblems(db, { env: process.env })) console.log(tl(lang(), '  ⚠ 绑定 {tier}（{key}）：{why} —— 看板"设置"里改', { tier: p.tier, key: p.key, why: dyn(p.why) }));
-  if (flags.daemon) await runDaemon(db, flags, launcher);
+  warnRuntime(db);
+  const d = flags.daemon ? await runDaemon(db, flags, launcher) : null;
+  guardLongRunner(db, () => { d?.stop(); w.close(); });
   await new Promise(() => {});   // 挂住进程
+}
+
+/**
+ * 长寿进程（看板、守护进程）的进程级兜底。原来全仓库没有一个 process.on：
+ * - 一个没接住的 Promise（某个请求处理里漏掉的 await）按 Node 默认会让整个看板退出 → 现在记下来、服务照常；
+ * - 同步异常之后进程状态不可信 → 记下来再退出（非零），交给外层的进程管理重启；
+ * - Ctrl-C / SIGTERM → 停守护进程的定时器、关看板、关库再退出。在跑的任务进程是脱离出去的，不受影响。
+ * 编排器（run）不装这些：它崩了就该以非零退出码崩，那是守护进程判断"要不要重拉"的依据。
+ */
+function guardLongRunner(db, onStop) {
+  const report = (kind, e) => {
+    console.error(`${new Date().toISOString()} ${kind}: ${e?.stack ?? e}`);
+    try { audit(db, { actorKind: 'system', action: 'process_error', payload: { kind, pid: process.pid, error: String(e?.message ?? e).slice(0, 500) } }); } catch { /* 库也坏了：只剩标准错误输出 */ }
+  };
+  process.on('unhandledRejection', (e) => report('unhandledRejection', e));
+  process.on('uncaughtException', (e) => { report('uncaughtException', e); process.exit(1); });
+  let stopping = false;
+  const stop = (sig) => {
+    if (stopping) return;
+    stopping = true;
+    console.log(tl(lang(), '收到 {sig}，正在停止（在跑的任务进程不受影响）…', { sig }));
+    try { onStop(); } catch { /* 尽力 */ }
+    try { db.close(); } catch { /* 已关 */ }
+    process.exit(0);
+  };
+  process.on('SIGINT', () => stop('SIGINT'));
+  process.on('SIGTERM', () => stop('SIGTERM'));
 }
 
 // 项目层（project.mjs）：整批契约建项目，串接由守护进程做；这里只有建 / 看 / 手动推进 / 交付。
@@ -1128,14 +1267,17 @@ async function cmdProject(db, sub, args, flags) {
     // 新建的唯一入口。--goal / --done 必填；--plan（旧名 --brief）= 已写好的规划，给了就由规划器切成多个任务，
     // 没给就从目标起草第一个任务（追问器）。仓库当场克隆，路径不对当场报错。
     const planFlag = flags.plan ?? flags.brief;
-    if (!flags.goal || !flags.done) die(tl(lang(), 'project new --goal <文本或文件> --done <文本或文件> (--source <仓库路径或 URL> | --empty) [--plan <规划文本或文件>] [--base <ref>] [--title <标题>]'));
+    if (!flags.goal || !flags.done) die(tl(lang(), 'project new --goal <文本或文件> --done <文本或文件> (--source <仓库路径或 URL> | --empty) [--plan <规划文本或文件>] [--base <ref>] [--title <标题>] [--visibility all|members]'));
     let r;
     if (flags.parallel && planFlag === undefined) die(tl(lang(), '并行开发要配合一份已写好的规划（--plan）'));
+    // 建的时候就定可见性：建好再改，这之间全员看得到标题与目标
+    if (flags.visibility !== undefined && !VISIBILITIES[flags.visibility]) die(tl(lang(), '可见性只能是：{values}', { values: Object.keys(VISIBILITIES).join(' / ') }));
     try {
       if (!flags.empty) checkRepoSource(flags.source === true ? '' : flags.source, { required: true });
       r = startProject(db, { userId, goal: textOrFile(flags.goal), doneDefinition: textOrFile(flags.done), plan: planFlag === undefined ? null : textOrFile(planFlag),
         source: flags.empty ? null : flags.source, empty: !!flags.empty, base: flags.base ?? null, title: flags.title === true ? null : flags.title ?? null, home: HOME });
       if (flags.parallel) setParallel(db, { projectId: r.projectId, on: true, userId });
+      if (flags.visibility === 'members') setVisibility(db, { projectId: r.projectId, visibility: 'members', by: userId });
     } catch (e) { die(translateError(e, lang())); }
     console.log(tl(lang(), '项目 {id}\n  仓库 {repo}\n  分支 {branch} @ {base}', { id: r.projectId, repo: r.repo, branch: r.branch, base: r.baseRef.slice(0, 8) }));
     if (r.planned) console.log(tl(lang(), '  方案待起草（载体任务 {carrier}）。守护进程会拉规划器；没开守护进程：node src/cli.mjs project plan {id}', { carrier: r.carrierId, id: r.projectId }));
@@ -1395,7 +1537,7 @@ async function cmdProject(db, sub, args, flags) {
       else if (!ev.verify) console.log(tl(lang(), '⚠ 验收命令 {cmd} 一次都没跑过', { cmd: ev.command.join(' ') }));
       else {
         console.log(tl(lang(), '验收 {cmd}：{result}', { cmd: (ev.verify.argv ?? ev.command).join(' '), result: ev.verify.ok ? tl(lang(), '通过') : tl(lang(), '没过（退出码 {code}）', { code: ev.verify.code ?? tl(lang(), '没跑起来') }) })
-          + `  ${new Date(ev.verify.at).toISOString().replace('T', ' ').slice(0, 19)}`);
+          + `  ${when(db, ev.verify.at, { seconds: true })}`);
         console.log(ev.verify.ranAtHead ? tl(lang(), '  跑的就是要推的这一份（{head}）', { head: String(ev.verify.head ?? '').slice(0, 8) })
           : tl(lang(), '⚠ 那次跑的是 {ran}，和现在要推的 {head} 不是同一份代码 —— 这个"通过"对这次没有效力', { ran: String(ev.verify.head ?? tl(lang(), '未知')).slice(0, 8), head: String(ev.stat?.head ?? tl(lang(), '未知')).slice(0, 8) }));
         if (ev.verify.tail) console.log(tl(lang(), '  输出尾部：') + `\n${String(ev.verify.tail).split('\n').slice(-12).map((l) => `    ${l}`).join('\n')}`);
@@ -1415,18 +1557,77 @@ async function cmdProject(db, sub, args, flags) {
 
 // 守护进程：答完题任务自己接着跑。每 --interval 秒扫一次超时链 + 拉起该接着跑的任务。
 // 判断规则在 src/core/daemon.mjs 开头，一句话：状态 running、没在跑、上次退出后有人动过（或到点下班 / 厂商错误按退避重试）。
+/** 状态库健康：`db stats` = 库文件 + 各进程最近一刻钟的等锁 / BUSY / 慢语句。 */
+function cmdDb(db, sub, dbPath, args = [], flags = {}) {
+  const mbOf = (b) => (b / 1048576).toFixed(1);
+  if (sub === 'backup') {
+    try { const b = backupNow(db, dbPath, { tag: flags.tag ? String(flags.tag) : 'manual', actorKind: 'user' }); console.log(tl(lang(), '已备份并核过：{file}（{mb} MB，版本 v{v}）', { file: b.file, mb: mbOf(b.bytes), v: b.version })); }
+    catch (e) { die(translateError(e, lang())); }
+    return;
+  }
+  if (sub === 'backups') {
+    const list = listBackups(dbPath);
+    if (!list.length) { console.log(tl(lang(), '还没有备份')); return; }
+    for (const b of list) console.log(`  ${when(db, b.mtime, { seconds: true })}  ${b.tag.padEnd(16)} ${b.file}`);
+    return;
+  }
+  if (sub === 'check') {
+    const r = checkDb(db, { full: !!flags.full });
+    console.log(r.ok ? tl(lang(), '{kind} 检查通过；外键无违例', { kind: r.kind }) : tl(lang(), '{kind} 检查发现问题：{problems}；外键违例 {fk} 条', { kind: r.kind, problems: r.problems.slice(0, 5).join(' / ') || '—', fk: r.fk.length }));
+    if (!r.ok) process.exitCode = 1;
+    return;
+  }
+  if (sub === 'restore') {
+    const file = args[0] ?? die(tl(lang(), 'db restore <备份文件> [--force]'));
+    // 还有谁在写这个库：活着的租约（编排器 / 项目推进）或守护进程心跳。看板进程没有可查的标记 —— 文档里写明恢复前先停看板。
+    const busy = () => {
+      const l = db.one(`SELECT resource, pid FROM leases WHERE expires_at > ? LIMIT 1`, Date.now());
+      if (l) return `${l.resource}（pid ${l.pid}）`;
+      return daemonStatus(HOME).alive ? tl(lang(), '守护进程') : null;
+    };
+    const who = busy();
+    db.close();
+    try {
+      const r = restoreFile(dbPath, file, { busy: () => who, force: !!flags.force });
+      const d2 = openDb(dbPath);   // 用当前代码打开：备份来自旧版本时顺带升级
+      const v = d2.raw.prepare('PRAGMA user_version').get().user_version;
+      audit(d2, { actorKind: 'user', action: 'db_restored', targetType: 'deployment', targetId: 'db', payload: { from: file, savedCurrentAs: r.savedCurrentAs, backupVersion: r.version, nowVersion: v } });
+      d2.close();
+      console.log(tl(lang(), '已从 {file} 恢复（备份是 v{from}，现在 v{to}）；恢复前的库另存为 {saved}', { file, from: r.version, to: v, saved: r.savedCurrentAs ?? '—' }));
+    } catch (e) { die(translateError(e, lang())); }
+    process.exit(0);
+  }
+  if (sub !== 'stats') die(tl(lang(), 'db 子命令：stats | backup [--tag] | backups | check [--full] | restore <备份文件> [--force]'));
+  const h = dbHealth(db, dbPath);
+  const mb = (b) => (b / 1048576).toFixed(1);
+  console.log(tl(lang(), '库文件：{db} MB（{pages} 页 × {size} 字节，空闲 {free} 页）；WAL：{wal} MB', { db: mb(h.file.dbBytes), pages: h.file.pageCount, size: h.file.pageSize, free: h.file.freelist, wal: mb(h.file.walBytes) }));
+  const p = h.processes;
+  console.log(tl(lang(), '最近一刻钟有观测的进程：{n} 个；写事务 {tx} 次，拿锁平均 {avg} ms、最长 {max} ms；撞 BUSY {busy} 次', {
+    n: p.procs.length, tx: p.lock.n, avg: p.lock.n ? (p.lock.totalMs / p.lock.n).toFixed(1) : '0', max: p.lock.maxMs, busy: p.busy }));
+  for (const x of p.procs) console.log(`  ${x.proc.padEnd(14)} pid ${String(x.pid).padEnd(7)} tx ${String(x.txCount).padEnd(6)} lock-max ${x.lock.maxMs} ms  busy ${x.busy}`);
+  if (p.slow.length) { console.log(tl(lang(), '慢语句（≥100 ms，最近的）：')); for (const s of p.slow) console.log(`  ${String(s.ms).padStart(6)} ms  ${s.proc}  ${s.sql.slice(0, 110)}`); }
+}
+
+/** 常驻进程启动时的运行环境自检：只提示，不拦（SQLite 版本见 core/sqlite-check.mjs）。 */
+function warnRuntime(db) {
+  const a = sqliteAdvice(db);
+  if (a) console.log(tl(lang(), '  ⚠ Node {node} 自带的 SQLite {version} 有一个已知缺陷：多个进程同时写同一个库时，有极小概率把库写坏。建议把 Node 升级到自带 SQLite {fixed} 或更新版本的发行版', { node: a.node, version: a.version, fixed: a.fixedIn }));
+}
+
 async function cmdDaemon(db, flags) {
   cliIdentity(db, flags);   // 令牌得有效 —— 守护进程起的 run 与人起的走同一条路
   await bindForLongRunner(db, flags, 'daemon');
   const launcher = makeLauncher(db, { home: HOME });
-  await runDaemon(db, flags, launcher);
+  warnRuntime(db);
+  const d = await runDaemon(db, flags, launcher);
+  guardLongRunner(db, () => d.stop());
   await new Promise(() => {});
 }
 
 async function runDaemon(db, flags, launcher) {
   const intervalMs = Math.max(5, Number(flags.interval ?? 15)) * 1000;
   const channels = channelsFromEnv(process.env, flags.notify);
-  const d = startDaemon(db, { home: HOME, launcher, intervalMs, iterations: flags.iterations ? Number(flags.iterations) : null,
+  const d = startDaemon(db, { home: HOME, dbPath, launcher, intervalMs, iterations: flags.iterations ? Number(flags.iterations) : null,
     notifyOpts: { env: process.env, extraCmd: flags.notify, digestEvery: flags['digest-every'] ? String(flags['digest-every']) : null,
       catalogCheckEvery: flags['no-catalog-check'] ? null : String(flags['catalog-check'] ?? '7d') },   // 目录与在用的键：守护进程每轮从库读（checkableCatalog）
     onEvent: (e) => {
@@ -1446,7 +1647,11 @@ async function runDaemon(db, flags, launcher) {
         if (e.done && channels.length) void notify(db, { taskId: e.taskId ?? null, kind: 'project_done', title: tl(contentLang(db), '[SuperIntern] 项目完成 {pid}', { pid: e.projectId }),
           text: tl(contentLang(db), '全部任务已合进项目分支。交付：node src/cli.mjs project deliver {pid} --remote <url> --pr', { pid: e.projectId }), ref: e.projectId, channels });
       } else if (e.type === 'project_error') console.log(`${stamp} ${tl(lang(), '✗ 项目 {pid} 推进失败（第 {n} 次，按退避等）：{err}', { pid: e.projectId, n: e.attempt, err: e.error })}`);
+      else if (e.type === 'llm_health') for (const l of e.lines) console.log(`${stamp} ⚡ ${l}`);
+      else if (e.type === 'invariants') for (const l of e.lines) console.log(`${stamp} ⚑ ${l}`);
+      else if (e.type === 'tick_failed') console.log(`${stamp} ${tl(lang(), '✗ 守护进程这一轮出错（已记入审计，下一轮照常）：{err}', { err: e.error })}`);
     } });
+  sayStartupNotes();
   console.log(tl(lang(), '守护进程 pid {pid}：每 {sec}s 扫一次；状态 running 且没在跑、且上次退出后有人动过的任务会被拉起', { pid: process.pid, sec: intervalMs / 1000 })
     + (channels.length ? tl(lang(), '；通知 {kinds}', { kinds: channels.map((c) => c.kind).join('/') }) : ''));
   const first = await d.tick();
@@ -1588,6 +1793,28 @@ function cmdStalls(db, flags) {
   if (loops.length) { console.log(tl(lang(), '\n⚠ 空转 {n} 处（系统在没有新信息时重复自己）', { n: loops.length })); for (const l of loops) console.log(`  ${l.taskId} ${l.title ?? ''}${tl(lang(), '：')}${dyn(l.why)}`); }
 }
 
+/** 运行期不变量：现状；--run 立刻全查一遍（不等守护进程的周期） */
+function cmdInvariants(db, flags) {
+  if (flags.run) sweepInvariants(db, { force: true, home: HOME, assess: (d, t, o) => assessTask(d, t, o), assessOpts: { hasWorkspace: (t) => existsSync(join(HOME, 'workspaces', t)) } });
+  const rows = invariantsView(db);
+  const when = (ts) => (ts ? new Date(ts).toLocaleString() : tl(lang(), '还没查过'));
+  for (const r of rows) {
+    // 0 个对象的"都对"什么都没证明（复盘的约定）：打 ·，不打 ✓
+    const mark = r.checkedAt == null || (!r.violations && !r.checked) ? '·' : r.error ? '?' : r.violations ? (r.level === 'bad' ? '✗' : '⚠') : '✓';
+    console.log(`${mark} ${tl(lang(), (r.violations ? INVARIANT_PROBLEMS : INVARIANT_NAMES)[r.id] ?? r.id)}  ${tl(lang(), '（{id}，最近一次 {t}）', { id: r.id, t: when(r.checkedAt) })}`);
+    if (r.error) console.log(tl(lang(), '    没查成：{err}', { err: r.error }));
+    else if (r.checkedAt != null && !r.checked && !r.skipped) console.log(tl(lang(), '    没有可查的对象'));
+    else if (r.skipped) console.log(tl(lang(), '    这次跳过：{why}', { why: r.skipped === 'paused' ? tl(lang(), '全部自动运行暂停着') : r.skipped }));
+    else if (r.violations) {
+      console.log(tl(lang(), '    {n} 处，{t} 发现：', { n: r.violations, t: when(r.since) }));
+      for (const v of r.sample) console.log(`      ${invariantLine(r.id, v, lang())}`);
+      if (r.violations > r.sample.length) console.log(tl(lang(), '      ……还有 {n} 处', { n: r.violations - r.sample.length }));
+    }
+    if (r.baselined) console.log(tl(lang(), '    另有 {n} 处是启用这项检查之前就有的，不计', { n: r.baselined }));
+  }
+  if (!flags.run) console.log(tl(lang(), '\n守护进程按各条的周期自动查；要马上全查一遍：node src/cli.mjs invariants --run'));
+}
+
 /**
  * 待决事项打包摘要：默认是"我"的（按令牌）；负责人可 --user <id> 看别人的。--send 按此人的通道真发一份并记 digests。
  * 守护进程按 --digest-every 定时发；换班交接自动发（值班者变了就给接班人推）。
@@ -1612,14 +1839,14 @@ async function cmdDigest(db, flags) {
 }
 
 /**
- * 模型目录漂移检查（确定性，不调模型）：存在性（各家 /models）、可选实调（--probe，每模型一次 16 token 请求）、
+ * 模型目录漂移检查（确定性，不调模型）：存在性（各家 /models）、可选实调（--probe，每模型一次 16 token 请求；--vision，每模型一次带图请求，看收不收截图）、
  * 单价与窗口（OpenRouter 公开表 / Gemini API）。只报告，目录由人改。结果落审计 catalog_checked，进负责人的待办摘要。
  */
 async function cmdCatalog(db, sub, flags) {
   if (sub === 'last') {
     const last = lastCatalogCheck(db);
     if (!last) { console.log(tl(lang(), '还没查过：node src/cli.mjs catalog check')); return; }
-    console.log(tl(lang(), '上次检查 {at}：{n} 项要看一眼', { at: new Date(last.checkedAt ?? last.ts).toISOString(), n: last.warnings }) + (last.probe ? tl(lang(), '（含实调）') : '') + (last.fetchErrors ? tl(lang(), '，{n} 处拉取失败', { n: last.fetchErrors }) : ''));
+    console.log(tl(lang(), '上次检查 {at}：{n} 项要看一眼', { at: when(db, last.checkedAt ?? last.ts, { seconds: true }), n: last.warnings }) + (last.probe ? tl(lang(), '（含实调）') : '') + (last.fetchErrors ? tl(lang(), '，{n} 处拉取失败', { n: last.fetchErrors }) : ''));
     for (const l of last.lines ?? []) console.log(`  - ${l}`);
     return;
   }
@@ -1657,10 +1884,10 @@ async function cmdCatalog(db, sub, flags) {
     } catch (e) { die(translateError(e, lang())); }
     return;
   }
-  if (sub !== 'check') die(tl(lang(), '用法：node src/cli.mjs catalog [list] | check [--probe] [--vendor <id>] | last | add|set <服务商/模型> --input <$/M> --output <$/M> [--cache-read] [--cache-write] [--window N] [--efforts low,medium,high|none] [--model <发给厂商的名>] | remove|enable|disable <键>'));
+  if (sub !== 'check') die(tl(lang(), '用法：node src/cli.mjs catalog [list] | check [--probe] [--vision] [--vendor <id>] | last | add|set <服务商/模型> --input <$/M> --output <$/M> [--cache-read] [--cache-write] [--window N] [--efforts low,medium,high|none] [--model <发给厂商的名>] | remove|enable|disable <键>'));
   const { userId } = cliIdentity(db, flags);
   const reg = checkableCatalog(db);
-  const r = await checkCatalog({ catalog: reg.catalog, vendors: reg.vendors, env: process.env, probe: !!flags.probe, only: flags.vendor ? String(flags.vendor) : null, lang: contentLang(db) });
+  const r = await checkCatalog({ catalog: reg.catalog, vendors: reg.vendors, env: process.env, probe: !!flags.probe, vision: !!flags.vision, only: flags.vendor ? String(flags.vendor) : null, lang: contentLang(db) });
   console.log(renderCatalogCheck(r, { lang: lang() }));
   recordCatalogCheck(db, r, { by: userId, actorKind: 'user', lang: contentLang(db) });
   process.exitCode = r.warnings ? 1 : 0;
@@ -1669,7 +1896,28 @@ async function cmdCatalog(db, sub, flags) {
 // ── 档位绑定与服务商的 CLI 面（看板是主界面；这里保证"全部动作都有 CLI"）─────────────────────────
 function cmdBind(db, sub, args, flags) {
   if (!sub || sub === 'show') { printBinding(db); return; }
-  if (sub !== 'set') die(tl(lang(), '用法：node src/cli.mjs bind [show] | bind set <tier>=<服务商/模型>... [--effort low|medium|high|none]'));
+  // bind role <角色> <服务商/模型 | tier>（tier = 取消单独绑定，回到档位）
+  if (sub === 'role') {
+    const [role, key] = args;
+    if (!role || !key) die(tl(lang(), '用法：node src/cli.mjs bind role <角色> <服务商/模型> [--effort low|medium|high] ｜ bind role <角色> tier（回到档位）。角色：{roles}', { roles: Object.keys(LLM_ROLES).join(' ') }));
+    const { userId } = cliIdentity(db, flags);
+    try { setRoleBinding(db, { role, modelKey: key === 'tier' ? null : key, effort: flags.effort ? String(flags.effort) : null, userId }); } catch (e) { die(translateError(e, lang())); }
+    console.log(key === 'tier' ? tl(lang(), '{role} 回到档位', { role }) : tl(lang(), '{role} → {key}', { role, key }));
+    printBinding(db); return;
+  }
+  // bind fallback <tier>=<服务商/模型|none>：主模型那家熔断 / 重试用尽时自动换用
+  if (sub === 'fallback') {
+    if (!args.length) die(tl(lang(), '用法：node src/cli.mjs bind fallback <tier>=<服务商/模型>（none = 去掉备用）'));
+    const { userId } = cliIdentity(db, flags);
+    for (const sp of args) {
+      const eq = String(sp).indexOf('='); if (eq <= 0) die(tl(lang(), '要写成 tier=服务商/模型，实得 {sp}', { sp }));
+      const tier = String(sp).slice(0, eq), key = String(sp).slice(eq + 1);
+      try { setFallback(db, { tier, modelKey: key === 'none' ? null : key, userId }); } catch (e) { die(translateError(e, lang())); }
+      console.log(key === 'none' ? tl(lang(), '{tier} 档不再配备用模型', { tier }) : tl(lang(), '{tier} 档备用 → {key}（主模型那家连着出错、或重试几次还失败时自动换用）', { tier, key }));
+    }
+    printBinding(db); return;
+  }
+  if (sub !== 'set') die(tl(lang(), '用法：node src/cli.mjs bind [show] | bind set <tier>=<服务商/模型>... [--effort low|medium|high|none] | bind fallback <tier>=<服务商/模型|none> | bind role <角色> <服务商/模型|tier>'));
   if (!args.length) die(tl(lang(), '要给 tier=服务商/模型（可多个）'));
   const { userId } = cliIdentity(db, flags);
   const effort = flags.effort === undefined ? undefined : (String(flags.effort) === 'none' ? null : String(flags.effort));
@@ -1732,9 +1980,128 @@ const cliIdentity = (db, flags) => {
   const tokenFile = flags['token-file'] ?? TOKEN_FILE;
   if (!existsSync(tokenFile)) die(tl(lang(), '找不到 CLI 令牌 {file}。先跑 node src/cli.mjs init', { file: tokenFile }));
   const plaintext = (flags.token ?? readFileSync(tokenFile, 'utf8')).trim();
-  const auth = authenticate(db, plaintext) ?? die(tl(lang(), '令牌无效或已吊销'));
-  return { plaintext, userId: auth.user_id };
+  const auth = authenticate(db, plaintext) ?? die(tl(lang(), '令牌无效、已过期或已吊销'));
+  return { plaintext, userId: auth.user_id, tokenId: auth.token_id, kind: auth.kind, userKind: auth.user_kind };
 };
+
+// 自己的令牌（list / new / revoke），管理员另能看全员（list --everyone）、吊销任何人的
+function cmdToken(db, sub, args, flags) {
+  const me = cliIdentity(db, flags);
+  const isLead = db.one(`SELECT role FROM users WHERE id=?`, me.userId)?.role === 'lead';
+  const day = (ts) => (ts ? when(db, ts, { zone: false }).slice(0, 10) : tl(lang(), '不过期'));
+  if (!sub || sub === 'list') {
+    const rows = flags.everyone ? (isLead ? activeTokens(db) : die(tl(lang(), '只有管理员能看全员的令牌'))) : tokensOf(db, me.userId, { current: me.tokenId, all: !!flags.all });
+    for (const t of rows) console.log(`  ${t.id}  ${(t.display_name ? `${t.display_name} ` : '')}${dyn(t.name ?? '-')}  ${t.kind}/${t.scope}  ${tl(lang(), '到期 {d}', { d: day(t.expires_at) })}  ${t.last_used_at ? tl(lang(), '最后使用 {d}{ip}', { d: new Date(t.last_used_at).toISOString().slice(0, 16).replace('T', ' '), ip: t.last_ip ? ` ${t.last_ip}` : '' }) : tl(lang(), '没用过')}${t.id === me.tokenId ? tl(lang(), '  ← 现在用的') : ''}${t.status && t.status !== 'active' ? `  [${t.status}]` : ''}`);
+    return;
+  }
+  if (sub === 'new') {
+    const name = args[0] ?? die(tl(lang(), 'token new <名字> [--scope read|write] [--days N] [--out <文件>]'));
+    const t = issueToken(db, { userId: me.userId, by: me.userId, name, scope: flags.scope ?? 'write', days: flags.days === undefined ? undefined : Number(flags.days), kind: me.userKind === 'service' ? 'service' : 'cli' });
+    audit(db, { actorKind: 'user', actorId: me.userId, action: 'token_issued', targetType: 'user', targetId: me.userId, payload: { tokenId: t.tokenId, name, scope: flags.scope ?? 'write', expiresAt: t.expiresAt, via: 'cli' } });
+    const out = flags.out ?? join(HOME, 'tokens', `${me.userId}-${t.tokenId}.token`);
+    mkdirSync(dirname(out), { recursive: true });
+    writeFileSync(out, t.plaintext, { mode: 0o600 });
+    console.log(tl(lang(), '已签发 {id}（{scope}，到期 {d}）；令牌写入 {file}（库里只有哈希，这是唯一副本）', { id: t.tokenId, scope: flags.scope ?? 'write', d: day(t.expiresAt), file: out }));
+    return;
+  }
+  if (sub === 'revoke') {
+    if (flags['all-others']) { console.log(tl(lang(), '已吊销 {n} 个（保留现在用的这枚）', { n: revokeAllOf(db, { userId: me.userId, byUserId: me.userId, keep: me.tokenId }) })); return; }
+    const id = args[0] ?? die(tl(lang(), 'token revoke <令牌 id> | token revoke --all-others'));
+    try { console.log(tl(lang(), '已吊销 {n} 个（含用它登录的浏览器会话）', { n: revokeTokenBy(db, { tokenId: id, byUserId: me.userId, isAdmin: isLead }) })); } catch (e) { die(translateError(e, lang())); }
+    return;
+  }
+  die(tl(lang(), '未知子命令：token {sub}（可选 list / new / revoke）', { sub }));
+}
+
+// 邀请链接（管理员）。链接 = 看板对外地址 + /?invite=<码>
+function cmdInvite(db, sub, args, flags) {
+  const me = cliIdentity(db, flags);
+  if (db.one(`SELECT role FROM users WHERE id=?`, me.userId)?.role !== 'lead') die(tl(lang(), '只有管理员能发邀请'));
+  if (!sub || sub === 'list') { for (const i of invitesList(db)) console.log(`  ${i.id}  ${i.role.padEnd(8)} ${(i.used_by_name ?? i.name ?? '-').padEnd(12)} ${i.status}  ${when(db, i.created_at)}`); return; }
+  if (sub === 'new') {
+    try {
+      const r = createInvite(db, { byUserId: me.userId, role: flags.role ?? 'member', name: flags.name ?? null, hours: flags.hours === undefined ? undefined : Number(flags.hours) });
+      const base = String(flags['public-url'] ?? 'https://<看板地址>').replace(/\/+$/, '');
+      console.log(tl(lang(), '邀请链接（只显示这一次，{date} 前有效、只能用一次；私下发给对方）：', { date: when(db, r.expiresAt) }));
+      console.log(`  ${base}/?invite=${encodeURIComponent(r.code)}`);
+    } catch (e) { die(translateError(e, lang())); }
+    return;
+  }
+  if (sub === 'revoke') { console.log(revokeInviteBy(db, { inviteId: args[0] ?? die(tl(lang(), 'invite revoke <邀请 id>')), byUserId: me.userId }) ? tl(lang(), '已撤销') : tl(lang(), '没有可撤销的（已用过、已撤销或已过期）')); return; }
+  die(tl(lang(), '未知子命令：invite {sub}（可选 list / new / revoke）', { sub }));
+}
+
+// 连接（推送 / 开 PR 用的凭据）。凭据从文件或标准输入读，不接受写在命令行上（会留在 shell 历史和进程列表里）。
+// 凭据文件读不到：说哪个文件、为什么（原来直接甩 Node 的堆栈；用户实际运行上把文件名记错时撞上）
+function readSecretFile(path, L) {
+  try { return readFileSync(path, 'utf8'); }
+  catch (e) { die(e.code === 'ENOENT' ? tl(L, '找不到文件：{path}（检查文件名与路径；记事本另存时可能多了 .txt 后缀）', { path }) : tl(L, '读不了文件 {path}：{why}', { path, why: e.code ?? e.message })); }
+}
+async function cmdCred(db, sub, args, flags) {
+  const me = cliIdentity(db, flags);
+  const L = lang();
+  const day = (ts) => when(db, ts, { zone: false }).slice(0, 10);
+  if (!sub || sub === 'list') {
+    const { rows, order } = listCredentials(db, { viewerId: me.userId });
+    if (!rows.length) console.log(tl(L, '（还没有任何连接：交付到 GitHub 时推不上去、也开不了 PR）'));
+    for (const c of rows) {
+      console.log(`  ${c.id}  ${c.name}  ${c.kind}  ${c.host}/${c.pathGlob}  ${c.hint ?? ''}  ${c.ownerId ? tl(L, '归 {name}', { name: c.ownerName ?? c.ownerId }) : tl(L, '部署级')}`
+        + `${c.expiresAt ? `  ${tl(L, '到期 {d}', { d: day(c.expiresAt) })}` : ''}${c.expired ? `  [${tl(L, '已过期')}]` : ''}`);
+    }
+    console.log(tl(L, '挑选顺序：{order}（改：node src/cli.mjs user setting deploy.credential_order personal_first|app_first）', { order }));
+    return;
+  }
+  if (sub === 'add') {
+    const kind = { token: 'token', 'github-app': 'github_app', ssh: 'ssh_key' }[args[0]]
+      ?? die(tl(L, 'cred add token|github-app|ssh --name <名字> (--key-file <文件> | --stdin) [--host github.com] [--repos acme/*] [--mine] [--app-id N] [--username U] [--expires YYYY-MM-DD]'));
+    const name = flags.name ?? die(tl(L, '要给 --name <名字>'));
+    const secret = typeof flags['key-file'] === 'string' ? readSecretFile(flags['key-file'], L) : flags.stdin ? readFileSync(0, 'utf8')
+      : die(tl(L, '凭据从文件（--key-file <路径>）或标准输入（--stdin）读；不接受写在命令行上（会留在 shell 历史和进程列表里）'));
+    try {
+      const r = addCredential(db, { kind, name: String(name), ownerId: flags.mine ? me.userId : null, host: flags.host ?? 'github.com', pathGlob: flags.repos ?? '*', secret,
+        appId: flags['app-id'] ?? null, username: flags.username ?? null, apiBase: flags['api-base'] ?? null,
+        expiresAt: flags.expires ? (validDayKey(String(flags.expires)) ? zonedTime(...String(flags.expires).split('-').map(Number), 23, 59, 59, deployTz(db)) : NaN) : null, byUserId: me.userId });
+      console.log(tl(L, '已添加 {id}（{hint}）。值已加密存进状态库，之后谁都看不到；原文件可以删了', { id: r.id, hint: r.hint }));
+    } catch (e) { die(translateError(e, L)); }
+    return;
+  }
+  if (sub === 'revoke') {
+    try { console.log(revokeCredential(db, { id: args[0] ?? die(tl(L, 'cred revoke <连接 id>')), byUserId: me.userId }) ? tl(L, '已吊销') : tl(L, '已经吊销过了')); } catch (e) { die(translateError(e, L)); }
+    return;
+  }
+  if (sub === 'check') {
+    const remote = args[0] ?? die(tl(L, 'cred check <远端地址> [--action read|push|pr]'));
+    let c;
+    try { c = await checkAccess(db, { remote: safePositional(remote), action: ['read', 'push', 'pr'].includes(flags.action) ? flags.action : 'push', actorId: me.userId }); } catch (e) { die(translateError(e, L)); }
+    console.log(c.credential ? tl(L, '会用「{name}」（{owner}）', { name: c.credential.name, owner: c.credential.ownerName ? tl(L, '{name} 自己的连接', { name: c.credential.ownerName }) : tl(L, '部署级连接') })
+      : c.local ? tl(L, '这是本机路径：用服务器上 git 自己的权限，不需要连接') : tl(L, '没有匹配的连接：会试服务器上 git 自己配的凭据（一般没有，多半会失败）'));
+    console.log(`  ${tl(L, '能读')}: ${c.canRead}  ${tl(L, '能推送')}: ${c.canPush ?? '-'}${c.defaultBranch ? `  ${tl(L, '（默认分支 {b}）', { b: c.defaultBranch })}` : ''}`);
+    if (c.detail) console.log(`  ${c.detail}`);
+    for (const x of c.tried) console.log(`  ${tl(L, '没用上的：')}${x.name} —— ${x.why}`);
+    process.exitCode = c.canRead === false || c.canPush === false ? 1 : 0;
+    return;
+  }
+  if (sub === 'oauth') {
+    // 用 GitHub 登录：给部署级 GitHub App 连接填 Client ID 与 Client secret（secret 只从文件或标准输入读）
+    const id = args[0] ?? die(tl(L, 'cred oauth <App 连接 id> --client-id <Client ID> [--secret-file <文件> | --stdin]   给 GitHub App 连接填登录用的 Client ID / Client secret'));
+    const secret = typeof flags['secret-file'] === 'string' ? readSecretFile(flags['secret-file'], L) : flags.stdin ? readFileSync(0, 'utf8') : undefined;
+    try { const r = setAppOAuth(db, { id, clientId: flags['client-id'], clientSecret: secret, byUserId: me.userId }); console.log(tl(L, '已保存：{id} 的 Client ID {cid}', { id: r.id, cid: r.clientId })); } catch (e) { die(translateError(e, L)); }
+    const g = githubLoginConfig(db);
+    console.log(g.enabled ? tl(L, 'GitHub 登录已就绪：只放行 {org} 的正式成员', { org: g.org }) : tl(L, 'GitHub 登录还缺：{what}（组织名用 user setting deploy.github_login_org <组织> 设）', { what: g.missing.join(', ') }));
+    return;
+  }
+  if (sub === 'member') {
+    // 不开浏览器验证 GitHub 登录的配置：App 装没装在组织上、有没有 Members 读权限、这个账号算不算正式成员
+    const login = args[0] ?? die(tl(L, 'cred member <GitHub 账号>   查这个账号是不是登录组织的正式成员（验证 GitHub 登录的配置）'));
+    const g = githubLoginConfig(db);
+    if (!g.org) die(tl(L, '还没设登录组织：user setting deploy.github_login_org <组织>'));
+    // 不用 die：网络请求刚结束就 process.exit，Windows 上 libuv 会断言失败（handle 还在关）
+    try { const m = await isOrgMember(db, { org: g.org, login }); console.log(m ? tl(L, '{login} 是 {org} 的正式成员', { login, org: g.org }) : tl(L, '{login} 不是 {org} 的正式成员（受邀还没接受也不算）', { login, org: g.org })); process.exitCode = m ? 0 : 1; }
+    catch (e) { console.error(tl(L, '查不了：{why}', { why: e.message })); process.exitCode = 1; }
+    return;
+  }
+  die(tl(L, '未知子命令：cred {sub}（可选 list / add / revoke / check / oauth / member）', { sub }));
+}
 
 // 交付：push + PR。PR 正文取真相源里最近一份 task_done 汇报，不另调模型。
 async function cmdDeliver(db, taskId, flags) {
@@ -1767,6 +2134,36 @@ function cmdSignoff(db, taskId, flags) {
 }
 
 // ── 用户与角色 ────────────────────────────────────────────────────────
+// 部署日历：时区、节假日表、接下来与平常不同的日子
+function cmdCalendar(db, sub, args, flags) {
+  if (!sub || sub === 'show') {
+    const cal = calendarOf(db), at = Date.now(), today = dayKey(at, cal.tz);
+    const set = !!getSetting(db, 'deploy.timezone');
+    console.log(tl(lang(), '部署时区：{tz}{note}；现在 {now}', { tz: cal.tz, note: set ? '' : tl(lang(), '（没设，按 UTC；服务器本机是 {sys}）', { sys: systemTz() }), now: fmtAt(at, cal.tz) }));
+    console.log(cal.last ? tl(lang(), '节假日表：{off} 天放假、{on} 天补班，排到 {last}', { off: cal.off.size, on: cal.on.size, last: cal.last }) : tl(lang(), '节假日表：没有（只跳过周末）'));
+    const days = Number(flags.days ?? 60);
+    for (let i = 0, k = today; i < days; i++, k = addDaysKey(k, 1)) {
+      const wd = weekdayOfKey(k), weekend = wd === 0 || wd === 6, work = isBusinessDay(k, cal);
+      if (weekend !== work && !cal.names.has(k)) continue;
+      console.log(`  ${k}  ${work ? tl(lang(), '上班') : tl(lang(), '放假')}${cal.names.get(k) ? `  ${cal.names.get(k)}` : ''}`);
+    }
+    return;
+  }
+  const me = cliIdentity(db, flags);
+  if (db.one(`SELECT role FROM users WHERE id=?`, me.userId)?.role !== 'lead') die(tl(lang(), '只有管理员能改部署日历'));
+  try {
+    if (sub === 'tz') { const r = setSetting(db, { key: 'deploy.timezone', value: args[0] === '-' ? '' : String(args[0] ?? die('calendar tz <IANA 时区名 | ->')), userId: me.userId }); console.log(tl(lang(), '部署时区：{tz}', { tz: r.value || 'UTC' })); return; }
+    if (sub === 'holidays') {
+      const text = typeof flags.file === 'string' ? readFileSync(flags.file, 'utf8') : flags.clear ? '' : die(tl(lang(), 'calendar holidays --file <文件> | --clear   文件一行一条：2026-10-01..2026-10-07 国庆；补班写 2026-10-11 班'));
+      setSetting(db, { key: 'deploy.holidays', value: text, userId: me.userId });
+      const cal = calendarOf(db);
+      console.log(tl(lang(), '节假日表已存：{off} 天放假、{on} 天补班，排到 {last}', { off: cal.off.size, on: cal.on.size, last: cal.last ?? '-' }));
+      return;
+    }
+  } catch (e) { die(translateError(e, lang())); }
+  die('calendar [show] [--days 60] | tz <时区 | -> | holidays --file <文件> | --clear');
+}
+
 function cmdUser(db, sub, args, flags) {
   if (sub === 'list' || !sub) {
     const cal = dutyCalendarOf(db, '');
@@ -1774,30 +2171,67 @@ function cmdUser(db, sub, args, flags) {
       console.log(`  ${u.id}  ${(u.disabledAt ? tl(lang(), '已停用') : u.role).padEnd(8)} ${u.name.padEnd(14)} ${tl(lang(), '标签 {tags}  通道 {channels}  令牌 {token}', { tags: u.tags.join(',') || '-', channels: u.channels.map((c) => `${c.kind}${c.host ? `@${c.host}` : ''}`).join(',') || '-', token: u.tokens ? tl(lang(), '有效') : tl(lang(), '无') })}`);
       if (u.responsibilities.count) console.log(tl(lang(), '      名下：{text}', { text: dyn(u.responsibilities.text) }));
     }
-    if (cal) console.log(tl(lang(), '  值班：{users}，起 {start}，每 {days} 天换', { users: cal.users.join(' → '), start: new Date(cal.start_at).toISOString().slice(0, 10), days: cal.period_days }));
+    if (cal) console.log(tl(lang(), '  值班：{users}，起 {start}，每 {days} 天换', { users: cal.users.join(' → '), start: fmtAt(cal.start_at, cal.tz), days: cal.period_days }));
+    if (cal?.overrides?.length) for (const o of cal.overrides) console.log(tl(lang(), '    代班：{from} – {to} 由 {user} 值班{note}', { from: o.from, to: o.to, user: o.user, note: o.note ? `（${o.note}）` : '' }));
     return;
   }
   const me = cliIdentity(db, flags);
   const requireLead = () => { if (db.one(`SELECT role FROM users WHERE id=?`, me.userId)?.role !== 'lead') die(tl(lang(), '只有管理员能管理成员')); };
   if (sub === 'add') {
     requireLead();
-    const name = args[0] ?? die(tl(lang(), 'user add <名字> --role member|observer [--tags a,b] [--out <令牌文件>]'));
-    const r = addUser(db, { name, role: flags.role ?? 'member', tags: String(flags.tags ?? '').split(',').map((s) => s.trim()).filter(Boolean), byUserId: me.userId });
+    const name = args[0] ?? die(tl(lang(), 'user add <名字> --role member|observer [--tags a,b] [--out <令牌文件>] | user add <名字> --service [--scope read|write] [--days N]'));
+    // 服务账户：不能登录看板、不能当管理员；替人做事时带 x-si-on-behalf-of 头，审计记 on_behalf_of
+    const r = flags.service
+      ? (() => { try { return addServiceAccount(db, { name, byUserId: me.userId, scope: flags.scope ?? 'write', days: flags.days === undefined ? undefined : Number(flags.days) }); } catch (e) { die(translateError(e, lang())); } })()
+      : addUser(db, { name, role: flags.role ?? 'member', tags: String(flags.tags ?? '').split(',').map((s) => s.trim()).filter(Boolean), byUserId: me.userId });
     const out = flags.out ?? join(HOME, 'tokens', `${name}.token`);
     mkdirSync(dirname(out), { recursive: true });
     writeFileSync(out, r.plaintext, { mode: 0o600 });
-    console.log(tl(lang(), '已加用户 {id}（{role}）', { id: r.userId, role: flags.role ?? 'member' }));
+    console.log(tl(lang(), '已加用户 {id}（{role}）', { id: r.userId, role: flags.service ? tl(lang(), '服务账户') : (flags.role ?? 'member') }));
     console.log(tl(lang(), '令牌写入 {file}（库里只有哈希，这个文件是唯一副本；交给本人，本人用 --token-file 指向它）', { file: out }));
     return;
   }
-  if (sub === 'tags') { requireLead(); setUserTags(db, { userId: args[0] ?? die(tl(lang(), '要给用户 id')), tags: String(flags.tags ?? '').split(',').map((s) => s.trim()).filter(Boolean), byUserId: me.userId }); console.log(tl(lang(), '标签已改')); return; }
+  // 每人花费 / 月度预算
+  if (sub === 'spend') {
+    const s = spendByPerson(db);
+    const usd = (m) => `$${(m / 1e6).toFixed(2)}`;
+    console.log(tl(lang(), '本月（{month}，{tz}）', { month: s.month, tz: s.tz }));
+    const lead = db.one(`SELECT role FROM users WHERE id=?`, me.userId)?.role === 'lead';   // 与看板一致：别人只看自己那一行
+    for (const r of s.rows.filter((x) => lead || x.userId === me.userId)) console.log(`  ${r.userId}  ${r.name.padEnd(12)} ${usd(r.month).padStart(10)}  ${tl(lang(), '上月 {last}  预算 {budget}', { last: usd(r.lastMonth), budget: r.budget === null ? '-' : usd(r.budget) })}`);
+    if (lead) console.log(tl(lang(), '  部署合计 {total}  预算 {budget}', { total: usd(s.deployment.month), budget: s.deployment.budget === null ? '-' : usd(s.deployment.budget) }));
+    return;
+  }
+  if (sub === 'budget') {
+    requireLead();
+    const id = args[0] ?? die(tl(lang(), 'user budget <id> --usd <每月美元> | --clear（用部署默认）'));
+    try { setPersonBudget(db, { userId: id, usd: flags.clear ? null : (flags.usd ?? die(tl(lang(), 'user budget <id> --usd <每月美元> | --clear（用部署默认）'))), byUserId: me.userId }); } catch (e) { die(translateError(e, lang())); }
+    console.log(tl(lang(), '已设'));
+    return;
+  }
+  if (sub === 'tags') { requireLead();setUserTags(db, { userId: args[0] ?? die(tl(lang(), '要给用户 id')), tags: String(flags.tags ?? '').split(',').map((s) => s.trim()).filter(Boolean), byUserId: me.userId }); console.log(tl(lang(), '标签已改')); return; }
   if (sub === 'perms') { try { console.log(renderPermissions(permissionsOf(db, args[0] ?? me.userId))); } catch (e) { die(translateError(e, lang())); } return; }
   if (sub === 'setting') {
     // 部署级开关：看 = 所有人；改 = 管理员。
     if (!args[0]) { for (const [k, d] of Object.entries(SETTINGS)) console.log(`${k} = ${getSetting(db, k)}   ${dyn(d.label)}`); return; }
     requireLead();
-    if (!['true', 'false'].includes(args[1])) die(tl(lang(), 'user setting <键> true|false'));
-    try { const r = setSetting(db, { key: args[0], value: args[1] === 'true', userId: me.userId }); console.log(`${r.key} = ${r.value}`); } catch (e) { die(translateError(e, lang())); }
+    // 按设置项的类型解析（原来只认 true / false，枚举和列表类的设置在命令行上改不了）
+    const def = SETTINGS[args[0]];
+    if (!def || args[1] === undefined) die(tl(lang(), 'user setting <键> <值>（布尔：true / false；整数；枚举取可选值之一；列表用逗号分隔）'));
+    const raw = String(args[1]);
+    const value = def.type === 'boolean' ? (raw === 'true' ? true : raw === 'false' ? false : raw)
+      : def.type === 'int' ? (/^-?\d+$/.test(raw) ? Number(raw) : raw)
+        : def.type === 'list' ? raw.split(',').map((x) => x.trim()).filter(Boolean)
+          : raw;
+    try { const r = setSetting(db, { key: args[0], value, userId: me.userId }); console.log(`${r.key} = ${JSON.stringify(r.value)}`); } catch (e) { die(translateError(e, lang())); }
+    return;
+  }
+  // 自己的时区（只影响给自己看的时刻：看板、摘要）；- 清掉 = 跟部署时区
+  if (sub === 'tz') {
+    const z = args[0];
+    if (z === undefined) { console.log(tl(lang(), '你的时区：{tz}{own}', { tz: viewerTz(db, me.userId), own: db.one(`SELECT tz FROM users WHERE id=?`, me.userId)?.tz ? '' : tl(lang(), '（跟部署时区）') })); return; }
+    if (z !== '-' && !validTz(z)) die(tl(lang(), '不认识的时区：{tz}（应为 IANA 时区名，如 Asia/Shanghai）', { tz: z }));
+    updateUser(db, me.userId, { tz: z === '-' ? null : z });
+    console.log(tl(lang(), '你的时区：{tz}{own}', { tz: viewerTz(db, me.userId), own: z === '-' ? tl(lang(), '（跟部署时区）') : '' }));
     return;
   }
   if (sub === 'channel') {
@@ -1813,6 +2247,14 @@ function cmdUser(db, sub, args, flags) {
   }
   try {
     if (sub === 'role') { requireLead(); const r = setUserRole(db, { userId: args[0] ?? die('user role <id> lead|member|observer'), role: args[1] ?? die(tl(lang(), 'user role <id> lead|member|observer（lead = 管理员）')), byUserId: me.userId }); console.log(r.changed ? tl(lang(), '角色已改为 {role}', { role: r.role }) : tl(lang(), '角色没变')); return; }
+    if (sub === 'git') {
+      const uid = args[0] ?? die(tl(lang(), 'user git <id> [--github <账号>] [--email <提交邮箱>]   写进提交 trailer 与 PR 溯源表；给 - 清掉'));
+      const val = (v) => (v === undefined ? undefined : v === '-' || v === true ? null : String(v));
+      if (flags.github === undefined && flags.email === undefined) die(tl(lang(), '要给 --github 或 --email（给 - 清掉）'));
+      const r = setGitIdentity(db, { userId: uid, github: val(flags.github), email: val(flags.email), byUserId: me.userId });
+      console.log(tl(lang(), '已保存 {name}：GitHub {gh}，提交邮箱 {em}', { name: r.name, gh: r.github ?? (flags.github === undefined ? tl(lang(), '（没改）') : tl(lang(), '（无）')), em: r.email ?? (flags.email === undefined ? tl(lang(), '（没改）') : tl(lang(), '（无）')) }));
+      return;
+    }
     if (sub === 'rename') { requireLead(); const r = renameUser(db, { userId: args[0] ?? die(tl(lang(), 'user rename <id> <新名字>')), name: args.slice(1).join(' '), byUserId: me.userId }); console.log(r.changed ? tl(lang(), '已改名为 {name}', { name: r.name }) : tl(lang(), '名字没变')); return; }
     if (sub === 'token') {
       const uid = args[0] ?? die(tl(lang(), 'user token <id> [--out <令牌文件>]   重发令牌：旧的立刻失效'));
@@ -1830,7 +2272,7 @@ function cmdUser(db, sub, args, flags) {
     if (sub === 'disable') { const r = disableUser(db, { userId: args[0] ?? die('user disable <id>'), byUserId: me.userId }); console.log(tl(lang(), '已停用，吊销令牌 {n} 枚。恢复：user enable <id>，再 user token <id> 重发令牌', { n: r.tokensRevoked })); return; }
     if (sub === 'enable') { enableUser(db, { userId: args[0] ?? die('user enable <id>'), byUserId: me.userId }); console.log(tl(lang(), '已恢复。令牌在停用时已吊销：user token <id> 重发')); return; }
   } catch (e) { die(e.needsHandover ? `${translateError(e, lang())}\n  → node src/cli.mjs handover preview --from ${args[0]} --to ${tl(lang(), '<接手人 id>')} --all --disable` : translateError(e, lang())); }
-  die(tl(lang(), 'user 子命令：list | add | tags | perms | setting | channel | role | rename | token | disable | enable'));
+  die(tl(lang(), 'user 子命令：list | add | tags | perms | setting | channel | git | role | rename | token | disable | enable'));
 }
 
 // ── 交接 ────────────────────────────────────────────────────────────────────
@@ -1924,10 +2366,43 @@ function cmdRouting(db, sub, args, flags) {
     if (sub === 'remove') { const k = setKnobs(db, { key, removeInterveners: [args[0] ?? die(tl(lang(), '要给用户 id'))], userId: me.userId }); console.log(tl(lang(), '已从所有行去掉；介入者现为 {list}', { list: k.interveners.join(tl(lang(), '、')) || none() })); return; }
     if (sub === 'duty') {
       const users = String(flags.users ?? '').split(',').map((s) => s.trim()).filter(Boolean);
-      const start = flags.start ? Date.parse(String(flags.start)) : Date.now();
-      if (!users.length || !Number.isFinite(start)) die('routing duty --users u_a,u_b --start 2026-09-21 [--period 7]');
+      // 起点按部署时区读：2026-09-21（当天 0 点）或 2026-09-21T09:00（那天 9 点换班）
+      const m = flags.start ? /^(\d{4}-\d{2}-\d{2})(?:[T ](\d{1,2}:\d{2}))?$/.exec(String(flags.start).trim()) : null;
+      if (!users.length || (flags.start && !m)) die('routing duty --users u_a,u_b --start 2026-09-21[T09:00] [--period 7]');
+      let start; try { start = m ? dutyStartAt(db, m[1], m[2] ?? '00:00') : Date.now(); } catch (e) { die(translateError(e, lang())); }
       setDutyCalendar(db, { key, users, startAt: start, periodDays: Number(flags.period ?? 7), userId: me.userId });
-      console.log(tl(lang(), '值班日历已存：{users}，每 {days} 天换', { users: users.join(' → '), days: flags.period ?? 7 })); return;
+      console.log(tl(lang(), '值班日历已存：{users}，每 {days} 天换', { users: users.join(' → '), days: flags.period ?? 7 }));
+      console.log(tl(lang(), '  起点 {start}（部署时区 {tz}）', { start: fmtAt(start, deployTz(db)), tz: deployTz(db) })); return;
+    }
+    // 换班：routing swap list | add <日期>[..<日期>] <成员 id> [--note 说明] | remove <序号> | clear
+    if (sub === 'swap') {
+      const cal = dutyCalendarOf(db, key) ?? die(tl(lang(), '还没有值班表：先设轮换名单与起点，再加代班'));
+      // 每条写出替的是谁（那几天按轮换本来该谁）：只列规则看不出"写着张三出差、其实那几天轮到李四"
+      const nameOf = (id) => db.one(`SELECT display_name FROM users WHERE id=?`, id)?.display_name ?? id;
+      const show = () => {
+        const xs = dutyCalendarOf(db, key).overrides, v = dutyView(db, key);
+        if (!xs.length) console.log(tl(lang(), '  没有代班'));
+        xs.forEach((o, i) => {
+          const was = (v.covers[i] ?? []).filter((u) => u !== o.user);
+          console.log(`  ${i + 1}. ${o.from} – ${o.to}  ${nameOf(o.user)} (${o.user})${was.length ? tl(lang(), '，替 {names}', { names: was.map(nameOf).join(tl(lang(), '、')) }) : tl(lang(), '，那几天本来就轮到他')}${o.note ? `  ${o.note}` : ''}`);
+        });
+        console.log(tl(lang(), '  此刻值班：{name}', { name: nameOf(v.now.user) }));
+      };
+      const act = args[0] ?? 'list';
+      let next = cal.overrides;
+      if (act === 'list') { show(); return; }
+      if (act === 'add') {
+        const r = /^(\d{4}-\d{2}-\d{2})(?:\.\.(\d{4}-\d{2}-\d{2}))?$/.exec(String(args[1] ?? ''));
+        if (!r || !args[2]) die('routing swap add 2026-10-03[..2026-10-04] <成员 id> [--note 说明]');
+        next = [...next, { from: r[1], to: r[2] ?? r[1], user: args[2], ...(flags.note ? { note: String(flags.note) } : {}) }];
+      } else if (act === 'remove') {
+        const i = Number(args[1]) - 1;
+        if (!(i >= 0 && i < next.length)) die(tl(lang(), '没有第 {n} 条代班', { n: args[1] ?? '?' }));
+        next = next.filter((_, j) => j !== i);
+      } else if (act === 'clear') next = [];
+      else die('routing swap list | add <日期>[..<日期>] <成员 id> [--note 说明] | remove <序号> | clear');
+      try { setDutyOverrides(db, { key, overrides: next, userId: me.userId }); show(); } catch (e) { die(translateError(e, lang())); }
+      return;
     }
     if (sub === 'export') { const f = flags.file ?? die(tl(lang(), '--file <路径>')); writeFileSync(f, JSON.stringify(rulesOf(db, key).map(({ id, project_id, template, created_at, ...r }) => r), null, 2)); console.log(tl(lang(), '已导出 {f}', { f })); return; }
     if (sub === 'import') {
@@ -1940,7 +2415,7 @@ function cmdRouting(db, sub, args, flags) {
       console.log(tl(lang(), '已存 {n} 行；按它回放 {q} 条历史事项：落空 {u} 条，打断 {i}', { n: rows.length, q: pv.questions, u: pv.unaddressed.length, i: Object.entries(pv.interruptions).map(([u, n]) => `${u}×${n}`).join(' ') || tl(lang(), '无') })); return;
     }
   } catch (e) { die(translateError(e, lang())); }
-  die(tl(lang(), 'routing 子命令：show | templates | template <名> | reset | owner <类型> <解析器>... | remove <用户> | duty | preview [--template 名] | export --file | import --file'));
+  die(tl(lang(), 'routing 子命令：show | templates | template <名> | reset | owner <类型> <解析器>... | remove <用户> | duty | swap | preview [--template 名] | export --file | import --file'));
 }
 
 function cmdQuestion(db, sub, args, flags) {
@@ -2048,7 +2523,7 @@ function cmdShow(db, taskId) {
     const note = a.action === 'plan_attempt'
       ? ` attempt=${p.attempt} accepted=${p.accepted}${p.accepted ? '' : ` ← ${p.rejections.join(tl(lang(), '；'))}`}`
       : '';
-    console.log(`  ${new Date(a.ts).toISOString()} ${a.actor_kind}/${a.actor_id ?? '-'} ${a.action}${note}`);
+    console.log(`  ${when(db, a.ts, { seconds: true })} ${a.actor_kind}/${a.actor_id ?? '-'} ${a.action}${note}`);
   }
 }
 
@@ -2061,10 +2536,11 @@ const usage = () => tl(lang(), `superintern {version} —— 服务端长期运�
   node src/cli.mjs decisions <项目 id|任务 id> [--all] [--void <决定 id> "理由"]   # 决定登记：此刻仍然有效的约定清单（有结论的事项 / 批准过的契约与变更 / 改过的目标）
   node src/cli.mjs stalls [--raise]                          # 停等账本：每个没结束的任务在等谁（自己 / 时钟 / 某个人 / 上游）；⚠ 那几行是说不出在等谁的缺陷，--raise 升成事项
   node src/cli.mjs digest [--user <id|名字>] [--send]        # 我的待办打包：等我答的 / 等冲突结论的 / 等别人的 / 知会我的；负责人另见没人接的、任务状态、未读汇报、异议
-  node src/cli.mjs catalog check [--probe] [--vendor <id>] | last   # 模型目录漂移：还在不在、能不能调（--probe 花极少的钱）、单价与窗口对不对；只报告，目录由人改
+  node src/cli.mjs catalog check [--probe] [--vision] [--vendor <id>] | last # 模型目录漂移：还在不在、能不能调（--probe 花极少的钱）、单价与窗口对不对；只报告，目录由人改
   node src/cli.mjs endpoint [list] | set <id> --adapter … --base-url … --key-env … | enable|disable|remove|test|models <id>   # 服务商（直连厂商 / 聚合平台）；key 只在 .env
   node src/cli.mjs catalog [list] | add|set <服务商/模型> --input <$/M> --output <$/M> [--window N] [--efforts …] | remove|enable|disable <键>   # 模型目录（缺单价不能绑）
   node src/cli.mjs bind [show] | bind set <tier>=<服务商/模型>... [--effort low|medium|high|none]   # 档位绑定（进库、记审计；下一个节点起生效）
+  node src/cli.mjs bind role <角色> <服务商/模型 | tier> [--effort low|medium|high] | bind fallback <tier>=<服务商/模型 | none>   # 某个角色单独绑模型（tier = 回到档位）；档位的备用模型（那家出故障时自动换过去）
   node src/cli.mjs init [--name <管理员显示名>] [--bind <tier>=<服务商/模型>]...     # 库已存在时 --name 改显示名；首装时 --bind 写默认绑定
   node src/cli.mjs new "<标题>" --goal <目标> --dod <完成定义> [--scope <范围>]
                                 [--constraint <约束>]... [--verify "<任务级验收命令>"]
@@ -2073,9 +2549,10 @@ const usage = () => tl(lang(), `superintern {version} —— 服务端长期运�
   node src/cli.mjs workspace <taskId> [--source <repo>] [--dir <路径>] [--ref <commit>] [--force]
   node src/cli.mjs run <taskId> [--cycles N] [--once] [--tier ...] [--iterations N]
                                 [--no-commit] [--no-verify] [--no-sandbox]
-  node src/cli.mjs revision <taskId> [--approve | --reject] [--reservation "批了，但这一条我保留意见：…"]
+  node src/cli.mjs revision <taskId> [--approve | --redo "要怎么改" | --reject] [--reservation "批了，但这一条我保留意见：…"]
   node src/cli.mjs sandbox [--reap] [--task <taskId>]
   node src/cli.mjs sources [add|remove]                      联网目录（管理员）：内置 5 个软件源，可加镜像 / 私有仓库 / 可信的信息源
+  node src/cli.mjs sources cred add <源 id> (--key-file <文件> | --stdin) [--basic] [--allow-write] | revoke <凭据 id>   联网源的凭据：只进出网代理、沙箱看不到，默认只在读请求上带
   node src/cli.mjs project setup <projectId> [--cmd "<命令>"]... [--clear]   环境准备命令：新工作区与项目级验收前自动先跑（装依赖用）
   node src/cli.mjs project egress <projectId> [--add <源>]... [--remove <源>]...   项目联网：从联网目录里勾选，项目下所有任务共用
   node src/cli.mjs egress <taskId> [--allow <源>]... [--deny <源>]...
@@ -2086,17 +2563,29 @@ const usage = () => tl(lang(), `superintern {version} —— 服务端长期运�
   node src/cli.mjs answer <questionId> "<答复>" [--token-file <路径>]   多人时按路由表数人头；立场不同会生成冲突事项
   node src/cli.mjs answer <questionId> --agree [答复 id]                 附议已有的那条（不写新文本，计入法定人数）
   node src/cli.mjs answer <questionId> --abstain ["说明"]                弃权：这条不归我（从收件人里去掉自己，人数重算）
+  node src/cli.mjs answer <questionId> "..." --allow-tests              答复并放行这一步对任务开始前就有的测试的改动（questions 里会列出是哪几个）
   node src/cli.mjs question transfer <questionId> --to user:<id> [--reason "..."]   把一条事项转给别人（事项级，不改表；理由会显示给对方）
   node src/cli.mjs user list | add <名字> --role member|observer [--tags a,b] | tags <id> --tags a,b | channel <id> --ntfy <url> | --remove <种类>
-  node src/cli.mjs user role <id> lead|member|observer（lead = 管理员）| perms [<id>]（权限一览）| setting [<键> true|false] | rename <id> <新名字> | token <id>（重发令牌）| disable <id> | enable <id>
+  node src/cli.mjs user role <id> lead|member|observer（lead = 管理员）| perms [<id>]（权限一览）| setting [<键> <值>] | rename <id> <新名字> | token <id>（重发令牌）| disable <id> | enable <id>
+  node src/cli.mjs user add <名字> --service [--scope read|write] [--days N]   服务账户：不能登录看板，替人做事时审计记 on_behalf_of
+  node src/cli.mjs token list [--all] [--everyone] | new <名字> [--scope read|write] [--days N] | revoke <令牌 id> | revoke --all-others   自己的令牌与登录
+  node src/cli.mjs invite list | new [--role member|observer] [--name <名字>] [--hours N] [--public-url <看板地址>] | revoke <邀请 id>   邀请链接（管理员）
+  node src/cli.mjs cred list | add token|github-app|ssh --name <名字> (--key-file <文件> | --stdin) [--host github.com] [--repos acme/*] [--mine] [--app-id N] | revoke <id> | check <远端>   连接（交付用的凭据）
+  node src/cli.mjs user git <id> [--github <账号>] [--email <提交邮箱>]   成员的 GitHub 账号与提交邮箱（写进提交与 PR 的出处；- 清空）
+  node src/cli.mjs cred oauth <GitHub App 连接 id> --client-id <id> (--secret-file <文件> | --stdin) | member <GitHub 账号>   用 GitHub 登录
+  node src/cli.mjs user spend | budget <id> --usd <美元> | budget <id> --clear   每个人本月 / 上月的花费；单人月度预算
+  node src/cli.mjs calendar [--days 60] | tz <时区 | -> | holidays --file <文件> | --clear   部署日历：时区（业务日 / 值班交接 / 月度预算按它算）、节假日与调休
+  node src/cli.mjs user tz [<时区> | -]   自己的时区（只影响给你看的时刻；- = 跟部署时区）
+  node src/cli.mjs routing swap list | add <日期>[..<日期>] <成员 id> [--note 说明] | remove <序号> | clear [--project <id>]   值班代班（那几天整天由他值，不管轮换轮到谁）
+  node src/cli.mjs trace <文件:行号 | 提交号> [--repo <仓库目录>] [--task <任务 id>]   修改溯源：这行代码 / 这个提交是哪一步做的、依据契约哪几条、谁的指令、谁批准
   node src/cli.mjs handover preview|run --from <id> --to <id> (--project <id> | --solo | --all) [--note ".."] [--disable]   交接；成员 run = 申请
   node src/cli.mjs handover requests | approve|reject|withdraw <申请 id>
   node src/cli.mjs routing show | templates | template <名> [--set pm=u_x] | reset | owner <类型> <解析器>... | remove <用户> |
-                           duty --users u_a,u_b --start 日期 | preview [--template 名] | export --file f | import --file f   [--project <id>]
+                           duty --users u_a,u_b --start 日期[T09:00] | preview [--template 名] | export --file f | import --file f   [--project <id>]
   node src/cli.mjs tick [taskId] [--notify <cmd>]   扫到期的问题：Ⅰ 级走默认 / Ⅱ 级升级或退默认（给 cron 用）
   node src/cli.mjs deliver <taskId> [--remote <url>] [--branch <名>] [--pr] [--base <分支>]
   node src/cli.mjs project new --file <项目.json> --source <仓库路径或URL> [--base <ref>]   整批契约建项目（守护进程串着跑）
-  node src/cli.mjs project new --brief <规划文本或文件> (--source <仓库> | --empty) [--title <名>]   让规划器切整批契约，人批一次
+  node src/cli.mjs project new --brief <规划文本或文件> (--source <仓库> | --empty) [--title <名>] [--visibility all|members]   让规划器切整批契约，人批一次
   node src/cli.mjs project plan <projectId> [--bind …]  规划器的一次寿命（守护进程会自动拉）
   node src/cli.mjs project show <projectId>            各任务状态 / 签收 / 合并
   node src/cli.mjs project advance <projectId>         手动推进一步（没开守护进程时用）
@@ -2104,11 +2593,11 @@ const usage = () => tl(lang(), `superintern {version} —— 服务端长期运�
   node src/cli.mjs project verify <projectId> [--cmd "<一条命令>" | --clear]   项目级验收命令（选填；没填时"项目达成"只能由人宣布）
   node src/cli.mjs project gear <projectId> [propose|auto]    自动化挡位；不带参数看当前挡与四条前提各自成不成立
   node src/cli.mjs project limits <projectId> [--key <项> --value <数> | --key <项> --clear]   项目默认上限（部署默认 → 项目默认 → 任务覆盖）
-  node src/cli.mjs project sandbox <projectId> [node|python]      沙箱镜像（默认只有 Node；python = 在它之上加 Python 3）
+  node src/cli.mjs project sandbox <projectId> [node|python]      沙箱镜像（默认 python = Node + Python 3，带页面点验用的 Chromium；node = 只有 Node，镜像小一些）
   node src/cli.mjs project concurrency <projectId> [--max <1-4>]   同时最多开几个任务（默认 2；只有开着的任务全都在等人时才让路）
   node src/cli.mjs project deliver <projectId> --remote <url> [--pr] [--base <分支>] [--accept-pending]
   node src/cli.mjs project signoff <projectId> [--accept-all]   后置签收：自动挡下 AI 自己加的任务攒着的签收，看清单 / 一次点掉（交付前必须清掉）
-                                    push 工作区分支；--pr 在 GitHub 开 PR（要 .env 里的 GITHUB_TOKEN；高风险任务先签收）
+                                    push 工作区分支；--pr 在 GitHub 开 PR（凭据见 cred；高风险任务先签收）
   node src/cli.mjs signoff <taskId> --accept | --reject "<理由>"   人工签收；打回 = 一条紧急修正
   node src/cli.mjs web [--port 7357] [--daemon]   看板（只绑 127.0.0.1；--daemon 同时带守护进程；不接 --bind —— 子进程自己读库里的绑定，库空时 --bind 写入一次）
   node src/cli.mjs web --team --public-url https://<内网域名> [--host 127.0.0.1] [--daemon]   团队模式：多人各自登录，放在 HTTPS 反向代理之后（docs/deploy-team.md）
@@ -2116,8 +2605,10 @@ const usage = () => tl(lang(), `superintern {version} —— 服务端长期运�
   node src/cli.mjs show <taskId>
   node src/cli.mjs questions [--all]      列开放 / 已升级的问题（--all 含已答复的最近 20 条）；一眼看有没有人要答
   node src/cli.mjs limit <taskId> [--budget_micro_usd N] [--runtime_ms N] [--llm_calls N]
-                                  [--node_retries N] [--idle_cycles N] [--context_tokens N]
+                                  [--node_retries N] [--idle_cycles N] [--context_tokens N] [--compact_tokens N]
   node src/cli.mjs replay <taskId>
+  node src/cli.mjs db backup [--tag <名>] | backups | check [--full] | restore <文件> | stats   备份、恢复、完整性检查、状态库体量
+  node src/cli.mjs invariants [--run]   运行期自检：各条最近一次的结果（--run 当场查一遍）
 
 全局：--db <路径>（默认 .superintern/state.db）
       --mode live|record|replay  --cassette <路径>（录制/回放 LLM 调用）
@@ -2145,6 +2636,15 @@ const { flags, positional } = parseArgs(process.argv.slice(2));
 const [cmd, ...rest] = positional;
 if (flags.version || cmd === 'version') { console.log(VERSION); process.exit(0); }
 if (!cmd || flags.help) { console.log(usage()); process.exit(0); }
+// 这个进程是哪一种（记进花费账本，复盘据此把每笔钱对到进程寿命上；见 core/lifetimes.mjs）。启动器拉起的子进程已经带着
+const PROC_OF = { web: 'web', daemon: 'daemon', run: 'run', draft: 'draft', plan: 'plan' };
+process.env[PROC_ENV] ||= cmd === 'project' && rest[0] === 'plan' ? 'project-plan' : (PROC_OF[cmd] ?? `cli:${cmd}`);
+// 长期运行的进程另写一份 JSON 行日志（见 core/log.mjs）；一次性命令的输出就是给人看的结果，不写
+if (['web', 'daemon', 'run', 'draft', 'plan', 'project-plan'].includes(process.env[PROC_ENV])) {
+  if (['run', 'draft', 'plan'].includes(cmd) && rest[0]) setLogBase({ task: rest[0] });
+  if (cmd === 'project' && rest[1]) setLogBase({ project: rest[1] });
+  installLogSink({ home: HOME });
+}
 
 const dbPath = flags.db ?? join(HOME, 'state.db');
 if (cmd !== 'init' && !existsSync(dbPath) && dbPath !== ':memory:') {
@@ -2162,9 +2662,26 @@ try {
     case 'workspace': cmdWorkspace(db, rest[0] ?? noTask(), flags); break;
     case 'run': await cmdRun(db, rest[0] ?? noTask(), flags); break;
     case 'say': await cmdSay(db, rest[0] ?? noTask(), rest.slice(1).join(' '), flags); break;
-    case 'answer': await cmdAnswer(db, rest[0] ?? die(tl(lang(), '要给问题 id')), rest.slice(1).join(' '), flags); break;
+    // --allow-tests 是开关：写在正文前面时解析器会把正文当成它的值，这里还回去
+    case 'answer': { const at = flags['allow-tests']; if (typeof at === 'string') flags['allow-tests'] = true;
+      await cmdAnswer(db, rest[0] ?? die(tl(lang(), '要给问题 id')), [...rest.slice(1), ...(typeof at === 'string' ? [at] : [])].join(' '), flags); break; }
     case 'show': cmdShow(db, rest[0] ?? noTask()); break;
+    case 'calendar': cmdCalendar(db, rest[0], rest.slice(1), flags); break;
+    case 'trace': {
+      // 修改溯源：从代码倒查回人。默认在当前目录的仓库里查（交付出去的仓库的克隆也行，提交信息里带着步骤 id）
+      const q = rest[0] ?? die(tl(lang(), 'trace <文件:行号 | 提交号> [--repo <仓库目录>] [--task <任务 id>]   从一行代码 / 一个提交查回：哪一步、依据契约哪几条、谁的指令、谁批准。默认查当前目录的仓库；--task 查某个任务的工作区，--repo 查别的目录'));
+      const dir = flags.repo ? String(flags.repo) : flags.task ? join(HOME, 'workspaces', String(flags.task)) : process.cwd();
+      try {
+        const t = parseTraceQuery(q);
+        const r = t.kind === 'commit' ? traceCommit(db, { dir, rev: t.rev }) : traceLine(db, { dir, file: t.file, line: t.line });
+        console.log(renderTrace(r, lang()));
+      } catch (e) { die(translateError(e, lang())); }
+      break;
+    }
     case 'user': cmdUser(db, rest[0], rest.slice(1), flags); break;
+    case 'token': cmdToken(db, rest[0], rest.slice(1), flags); break;
+    case 'invite': cmdInvite(db, rest[0], rest.slice(1), flags); break;
+    case 'cred': await cmdCred(db, rest[0], rest.slice(1), flags); break;
     case 'routing': cmdRouting(db, rest[0], rest.slice(1), flags); break;
     case 'handover': await cmdHandover(db, rest[0], rest.slice(1), flags); break;
     case 'question': cmdQuestion(db, rest[0], rest.slice(1), flags); break;
@@ -2177,6 +2694,8 @@ try {
     case 'replay': console.log(renderReplay(replay(db, rest[0] ?? noTask()))); break;
     case 'tick': await cmdTick(db, rest[0] ?? null, flags); break;
     case 'stalls': cmdStalls(db, flags); break;
+    case 'invariants': cmdInvariants(db, flags); break;
+    case 'db': cmdDb(db, rest[0], dbPath, rest.slice(1), flags); break;
     case 'decisions': cmdDecisions(db, rest[0] ?? die(tl(lang(), '要给项目 id 或任务 id')), flags); break;
     case 'web': await cmdWeb(db, flags); break;
     case 'project': await cmdProject(db, rest[0] ?? die('project new | show | plan | advance | deliver | append | members | member | visibility | goal | budget | verify | gear | limits | concurrency | sandbox | egress | setup | signoff | review | reopen | redo | abort | rename | archive'), rest.slice(1), flags); break;
@@ -2203,5 +2722,6 @@ try {
     default: die(`${tl(lang(), "未知命令 '{cmd}'", { cmd })}\n\n${usage()}`);
   }
 } finally {
+  await flushSpans().catch(() => {});   // 可选的追踪导出：攒着的 span 在退出前发出去
   db.close();
 }

@@ -9,7 +9,7 @@ import { openDb, ensureOwner, newId, now } from '../src/db/db.mjs';
 import { loadTemplates, validateRules, saveRules, applyTemplate, diffFromTemplate, rulesOf, profileOf,
   prefixesOfScope, filesOfScope, matchChains, resolveRecipients, routeQuestion, advanceRoute, transferQuestion, authorize,
   knobsOf, setKnobs, previewRouting, dueAfter, addBusinessDays, setDutyCalendar, onDutyAt, DECISION_TYPES, guessDecisionType, decisionTypeOfQuestion,
-  prefixesOf, scopeFilesOf } from '../src/core/routing.mjs';
+  prefixesOf, scopeFilesOf, rerouteOpen } from '../src/core/routing.mjs';
 import { scopePathProblems, normScopePaths } from '../src/core/project.mjs';
 
 let pass = 0, fail = 0;
@@ -210,6 +210,33 @@ section('5. 事项路由：解析写回 questions；next 转下一行；转交�
   const t2 = mkTask('.');
   const q2 = mkQ(t2);
   eq(db.tx(() => routeQuestion(db, { questionId: q2, decisionType: 'spec_choice', typeSource: 'self' })).answerers, [lead], '无前缀 → * 行 → lead');
+}
+
+section('5b. 改了路由表：已发出、还没人答的事项按新规则改发');
+{
+  // 放在自己的项目里（项目的表），不动默认表的任务 —— 后面的"预演"按默认表数事项
+  const pid = newId('p');
+  db.run(`INSERT INTO projects (id,owner_id,title,brief,repo,branch,base_ref,status,created_at) VALUES (?,?,'p','b','/tmp/x','main','HEAD','active',?)`, pid, lead, t0);
+  applyTemplate(db, { key: pid, name: 'solo', userId: lead });
+  const task = mkTask('改 src/core/y.mjs');
+  db.run(`UPDATE tasks SET project_id=? WHERE id=?`, pid, task);
+  const qa = mkQ(task), qb = mkQ(task), qc = mkQ(task), qd = mkQ(task);
+  for (const q of [qa, qb, qc, qd]) db.tx(() => routeQuestion(db, { questionId: q, decisionType: 'spec_choice', typeSource: 'self', at: t0 }));
+  eq(JSON.parse(db.one(`SELECT addressed_to FROM questions WHERE id=?`, qa).addressed_to), [lead], '改表前：发给负责人');
+  db.run(`INSERT INTO answers (id,question_id,user_id,body,stance,created_at) VALUES (?,?,?,?,?,?)`, newId('a'), qb, lead, '先这样', 'answer', t0);
+  db.run(`INSERT INTO answers (id,question_id,user_id,body,stance,created_at) VALUES (?,?,?,?,?,?)`, newId('a'), qd, carol, '顺带说一句', 'comment', t0);
+  transferQuestion(db, { questionId: qc, to: [`user:${alice}`], byUserId: lead });
+  const rules = rulesOf(db, pid).map(({ id, project_id, template, created_at, ...r }) => r);
+  rules.push({ decision_type: 'spec_choice', scope: 'src', position: 0, recipients: [`user:${bob}`], quorum: '1', conflict_policy: 'block', timeout_action: 'hang', timeout_after: null });
+  saveRules(db, { key: pid, rules, userId: lead });
+  const mine = [qa, qb, qc, qd];
+  const r = rerouteOpen(db, { key: pid, byUserId: lead });
+  eq(r.moved.map((m) => m.id).filter((id) => mine.includes(id)), [qa, qd], '还没人表态的两条改发（只有顺带的补充不算有人答过）');
+  eq(JSON.parse(db.one(`SELECT addressed_to FROM questions WHERE id=?`, qa).addressed_to), [bob], '按新规则改发给 bob');
+  eq(r.kept.filter((k) => mine.includes(k.id)).map((k) => [k.id, k.why]), [[qb, 'answered'], [qc, 'transferred']], '有人答过的、人手动转交过的不动，列出来告诉改表的人');
+  eq(JSON.parse(db.one(`SELECT addressed_to FROM questions WHERE id=?`, qc).addressed_to), [alice], '转交过的仍在 alice 那里');
+  eq(db.one(`SELECT count(*) n FROM audit_log WHERE action='question_rerouted' AND target_id=?`, qa).n, 1, '改发进审计');
+  eq(rerouteOpen(db, { key: pid, byUserId: lead }).moved.filter((m) => mine.includes(m.id)).length, 0, '再跑一次没有要改发的（收件人没变的不碰）');
 }
 
 section('6. 授权：查表不查 role；负责人恒可；旁观者恒不可');

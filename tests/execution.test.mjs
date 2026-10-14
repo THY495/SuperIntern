@@ -426,6 +426,26 @@ section('11. 两个出口 + 一个不体面的收场');
   assert(db.one(`SELECT 1 AS x FROM audit_log WHERE action='node_stalled'`), '失败原因进审计轨');
   db.close();
 }
+{
+  // 撞上限重开后，执行器看见上一次没提交的文件"查不到来源"。git 工作区里先写一个文件再跑到头
+  const { db, taskId, n1 } = fixture();
+  const ws = join(TMP, 'ws-stall'); mkdirSync(ws, { recursive: true });
+  const g = (...x) => execFileSync('git', x, { cwd: ws, encoding: 'utf8' });
+  writeFileSync(join(ws, 'README.md'), '# x\n'); g('init', '-q'); g('config', 'user.email', 't@t'); g('config', 'user.name', 't'); g('add', '-A'); g('commit', '-q', '-m', 'init');
+  const before = JSON.stringify(assembleExecutor(db, { taskId, nodeId: n1, tier: 'standard', vendorId: 'deepseek' }));
+  assert(!before.includes('这一步上一次没做完') && before.includes('只有写进工作区的文件留下'), '第一次做：没有"上一次没做完"那段；轮次预算不再说"之前做的活不算数"');
+  const client = new LlmClient({ mode: 'fake', fake: makeFake([
+    toolCall('write_file', { path: 'src/llm/sse.mjs', content: 'export const half = 1;\n' }), toolCall('list_dir', {}), toolCall('list_dir', {}),
+  ]) });
+  const r = await executeNode(db, { client, taskId, nodeId: n1, workspace: ws, tier: 'standard', vendorId: 'deepseek', narrativeDir: join(TMP, 'narr-stall'), maxIterations: 3 });
+  eq(r.kind, 'stalled', '写了一半就跑到头');
+  const p = JSON.parse(db.one(`SELECT payload FROM audit_log WHERE action='node_stalled' AND target_id=?`, n1).payload);
+  eq(JSON.stringify(p.left), '["src/llm/sse.mjs"]', '审计记下当时工作区里留下的改动');
+  const next = JSON.stringify(assembleExecutor(db, { taskId, nodeId: n1, tier: 'standard', vendorId: 'deepseek' }));
+  assert(next.includes('这一步上一次没做完') && next.includes('src/llm/sse.mjs') && next.includes('上一次的你') && next.includes('narr-stall'),
+    '重开时装配说清：上一次没做完、留下了哪些文件、是上一次的你留下的、过程原文在哪');
+  db.close();
+}
 
 // ═══════════════════════════════════════════════════════════════════════════
 section('12. 终结性工具后立刻收工，不白烧上下文');

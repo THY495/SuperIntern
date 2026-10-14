@@ -3,7 +3,7 @@
 // 认三种写法（第一个字符串参数必须是字面量；模板字符串里不许有 ${}，占位符写 {名字}）：
 //   tl(<任意表达式>, '原文', …)     服务端 / CLI
 //   new I18nError('原文', …)       报错
-//   T('原文', …)                    看板（src/web/index.html）
+//   T('原文', …)                    看板（src/web/app/*.js）
 //   N_('原文')                      只登记不翻（原文在别处翻，例如 DECISION_TYPES 的 label 由看板 T(label) 翻）
 // 另外：看板页面 <script> / <style> 之外的静态 HTML 里的中文（文字与 title / placeholder 等属性），服务端出页面时替换。
 
@@ -15,7 +15,9 @@ import { fileURLToPath } from 'node:url';
 export const SRC = join(dirname(fileURLToPath(import.meta.url)), '..');
 
 const walk = (d) => readdirSync(d).flatMap((n) => { const p = join(d, n); return statSync(p).isDirectory() ? (n === 'i18n' ? [] : walk(p)) : [p]; });
-export const sourceFiles = () => walk(SRC).filter((p) => /\.(mjs|html)$/.test(p));
+/** 看板：页面（静态文字）与 src/web/app/*.js（T() / Tc() 只在这里用；严格 CSP 之前脚本内联在 index.html 里） */
+const isBoard = (p) => p.endsWith('.html') || /(^|[\\/])web[\\/]app[\\/][^\\/]+\.js$/.test(p);
+export const sourceFiles = () => walk(SRC).filter((p) => /\.mjs$/.test(p) || isBoard(p));
 
 /** 读一个字符串字面量（i 指向引号）。返回 { value, end, raw }；不是字面量返回 null。 */
 function readLiteral(s, i) {
@@ -57,7 +59,7 @@ export function extractFrom(text, file) {
   let m;
   while ((m = re.exec(text))) {
     const fn = m[1], at = m.index + m[0].length;
-    if ((fn === 'T' || fn === 'Tc') && !file.endsWith('.html')) continue;          // T() / Tc() 只在看板里用
+    if ((fn === 'T' || fn === 'Tc') && !isBoard(file)) continue;          // T() / Tc() 只在看板里用
     if (fn === 'Tc') {   // Tc('上下文', '原文')：键是"上下文|原文"
       let j = at; while (/\s/.test(text[j])) j++;
       const ctx = readLiteral(text, j); if (!ctx) { push(m.index, null); continue; }

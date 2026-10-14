@@ -11,9 +11,9 @@
 // 让人能在看板上看见后改口。
 
 import { MESSAGE_KINDS } from './inbox.mjs';
-import { textOf } from '../llm/canonical.mjs';
+import { textOf, LLM_ROLES } from '../llm/canonical.mjs';
 
-export const CLASSIFIER_TIER = 'standard';
+export const CLASSIFIER_TIER = LLM_ROLES.classifier;
 /** 低于这个置信度的高权限类别（instruction / correction / answer）一律落 context。 */
 export const CONFIDENCE_FLOOR = 0.6;
 /** 模型可以吐四个值；规范化后 kind 只允许 instruction / correction / context。 */
@@ -128,7 +128,7 @@ export async function classify(text, { openQuestions = [], llmClient }) {
 
   for (let attempt = 0; attempt < 2; attempt++) {
     const resp = await llmClient.complete({
-      tier: CLASSIFIER_TIER, system: systemPrompt(), messages, maxTokens: 500,
+      role: 'classifier', tier: CLASSIFIER_TIER, system: systemPrompt(), messages, maxTokens: 500,
     });
     const raw = extractJson(textOf(resp));
     if (raw && ALLOWED_KINDS.includes(raw.kind)) {

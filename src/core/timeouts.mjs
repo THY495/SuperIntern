@@ -17,8 +17,12 @@
 // 重新计时到保守默认。多用户（权限画像）落地后这里换成真的改 addressed_to。
 
 import { newId, now, audit, insertEdge } from '../db/db.mjs';
+import { insertMessage } from '../db/messages.mjs';
 import { advanceRoute } from './routing.mjs';
+import { clearQuestionTimeout, clearRouteDue } from './questions.mjs';
+import { insertAnswer } from './answers.mjs';
 import { tl, contentLang } from '../i18n/index.mjs';
+import { transition } from '../db/state.mjs';
 
 export const TIMEOUT_DEFAULTS_MS = {
   l1: 30 * 60_000,          // Ⅰ 级 → 默认动作
@@ -60,7 +64,7 @@ export function sweepTimeouts(db, { taskId = null, at = now(), onEvent = () => {
       // Ⅱ 级第一次到期：升级。没有别的应答人时升级 = 再等一段、再喊一次。
       const fallback = paramMs(db, q.task_id, 'l2_fallback');
       db.tx(() => {
-        db.run(`UPDATE questions SET status='escalated', escalated_at=?, timeout_at=? WHERE id=?`, at, at + fallback, q.id);
+        transition(db, 'questions', q.id, 'escalated', { set: { escalated_at: at, timeout_at: at + fallback } });
         audit(db, { actorKind: 'system', action: 'question_escalated', targetType: 'question', targetId: q.id,
           payload: { taskId: q.task_id, nodeId: q.node_id, level: 2, askedAt: q.asked_at, timedOutAt: q.timeout_at,
             nextTimeoutAt: at + fallback, hasDefault: !!q.default_action } });
@@ -72,7 +76,7 @@ export function sweepTimeouts(db, { taskId = null, at = now(), onEvent = () => {
     if (!q.default_action) {
       // Ⅱ 级升级后仍无人答、又没有保守默认可退：只能继续挂着。记一次审计，timeout_at 清掉免得每轮都记。
       db.tx(() => {
-        db.run(`UPDATE questions SET timeout_at=NULL WHERE id=?`, q.id);
+        clearQuestionTimeout(db, q.id);
         audit(db, { actorKind: 'system', action: 'question_stuck', targetType: 'question', targetId: q.id,
           payload: { taskId: q.task_id, nodeId: q.node_id, level: q.level, why: tl(L, '升级后仍无人答，且没有默认动作可退；分支继续挂起') } });
       });
@@ -97,7 +101,7 @@ export function sweepTimeouts(db, { taskId = null, at = now(), onEvent = () => {
       const from = JSON.parse(q.addressed_to || '[]');
       const r = db.tx(() => {
         const adv = advanceRoute(db, { questionId: q.id, at });
-        if (!adv) db.run(`UPDATE questions SET route_due_at=NULL WHERE id=?`, q.id);
+        if (!adv) clearRouteDue(db, q.id);
         audit(db, { actorKind: 'system', action: adv ? 'question_rerouted' : 'question_stuck', targetType: 'question', targetId: q.id,
           payload: { taskId: q.task_id, nodeId: q.node_id, decisionType: q.decision_type, from, to: adv?.answerers ?? null, stage: adv?.route?.stage ?? null,
             nextDueAt: adv?.dueAt ?? null, why: adv ? tl(L, '路由行时限到，转下一行') : tl(L, '路由行时限到但没有下一行；继续挂起') } });
@@ -114,7 +118,7 @@ export function sweepTimeouts(db, { taskId = null, at = now(), onEvent = () => {
       continue;
     }
     db.tx(() => {
-      db.run(`UPDATE questions SET route_due_at=NULL WHERE id=?`, q.id);
+      clearRouteDue(db, q.id);
       audit(db, { actorKind: 'system', action: 'question_stuck', targetType: 'question', targetId: q.id,
         payload: { taskId: q.task_id, nodeId: q.node_id, level: q.level, why: tl(L, '路由行时限到，兜底是 default 但事项没有默认动作；继续挂起') } });
     });
@@ -128,15 +132,14 @@ export function sweepTimeouts(db, { taskId = null, at = now(), onEvent = () => {
 function applyDefault(db, q, at, why) {
   const mid = newId('m');
   db.tx(() => {
-    db.run(`INSERT INTO messages (id,task_id,sender_id,body,kind,kind_source,urgency,urgency_source,trust_label,token_id,received_at)
-            VALUES (?,?,NULL,?,'answer','explicit','normal','explicit','agent-generated',NULL,?)`,
-    mid, q.task_id, tl(contentLang(db), '[超时默认] {why}，按你提出时登记的默认动作执行：\n{action}', { why, action: q.default_action }), at);
+    insertMessage(db, { id: mid, taskId: q.task_id, kind: 'answer', trustLabel: 'agent-generated', receivedAt: at,
+      body: tl(contentLang(db), '[超时默认] {why}，按你提出时登记的默认动作执行：\n{action}', { why, action: q.default_action }) });
     insertEdge(db, mid, q.id, 'answers', at);
-    db.run(`INSERT INTO answers (id,question_id,user_id,message_id,body,stance,created_at) VALUES (?,?,NULL,?,?,'answer',?)`, newId('a'), q.id, mid, q.default_action, at);
-    db.run(`UPDATE questions SET status='defaulted', resolved_at=?, route_due_at=NULL WHERE id=?`, at, q.id);
-    if (q.node_id) db.run(`UPDATE nodes SET status='pending' WHERE id=? AND status='blocked'`, q.node_id);
+    insertAnswer(db, { questionId: q.id, messageId: mid, body: q.default_action, stance: 'answer', at });
+    transition(db, 'questions', q.id, 'defaulted', { set: { resolved_at: at, route_due_at: null } });
+    if (q.node_id) transition(db, 'nodes', q.node_id, 'pending', { from: ['blocked'], onMismatch: 'skip' });
     const stillOpen = db.one(`SELECT count(*) AS n FROM questions WHERE task_id=? AND status IN ('open','escalated')`, q.task_id).n;
-    if (!stillOpen) db.run(`UPDATE tasks SET status='running' WHERE id=? AND status='waiting'`, q.task_id);
+    if (!stillOpen) transition(db, 'tasks', q.task_id, 'running', { from: ['waiting'], onMismatch: 'skip' });
     audit(db, { actorKind: 'system', action: 'question_defaulted', targetType: 'question', targetId: q.id,
       payload: { taskId: q.task_id, nodeId: q.node_id, level: q.level, messageId: mid, defaultAction: q.default_action, why,
         askedAt: q.asked_at, timedOutAt: q.timeout_at, escalatedAt: q.escalated_at } });

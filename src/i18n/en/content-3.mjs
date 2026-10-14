@@ -34,7 +34,6 @@ export default {
   '还有 {n} 个任务的签收被后置了（自动挡下 AI 自己加的）：{list}。交付前要一次签掉：命令行加 --accept-pending，或先 node src/cli.mjs project signoff {id} --accept-all':
     '{n} task(s) still have deferred sign-offs (added by the AI itself in auto mode): {list}. Sign them all off before delivering: add --accept-pending on the command line, or first run node src/cli.mjs project signoff {id} --accept-all',
   '远端不是 GitHub（{remote}），已推送，未创建 PR': 'The remote is not GitHub ({remote}); pushed, but no PR was created',
-  '未设置 GITHUB_TOKEN：已推送，未创建 PR。在 .env 中设置后重新交付即可': 'GITHUB_TOKEN is not set: pushed, no PR opened. Set it in .env and deliver again',
   '{order}. **{title}**（`{id}`）\n   {summary}': '{order}. **{title}** (`{id}`)\n   {summary}',
   '> 项目已中止：本次只交付已签收并合并的第 1–{merged} 个任务（共 {total} 个）。\n\n':
     '> The project was aborted: this delivery only includes tasks 1–{merged}, which were signed off and merged ({total} in total).\n\n',

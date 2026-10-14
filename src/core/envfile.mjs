@@ -30,5 +30,3 @@ export function setEnvVar(path, name, value, { env = process.env } = {}) {
   return { name, existed, present: !!v };
 }
 
-/** 只回答"填了没有"。 */
-export const envHas = (name, env = process.env) => !!env[name];

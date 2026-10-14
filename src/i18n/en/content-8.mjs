@@ -5,6 +5,8 @@ export default {
   '给页面截图补样例数据（si-preview.json 的 seed）': 'Add sample data for page screenshots (seed in si-preview.json)',
   '执行器未声明隔离 —— 命令直接跑在宿主机上': 'The executor is not isolated — commands run directly on the host',
   '启动时发现节点停在 running —— 上一个进程死在它手里': 'Found the step stuck in running at startup — the previous process died while running it',
+  '任务 {taskId} 已有编排器在跑（pid {pid}）：同一任务同时只能有一个，否则两边会抢同一个步骤。等它结束，或先在看板上暂停它':
+    'Task {taskId} already has an orchestrator running (pid {pid}): only one can run per task, otherwise both would grab the same step. Wait for it to finish, or pause it on the board first',
   '{label}是硬边界：撞顶 = 容器被 OOM / pids-limit 掐死，属任务自身失控或泄漏，提高上限不是解法。已记审计，硬失败。':
     '{label} is a hard limit: hitting it means the container was killed by OOM / pids-limit, which points to the task running away or leaking. Raising the limit is not the fix. Logged to the audit trail; hard failure.',
   '｜被拒目标：{hosts}': ' | Blocked targets: {hosts}',
@@ -16,7 +18,7 @@ export default {
   '没有就绪节点，但也不是全部完成 —— 依赖成环或有节点停在非终态': 'No step is ready, but not everything is done — the dependencies form a cycle or a step is stuck in a non-final state',
   'limit.budget_micro_usd（{spent} ≥ {budget}）': 'limit.budget_micro_usd ({spent} ≥ {budget})',
   'limit.runtime_ms（{runtime} ≥ {cap}）': 'limit.runtime_ms ({runtime} ≥ {cap})',
-  'limit.context_tokens（上一轮 {tokens} ≥ {cap}{window}）': 'limit.context_tokens (last turn {tokens} ≥ {cap}{window})',
+  'limit.context_tokens（这一轮 {tokens} ≥ {cap}{window}）': 'limit.context_tokens (this turn {tokens} ≥ {cap}{window})',
   '，按所绑模型窗口 {window} 的 75% 封顶': ', capped at 75% of the assigned model\'s window of {window}',
   '已随节点 {id} 的上下文读入并落进交接记录': 'Read in with the context of step {id} and recorded in its handoff',
   '轮级闸门掐停：{stopped}': 'Stopped by the per-turn gate: {stopped}',
@@ -29,6 +31,8 @@ export default {
     '[system] The workspace had uncommitted changes before the acceptance check: {paths} — the acceptance check only counts the committed version; commit these changes or discard them',
   '[系统] 验收重新生成了已提交进仓库的构建产物：{paths} —— 已还原成提交时的样子；构建产物不该进仓库（应写进 .gitignore 并从跟踪里摘掉）':
     '[system] The acceptance check regenerated build output that is committed to the repository: {paths} — restored to the committed version; build output should not be in the repository (add it to .gitignore and untrack it)',
+  '[系统] 验收跑完留下了新文件：{paths} —— 已删掉（没动已提交的那一版，不算验收改了工作区；常留的话可以写进 .gitignore）':
+    '[system] The acceptance check left new files behind: {paths} — deleted (the committed version was not touched, so this does not count as the check changing the workspace; if they keep appearing, add them to .gitignore)',
   '[系统] 验收命令改动了工作区：{paths} —— 验收不许留下改动（已撤掉这些改动）':
     '[system] The acceptance command changed the workspace: {paths} — the acceptance check must not leave changes (these changes were discarded)',
 
@@ -97,4 +101,20 @@ export default {
   // ── ledger.mjs ──
   '请求 {requested} 实际由 {served} 代答 —— 目录键 {key} 可能已退役或改名，跑 node src/cli.mjs catalog check':
     'Requested {requested} but {served} answered — catalog key {key} may have been retired or renamed; run node src/cli.mjs catalog check',
+  "管理员暂停了全部自动运行（看板顶栏的「恢复自动运行」，或 cli user setting deploy.paused false）；恢复之后再运行": "An admin has paused all automatic runs (use “Resume automatic runs” in the board’s top bar, or cli user setting deploy.paused false); run again after resuming",
+  "管理员暂停了全部自动运行；恢复后自动接着跑": "An admin paused all automatic runs; work continues automatically after resuming",
+  "暂停全部自动运行": "Pause all automatic runs",
+  "{table} 里没有 {id}": "{table} has no row {id}",
+  "{table} {id}：不允许从 {from} 改成 {to}": "{table} {id}: cannot change from {from} to {to}",
+  "{table} {id} 当前是 {current}，不能改成 {to}（可能已被别人处理）": "{table} {id} is now {current} and cannot be changed to {to} (someone may have handled it already)",
+  "{resource} 正由另一个进程处理（{holder}，租约到 {until}）：同一时刻只能有一个": "{resource} is being handled by another process ({holder}, lease until {until}): only one at a time",
+  "{resource} 的租约已被接管（我的代数 {epoch}，现在 {now}）：这个进程不再有权写，退出": "The lease on {resource} was taken over (my epoch {epoch}, now {now}): this process may no longer write and is exiting",
+  "{label}：值无效（应为 {min}–{max} 的整数）": "{label}: invalid value (must be an integer from {min} to {max})",
+  "内存库没有可备份的文件": "An in-memory database has no file to back up",
+  "备份做出来了但核不过（{why}），已删掉": "The backup was written but failed verification ({why}) and has been deleted",
+  "这份备份核不过（{why}），不恢复": "This backup fails verification ({why}); not restoring",
+  "还有进程在用这个库（{who}）：先停掉看板 / 守护进程 / 在跑的任务，或加 --force": "The database is still in use ({who}): stop the board / daemon / running tasks first, or add --force",
+  "定期备份间隔（小时，0 = 不备份）": "Backup interval (hours, 0 = off)",
+  "日志保留天数": "Log retention (days)",
+  "已合并 / 已归档任务的工作区自动删依赖目录（node_modules 等）": "Remove dependency folders (node_modules etc.) from workspaces of merged / archived tasks",
 };

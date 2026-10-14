@@ -103,5 +103,28 @@ section('2. 基线语义：延续 / 作废 / 工作区重建后失效');
   db.close();
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+section('3. git 工作区算不出改动清单 → 拒收，不放行（原来范围 / 只读路径校验整个跳过）');
+// ═══════════════════════════════════════════════════════════════════════════
+{
+  const { db, taskId, nodeId } = fixture();
+  // 执行器写完文件顺手把 .git 弄坏（真实情形：残留的 index.lock、改坏的 ref）—— 之后 git 一律报错
+  const ws2 = join(TMP, 'ws2'); mkdirSync(ws2);
+  const g2 = (...a) => execFileSync('git', ['-c', 'user.name=t', '-c', 'user.email=t@t', ...a], { cwd: ws2, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+  g2('init', '-q'); writeFileSync(join(ws2, 'README.md'), 'x\n'); g2('add', '-A'); g2('commit', '-q', '-m', 'init');
+  class BreakingExec extends LocalExecutor {
+    writeFile(w, p, c) { super.writeFile(w, p, c); writeFileSync(join(w, '.git', 'HEAD'), 'garbage\n'); }
+  }
+  const r = await executeNode(db, { client: new LlmClient({ mode: 'fake', fake: makeFake([
+    call('write_file', { path: 'export.mjs', content: 'export const toCsv = (r) => r.join(",");\n' }),
+    call('submit_handoff', handoff),
+    call('raise_question', { level: 2, text: 'git 坏了', blocked_by: '工作区 git 报错', work_done: '写了 export.mjs', plan_after_answer: '修好再交' }),
+  ]) }), taskId, nodeId, workspace: ws2, tier: 'standard', vendorId: 'fake', narrativeDir: join(TMP, 'nar'), exec: new BreakingExec(), maxIterations: 6 });
+  eq(r.rejections.length, 1, '交接被拒了一次');
+  assert(/算不出这一步改动了哪些文件/.test(r.rejections[0]?.[0] ?? ''), `拒收理由说清是 git 出错、校验做不了（${(r.rejections[0]?.[0] ?? '').slice(0, 60)}…）`);
+  eq(r.kind, 'question', '没有被当成 done 放行');
+  db.close();
+}
+
 console.log(`\n${'═'.repeat(72)}\n${fail ? '❌' : '✅'} ${pass} 通过，${fail} 失败\n${'═'.repeat(72)}`);
 process.exitCode = fail ? 1 : 0;

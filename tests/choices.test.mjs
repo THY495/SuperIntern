@@ -69,12 +69,18 @@ section('1. 按主题分两堆：依赖 / 构建 / 仓库结构 → 结构；界
 {
   const cases = [
     ['frontend.priority.label.zh', '优先级的中文显示文案定为 低/中/高（low/medium/high）。', 'spec_choice'],
-    ['backend.post.success_status', 'POST /api/tickets 成功返回 201（非 200）。', 'spec_choice'],
+    // 状态码这类只有写代码的人在乎（原来归规格，发给了管产品的人）
+    ['backend.post.success_status', 'POST /api/tickets 成功返回 201（非 200）。', 'structural'],
+    ['api.success_codes', 'POST/GET/PATCH 成功响应码定为 200，DELETE 成功定为 204，测试按此断言。', 'structural'],
+    ['backend.app.entry', '测试假定应用入口为 backend.app:app（模块级变量 app）', 'structural'],
     ['ticketUtils.unknown_priority_sort_position', '未知/缺失的 priority 排在所有已知优先级之后', 'spec_choice'],
     ['preview.uvicorn.dependency', 'si-preview.json 的后端启动命令依赖 uvicorn，而 uvicorn 不在 backend/requirements.txt', 'structural'],
     ['gitignore.dist.tracked', 'frontend/dist/** 已被跟踪，根 .gitignore 的 dist/ 规则对已跟踪文件无效', 'structural'],
   ];
   for (const [k, s, want] of cases) eq(domainOf({ subject_key: k, statement: s }), want, `${k} → ${want === 'structural' ? '结构' : '规格'}`);
+  // 执行器标了谁会在乎：按它分，不看正则
+  eq(domainOf({ subject_key: 'list.sort.ties', statement: '同评分的书保持原有相对顺序', audience: 'developer' }), 'structural', '标 developer → 结构（即便正文像界面行为）');
+  eq(domainOf({ subject_key: 'ui.status.code', statement: '列表上把 HTTP 404 显示成"这本书已被删除"', audience: 'user' }), 'spec_choice', '标 user → 规格（即便正文提到状态码）');
 }
 
 section('2. 做完时：每个领域合成一条过目事项，按路由送人；Ⅱ 级带默认、不挡签收；幂等');

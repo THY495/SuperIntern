@@ -18,6 +18,14 @@ import ui4 from './en/ui-4.mjs';
 import ui5 from './en/ui-5.mjs';
 import ui6 from './en/ui-6.mjs';
 import ui7 from './en/ui-7.mjs';
+import ui8 from './en/ui-8.mjs';
+import ui9 from './en/ui-9.mjs';
+import ui10 from './en/ui-10.mjs';
+import ui11 from './en/ui-11.mjs';
+import ui12 from './en/ui-12.mjs';
+import ui13 from './en/ui-13.mjs';
+import ui14 from './en/ui-14.mjs';
+import ui15 from './en/ui-15.mjs';
 import uiShell from './en/ui-shell.mjs';
 import content1 from './en/content-1.mjs';
 import content2 from './en/content-2.mjs';
@@ -30,6 +38,16 @@ import content8 from './en/content-8.mjs';
 import core from './en/core.mjs';
 import cli from './en/cli.mjs';
 import parallel from './en/parallel.mjs';
+import diagnose from './en/diagnose.mjs';
+import testGuard from './en/test-guard.mjs';
+import roles from './en/roles.mjs';
+import liveApp from './en/live-app.mjs';
+import signoff from './en/signoff.mjs';
+import breaker from './en/breaker.mjs';
+import invariants from './en/invariants.mjs';
+import capabilities from './en/capabilities.mjs';
+import compaction from './en/compaction.mjs';
+import rechecks from './en/rechecks.mjs';
 
 export const LANGS = ['zh', 'en'];
 export const DEFAULT_LANG = 'zh';
@@ -49,7 +67,7 @@ function merge(parts) {
   return out;
 }
 // 看板按段分文件（多人同时补译时互不冲突）：ui-1…7 是脚本各段，ui-shell 是静态 HTML
-export const CATALOGS = { en: merge({ ui, ui1, ui2, ui3, ui4, ui5, ui6, ui7, uiShell, core, cli, content1, content2, content3, content4, content5, content6, content7, content8, parallel }) };
+export const CATALOGS = { en: merge({ ui, ui1, ui2, ui3, ui4, ui5, ui6, ui7, ui8, ui9, ui10, ui11, ui12, ui13, ui14, ui15, uiShell, core, cli, content1, content2, content3, content4, content5, content6, content7, content8, parallel, diagnose, testGuard, roles, liveApp, signoff, breaker, invariants, capabilities, compaction, rechecks }) };
 
 /** 把 {名字} 换成参数；参数里没有的占位符原样留着（看得出漏传了什么）。 */
 export const fmt = (s, params) => (params ? String(s).replace(/\{(\w+)\}/g, (m, k) => (k in params ? String(params[k] ?? '') : m)) : String(s));
@@ -101,8 +119,9 @@ export function localizeHtml(html, lang) {
     .replace(/>([^<>]*)</g, (m, t) => { const k = t.trim(); return CJK.test(k) ? `>${t.replace(k, tr(k))}<` : m; })
     .replace(new RegExp(`\\b(${SHELL_ATTRS.join('|')})="([^"]*)"`, 'g'), (m, a, v) => (CJK.test(v) ? `${a}="${tr(v)}"` : m)))).join('');
   out = out.replace(/<html lang="[^"]*">/, `<html lang="${l === 'zh' ? 'zh' : l}">`);
-  const boot = `<script>window.SI_I18N=${JSON.stringify({ lang: l, catalog: l === DEFAULT_LANG ? {} : cat }).replace(/</g, '\\u003c')};</script>`;
-  return out.replace(/<script>/, `${boot}\n<script>`);
+  // 词表放在 JSON 数据块里（页面不许有内联脚本，CSP script-src 'self'）；01-core.js 读它。< 转义：正文里出现 </script> 也截不断
+  const boot = `<script type="application/json" id="si-i18n">${JSON.stringify({ lang: l, catalog: l === DEFAULT_LANG ? {} : cat }).replace(/</g, '\\u003c')}</script>`;
+  return out.replace(/<script src=/, `${boot}\n<script src=`);
 }
 
 /** 带模板的报错：message 是中文（照旧能被日志、测试读），服务端据 tpl / params 翻成请求人的语言。 */

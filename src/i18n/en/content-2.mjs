@@ -63,9 +63,11 @@ export default {
   '重新规划失败': 'Replanning failed',
   '项目验收没过': 'Project acceptance check failed',
   '合进项目分支后重跑验收没过': 'Acceptance check failed when re-run after merging into the project branch',
+  '执行进程出错退出': 'The run process exited with an error',
   '挂事项失败': 'Failed to raise an item',
   '出错': 'Error',
   '任务「{title}」已经 {min} 分钟没有任何动静，而系统说不出它在等谁。': 'Task "{title}" has shown no activity for {min} minutes, and the system can\'t say what it is waiting for.',
+  '任务「{title}」刚停下，而系统说不出它在等谁。': 'Task "{title}" has just stopped, and the system can\'t say what it is waiting for.',
   '「{state}」': '"{state}"',
   '{why}。': '{why}.',
   '系统对它的判断是「{state}」——{why}。': 'The system\'s assessment is "{state}" — {why}.',
@@ -100,8 +102,8 @@ export default {
   '容器进程数上限': 'Container process limit',
   '建议：先检查宿主机与服务商，而不是步骤本身。\n该项统计进程在同一步骤上异常退出的次数（断电、OOM、Ctrl-C、服务商 5xx 重试耗尽均计入）；连续发生通常是环境问题（某条命令耗尽宿主机内存、服务商持续故障），而不是步骤规格有问题。\n请先查看 replay 中 node_crashed / provider_error 的 message，更换服务商（--bind）或修复环境后，再考虑调整此上限。':
     'Suggestion: check the host and the provider first, not the step itself.\nThis counts how many times the process exited abnormally on the same step (power loss, OOM, Ctrl-C and exhausted provider 5xx retries all count); repeated occurrences usually point to an environment problem (a command exhausting host memory, an ongoing provider outage) rather than a problem with the step spec.\nFirst check the message of node_crashed / provider_error in the replay, switch providers (--bind) or fix the environment, and only then consider adjusting this limit.',
-  '建议：上下文达到上限时，通常不应选择 (A) 提高上限。\n某类步骤频繁达到上下文上限，说明规划粒度过粗，应在细化步骤时将其拆小，而不是依赖压缩上下文。\n请先判断该步骤能否拆成两步；确实无法拆分时（例如必须一次读完一份大规格）再提高上限，并确认所分配模型的上下文窗口足够（本上限不随模型自动调整）。':
-    'Suggestion: when the context hits its limit, (A) raising the limit is usually not the right choice.\nIf a kind of step keeps hitting the context limit, the planning is too coarse: split it into smaller steps when refining the plan, rather than relying on compressing the context.\nFirst decide whether the step can be split in two; only raise the limit when it truly cannot be split (e.g. a large spec must be read in one go), and make sure the assigned model\'s context window is large enough (this limit does not adjust to the model automatically).',
+  '建议：上下文达到上限时，通常不应选择 (A) 提高上限。\n某类步骤频繁达到上下文上限，说明规划粒度过粗，应在细化步骤时将其拆小；自动整理只是托底，整理之后仍然超限说明这一步装不下。\n请先判断该步骤能否拆成两步；确实无法拆分时（例如必须一次读完一份大规格）再提高上限，并确认所分配模型的上下文窗口足够（本上限不随模型自动调整）。':
+    'Suggestion: when the context hits its limit, (A) raising the limit is usually not the right choice.\nIf a kind of step keeps hitting the context limit, the planning is too coarse: split it into smaller steps when refining the plan; automatic compaction is only a fallback, and still hitting the limit after compaction means the step does not fit.\nFirst decide whether the step can be split in two; only raise the limit when it truly cannot be split (e.g. a large spec must be read in one go), and make sure the assigned model\'s context window is large enough (this limit does not adjust to the model automatically).',
   '建议：联网请求连续被拒时，通常不应提高此上限。\n连续被拒说明任务要访问的范围与已放行的范围不一致：要么缺少应放行的软件源分组（在 replay 中查看连续被拒的域名及其所属分组），要么任务在访问不应连接的域名（应暂停并由人判断其意图）。\n请由人查看记录后决定：放行对应分组，或修改计划使任务在已放行范围内完成；仅提高次数上限只会让同样的请求再被拒几次。':
     'Suggestion: when network requests are denied repeatedly, raising this limit is usually not the answer.\nRepeated denials mean what the task wants to reach does not match what has been allowed: either a package-source group that should be allowed is missing (check the denied domains and their groups in the replay), or the task is reaching domains it should not connect to (pause it and let a person judge its intent).\nLet a person review the records and decide: allow the matching group, or change the plan so the task finishes within what is already allowed. Just raising the count limit only lets the same requests be denied a few more times.',
   '该项是硬边界，不支持追加：达到上限时容器已被 OOM kill，属于任务自身失控或泄漏，给失控的任务更多内存只会放大宿主机的内存风险。\n达到上限时编排器记录一条审计事件后直接失败，不提问，也不给出追加建议。\n请先检查最近几条命令与进程树，确认任务在做什么、为何耗尽内存，并修复任务本身。':

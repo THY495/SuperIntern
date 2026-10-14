@@ -11,7 +11,9 @@
 
 import { spawn } from 'node:child_process';
 import { readFileSync, writeFileSync, readdirSync, statSync, mkdirSync, existsSync, realpathSync } from 'node:fs';
-import { resolve, relative, dirname, sep } from 'node:path';
+import { resolve, relative, dirname, sep, join, basename } from 'node:path';
+import { stopwatch } from './clock.mjs';
+import { maybeFault } from './faults.mjs';
 
 export const DEFAULT_LIMITS = {
   timeoutMs: 120_000,
@@ -77,6 +79,25 @@ export function containedPath(workspace, p) {
   return abs;
 }
 
+/**
+ * 这个路径落在工作区根的 .git 里吗。按真实路径比（realpathSync.native：Windows 上大小写、8.3 短名 GIT~1 都还原成真名），
+ * 词法上第一段是 .git 的也算（.git 还不存在时写 .git/config 等于造一个仓库让宿主去信）。
+ */
+export function inGitDir(workspace, abs) {
+  const root = realpathSync.native(resolve(workspace));
+  const first = (rel) => rel.split(/[\\/]/)[0].toLowerCase();
+  if (first(relative(root, abs)) === '.git') return true;
+  let cur = abs, rest = '';
+  for (;;) {
+    try { cur = join(realpathSync.native(cur), rest); break; } catch { /* 不存在，往上 */ }
+    const up = dirname(cur);
+    if (up === cur) return false;
+    rest = rest ? join(basename(cur), rest) : basename(cur);
+    cur = up;
+  }
+  return first(relative(root, cur)) === '.git';
+}
+
 /** 逐级向上找到第一个真实存在的祖先并解析它。全不存在时原样返回。 */
 function realOfNearestExisting(abs) {
   for (let cur = abs; ;) {
@@ -95,7 +116,7 @@ function realOfNearestExisting(abs) {
  * @returns {Promise<{code, stdout, stderr, truncated, timedOut, durationMs}>}
  */
 export function spawnCapped(file, args, { cwd, env, timeoutMs, maxOutputBytes, killAfterMs = null }) {
-  const started = Date.now();
+  const elapsed = stopwatch();   // 时长用单调时钟
   return new Promise((done) => {
     const child = spawn(file, args, { cwd, env, shell: false });
 
@@ -115,7 +136,7 @@ export function spawnCapped(file, args, { cwd, env, timeoutMs, maxOutputBytes, k
       killAfterMs ?? timeoutMs);
     const finish = (code) => {
       clearTimeout(timer);
-      done({ code, stdout: out, stderr: err, truncated, timedOut, durationMs: Date.now() - started });
+      done({ code, stdout: out, stderr: err, truncated, timedOut, durationMs: Math.round(elapsed()) });
     };
     // spawn 失败（命令不存在等）走 'error' 而非 'close'，两条路都要收口，
     // 否则 Promise 永不 settle，整个执行 loop 静默挂死
@@ -146,6 +167,9 @@ export class HostFileOps {
 
   writeFile(workspace, p, content) {
     const abs = containedPath(workspace, p);
+    // .git 归系统：宿主上的 git 会读里面的钩子和配置（fsmonitor、过滤器驱动、credential.helper…… 都能执行命令），
+    // 写得进去 = 能在宿主上跑命令。沙箱里 .git 是只读挂载，但这条是宿主侧的写，挂载管不到，在这里拦
+    if (inGitDir(workspace, abs)) throw new Error(`不能写 .git 里的东西（仓库配置和钩子归系统管，提交也由系统做）：${p}`);
     mkdirSync(dirname(abs), { recursive: true });
     writeFileSync(abs, content);
     return abs;
@@ -157,9 +181,14 @@ export class HostFileOps {
 
   listDir(workspace, p = '.') {
     const abs = p === '.' ? realpathSync(resolve(workspace)) : containedPath(workspace, p);
+    // 一个条目读不了（容器里建的 .venv/bin/python 之类符号链接，在 Windows 宿主上 stat 报 EACCES；或者断链）
+    // 只标出来，不让整个目录列不出 —— 原来是整个 list_dir / 从根开始的 grep 一起抛
     return readdirSync(abs, { withFileTypes: true })
       .filter((e) => e.name !== '.git' && e.name !== 'node_modules')
-      .map((e) => (e.isDirectory() ? `${e.name}/` : `${e.name}  ${statSync(resolve(abs, e.name)).size}B`));
+      .map((e) => {
+        if (e.isDirectory()) return `${e.name}/`;
+        try { return `${e.name}  ${statSync(resolve(abs, e.name)).size}B`; } catch { return `${e.name}  (${e.isSymbolicLink() ? '链接，读不了' : '读不了'})`; }
+      });
   }
 }
 
@@ -176,6 +205,7 @@ export class LocalExecutor extends HostFileOps {
 
   /** @returns {Promise<{code, stdout, stderr, truncated, timedOut, durationMs}>} */
   execute(cmd, workspace, limits = {}) {
+    maybeFault('exec', { file: cmd.file, args: cmd.args });   // 故障注入点
     const lim = { ...this.defaults, ...limits };
     const { file, args = [] } = cmd;
     if (!file) throw new Error('execute: cmd.file 必填');

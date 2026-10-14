@@ -81,6 +81,53 @@ section('① 达成确认覆盖整个项目：管各目录的人都收得到（�
   eq(addressed(r.questionId), ALL3, '达成确认送负责人 + 阿青 + 阿明（只送负责人的话，提需求的成员没机会说还差什么）');
 }
 
+section('①b 达成确认是全局事项：各目录的人顺带收到、能说还差什么，但不计法定人数（三个人都得表态才生效）');
+{
+  const route = (qid) => JSON.parse(db.one(`SELECT route FROM questions WHERE id=?`, qid).route);
+  const status = (qid) => db.one(`SELECT status FROM questions WHERE id=?`, qid).status;
+  // 负责人一个人确认就定了
+  const P = project('p1b');
+  requestReview(db, { projectId: P.projectId });
+  const r = await planProject(db, { client: client([call('project_goal_reached', { reason: '都兑现了', unverified: [] })]), projectId: P.projectId });
+  const rows = route(r.questionId).rows;
+  eq(rows.filter((x) => x.advisory).map((x) => x.scope).sort().join(','), 'backend/,frontend/', '两个目录段都是顺带（quorum 0）');
+  eq(rows.filter((x) => !x.advisory).map((x) => `${x.scope}:${x.recipients.join('+')}`).join(','), `*:${owner.userId}`, '计数的是整个项目那一段（负责人）');
+  as(owner)(r.questionId, 'A');
+  eq(status(r.questionId), 'answered', '负责人回 A → 当场定案（原来要等阿青、阿明都表态）');
+  eq((await planProject(db, { client: client([]), projectId: P.projectId })).kind, 'reached', '项目按已达成处理');
+
+  // 顺带的人先说了还差什么、负责人仍确认达成 → 照负责人定（A 选项写的就是这个）；她那句留档为 dissent、通知她
+  const P2 = project('p1c');
+  requestReview(db, { projectId: P2.projectId });
+  const r2 = await planProject(db, { client: client([call('project_goal_reached', { reason: '都兑现了', unverified: [] })]), projectId: P2.projectId });
+  as(lin)(r2.questionId, 'B\n还差：每本书显示评分标签');
+  eq(status(r2.questionId), 'open', '阿青答了不定案（她那段不计数）');
+  as(owner)(r2.questionId, 'A');
+  eq(status(r2.questionId), 'answered', '负责人回 A 当场定案');
+  eq(db.one(`SELECT stance FROM answers WHERE question_id=? AND user_id=?`, r2.questionId, lin.userId).stance, 'dissent', '阿青那句留档为不同意见');
+  const ov = db.one(`SELECT payload FROM audit_log WHERE action='answer_overridden' AND target_id=?`, r2.questionId);
+  assert(ov && JSON.parse(ov.payload).notify.includes(lin.userId), '通知阿青：负责人越过了她的答复');
+  eq((await planProject(db, { client: client([]), projectId: P2.projectId })).kind, 'reached', '项目按已达成处理');
+
+  // 负责人也回"还差" → 顺带的人写的还差什么一起交给 AI；阿明回的 A 不计（不变成"有人批准、有人要改"）
+  const P3 = project('p1d');
+  requestReview(db, { projectId: P3.projectId });
+  const r4 = await planProject(db, { client: client([call('project_goal_reached', { reason: '都兑现了', unverified: [] })]), projectId: P3.projectId });
+  as(lin)(r4.questionId, 'B\n还差：每本书显示评分标签');
+  as(zhou)(r4.questionId, 'A');
+  eq(status(r4.questionId), 'open', '阿青、阿明答了都不定案');
+  as(owner)(r4.questionId, 'B\n还差：导出 CSV');
+  eq(status(r4.questionId), 'answered', '负责人回"还差"就定案');
+  eq(db.one(`SELECT count(*) n FROM answers WHERE question_id=? AND stance='dissent'`, r4.questionId).n, 0, '阿青那句没被判成 dissent');
+  const c3 = client([call('propose_project', { title: '藏书', tasks: [{ ...T('T9 标签', 'frontend/'), requested_by: ['阿青'] }, { ...T('T10 导出', 'frontend/'), requested_by: ['local-owner'] }], notes: '' })]);
+  const r3 = await planProject(db, { client: c3, projectId: P3.projectId });
+  assert(/每本书显示评分标签/.test(c3.seen[0]) && /导出 CSV/.test(c3.seen[0]), '两人的"还差"都交给了下一版规划器');
+  assert(!/批准了这一版/.test(c3.seen[0]), '阿明的 A 不计（不写成"阿明批准了这一版"）');
+  const rows3 = route(r3.questionId).rows;
+  eq(rows3.filter((x) => !x.advisory).map((x) => x.scope).join(','), 'frontend/', '复盘提的任务方案：任务碰到的 frontend 要齐人');
+  eq(rows3.filter((x) => x.advisory).map((x) => x.scope).join(','), 'backend/', '没碰到的 backend 是顺带');
+}
+
 section('⑤ 复盘提的任务方案：E「已经达成」出口、C 如实说停滞、「C：说明」认作放弃');
 {
   eq(readVerdict('E', REVIEW_LABELS), 'reached', '「E」→ 已经达成');

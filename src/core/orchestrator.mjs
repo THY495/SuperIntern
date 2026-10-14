@@ -15,8 +15,10 @@ import { tl, contentLang, I18nError, N_ } from '../i18n/index.mjs';
 import { raiseSignoffQuestion } from './deliver.mjs';
 import { join, resolve } from 'node:path';
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { gitRaw } from './git.mjs';
 import { effectiveSetupOf, runSetupCommands, setupFingerprint, parallelOf } from './project-settings.mjs';
-import { readPreviewSpec, capturePreview, hasUi, touchesUi, PREVIEW_FILE } from './preview.mjs';
+import { getSetting } from './settings.mjs';
+import { readPreviewSpec, capturePreview, hasUi, touchesUi, missingSeedFiles, PREVIEW_FILE } from './preview.mjs';
 import { setParam, getParam as paramValue } from './params.mjs';
 import { lockedPathsFor, coveredBy, sharedPathsOf } from './parallel.mjs';
 import { contractGaps } from './contract-coverage.mjs';
@@ -27,7 +29,11 @@ import { raiseChoiceReviews, CHOICES_MARK } from './choices.mjs';
 export const blocksExecution = (q) => q.decision_type !== 'signoff'
   && !['stall', 'loop', 'choices'].some((m) => hasMark(q.text, m));
 import { audit, now, newId } from '../db/db.mjs';
-import { tierEntry } from '../llm/canonical.mjs';
+import { linkSystemNode, linkInstruction } from './provenance.mjs';
+import { insertNode, uiChecksOf } from '../db/nodes.mjs';
+import { LiveApp } from './live-app.mjs';
+import { LLM_ROLES } from '../llm/canonical.mjs';
+import { pickVerifierModel } from '../llm/registry.mjs';
 import { readyNodes } from '../context/assemble.mjs';
 import { executeNode } from '../agent/executor.mjs';
 import { flushLedger, taskSpendMicroUsd } from './ledger.mjs';
@@ -41,16 +47,23 @@ import { nodesForReplan, proposeRevision, applyRevision, pendingRevision,
 import { workspaceStatus, commitWorkspace, isBuildOutput, discardChanges, contributionOf } from './workspace.mjs';
 import { raiseVerifyFailed, raiseReplanFailed } from './handback.mjs';
 import { LocalExecutor } from './executor.mjs';
-import { isInfraError, HardLimitError } from './errors.mjs';
+import { isInfraError, HardLimitError, SandboxError } from './errors.mjs';
 import { makeReport } from '../agent/reporter.mjs';
-import { verifyHandoff } from '../agent/verifier.mjs';
+import { verifyHandoff, combineVerdicts } from '../agent/verifier.mjs';
 import { sweepTimeouts } from './timeouts.mjs';
 import { escalationFor, recordEscalation } from './escalate.mjs';
+import { pidAlive } from './proc.mjs';
+import { transition } from '../db/state.mjs';
+import { acquireLease, releaseLease, leaseOf, setFence, clearFence, startHeartbeat, HOLDER } from '../db/lease.mjs';
+import { estimateCallMicro, reserveCall, releaseReservation } from './spend.mjs';
+import { stopwatch } from './clock.mjs';
+import { withLogContext, enterLogContext } from './log.mjs';
+import { commitTrailers } from './provenance-render.mjs';
+import { withSpan } from './otel.mjs';
 
-/** 任务级参数。取当前生效的那条。 */
-export const getParam = (db, taskId, key) => db.one(
-  `SELECT value FROM params WHERE task_id=? AND key=? AND superseded_at IS NULL
-    ORDER BY recorded_at DESC LIMIT 1`, taskId, key)?.value ?? null;
+// 任务级参数一律经 params.mjs 读（JSON 解析后的值；同一毫秒写的两条按 rowid 取后写的）。这里原来有一份返回原串、
+// 不按 rowid 排的副本，两份行为不一样（顺手合掉）。
+const getParam = paramValue;
 
 /** finalize 补了一步、要回到主循环接着跑（而不是结束这次运行）。 */
 const AGAIN = Symbol('again');
@@ -68,8 +81,10 @@ export const PREVIEW_NODE = {
 export const PREVIEW_SEED_NODE_KEY = 'preview.seed_node';
 export const PREVIEW_SEED_NODE = {
   title: N_('给页面截图补样例数据（si-preview.json 的 seed）'),
-  spec: (L) => tl(L, '{file} 里的页面接了后端，但没写 seed：系统截图时库是空的，签收的人只看得到空列表。补一条或几条 seed（至多 3 条，每条一个进程、不经 shell）：服务起来之后往里放几条有代表性的样例数据 ——例如写一个样例数据脚本（通过后端的新建接口写入，或直接写库），或用 curl 调新建接口。样例要覆盖页面上主要的几种状态。只改 {file} 与新加的样例数据脚本；不要自己截图、不要提交图片或数据库文件。', { file: PREVIEW_FILE }),
-  acceptance: (L) => tl(L, '{file} 的 seed 非空；在沙箱里按 start 起服务、跑一遍 seed 后，列表接口返回的数据不为空（交接记录里贴出这次请求的结果）。', { file: PREVIEW_FILE }),
+  spec: (L) => tl(L, '{file} 里的页面接了后端，但没写 seed：系统截图时库是空的，签收的人只看得到空列表。补一条或几条 seed（至多 3 条，每条一个进程、不经 shell）：服务起来之后往里放几条有代表性的样例数据 ——例如写一个样例数据脚本（通过后端的新建接口写入，或直接写库），或用 curl 调新建接口。样例要覆盖页面上主要的几种状态。脚本开头先检查环境变量 SI_PREVIEW=1（系统截图时会设），不是就退出并说明 —— 免得有人对真跑着的后端执行、把示例数据写进真库。只改 {file} 与新加的样例数据脚本；不要自己截图、不要提交图片或数据库文件。', { file: PREVIEW_FILE }),
+  acceptance: (L) => tl(L, '{file} 的 seed 非空；在沙箱里按 start 起服务、带 SI_PREVIEW=1 跑一遍 seed 后，列表接口返回的数据不为空；不带 SI_PREVIEW=1 跑，样例数据脚本拒绝运行、不写数据（交接记录里贴出这几次的结果）。', { file: PREVIEW_FILE }),
+  // seed 写了、但引用的脚本不在了（被当作越界改动撤回）—— 同一步，开头说清是哪几个文件
+  broken: (L, missing) => tl(L, '{file} 的 seed 引用的 {paths} 在仓库里不存在（可能被当作越界改动撤回了）：截图时样例数据灌不进去，签收的人只看得到空页。重新写一份样例数据脚本，放在本任务能改的位置，并改 {file} 的 seed 指向它。脚本开头先检查环境变量 SI_PREVIEW=1（系统截图时会设），不是就退出并说明。', { file: PREVIEW_FILE, paths: missing.join(tl(L, '、')) }),
 };
 
 /** 这个任务补不补截图那两步（理由见 finalize 里那段注释）。纯查询，测试直接调。 */
@@ -139,7 +154,62 @@ const census = (db, taskId) => Object.fromEntries(
  * 前者的问题由模型写（level_source='classifier'），后者由状态机写（'hard_rule'），
  * 后者在预算已经花光时也必须能产生 —— 所以它一次 LLM 都不能调。
  */
-export async function orchestrate(db, {
+/**
+ * 编排一个任务。同一任务同时只能有一个编排器，现在靠租约（db/lease.mjs）：
+ *   · 开跑前取得 task:<id> 的租约 —— 别人持有且没过期就拒绝；按到期时间接管、不看 pid（pid 复用不再把任务卡住）；
+ *   · 拿到后登记写入防护：本进程对这个任务的任务 / 步骤状态写入，逐次核对代数 —— 被判死后醒过来的"僵尸"
+ *     编排器写不进去（原来它会照样写库、推代码，与接替它的那个抢同一个步骤）；
+ *   · 定时续约（等模型的时候事件循环是空的，续得上）；正常退出交还；崩溃则两分钟后自然到期。
+ * 被接管时以 lease_lost 退出，不再动任何状态。
+ */
+export async function orchestrate(db, opts) {
+  const { taskId } = opts;
+  const pid = process.pid;
+  const res = `task:${taskId}`;
+  // 没有租约行 = 还没有新版编排器跑过这个任务；老版本的编排器（升级时可能还活着）不认租约，按原来的判据兜底一次
+  if (!leaseOf(db, res)) {
+    const last = db.one(`SELECT id, payload FROM audit_log WHERE action='orchestrator_started' AND target_id=? ORDER BY id DESC LIMIT 1`, taskId);
+    const exited = last && db.one(`SELECT 1 FROM audit_log WHERE action='orchestrator_exit' AND target_id=? AND id>? LIMIT 1`, taskId, last.id);
+    const other = last && !exited ? (() => { try { return JSON.parse(last.payload).pid; } catch { return null; } })() : null;
+    if (other && other !== pid && pidAlive(other)) {
+      throw new I18nError('任务 {taskId} 已有编排器在跑（pid {pid}）：同一任务同时只能有一个，否则两边会抢同一个步骤。等它结束，或先在看板上暂停它', { taskId, pid: other });
+    }
+  }
+  let lease;
+  try { lease = acquireLease(db, res, { meta: { pid, argv: process.argv.slice(1).join(' ') } }); }
+  catch (e) {
+    if (e.leaseHeld) throw new I18nError('任务 {taskId} 已有编排器在跑（pid {pid}）：同一任务同时只能有一个，否则两边会抢同一个步骤。等它结束，或先在看板上暂停它', { taskId, pid: e.pid });
+    throw e;
+  }
+  setFence(res, lease.epoch);
+  let lost = null;
+  const stopBeat = startHeartbeat(db, res, lease.epoch, { onLost: (e) => { lost = e; } });
+  const sw = stopwatch();
+  try {
+    return await withLogContext({ task: taskId }, () => orchestrateTask(db, { ...opts, lease }));
+  } catch (e) {
+    if (!e?.leaseLost) {
+      // 真 bug 照旧炸（不"优雅处理"），但留一行退出：原因进审计轨（原来只在进程日志里，复盘数不出能力表误拒这类崩溃），
+      // 这一段跑了多久也照样算进活动时长（原来崩溃的那段不计）。恢复走租约到期，不看这一行
+      try {
+        audit(db, { actorKind: 'system', action: 'orchestrator_exit', targetType: 'task', targetId: taskId,
+          payload: { pid, kind: 'crash', elapsedMs: Math.round(sw()), error: { name: e?.name ?? 'Error', message: String(e?.message ?? e).slice(0, 300), capability: !!e?.capability } } });
+      } catch { /* 库本身坏了：写不进去也照样把原错误抛出去 */ }
+      throw e;
+    }
+    // 被接管：只留一行退出审计（审计不受防护，记下"这个进程知道自己被接管了"），不动任何状态
+    audit(db, { actorKind: 'system', action: 'orchestrator_exit', targetType: 'task', targetId: taskId,
+      payload: { pid, kind: 'lease_lost', epoch: lease.epoch, why: String(e.message).slice(0, 300) } });
+    (opts.onEvent ?? (() => {}))({ type: 'lease_lost', epoch: lease.epoch });
+    return { kind: 'lease_lost', pid, epoch: lease.epoch };
+  } finally {
+    stopBeat();
+    clearFence(res);
+    if (!lost) { try { releaseLease(db, res, lease.epoch); } catch { /* 交还失败无妨：会自然到期 */ } }
+  }
+}
+
+async function orchestrateTask(db, {
   taskId, workspace, makeClient, narrativeDir,
   maxCycles = 12, maxIterations = 20, tierOverride = null,
   commit = true, verify = true, exec = new LocalExecutor(), onEvent = () => {},
@@ -147,11 +217,12 @@ export async function orchestrate(db, {
   // 同一个模式：离线测试用脚本化的假模型，多一个会消费脚本的 LLM 角色就得改每个
   // 夹具；而真跑不该有免检通道。测它们的测试显式打开。
   report = false, llmVerify = false,
+  lease,
 }) {
   const pid = process.pid;
   const L = contentLang(db);   // 审计里给人看的 why、验收附注、系统补的节点标题按内容语言写
   audit(db, { actorKind: 'system', action: 'orchestrator_started', targetType: 'task', targetId: taskId,
-    payload: { pid, maxCycles, argv: process.argv.slice(1).join(' ') } });
+    payload: { pid, maxCycles, argv: process.argv.slice(1).join(' '), epoch: lease.epoch, ...(lease.takeover ? { takeoverFrom: lease.previous } : {}) } });
 
   // "这次的命令跑在哪"必须落在真相源里。
   //
@@ -181,22 +252,42 @@ export async function orchestrate(db, {
   // 打死（断电、OOM、Ctrl-C、厂商 5xx）是另一件事，有它自己的维度
   // `limit.node_reclaims`（按 node_reclaimed 审计行数计）—— 连死三次在同一节点上
   // 也该叫人，只是叫人的理由要说对。
-  for (const n of db.all(`SELECT id FROM nodes WHERE task_id=? AND status='running'`, taskId)) {
-    db.run(`UPDATE nodes SET status='pending' WHERE id=?`, n.id);
+  const stuck = db.all(`SELECT id FROM nodes WHERE task_id=? AND status='running'`, taskId);
+  for (const n of stuck) {
+    transition(db, 'nodes', n.id, 'pending');
     const reclaims = db.one(`SELECT count(*) AS n FROM audit_log WHERE action='node_reclaimed' AND target_id=?`, n.id).n + 1;
     audit(db, { actorKind: 'system', action: 'node_reclaimed', targetType: 'node', targetId: n.id,
       payload: { pid, why: tl(L, '启动时发现节点停在 running —— 上一个进程死在它手里'), reclaims } });
     onEvent({ type: 'reclaimed', nodeId: n.id, reclaims });
   }
+  // 补提交（故障注入查出）：上一个进程把步骤置了 done、却在提交那一刻死了（或 git 出错）—— 产物留在工作区没进分支，
+  // 重跑也不会再提交它（那一步已经 done 了），合并时就少了它。判据以 git 为准：步骤提交的说明里都有 "node: <id>"。
+  // 只在没有被认领的步骤时做：认领到 running 的步骤说明上一个进程死在步骤中途，工作区里的改动可能是半截活，不该替它提交。
+  if (commit && !stuck.length && workspace && existsSync(join(workspace, '.git'))) {
+    let st = null; try { st = workspaceStatus(workspace); } catch { /* 读不了 git 就不补 */ }
+    if (st?.dirty) {
+      const done = db.all(`SELECT id, title FROM nodes WHERE task_id=? AND status='done' ORDER BY finished_at, rowid`, taskId);
+      const committed = (id) => { try { return !!gitRaw(workspace, ['log', '--format=%H', '-1', `--grep=node: ${id}`]).trim(); } catch { return true; } };
+      const missing = done.filter((n) => !committed(n.id));
+      if (missing.length) {
+        const sha = commitWorkspace(workspace, `${missing.map((n) => n.title).join(' / ')}\n\n${missing.map((n) => `node: ${n.id}`).join('\n')}\n(recommit: the previous run marked these steps done but did not commit their output)`);
+        audit(db, { actorKind: 'system', action: 'workspace_recommitted', targetType: 'task', targetId: taskId,
+          payload: { pid, nodes: missing.map((n) => n.id), sha, files: st.changed } });
+        onEvent({ type: 'recommitted', nodes: missing.map((n) => n.id), sha });
+      }
+    }
+  }
 
   // 本次寿命的起点。`limit.runtime_ms` 累加的是**编排器真在跑**的区间，
   // 不是"建任务到现在"—— 挂起等人是正常状态，按墙上时钟算会惩罚回得慢的人。
   const startedAt = now();
+  const elapsed = stopwatch();   // 时长用单调时钟；startedAt 只作时间戳
+  const DEPLOY_PAUSED = 'deploy.paused';
   const finish = (kind, extra = {}) => {
     // elapsedMs 不是给人看的装饰：limits.priorRuntimeMs 真的从这里读。
     // 让一条活着的护栏依赖审计轨，轨烂了当场就会被发现，而不是等到复盘时。
     audit(db, { actorKind: 'system', action: 'orchestrator_exit', targetType: 'task', targetId: taskId,
-      payload: { pid, kind, elapsedMs: now() - startedAt, ...extra } });
+      payload: { pid, kind, elapsedMs: Math.round(elapsed()), ...extra } });
     return { kind, pid, ...extra };
   };
 
@@ -283,7 +374,7 @@ export async function orchestrate(db, {
   /** 本次体检的 ctx。每次先推进持久化计数（读 JSONL 新增行 → 写回 params）再取值。 */
   const limitsCtx = () => {
     advanceConsecutiveDenials(db, taskId, egressAuditFile);
-    return { startedAt, idleCycles, peakContextTokens };
+    return { startedAt, elapsed, idleCycles, peakContextTokens };
   };
 
   // ── 环境准备 ───────────────────────────────────────────────────────
@@ -303,7 +394,7 @@ export async function orchestrate(db, {
         onEvent({ type: 'env_setup_start', commands: argvs.length });
         const r = await runSetupCommands(exec, workspace, argvs, L);
         audit(db, { actorKind: 'system', action: r.ok ? 'env_setup_done' : 'env_setup_failed', targetType: 'task', targetId: taskId,
-          payload: { pid, source: setupSource, results: r.results.map((x) => ({ cmd: x.argv.join(' '), code: x.code, timedOut: x.timedOut, tail: x.tail.slice(-600) })) } });
+          payload: { pid, source: setupSource, results: r.results.map((x) => ({ cmd: x.argv.join(' '), code: x.code, timedOut: x.timedOut, elapsedMs: x.elapsedMs ?? null, tail: x.tail.slice(-600) })) } });
         if (r.ok) { try { writeFileSync(marker, fp); } catch { /* 写不进去就下次再跑一遍 */ } }
         onEvent({ type: 'env_setup', ok: r.ok, results: r.results });
       }
@@ -338,13 +429,15 @@ export async function orchestrate(db, {
     // 暂停不是挂起（suspended 由人设、waiting 由问题设），恢复也不是答题 —— 是人再按一次。
     if (task.status === 'suspended') return finish('paused', { cycles: cycle - 1, completed, why: tl(L, '任务被人暂停；恢复：cli 或看板 resume') });
     if (task.status === 'aborted') return finish('aborted_by_user', { cycles: cycle - 1, completed, why: tl(L, '任务被人中止') });
+    // 部署级急停：任务状态不动，退出类型单列 —— 守护进程据此在急停解除后自动接着拉
+    if (getSetting(db, 'deploy.paused')) return finish('deploy_paused', { cycles: cycle - 1, completed, why: tl(L, '管理员暂停了全部自动运行；恢复后自动接着跑') });
 
     // ⓪ 硬上限体检。**排在挑节点之前**：闸门的意义是不让下一份钱
     //    花出去，放在花完之后检查那叫记账，不叫闸门。
     const breach = checkLimits(db, taskId, limitsCtx());
     if (breach) return breachOut(breach);
 
-    // ⓪′ 人发来的修正/新指令（五步流水线）。**必须在挑节点之前处理。**
+    // ⓪′ 人发来的修正/新指令（五步修正流水线）。**必须在挑节点之前处理。**
     //
     // 为什么不放它过去让执行器自己看着办：那等于让执行器**自行改变任务目标**，
     // 而目标属宪法层，执行层无权动。装配层因此也明写了
@@ -352,7 +445,7 @@ export async function orchestrate(db, {
     //
     // `context` 类不在此列：补充上下文不改变要做什么，进收件箱段给执行器读就行。
     //
-    // 流水线第 3 步（在途工作处理）在当前的串行模型里**是空的**：这里排在挑节点
+    // 流水线第 3 步（在途工作处理）在串行模型里**是空的**：这里排在挑节点
     // 之前，所以流水线跑起来时不可能有节点在途。如实记着，不假装实现了 ——
     // 一旦有并发执行器它就必须真的做。
     const pendingRev = pendingRevision(db, taskId);
@@ -460,6 +553,7 @@ export async function orchestrate(db, {
     }
 
     const node = ready[0];
+    enterLogContext({ node: node.id });   // 之后这一步里的日志都带上步骤 id
     // 自动升档：重试 ≥2 升一档，升档前过花费 + 时长闸门；`--tier` 显式覆盖时人说了算，不升。
     let tier = tierOverride ?? node.model_tier;
     if (!tierOverride) {
@@ -473,6 +567,9 @@ export async function orchestrate(db, {
       }
     }
     const client = makeClient(tier);
+    // 这一步执行器实际用的模型（角色单独绑了就是那个，否则按档位）。原来这里只按档位、且没带库里的服务商表 ——
+    // 用户自己加的服务商会被当成"不存在"（按角色绑定顺带修）。⚠️ 在下面的 try 里取：绑定配错抛 ConfigError，要走"退回 pending、不计重试"那条路
+    let execEntry = null;
     onEvent({ type: 'node_start', cycle, node, tier });
 
     // 本节点的账，**每一轮工具调用后就落库**，不等节点结束。
@@ -489,51 +586,89 @@ export async function orchestrate(db, {
 
     let r;
     let infra = null;   // 基础设施错误（厂商 / 硬边界）：不是节点的错，另走一条路
+    // 执行器实际用的模型的窗口。原来取的是档位绑定 —— 按角色绑定单独给执行器绑了模型时，窗口取错了模型
+    const execWindow = () => { try { return client.catalog?.[(execEntry ?? client.entryFor(tier, 'executor')).key]?.contextWindow ?? null; } catch { return client.catalog?.[client.binding?.[tier]]?.contextWindow ?? null; } };
     try {
-      r = await executeNode(db, {
+      execEntry = client.entryFor(tier, 'executor');
+      // 开了 OTLP 导出时这一步是一个 span，里面每次模型调用是它的子 span（core/otel.mjs）
+      r = await withSpan('execute_step', { attributes: { 'superintern.tier': tier, 'superintern.cycle': cycle } }, () => executeNode(db, {
         client, taskId, nodeId: node.id, workspace, tier,
-        vendorId: tierEntry(tier, client.binding, client.catalog).vendorId,
+        vendorId: execEntry.vendorId,
         narrativeDir: narrativeDir ?? join(workspace, '..', 'narratives'),
         maxIterations, exec,
         // 验收员用自己的 client（新鲜上下文、独立记账），执行器对它一无所知。
-        verifier: llmVerify ? async ({ args, changed }) => {
-          const vc = makeClient('standard');
+        // 验收员没单独绑模型、它的档位又与执行器同一家时，按 deploy.verifier_vendor 换一家；高风险步骤可两家会签（deploy.verifier_cosign）
+        verifier: llmVerify ? async ({ args, changed, testChanges }) => {
+          const policy = getSetting(db, 'deploy.verifier_vendor');
+          // 有界面条目、或这一步改了界面时，验收员可以把应用起起来看（第一次用到才真起）。会签的两个验收员共用一个会话
+          const live = liveAppFor(db, { node, exec, workspace, changed });
+          const one = async (avoid) => {
+            const vc = makeClient(LLM_ROLES.verifier);
+            const pick = pickVerifierModel(vc, { executorKey: execEntry.key, executorVendor: execEntry.vendorId, policy, avoid });
+            if (pick.source === 'policy') vc.roleBinding = { ...vc.roleBinding, verifier: { key: pick.key, effort: null } };
+            // 这一档的备用模型若与执行器（或会签的第一个验收员）同一出品方，验收员不换过去
+            if (policy === 'different' && !pick.sameMaker) vc.fallbackAvoidMakers = [pick.executorMaker, ...avoid].filter(Boolean);
+            try {
+              return { pick, v: await verifyHandoff(db, { client: vc, taskId, nodeId: node.id, workspace, exec, args, changed, testChanges,
+                picked: { ...pick, executorVendor: execEntry.vendorId, executorKey: execEntry.key },
+                live: live.app, liveWhy: live.why, vision: vc.visionFor(LLM_ROLES.verifier, 'verifier') }) };
+            } finally {
+              const led = flushLedger(db, vc, { taskId, nodeId: node.id, role: 'verifier' });
+              if (led.rows) onEvent({ type: 'billed', node, role: 'verifier', ...led });
+            }
+          };
           try {
-            return await verifyHandoff(db, { client: vc, taskId, nodeId: node.id, workspace, exec, args, changed });
+            const first = await one([]);
+            if (!(getSetting(db, 'deploy.verifier_cosign') === 'high_risk' && node.risk_tier === 'high')) return first.v;
+            // 第一个没给出结论就不必再请第二个：没结论照常按环境问题处理
+            if (first.v.noVerdict) return first.v;
+            const second = await one([first.pick.maker]);
+            return second.pick.key === first.pick.key ? first.v : combineVerdicts([first.v, second.v]);
           } finally {
-            const led = flushLedger(db, vc, { taskId, nodeId: node.id, role: 'verifier' });
-            if (led.rows) onEvent({ type: 'billed', node, role: 'verifier', ...led });
+            // 关服务、关浏览器、还原工作区（验收员点、填出来的数据不能当产物交）。真起过才记审计
+            if (live.app) {
+              const s = await live.app.close();
+              if (s.used) audit(db, { actorKind: 'system', action: 'live_app_session', targetType: 'node', targetId: node.id, payload: s });
+            }
           }
         } : null,
         onStep: (i, resp) => { flushStep(); onEvent({ type: 'step', node, i, resp }); },
         // 轮级闸门。只查按轮增长的几维 —— 其余几维在一个节点内不会变，每轮重查是白费查询。
         // 闸门必须在节点跑到一半时就能掐：单个节点的花费也可能超过预算，
         // 只在节点边界检查等于给每个节点发一张"最多再超一个节点"的免死金牌。
-        abort: (i) => {
-          if (i === 0) return null;   // 第一轮先让它跑起来，否则触顶后连叙事都没有
+        abort: (i, info = {}) => {
+          // 预占：这一轮按最坏情况（上一轮的提示词体量 + 输出打满）预占，事务里连同项目 / 按人 / 部署闸门一起判 ——
+          // 几个编排器并行时不会一起越过闸门；原来项目预算只在步骤边界查，一个步骤能越过去整整一步的钱
+          const est = estimateCallMicro(execEntry.pricing, { inputTokens: Math.max(peakContextTokens, contextPeak(client)), maxTokens: 16000 });
+          const rv = reserveCall(db, { taskId, holder: HOLDER, microUsd: est });
+          if (i === 0) return null;   // 第一轮先让它跑起来，否则触顶后连叙事都没有（预占照记，别人看得见）
+          if (!rv.ok) return tl(L, '{scope}预算（含别的任务已预占的 {est} 估算）：{actual} ≥ {limit}', { scope: tl(L, rv.breach.scope === 'project' ? '项目' : rv.breach.scope === 'person' ? '个人月度' : '部署月度'), est: `$${(est / 1e6).toFixed(4)}`, actual: `$${(rv.breach.actual / 1e6).toFixed(4)}`, limit: `$${(rv.breach.limit / 1e6).toFixed(4)}` });
+          // 部署级急停：步骤跑到一半也在下一轮停（节点回 pending、不计重试，见下方 aborted 分支）
+          if (getSetting(db, 'deploy.paused')) return DEPLOY_PAUSED;
           // 已落库 + 还在内存里的（onStep 每轮 flush，内存里通常只剩零头）
           const spent = taskSpendMicroUsd(db, taskId)
             + (client.ledger ?? []).reduce((s, e) => s + e.microUsd, 0);
           const budget = limitOf(db, taskId, 'limit.budget_micro_usd');
           if (spent >= budget) return tl(L, 'limit.budget_micro_usd（{spent} ≥ {budget}）', { spent, budget });
-          const runtime = priorRuntimeMs(db, taskId) + (now() - startedAt);
+          const runtime = priorRuntimeMs(db, taskId) + elapsed();
           const cap = limitOf(db, taskId, 'limit.runtime_ms');
           if (runtime >= cap) return tl(L, 'limit.runtime_ms（{runtime} ≥ {cap}）', { runtime, cap });
-          // 上下文体量。读**上一轮实际发出去的**提示词体量，因为下一轮只会更大 ——
-          // 发之前拿不到确切数，用上一轮当下界是保守且够用的。
-          const ctxTokens = Math.max(peakContextTokens, contextPeak(client));
-          const ctx = contextCapOf(db, taskId, { contextWindow: client.catalog?.[client.binding?.[tier]]?.contextWindow ?? null });
-          if (ctxTokens >= ctx.cap) return tl(L, 'limit.context_tokens（上一轮 {tokens} ≥ {cap}{window}）', { tokens: ctxTokens, cap: ctx.cap,
+          // 上下文体量。有整理器时看**这一轮要发出去的**体量（整理之后的估算，按上一轮真实用量校准）——
+          // 整理过之后上一轮的峰值不再是下界；没有整理器（整理线关了）时照旧读上一轮实际发出去的，下一轮只会更大。
+          const ctxTokens = info.nextTokens ?? Math.max(peakContextTokens, contextPeak(client));
+          const ctx = contextCapOf(db, taskId, { contextWindow: execWindow() });
+          if (ctxTokens >= ctx.cap) return tl(L, 'limit.context_tokens（这一轮 {tokens} ≥ {cap}{window}）', { tokens: ctxTokens, cap: ctx.cap,
             window: ctx.source === 'model' ? tl(L, '，按所绑模型窗口 {window} 的 75% 封顶', { window: ctx.window }) : '' });
           return null;
         },
-      });
+      }));
     } catch (e) {
       // 只接基础设施错误。别的异常照旧炸 —— 那是真 bug，不该被"优雅处理"藏起来。
       if (!isInfraError(e)) throw e;
       infra = e;
     } finally {
       flushStep();   // 无论成败都落账。失败的尝试同样烧了钱。
+      releaseReservation(db, { taskId, holder: HOLDER });   // 落了账就不再需要预占
       onEvent({ type: 'billed', node, rows: nodeRows, microUsd: nodeMicro });
     }
 
@@ -542,14 +677,23 @@ export async function orchestrate(db, {
       if (infra instanceof HardLimitError) {
         // 硬边界（OOM / pids）：**是**节点的错 —— 计一次重试，走 breachOut 的 hard_fail 分支
         // （审计在那里记；容器侧只抛不记，一处记一次）。
-        db.run(`UPDATE nodes SET status='pending', retry_count=retry_count+1 WHERE id=?`, node.id);
+        transition(db, 'nodes', node.id, 'pending', { setSql: 'retry_count=retry_count+1' });
         return breachOut(infra.breach, node.id);
+      }
+      if (infra instanceof SandboxError) {
+        // 沙箱管理命令失败：运行时中途掉了、镜像 / 容器没了。不是这一步的错 —— 退回 pending、不计重试；
+        // 不写汇报（不是模型能说清的事），守护进程按退避再拉（运行时整个掉了的那种，它每轮的运行时检查会先接住、不拉）
+        const err = infra.summary();
+        transition(db, 'nodes', node.id, 'pending');
+        audit(db, { actorKind: 'system', action: 'sandbox_error', targetType: 'node', targetId: node.id, payload: { pid, ...err } });
+        onEvent({ type: 'sandbox_error', node, error: err });
+        return finish('sandbox_error', { completed, nodeId: node.id, error: err });
       }
       // 厂商侧（403 / 重试耗尽的 5xx / 网络）与配置侧（ConfigError：绑定停用 / 缺 key，err.config=true）：
       // **不是**节点的错 —— 退回 pending，不计重试。两者共用 provider_error 这个退出原因（汇报触发、通知、守护进程退避都认它），
       // 靠 err.config 分文案；守护进程对 config 另有一条：注册表改过就立刻再拉（daemon.assessPhase）。
       const err = infra.summary?.() ?? { message: String(infra.message) };
-      db.run(`UPDATE nodes SET status='pending' WHERE id=?`, node.id);
+      transition(db, 'nodes', node.id, 'pending');
       audit(db, { actorKind: 'system', action: 'provider_error', targetType: 'node', targetId: node.id,
         payload: { pid, ...err } });
       onEvent({ type: 'provider_error', node, error: err });
@@ -564,8 +708,9 @@ export async function orchestrate(db, {
       if (commit) {
         const st = workspaceStatus(workspace);
         if (st.dirty) {
+          // 提交自带可读出处：库外也看得懂这处改动凭什么 —— 保留 node: / handoff: 两行（按步骤找提交认它们），后面接 trailer
           const sha = commitWorkspace(workspace,
-            `${node.title}\n\nnode: ${node.id}\nhandoff: ${r.handoffId}`);
+            `${node.title}\n\n${commitTrailers(db, node.id, { handoffId: r.handoffId }).join('\n')}`);
           onEvent({ type: 'commit', node, sha, changed: st.changed });
         }
       }
@@ -574,13 +719,20 @@ export async function orchestrate(db, {
       // 节点失败退回重试时，这些消息必须还在，否则它们会在一次失败里静默蒸发。
       const ctxMsgs = pendingMessages(db, taskId).filter((m) => m.kind === 'context');
       if (ctxMsgs.length) {
-        consumeMessages(db, { taskId, ids: ctxMsgs.map((m) => m.id),
-          why: tl(L, '已随节点 {id} 的上下文读入并落进交接记录', { id: node.id }) });
+        db.tx(() => {
+          consumeMessages(db, { taskId, ids: ctxMsgs.map((m) => m.id),
+            why: tl(L, '已随节点 {id} 的上下文读入并落进交接记录', { id: node.id }) });
+          // 出处：原来只在审计的说明文字里提一句，链上没有"这一步读进了哪几条补充"
+          for (const m of ctxMsgs) linkInstruction(db, { nodeId: node.id, messageId: m.id });
+        });
       }
       await reportOn('node_done', node.id);   // 汇报触发之一：里程碑完成
       completed.push({ nodeId: node.id, title: node.title, handoffId: r.handoffId });
       idleCycles = 0;              // 有节点走到 done，死人开关归零
       continue;
+    }
+    if (r.kind === 'aborted' && r.stopped === `aborted: ${DEPLOY_PAUSED}`) {
+      return finish('deploy_paused', { cycles: cycle, completed, nodeId: node.id, why: tl(L, '管理员暂停了全部自动运行；恢复后自动接着跑') });
     }
     if (r.kind === 'aborted') {
       // 轮级闸门掐停。节点已回 pending 且**没有**计重试。这里必须走 breachOut：
@@ -617,7 +769,7 @@ export async function orchestrate(db, {
     // 此时用**厂商说的**那个事实覆盖实测值：上限设成实测的一半，意思是"这次的正确上限至少比现在低这么多"。
     if (r.stopped === 'context_exceeded') {
       const seen = Math.max(peakContextTokens, contextPeak(client));
-      const ctx = contextCapOf(db, taskId, { contextWindow: client.catalog?.[client.binding?.[tier]]?.contextWindow ?? null });
+      const ctx = contextCapOf(db, taskId, { contextWindow: execWindow() });
       return breachOut({
         key: 'limit.context_tokens', label: '单轮上下文体量',
         limit: ctx.cap, actual: seen,
@@ -651,7 +803,7 @@ export async function orchestrate(db, {
     // 逐条跑，第一条不过就停 —— 与主验收同一条判据、同一条审计路径。
     const extraRaw = verify && raw ? getParam(db, taskId, 'task.verify_extra') : null;
     const extra = Array.isArray(extraRaw) ? extraRaw : (typeof extraRaw === 'string' ? JSON.parse(extraRaw) : []);
-    const commands = raw ? [JSON.parse(raw), ...extra] : [];
+    const commands = raw ? [typeof raw === 'string' ? JSON.parse(raw) : raw, ...extra] : [];
     const verifyFailed = async (v) => {
       // **不置 done**。所有节点都交了合格的交接记录，任务级验收仍可能不过——
       // 那正是它存在的理由：交接记录管的是"这一步做完了"，任务级判据管的是
@@ -692,21 +844,31 @@ export async function orchestrate(db, {
       // 前者是工具的正常行为，后者才是要防的事。
       const before = safeStatus(workspace)?.changed ?? null;
       const run = runnableArgv(argv, workspace);   // node --test <目录> → glob（Node 22 不展开目录）
+      const vsw = stopwatch();
       const out = await exec.execute({ file: run[0], args: run.slice(1) }, workspace,
         { mode: 'write', timeoutMs: 300_000 });
-      const after = safeStatus(workspace)?.changed ?? null;
+      const verifyMs = Math.round(vsw());
+      const afterSt = safeStatus(workspace);
+      const after = afterSt?.changed ?? null;
       const touched = before && after ? after.filter((p) => !before.includes(p)) : [];
       // 跑完一律把验收留下的改动撤掉，工作区回到验收前（= 已提交的那一版）。不撤的话下一次验收的基准又是脏的，
       // 判定就看运气；合并与交付也会被这些改动卡住。撤不撤与判不判失败是两件事：撤是为了下一步，判照旧。
       if (touched.length) discardChanges(workspace, touched);
       // 重建了已提交的构建产物不算"改了工作区"：那说明构建产物不该进仓库，不说明代码有问题。照实记一行，不判失败。
       const rebuilt = touched.filter(isBuildOutput);
-      const mutated = touched.filter((p) => !isBuildOutput(p));
-      verification = { argv, code: out.code, timedOut: out.timedOut, mutated,
+      // 新建的没跟踪文件（虚拟环境、缓存、测试输出）动不了已提交的那一版，上面已删掉 —— 照实记一行，不判失败
+      const untracked = new Set(afterSt?.untracked ?? []);
+      const leftovers = touched.filter((p) => !isBuildOutput(p) && untracked.has(p));
+      const mutated = touched.filter((p) => !isBuildOutput(p) && !untracked.has(p));
+      verification = { argv, code: out.code, timedOut: out.timedOut, mutated, elapsedMs: verifyMs,
         tail: (out.stdout + out.stderr).trim().split('\n').slice(-40).join('\n') };
       if (rebuilt.length) {
         verification.rebuilt = rebuilt;
         verification.tail += `\n${tl(L, '[系统] 验收重新生成了已提交进仓库的构建产物：{paths} —— 已还原成提交时的样子；构建产物不该进仓库（应写进 .gitignore 并从跟踪里摘掉）', { paths: rebuilt.join(' ') })}`;
+      }
+      if (leftovers.length) {
+        verification.leftovers = leftovers;
+        verification.tail += `\n${tl(L, '[系统] 验收跑完留下了新文件：{paths} —— 已删掉（没动已提交的那一版，不算验收改了工作区；常留的话可以写进 .gitignore）', { paths: leftovers.join(' ') })}`;
       }
       if (mutated.length) verification.tail += `\n${tl(L, '[系统] 验收命令改动了工作区：{paths} —— 验收不许留下改动（已撤掉这些改动）', { paths: mutated.join(' ') })}`;
       onEvent({ type: 'verified', verification });
@@ -716,10 +878,13 @@ export async function orchestrate(db, {
     if (cov?.gaps.length) {
       if (!getParam(db, taskId, CONTRACT_NODE_KEY)) {
         const nid = newId('n');
-        db.run(`INSERT INTO nodes (id,task_id,title,spec,acceptance,status,risk_tier,model_tier,created_at) VALUES (?,?,?,?,?,'pending','low','standard',?)`,
-          nid, taskId, tlN(L, CONTRACT_NODE.title), CONTRACT_NODE.spec(L, cov.files, cov.gaps), CONTRACT_NODE.acceptance(L), now());
-        setParam(db, { taskId, key: CONTRACT_NODE_KEY, value: nid, by: { kind: 'agent', id: 'orchestrator' }, governance: 'execution' });
-        audit(db, { actorKind: 'system', action: 'contract_node_added', targetType: 'task', targetId: taskId, payload: { pid, nodeId: nid, files: cov.files, gaps: cov.gaps } });
+        // 建步骤、记"补过了"、审计一个事务：原来三句分开写，建完步骤就崩的话，下次会再补一个同样的
+        db.tx(() => {
+          insertNode(db, { id: nid, taskId, title: tlN(L, CONTRACT_NODE.title), spec: CONTRACT_NODE.spec(L, cov.files, cov.gaps), acceptance: CONTRACT_NODE.acceptance(L) });
+          linkSystemNode(db, { nodeId: nid, taskId, policy: 'contract_coverage' });
+          setParam(db, { taskId, key: CONTRACT_NODE_KEY, value: nid, by: { kind: 'agent', id: 'orchestrator' }, governance: 'execution' });
+          audit(db, { actorKind: 'system', action: 'contract_node_added', targetType: 'task', targetId: taskId, payload: { pid, nodeId: nid, files: cov.files, gaps: cov.gaps } });
+        });
         onEvent({ type: 'contract_node_added', nodeId: nid, gaps: cov.gaps.length });
         return AGAIN;
       }
@@ -740,24 +905,39 @@ export async function orchestrate(db, {
     const { preview: previewWritable, seed: seedable } = previewStepsFor(db, taskId);
     if (previewWritable && exec?.isolated && workspace && !readPreviewSpec(workspace) && hasUi(workspace) && !getParam(db, taskId, PREVIEW_NODE_KEY)) {
       const nid = newId('n');
-      db.run(`INSERT INTO nodes (id,task_id,title,spec,acceptance,status,risk_tier,model_tier,created_at) VALUES (?,?,?,?,?,'pending','low','standard',?)`,
-        nid, taskId, tlN(L, PREVIEW_NODE.title), PREVIEW_NODE.spec(L), PREVIEW_NODE.acceptance(L), now());
-      setParam(db, { taskId, key: PREVIEW_NODE_KEY, value: nid, by: { kind: 'agent', id: 'orchestrator' }, governance: 'execution' });
-      audit(db, { actorKind: 'system', action: 'preview_node_added', targetType: 'task', targetId: taskId, payload: { pid, nodeId: nid } });
+      db.tx(() => {
+        insertNode(db, { id: nid, taskId, title: tlN(L, PREVIEW_NODE.title), spec: PREVIEW_NODE.spec(L), acceptance: PREVIEW_NODE.acceptance(L) });
+        linkSystemNode(db, { nodeId: nid, taskId, policy: 'preview_spec' });
+        setParam(db, { taskId, key: PREVIEW_NODE_KEY, value: nid, by: { kind: 'agent', id: 'orchestrator' }, governance: 'execution' });
+        audit(db, { actorKind: 'system', action: 'preview_node_added', targetType: 'task', targetId: taskId, payload: { pid, nodeId: nid } });
+      });
       onEvent({ type: 'preview_node_added', nodeId: nid });
       return AGAIN;
     }
     const pv = exec?.isolated && workspace ? readPreviewSpec(workspace, L) : null;
-    if (seedable && pv?.spec && !pv.spec.seed.length && (pv.spec.ready.length > 1 || pv.spec.start.length > 1) && !getParam(db, taskId, PREVIEW_SEED_NODE_KEY)) {
+    // seed 写了但引用的脚本不在了，与没写 seed 同样处理；写了 seed 本身就说明页面要数据，不再看是不是多服务。
+    // 只由碰了界面、截图说明或那个脚本本身的任务接手：只改后端的任务不截图（见下面 preview_skipped），补了这一步也没人看
+    let broken = pv?.spec ? missingSeedFiles(workspace, pv.spec) : [];
+    if (broken.length) {
+      const gone = broken.flatMap((b) => b.missing);
+      const mine = contributionOf(db, { taskId, dir: workspace, head: safeStatus(workspace)?.head ?? null }).files;
+      if (Array.isArray(mine) && !touchesUi(workspace, mine) && !mine.some((p) => gone.includes(p))) broken = [];
+    }
+    const noSeed = pv?.spec && !pv.spec.seed.length && (pv.spec.ready.length > 1 || pv.spec.start.length > 1);
+    if (seedable && pv?.spec && (noSeed || broken.length) && !getParam(db, taskId, PREVIEW_SEED_NODE_KEY)) {
       const nid = newId('n');
-      db.run(`INSERT INTO nodes (id,task_id,title,spec,acceptance,status,risk_tier,model_tier,created_at) VALUES (?,?,?,?,?,'pending','low','standard',?)`,
-        nid, taskId, tlN(L, PREVIEW_SEED_NODE.title), PREVIEW_SEED_NODE.spec(L) + seedPlacement(db, taskId, L), PREVIEW_SEED_NODE.acceptance(L), now());
-      setParam(db, { taskId, key: PREVIEW_SEED_NODE_KEY, value: nid, by: { kind: 'agent', id: 'orchestrator' }, governance: 'execution' });
-      audit(db, { actorKind: 'system', action: 'preview_seed_node_added', targetType: 'task', targetId: taskId, payload: { pid, nodeId: nid } });
+      const missing = [...new Set(broken.flatMap((b) => b.missing))];
+      db.tx(() => {
+        insertNode(db, { id: nid, taskId, title: tlN(L, PREVIEW_SEED_NODE.title),
+          spec: (missing.length ? PREVIEW_SEED_NODE.broken(L, missing) : PREVIEW_SEED_NODE.spec(L)) + seedPlacement(db, taskId, L), acceptance: PREVIEW_SEED_NODE.acceptance(L) });
+        linkSystemNode(db, { nodeId: nid, taskId, policy: 'preview_seed' });
+        setParam(db, { taskId, key: PREVIEW_SEED_NODE_KEY, value: nid, by: { kind: 'agent', id: 'orchestrator' }, governance: 'execution' });
+        audit(db, { actorKind: 'system', action: 'preview_seed_node_added', targetType: 'task', targetId: taskId, payload: { pid, nodeId: nid, ...(missing.length ? { missing } : {}) } });
+      });
       onEvent({ type: 'preview_node_added', nodeId: nid });
       return AGAIN;
     }
-    db.run(`UPDATE tasks SET status='done' WHERE id=?`, taskId);
+    transition(db, 'tasks', taskId, 'done');
     // 产物落在哪个分支的哪个 commit 上 —— 机械取数口，进审计轨，
     // 这样"任务完成时产物在哪"只凭真相源就能答。
     const ws = safeStatus(workspace);
@@ -794,6 +974,25 @@ export async function orchestrate(db, {
 }
 
 const safeStatus = (dir) => { try { return workspaceStatus(dir); } catch { return null; } };
+
+/**
+ * 这次验收能不能把应用起起来看。返回 { app, why }：
+ *   app = LiveApp（第一次用到才真起服务）；null 且 why 非空 = 有界面条目但起不了（原因给验收员、进审计）；
+ *   两个都空 = 这一步跟界面无关。没有界面条目、只是改了界面的步骤：有 si-preview.json 就给（验收员可选着看），没有就算了。
+ */
+function liveAppFor(db, { node, exec, workspace, changed }) {
+  const ui = uiChecksOf(node);
+  const files = changed ? [...changed] : null;
+  if (!ui.length && !(workspace && exec?.isolated && touchesUi(workspace, files))) return { app: null, why: null };
+  const L = contentLang(db);
+  if (!exec?.isolated || !workspace) return { app: null, why: tl(L, '不在沙箱里跑，起不了应用') };
+  const pv = readPreviewSpec(workspace, L);
+  if (!pv?.spec) return { app: null, why: ui.length ? (pv?.error ?? tl(L, '仓库根没有 {file}', { file: PREVIEW_FILE })) : null };
+  // 点验时的画面存在任务的 previews 目录下（与签收截图同一处），一次会话一个子目录；看板按 key 取图
+  const key = `${node.id}-${Date.now().toString(36)}`;
+  const keepDir = join(resolve(workspace, '..', '..'), 'previews', node.task_id, 'live', key);
+  return { app: new LiveApp(exec, workspace, pv.spec, { lang: L, keepDir, key }), why: null };
+}
 
 /**
  * 本次节点执行里见过的最大提示词体量（原价 + 缓存读 + 缓存写一起算 ——

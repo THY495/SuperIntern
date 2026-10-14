@@ -17,6 +17,7 @@
 import { newId, now, audit } from '../db/db.mjs';
 import { stripTransferHint } from './routing.mjs';
 import { tl, contentLang, I18nError } from '../i18n/index.mjs';
+import { transition } from '../db/state.mjs';
 
 /**
  * 哪些已答的事项算"决定"。
@@ -88,12 +89,18 @@ export function record(db, { projectId = null, taskId = null, subject, statement
 }
 
 /** 作废一条。`supersededBy` 只进审计与 void_reason —— 取代关系记在新那条的 supersedes 上，一处真相。 */
+/** 任务重做：契约里的"行为规则"整行挪给新任务（作废状态、裁定出处原样保留）。 */
+export const moveContractRules = (db, { fromTaskId, toTaskId }) =>
+  db.run(`UPDATE decision_registry SET task_id=? WHERE task_id=? AND source_kind='contract' AND subject LIKE '%行为规则'`, toTaskId, fromTaskId);
+
+/** heir 这一条取代 prior（接续关系，不是作废）。 */
+export const markSupersedes = (db, { heirId, priorId }) => db.run(`UPDATE decision_registry SET supersedes=? WHERE id=?`, priorId, heirId);
+
 export function voidOne(db, { id, by = null, reason = '', at = now(), supersededBy = null }) {
   const row = db.one(`SELECT id, status, subject, project_id FROM decision_registry WHERE id=?`, id);
   if (!row) throw new I18nError('决定不存在：{id}', { id });
   if (row.status === 'void') return { changed: false };
-  db.run(`UPDATE decision_registry SET status='void', void_reason=?, voided_at=?, voided_by=? WHERE id=?`,
-    String(reason ?? ''), at, by, id);
+  transition(db, 'decision_registry', id, 'void', { set: { void_reason: String(reason ?? ''), voided_at: at, voided_by: by } });
   audit(db, { actorKind: by ? 'user' : 'system', actorId: by, action: 'decision_voided', targetType: 'project',
     targetId: row.project_id ?? null, payload: { decisionId: id, subject: head(row.subject, 120), reason, supersededBy } });
   return { changed: true };

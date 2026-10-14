@@ -12,6 +12,7 @@ import { openDb, ensureOwner, newId, now, audit, insertEdge } from '../src/db/db
 import { LlmClient } from '../src/llm/client.mjs';
 import { makeFake } from '../src/llm/providers.mjs';
 import { startWeb, taskDetail } from '../src/web/server.mjs';
+import { fetchBoard, appScripts } from '../src/web/page-scripts.mjs';
 import { createTaskFromSpec } from '../src/core/project.mjs';
 import { addUser } from '../src/core/users.mjs';
 
@@ -54,7 +55,7 @@ process.on('exit', () => { try { rmSync(TMP, { recursive: true, force: true }); 
 section('1. 只绑本机；页面与只读视图');
 {
   eq(w.host, '127.0.0.1', '只绑 127.0.0.1');
-  const html = await fetch(base + '/').then((r) => r.text());
+  const html = await fetchBoard(base);
   assert(html.includes('步骤') && html.includes('待决事项') && html.includes('消息') && html.includes('动态'), '页面含四视图（步骤 / 待决事项 / 动态 / 消息）');
   assert(html.includes('id="viewTask"') && html.includes('id="viewSettings"') && html.includes('data-pane="bind"'), '任务 / 设置两个视图；设置按分区（模型分配 / 服务商 / 模型列表 / 决策路由 / 成员）');
   assert(!/方言|力度|接入点|型号/.test(html), '界面不用自造词（API 格式 / 推理强度 / 服务商 / 模型）');
@@ -182,7 +183,7 @@ section('3b. 项目层：列表、从规划新建、推进 / 交付只经已有�
   assert(r.status === 400 && /项目目标不能为空/.test(r.error), '没写目标 400');
   r = await post(`/api/projects/${pid}/nope`, {});
   eq(r.status, 404, '不认识的项目动作 404');
-  const html = await fetch(base + '/').then((x) => x.text());
+  const html = await fetchBoard(base);
   assert(html.includes('id="btnCreate"') && html.includes('id="newIsPlan"') && html.includes('id="viewProject"') && html.includes('id="projRouting"'), '页面含单入口的新建（规划勾选 = 建项目）与项目页（项目页里有本项目的决策路由）');
   assert(['id="side"', 'id="sideNav"', 'id="viewInbox"', 'data-go="settings"'].every((x) => html.includes(x)) && !html.includes('id="taskSel"'), '侧栏导航（收件箱 / 项目 → 任务 / 独立任务 / 已结束）取代了顶栏的任务下拉框');
 }
@@ -201,7 +202,7 @@ section('3c. 角色与路由：按请求识别身份；旁观者只读；路由�
   const me = await getAs(alice.plaintext, '/api/me');
   eq(JSON.stringify([me.role, me.viaOwnToken]), JSON.stringify(['member', true]), '/api/me 按请求头识别身份');
   eq((await get('/api/me')).role, 'lead', '不带头 = 起看板那个人');
-  eq((await fetch(base + '/api/me', { headers: { 'x-superintern-token': 'nope' } })).status, 400, '坏令牌 400');
+  eq((await fetch(base + '/api/me', { headers: { 'x-superintern-token': 'nope' } })).status, 401, '坏令牌 401（原来是异常兜成的 400；路由表统一认证后按语义回 401）');
 
   const t2 = newId('t'), n3 = newId('n');
   db.run(`INSERT INTO tasks (id,owner_id,title,status,created_at) VALUES (?,?,'角色测试','waiting',?)`, t2, owner.userId, t0);
@@ -257,7 +258,7 @@ section('3c. 角色与路由：按请求识别身份；旁观者只读；路由�
   eq(JSON.stringify([dg.name, dg.waitingOnMe.map((x) => x.questionId), dg.actionable]), JSON.stringify(['dave', [q2], 1]), '/api/digest：dave 的等我答 = 转交来的 q2');
   assert(typeof dg.text === 'string' && dg.text.includes(`answer ${q2}`), '带纯文本版，含命令');
   eq((await getAs(carol.plaintext, '/api/digest')).total, 0, '旁观者的待办为空');
-  assert(/收件箱/.test(await (await fetch(base + '/')).text()), '页面有"收件箱"（跨任务的待办）');
+  assert(/收件箱/.test(await fetchBoard(base)), '页面有"收件箱"（跨任务的待办）');
   r = await postAs(dave.plaintext, `/api/tasks/${t2}/answer`, { questionId: q2, body: '分号' });
   eq(r.status, 200, 'dave 答');
   eq(db.one(`SELECT status FROM questions WHERE id=?`, q2).status, 'answered', '生效');
@@ -278,6 +279,13 @@ section('3d. 成员管理与交接：只给种类 + 主机名；本人可管自�
   eq((await postAs(erin.plaintext, '/api/users', { action: 'channel_remove', userId: erin.userId, kind: 'feishu' })).status, 200, '成员能删自己的通道');
   eq((await postAs(erin.plaintext, '/api/users', { action: 'channel_set', userId: frank.userId, kind: 'ntfy', target: 'https://x.example/t' })).status, 403, '成员不能动别人的通道');
   eq((await postAs(erin.plaintext, '/api/users', { action: 'rename', userId: erin.userId, name: 'erin2' })).status, 403, '成员不能改名');
+  // GitHub 账号与提交邮箱 —— 本人可改；别人的提交邮箱只给管理员看
+  r = await postAs(erin.plaintext, '/api/users', { action: 'git_identity', userId: erin.userId, github: 'erin-gh', email: '7+erin@users.noreply.github.com' });
+  eq(JSON.stringify([r.status, r.users.find((u) => u.id === erin.userId).github, r.users.find((u) => u.id === erin.userId).commitEmail]), JSON.stringify([200, 'erin-gh', '7+erin@users.noreply.github.com']), '成员能设自己的 GitHub 账号与提交邮箱');
+  eq((await postAs(erin.plaintext, '/api/users', { action: 'git_identity', userId: frank.userId, github: 'x' })).status, 403, '成员不能设别人的');
+  const asFrank = await fetch(base + '/api/users', { headers: { 'x-superintern-token': frank.plaintext } }).then((x) => x.json());
+  eq(JSON.stringify([asFrank.users.find((u) => u.id === erin.userId).github, asFrank.users.find((u) => u.id === erin.userId).commitEmail]), JSON.stringify(['erin-gh', null]), '别的成员看得到 GitHub 账号，看不到提交邮箱');
+  eq((await get('/api/users')).users.find((u) => u.id === erin.userId).commitEmail, '7+erin@users.noreply.github.com', '管理员看得到');
   eq((await post('/api/users', { action: 'rename', userId: erin.userId, name: 'erin2' })).users.find((u) => u.id === erin.userId).name, 'erin2', '负责人改名');
   eq((await post('/api/users', { action: 'role', userId: frank.userId, role: 'lead' })).users.find((u) => u.id === frank.userId).role, 'lead', '管理员角色可直接授予');
   eq((await post('/api/users', { action: 'role', userId: frank.userId, role: 'member' })).users.find((u) => u.id === frank.userId).role, 'member', '也可直接收回');
@@ -300,7 +308,7 @@ section('3d. 成员管理与交接：只给种类 + 主机名；本人可管自�
   assert(r.status === 400 && /本机身份/.test(r.error), '本机身份的令牌不能在看板里重发（会让看板自己失去身份）');
   r = await post('/api/users', { action: 'token', userId: erin.userId });
   assert(r.status === 200 && r.result.plaintext && r.result.plaintext !== erin.plaintext, '重发令牌：明文只在这次响应里');
-  eq((await fetch(base + '/api/me', { headers: { 'x-superintern-token': erin.plaintext } })).status, 400, '旧令牌立刻失效');
+  eq((await fetch(base + '/api/me', { headers: { 'x-superintern-token': erin.plaintext } })).status, 401, '旧令牌立刻失效（401）');
   const erinTok = r.result.plaintext;
 
   // 交接：给 erin 一条路由点名，再由她申请交给 frank
@@ -326,12 +334,12 @@ section('3d. 成员管理与交接：只给种类 + 主机名；本人可管自�
   assert(r.status === 400 && r.needsHandover, '名下有事的人不能直接停用，响应标 needsHandover');
   r = await post('/api/users', { action: 'disable', userId: erin.userId });
   assert(r.status === 200 && r.users.find((u) => u.id === erin.userId).disabledAt, '名下没事 → 停用');
-  eq((await fetch(base + '/api/me', { headers: { 'x-superintern-token': erinTok } })).status, 400, '停用后令牌失效');
+  eq((await fetch(base + '/api/me', { headers: { 'x-superintern-token': erinTok } })).status, 401, '停用后令牌失效（401）');
   // 收尾：路由表还原，免得影响后面的段
   const back = (await get('/api/routing')).rows.map(({ id, project_id, template, created_at, ...x }) => x);
   back.find((x) => x.decision_type === 'spec_choice' && x.scope === '*' && x.position === 0).recipients = keep;
   eq((await post('/api/routing', { action: 'rows', rows: back })).status, 200, '（收尾）路由表还原');
-  const html = await (await fetch(base + '/')).text();
+  const html = await fetchBoard(base);
   assert(['id="users"', 'renderHandoverPanel', 'btnProjHandover', 'task-lead-only'].every((x) => html.includes(x)), '页面含成员面板、交接流程、项目页的移交入口、按任务负责人显隐的控制杆');
   assert(html.includes('function recPicker') && !html.includes('RESOLVER_HELP') && !/<input class="c-rec"/.test(html), '决策路由的接收人用选人控件，不再手写 user:<id>');
 }
@@ -359,7 +367,7 @@ section('3e. 生命周期：中止可反悔、改标题、归档；"与我有关
   const mineOf = async (tok) => (await getAs(tok, '/api/tasks')).tasks.find((t) => t.id === taskId).mine;
   eq(JSON.stringify([await mineOf(owner.plaintext), await mineOf(gina.plaintext)]), JSON.stringify([true, false]), '"与我有关"：负责人 true，无关成员 false');
   eq((await postAs(gina.plaintext, '/api/projects/pj_nope/abort', {})).status, 404, '项目动作：不存在的项目 404');
-  const page = await (await fetch(base + '/')).text();
+  const page = await fetchBoard(base);
   assert(/只看与我有关/.test(page) && /data-stall-reopen/.test(page) && /中止项目/.test(page) && /已归档/.test(page), '页面有：只看与我有关 / 恢复当前任务 / 中止项目 / 已归档');
 }
 
@@ -388,7 +396,7 @@ section('3f. 统一入口：最近用过的仓库、提交前校验、任务详�
   eq(JSON.stringify([d.schedule.due, d.schedule.verb, d.schedule.reason]), JSON.stringify([true, 'draft', 'draft:first']), '任务详情带 schedule：该澄清了（与守护进程同一个判断）');
   const dg = await get('/api/digest');
   assert(dg.daemonOff && dg.daemonOff.unfinished > 0 && /自动运行未开启/.test(dg.text), '看板没带 --daemon、没有心跳、有未结束任务 → 管理员待办里有"自动运行未开启"');
-  const page = await (await fetch(base + '/')).text();
+  const page = await fetchBoard(base);
   assert(/这是一份已写好的规划/.test(page) && /id="newRepo"/.test(page) && !/id="ideaText"/.test(page), '页面：单入口 + 规划勾选 + 仓库下拉，旧的两个表单没了');
   assert(/id="newGoal"/.test(page) && /id="newDone"/.test(page) && /完成定义/.test(page), '页面：新建项目要填目标与完成定义');
 }
@@ -431,7 +439,7 @@ section('3g. 添加任务：看板接口只记下要加什么，不建任务；�
   eq((await postAs(hank.plaintext, `/api/projects/${pid}/goal`, { goal: 'x' })).status, 403, '成员不能改目标');
   eq((await post(`/api/projects/${pid}/member`, { userId: hank.userId, remove: true })).status, 200, '移出成员');
   await post(`/api/projects/${pid}/visibility`, { visibility: 'all' });
-  const page = await (await fetch(base + '/')).text();
+  const page = await fetchBoard(base);
   assert(/添加任务…/.test(page) && !/接续为项目…/.test(page), '页面有"添加任务…"；"接续为项目…"已退役');
   assert(/项目成员/.test(page) && /仅本项目成员可见/.test(page) && /职能说明/.test(page), '页面有项目成员 / 可见性 / 职能说明');
 }
@@ -491,33 +499,88 @@ section('步骤按执行顺序编号（同一次规划的节点时间戳相同�
   eq(taskDetail(db, tid).nodes.map((n) => n.title).join('→'), '先做→再做→最后', '按依赖深度排：页面上的"步骤 1/2/3"就是执行顺序');
 }
 
-section('看板页面的内联脚本至少要能被解析');
-// 用脚本改 index.html 时，模板串里的 `\n` 容易被 heredoc / 替换吃成真换行 —— 整页脚本
-// 当场语法错误、看板一片空白，而不解析页面脚本的测试会全绿照样通过。
+section('看板页面：脚本外置、CSP 与安全头；发出去的每个脚本都能被解析');
+// 补丁脚本改页面脚本时，模板串里的 `\n` 不止一次被 heredoc / 替换吃成了真换行 —— 整页脚本
+// 当场语法错误、看板一片空白，而这份测试原来从不解析页面脚本，全绿照样通过（2026-09-21 撞上）。
+// 加载顺序与跨文件引用见 tests/ui-script.test.mjs；这里看服务端真发出去的东西。
 {
-  const { readFileSync } = await import('node:fs');
-  const html = readFileSync(new URL('../src/web/index.html', import.meta.url), 'utf8');
-  const scripts = [...html.matchAll(/<script(?![^>]*\bsrc=)[^>]*>([\s\S]*?)<\/script>/g)].map((m) => m[1]);
-  assert(scripts.length > 0, '页面里有内联脚本');
-  for (const [i, s] of scripts.entries()) {
-    let err = null;
-    try { new Function(s); } catch (e) { err = e.message; }
-    assert(!err, `第 ${i + 1} 段内联脚本能被解析${err ? `（${err}）` : ''}`);
+  const r = await fetch(base + '/');
+  const page = await r.text();
+  const csp = r.headers.get('content-security-policy') ?? '';
+  const dir = (k) => csp.split(';').map((s) => s.trim()).find((s) => s.startsWith(k + ' '));
+  eq(dir('script-src'), "script-src 'self'", "CSP：script-src 只许本站（不许 'unsafe-inline' / 'unsafe-eval'）");
+  assert(["object-src 'none'", "base-uri 'none'", "connect-src 'self'", "img-src 'self' data:", "frame-ancestors 'none'", "require-trusted-types-for 'script'"].every((x) => dir(x.split(' ')[0]) === x), 'CSP：object-src / base-uri / connect-src / img-src / frame-ancestors / Trusted Types 都在', csp);
+  eq([r.headers.get('cross-origin-opener-policy'), r.headers.get('x-content-type-options'), r.headers.get('cache-control')].join(' | '), 'same-origin | nosniff | no-store', '页面：COOP、nosniff、no-store');
+  eq(r.headers.get('strict-transport-security'), null, '没走 HTTPS 不发 HSTS');
+  const api = await fetch(base + '/api/session');
+  eq([api.headers.get('cross-origin-opener-policy'), api.headers.get('x-content-type-options'), api.headers.get('cache-control')].join(' | '), 'same-origin | nosniff | no-store', '接口：同样带 COOP、nosniff、no-store');
+  const inline = [...page.matchAll(/<script(?![^>]*\bsrc=)([^>]*)>/g)].map((m) => m[1].trim());
+  assert(inline.length > 0 && inline.every((a) => a === 'type="application/json" id="si-i18n"'), '页面里唯一的非外置 <script> 是词表数据块（不执行）', inline.join(' / '));
+  const list = appScripts(page);
+  assert(list.length > 1, `页面引用 ${list.length} 个外置脚本`);
+  const bad = [];
+  for (const s of list) {
+    const x = await fetch(base + s.url);
+    const text = await x.text();
+    if (x.status !== 200 || !/^text\/javascript/.test(x.headers.get('content-type') ?? '')) { bad.push(`${s.url}: ${x.status} ${x.headers.get('content-type')}`); continue; }
+    try { new Function(text); } catch (e) { bad.push(`${s.url}: ${e.message}`); }
+    const again = await fetch(base + s.url, { headers: { 'if-none-match': x.headers.get('etag') } });
+    if (again.status !== 304) bad.push(`${s.url}: 带 etag 再取应 304，实得 ${again.status}`);
+    await again.arrayBuffer();
   }
+  assert(bad.length === 0, '每个脚本：200、text/javascript、能被解析；没改过的再取是 304', bad.join(' | '));
+  const miss = [];
+  for (const u of ['/app/99-nope.js', '/app/../server.mjs', '/app/%2e%2e/server.mjs', '/app/01-core.js/', '/app/01-CORE.js', '/app/x.js', '/app/']) {
+    const x = await fetch(base + u); await x.arrayBuffer();
+    if (x.status !== 404) miss.push(`${u}: ${x.status}`);
+  }
+  assert(miss.length === 0, '页面没引用的、绕路径的、大小写不对的一律 404（只发启动时读进内存的那几个）', miss.join(' | '));
 }
 
-section('已合并的项目任务上发修正 / 新指令 → 转成项目的「添加任务」，记在说话的人名下（否则发到已合并任务上的新指令会悬空、需求丢了）');
+section('已合并的项目任务上发修正 / 新指令 → 转成项目的「添加任务」，记在说话的人名下（原来发到已合并任务上的新指令悬空、需求丢了）');
 {
   const { appendStateOf } = await import('../src/agent/project-append.mjs');
   const pj = newId('pj'), tm = newId('t'), at = now();
   db.run(`INSERT INTO projects (id,owner_id,title,brief,repo,branch,base_ref,status,draft_version,created_at,goal,done_definition,visibility)
-          VALUES (?,?,'待办清单','b','/r','superintern/x','main','done',1,?,'g','d','team')`, pj, owner.userId, at);
+          VALUES (?,?,'藏书','b','/r','superintern/x','main','done',1,?,'g','d','all')`, pj, owner.userId, at);
   db.run(`INSERT INTO tasks (id,owner_id,title,status,created_at,project_id,project_order,merged_at) VALUES (?,?,'T1','done',?,?,1,?)`, tm, owner.userId, at, pj, at);
-  const r = await post(`/api/tasks/${tm}/say`, { body: '每条待办显示优先级标签，按优先级从高到低排', kind: 'instruction' });
+  const r = await post(`/api/tasks/${tm}/say`, { body: '每本书显示评分标签，按评分从高到低排', kind: 'instruction' });
   eq(r.result?.appended, true, '转成了添加任务');
   const st = appendStateOf(db, pj);
-  eq([st.brief, st.requestedBy].join('|'), ['每条待办显示优先级标签，按优先级从高到低排', owner.userId].join('|'), '需求原文、记在说话的人名下');
+  eq([st.brief, st.requestedBy].join('|'), ['每本书显示评分标签，按评分从高到低排', owner.userId].join('|'), '需求原文、记在说话的人名下');
   eq(db.one(`SELECT count(*) n FROM messages WHERE task_id=? AND kind='instruction'`, tm).n, 0, '没有在已合并的任务上留一条没人接的消息');
+}
+
+section('修改溯源：步骤出处、追溯；看不到的任务的步骤不给内容');
+{
+  const { execFileSync } = await import('node:child_process');
+  const at = now(), ta = newId('t'), na = newId('n'), pj = newId('pj'), tb = newId('t'), nb = newId('n');
+  db.run(`INSERT INTO tasks (id,owner_id,title,status,created_at) VALUES (?,?,'溯源 A','running',?)`, ta, owner.userId, at);
+  db.run(`INSERT INTO nodes (id,task_id,title,spec,acceptance,status,priority,created_at) VALUES (?,?,'A 的一步','s','a','pending',5,?)`, na, ta, at);
+  db.run(`INSERT INTO projects (id,owner_id,title,brief,repo,branch,base_ref,status,draft_version,created_at,goal,done_definition,visibility)
+          VALUES (?,?,'保密项目','b','/r','superintern/y','main','active',1,?,'g','d','members')`, pj, owner.userId, at);
+  db.run(`INSERT INTO tasks (id,owner_id,title,status,created_at,project_id,project_order) VALUES (?,?,'溯源 B','running',?,?,1)`, tb, owner.userId, at, pj);
+  db.run(`INSERT INTO nodes (id,task_id,title,spec,acceptance,status,priority,created_at) VALUES (?,?,'B 的一步','s','a','pending',5,?)`, nb, tb, at);
+  const ws = join(HOME, 'workspaces', ta); mkdirSync(ws, { recursive: true });
+  const g = (...a) => execFileSync('git', ['-C', ws, '-c', 'user.name=SuperIntern', '-c', 'user.email=a@l', ...a], { encoding: 'utf8' }).trim();
+  g('init', '-q'); writeFileSync(join(ws, 'x.txt'), '1\n'); g('add', '-A');
+  g('commit', '-q', '-m', `合并两步\n\nnode: ${na}\nnode: ${nb}`);
+  const sha = g('rev-parse', 'HEAD');
+  const getAs = (tok, p) => fetch(base + p, { headers: { 'x-superintern-token': tok } }).then(async (r) => ({ status: r.status, ...(await r.json()) }));
+
+  let r = await getAs(owner.plaintext, `/api/tasks/${ta}/provenance?node=${na}`);
+  eq(JSON.stringify([r.status, r.node?.id, r.commits]), JSON.stringify([200, na, [sha.slice(0, 7)]]), '步骤出处：带对应提交');
+  eq((await getAs(owner.plaintext, `/api/tasks/${ta}/provenance?node=${nb}`)).status, 404, '别的任务的步骤不能借这个任务的地址看');
+  r = await getAs(owner.plaintext, `/api/tasks/${ta}/trace?q=x.txt:1`);
+  eq(JSON.stringify([r.status, r.nodes?.map((p) => p.node?.id ?? p.hidden)]), JSON.stringify([200, [na, nb]]), '负责人：两步都看得到');
+  const ivy2 = addUser(db, { name: 'ivy2', role: 'member', byUserId: owner.userId });
+  r = await getAs(ivy2.plaintext, `/api/tasks/${ta}/trace?q=${sha.slice(0, 10)}`);
+  eq(JSON.stringify([r.status, r.nodes?.[0]?.node?.id, r.nodes?.[1]]), JSON.stringify([200, na, { hidden: nb }]), '看不到保密项目的成员：那一步只给 id，不给标题 / 条款 / 指令');
+  assert(!JSON.stringify(r).includes('B 的一步') && !JSON.stringify(r).includes('溯源 B'), '响应里没有那个任务的任何文字');
+  eq((await getAs(ivy2.plaintext, `/api/tasks/${tb}/trace?q=HEAD`)).status, 404, '看不到的任务：接口本身 404');
+  r = await getAs(owner.plaintext, `/api/tasks/${ta}/trace?q=--output=x:1`);
+  eq(r.status, 400, '像选项的输入：400');
+  eq((await getAs(owner.plaintext, `/api/tasks/${taskId}/trace?q=HEAD`)).status, 400, '还没有工作区的任务：400，说清楚');
 }
 
 w.close(); db.close();

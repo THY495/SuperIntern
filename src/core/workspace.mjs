@@ -10,13 +10,17 @@
 // 而验收标准必须是机械可判的。
 
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdirSync, rmSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, rmSync, readFileSync, writeFileSync, readdirSync } from 'node:fs';
 import { resolve, join } from 'node:path';
 import { audit, newId } from '../db/db.mjs';
+import { writeParam, clearParam } from './params.mjs';
+import { gitRaw as gitRawBase } from './git.mjs';
 import { I18nError, tl } from '../i18n/index.mjs';
+import { managementPaths, exposedBy } from './mgmt-paths.mjs';
 
-const gitRaw = (cwd, ...args) =>
-  execFileSync('git', args, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+// 工作区里有克隆、gc 这种大仓库上会跑很久的操作：时限放宽到 10 分钟（统一封装默认 2 分钟）。
+const WS_GIT_TIMEOUT_MS = 10 * 60_000;
+const gitRaw = (cwd, ...args) => gitRawBase(cwd, args, { timeout: WS_GIT_TIMEOUT_MS });
 const git = (cwd, ...args) => gitRaw(cwd, ...args).trim();
 
 /** 当前 HEAD。每个节点开跑前取一次，作为该节点产物的基线。 */
@@ -47,19 +51,13 @@ export function nodeBaseline(db, { taskId, nodeId, workspace, actorId = 'executo
   const stored = row ? JSON.parse(row.value) : null;
   if (stored && hasCommit(workspace, stored)) return { base: stored, resumed: true };
   const head = headOf(workspace);
-  const t = Date.now();
-  db.run(`UPDATE params SET superseded_at=?, valid_to=? WHERE task_id=? AND key=? AND superseded_at IS NULL`, t, t, taskId, key);
-  db.run(`INSERT INTO params (id,task_id,key,value,layer,governance_class,set_by_kind,set_by_id,valid_from,recorded_at)
-          VALUES (?,?,?,?,'task','execution','agent',?,?,?)`,
-  newId('p'), taskId, key, JSON.stringify(head), actorId, t, t);
+  writeParam(db, { taskId, key, value: head, by: { kind: 'agent', id: actorId }, governance: 'execution' });
   return { base: head, resumed: false };
 }
 
 /** 这一段工作结束（done，或修正改了规格要重做）：基线作废，下一段重取。 */
 export function clearNodeBaseline(db, { taskId, nodeId }) {
-  const t = Date.now();
-  db.run(`UPDATE params SET superseded_at=?, valid_to=? WHERE task_id=? AND key=? AND superseded_at IS NULL`,
-    t, t, taskId, BASE_KEY(nodeId));
+  clearParam(db, { taskId, key: BASE_KEY(nodeId) });
 }
 
 /** 任务工作区建立时的 commit（`workspace_created` 审计里的 head）—— 读的正是下面 `ensureWorkspace` 写的那条。 */
@@ -151,7 +149,7 @@ export function changedSince(dir, base) {
  */
 export const pinLineEndings = (dir) => git(dir, 'config', 'core.autocrlf', 'false');
 
-export const DEP_EXCLUDES = ['node_modules/', '.venv/', 'venv/', '__pycache__/', '*.pyc', '.pytest_cache/', '.mypy_cache/', '.npm/', '.cache/', 'dist-newstyle/', '.si-preview/', '*.db', '*.sqlite', '*.sqlite3', '*.db-journal', '*.db-wal', '*.db-shm',
+export const DEP_EXCLUDES = ['node_modules/', '.venv/', 'venv/', '__pycache__/', '*.pyc', '.pytest_cache/', '.mypy_cache/', '.npm/', '.cache/', 'dist-newstyle/', '.si-preview/', '.si-outputs/', '*.db', '*.sqlite', '*.sqlite3', '*.db-journal', '*.db-wal', '*.db-shm',
   'dist/', 'coverage/', '.next/', '.nuxt/', '.vite/', '.turbo/', '.parcel-cache/', '*.tsbuildinfo',
   // 测试工具跑一遍就会写出来的产物（比如 Playwright 失败时往 frontend/test-results/ 写 .last-run.json、error-context.md，
   // 交接次次被范围校验判越界，直到撞重试上限）。它们与 coverage/ 同类：跑测试的副产物，不是谁的改动。
@@ -203,6 +201,21 @@ export function writeDepExcludes(ws) {
   } catch { return false; }   // 写不进去不连累开工作区：代价是依赖目录会被当成改动，越界校验会说出来
 }
 
+/** 工作区标记：放在 .git 里（不进仓库、不进 diff），建工作区时写，强制重建前查。 */
+const WS_MARK = 'superintern-workspace';
+const markWorkspace = (ws) => { try { writeFileSync(join(ws, '.git', WS_MARK), 'created by SuperIntern; safe to delete with --force\n'); } catch { /* 标记写不进去：下次 --force 会按老规则（v0/ 分支）认 */ } };
+
+/**
+ * 这个目录能不能被 --force 整个删掉：空目录；带工作区标记；或（标记出现之前建的）git 仓库里有 v0/ 任务分支。
+ * 其余一律不能 —— 包括用户手误给的上层目录、家目录、别的项目。
+ */
+export function isDeletableWorkspace(dir) {
+  try { if (readdirSync(dir).length === 0) return true; } catch { return false; }
+  if (existsSync(join(dir, '.git', WS_MARK))) return true;
+  if (!existsSync(join(dir, '.git'))) return false;
+  try { return git(dir, 'for-each-ref', '--format=%(refname)', 'refs/heads/v0/').trim().length > 0; } catch { return false; }
+}
+
 /**
  * 删一份工作区目录，包括容器在里面建的符号链接（Windows 宿主上会撞到）。
  *
@@ -212,6 +225,50 @@ export function writeDepExcludes(ws) {
  * 普通删除失败时，起一个一次性容器从 Linux 那一侧把内容删掉，再删目录本身。没有容器运行时就把原来的错误抛出去。
  */
 export function forceRemoveDir(dir) {
+  // 递归删除只认系统自己建的目录。GitLab 2017 / Replit 2025 那一类事故：
+  // 破坏性操作的目标由人手输（--dir），写错一层就是整棵树。宁可拒绝，也不猜。
+  if (!isDeletableWorkspace(dir)) {
+    throw new I18nError('拒绝删除：{dir} 不是 SuperIntern 建的工作区（没有工作区标记，也没有 v0/ 任务分支）。确实要换到这个位置，请先自己清空或换一个新目录', { dir });
+  }
+  try { rmSync(dir, { recursive: true, force: true }); return; } catch (e) {
+    try {
+      execFileSync('docker', ['run', '--rm', '--network', 'none', '-v', `${dir}:/x`, 'superintern/sandbox:v0.1',
+        'sh', '-c', 'find /x -mindepth 1 -delete'], { stdio: ['ignore', 'pipe', 'pipe'] });
+    } catch { throw e; }
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+/** 依赖 / 缓存目录名：都能由锁文件重建（npm ci、pip install、cabal build……），工作区合并或归档后可以删。 */
+export const DEP_DIRS = ['node_modules', '.venv', 'venv', '__pycache__', '.pytest_cache', '.mypy_cache', '.npm', '.cache', 'dist-newstyle'];
+
+/** 工作区里的依赖目录（相对路径）：不进 .git，找到一个就不再往它里面找。 */
+export function findDepDirs(ws) {
+  const out = [];
+  const walk = (rel, depth) => {
+    if (depth > 8) return;
+    let ents;
+    try { ents = readdirSync(join(ws, rel), { withFileTypes: true }); } catch { return; }
+    for (const e of ents) {
+      if (!e.isDirectory() || e.name === '.git') continue;
+      const r = rel ? `${rel}/${e.name}` : e.name;
+      if (DEP_DIRS.includes(e.name)) out.push(r);
+      else walk(r, depth + 1);
+    }
+  };
+  walk('', 0);
+  return out;
+}
+
+/**
+ * 删工作区里的一个依赖目录。只认 DEP_DIRS 里的名字、只在系统建的工作区里删（与 forceRemoveDir 同一条底线）；
+ * 普通删除删不掉（容器建的 Linux 符号链接落在 NTFS 上、或 Linux 上属 root）时，起一次性容器从里面删。
+ */
+export function removeDepDir(ws, rel) {
+  const name = rel.split('/').pop();
+  if (!DEP_DIRS.includes(name) || rel.split('/').includes('..')) throw new Error(`不是依赖目录：${rel}`);
+  if (!isDeletableWorkspace(ws)) throw new I18nError('拒绝删除：{dir} 不是 SuperIntern 建的工作区（没有工作区标记，也没有 v0/ 任务分支）。确实要换到这个位置，请先自己清空或换一个新目录', { dir: ws });
+  const dir = join(ws, rel);
   try { rmSync(dir, { recursive: true, force: true }); return; } catch (e) {
     try {
       execFileSync('docker', ['run', '--rm', '--network', 'none', '-v', `${dir}:/x`, 'superintern/sandbox:v0.1',
@@ -231,6 +288,9 @@ export function forceRemoveDir(dir) {
 export function ensureWorkspace(db, { taskId, source, dir, force = false, ref = null, empty = false }) {
   const ws = resolve(dir);
   const branch = `v0/${taskId}`;
+  // 工作区罩住了状态库 / 主密钥（--dir 指到了数据目录的上级）= 任务里的 AI 读得到它们。拒
+  const exposed = exposedBy(ws, managementPaths(db));
+  if (exposed.length) throw new I18nError('工作区 {dir} 包含了系统自己的数据（{what}）：任务里的 AI 会读得到。换一个不在数据目录上级的位置', { dir: ws, what: exposed.map((m) => m.path).join('、') });
 
   // 新项目（从想法开始）：没有源仓库，起一个空仓库 + 一个空提交，让后面所有"基线 = HEAD"的
   // 逻辑（节点基线、净改动守卫、交付）照常成立。
@@ -245,6 +305,7 @@ export function ensureWorkspace(db, { taskId, source, dir, force = false, ref = 
     git(ws, '-c', 'user.name=superintern', '-c', 'user.email=superintern@local', 'commit', '-q', '--allow-empty', '-m', `init: ${taskId}`);
     const head = git(ws, 'rev-parse', 'HEAD');
     writeDepExcludes(ws);
+    markWorkspace(ws);
     audit(db, { actorKind: 'system', action: 'workspace_created', targetType: 'task', targetId: taskId,
       payload: { dir: ws, branch, source: null, ref: null, head, empty: true } });
     return { dir: ws, branch, head, ref: null, created: true };
@@ -270,6 +331,7 @@ export function ensureWorkspace(db, { taskId, source, dir, force = false, ref = 
   // autocrlf 关掉：Windows 上默认 true，克隆把文件写成 CRLF，容器（Linux）里的 git 一开始就报 ' M'，
   // agent 得花两条假设去证明"不是我改的"。工作区只给容器用，行尾按仓库原样。
   git(src, '-c', 'core.autocrlf=false', 'clone', '--quiet', '--no-hardlinks', src, ws);
+  markWorkspace(ws);
   pinLineEndings(ws);
 
   // `ref` 让工作区落在某个历史提交上，而不是当前 HEAD。
@@ -348,6 +410,8 @@ export function workspaceStatus(dir) {
     head: git(dir, 'rev-parse', 'HEAD'),
     dirty: porcelain.length > 0,
     changed: porcelain.split('\n').filter(Boolean).map((l) => l.slice(3)),
+    // 没跟踪的（porcelain "??"）：新建的文件 / 目录，动不了已提交的那一版
+    untracked: porcelain.split('\n').filter((l) => l.startsWith('??')).map((l) => l.slice(3)),
   };
 }
 

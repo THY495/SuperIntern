@@ -13,11 +13,12 @@ import { mkdtempSync, rmSync, writeFileSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { openDb, ensureOwner, newId, now } from '../src/db/db.mjs';
-import { LlmClient, runToolLoop } from '../src/llm/client.mjs';
+import { LlmClient, runToolLoop, withNonEmptyAssistant, EMPTY_TURN_TEXT } from '../src/llm/client.mjs';
 import { makeFake } from '../src/llm/providers.mjs';
 import { orchestrate } from '../src/core/orchestrator.mjs';
 import { LocalExecutor } from '../src/core/executor.mjs';
-import { ProviderError, HardLimitError, ConfigError, isInfraError } from '../src/core/errors.mjs';
+import { ProviderError, HardLimitError, ConfigError, SandboxError, isInfraError } from '../src/core/errors.mjs';
+import { CapabilityError } from '../src/core/capabilities.mjs';
 import { setLimit } from '../src/core/limits.mjs';
 import { TIER_BINDING, MODEL_CATALOG, VENDORS, tierEntry } from '../src/llm/canonical.mjs';
 
@@ -127,6 +128,52 @@ section('2. 厂商侧重试：只重试可重试的，有界，最终抛 Provide
     globalThis.fetch = async () => { throw new Error('fetch failed'); };
     e = null; try { await call(new LlmClient(fast)); } catch (x) { e = x; }
     assert(e instanceof ProviderError && e.status === null && e.retryable, '网络失败 → status=null、可重试、耗尽后抛');
+
+    // 空的 assistant 轮（推理吃光上限、正文为空）被调用方原样塞回历史：发出去之前补一句占位（Moonshot 对空内容回 400）
+    let sent = null;
+    globalThis.fetch = async (url, init) => { sent = JSON.parse(init.body); return { ok: true, status: 200, json: async () => ({ choices: [{ message: { content: '{}' }, finish_reason: 'stop' }], usage: {} }) }; };
+    await new LlmClient({ mode: 'live', retryDelays: [0, 0, 0], binding: { ...TIER_BINDING, standard: 'deepseek/deepseek-v4-pro' } }).complete({ tier: 'standard', system: 's', maxTokens: 8,
+      messages: [{ role: 'user', content: [{ type: 'text', text: 'x' }] }, { role: 'assistant', content: [{ type: 'thinking', text: '…' }] }, { role: 'user', content: [{ type: 'text', text: '再来' }] }] });
+    const asst = sent?.messages?.find((m) => m.role === 'assistant');
+    eq(asst?.content, EMPTY_TURN_TEXT, 'OpenAI 形状：空 assistant 轮发出去是一句占位，不是 content:null');
+    const kept = withNonEmptyAssistant({ messages: [{ role: 'assistant', content: [{ type: 'tool_call', id: 'c', name: 'f', args: {} }] }] });
+    eq(kept.messages[0].content.length, 1, '只有工具调用的 assistant 轮不算空，不动');
+
+    // 网关回 200 + 空体 `null`，解析器读 choices 抛 TypeError → 编排器当真 bug 崩掉、停了 33 分钟
+    const bodies = (list) => { let i = 0; return async () => { const b = list[Math.min(i++, list.length - 1)]; return { ok: true, status: 200, json: async () => (b instanceof Error ? Promise.reject(b) : b) }; }; };
+    const good = { id: 'm', type: 'message', role: 'assistant', model: 'x', content: [{ type: 'text', text: 'ok' }], stop_reason: 'end_turn', usage: { input_tokens: 1, output_tokens: 1 } };
+    globalThis.fetch = bodies([null, new SyntaxError('Unexpected end of JSON input'), good]);
+    const r2 = await call(new LlmClient(fast));
+    assert(r2?.content?.[0]?.text === 'ok', '200 + 空体、200 + 截断的 JSON：当上游失败重试，第三次正常 → 调用方看不到');
+    globalThis.fetch = bodies([null]);
+    e = null; try { await call(new LlmClient(fast)); } catch (x) { e = x; }
+    assert(e instanceof ProviderError && e.retryable === true && e.malformed === true, '一直空体 → 可重试的 ProviderError（带 malformed），不是 TypeError');
+    eq(e.attempts, 4, '空体照可重试的次数重试，有界');
+    eq(e.summary().malformed, true, '审计摘要里带 malformed');
+    globalThis.fetch = bodies([{ error: { code: 400, message: 'context too long' } }]);
+    e = null; try { await call(new LlmClient(fast)); } catch (x) { e = x; }
+    assert(e instanceof ProviderError && e.retryable === false && e.status === 400 && e.attempts === 1, '200 里包着 error.code=400：照 400 判，不重试');
+    globalThis.fetch = bodies([{ error: { message: 'upstream exploded' } }, good]);
+    assert((await call(new LlmClient(fast)))?.content?.length, '200 里包着没状态码的 error：当可重试，下一次成功');
+    globalThis.fetch = bodies([{ id: 'm', type: 'message', content: [null], usage: {} }]);
+    e = null; try { await call(new LlmClient(fast)); } catch (x) { e = x; }
+    assert(e instanceof ProviderError && e.retryable === true && /形状/.test(e.message), `回包里的块是坏的（解析器抛 TypeError）→ 可重试的 ProviderError（${String(e?.message).slice(0, 50)}）`);
+
+    // 连接卡住（不回、不断）：原来没有时限，靠 fetch 默认的 300 s × 4 次；现在按总时限掐断、当网络失败重试
+    process.env.SUPERINTERN_LLM_TIMEOUT_MS = '150';
+    let calls = 0, sawSignal = 0;
+    globalThis.fetch = (url, init) => new Promise((_, reject) => {
+      calls++; if (init?.signal) sawSignal++;
+      init?.signal?.addEventListener('abort', () => reject(init.signal.reason));
+    });
+    const t0 = Date.now();
+    // AbortSignal.timeout 的计时器是 unref 的：测试进程里没有别的句柄时进程会先退出，留一个句柄撑住（真服务里有服务器撑着）
+    const keep = setInterval(() => {}, 1000);
+    e = null; try { await call(new LlmClient(fast)); } catch (x) { e = x; } finally { clearInterval(keep); }
+    assert(e instanceof ProviderError && e.status === null && e.retryable, `卡住的连接被掐断 → 可重试的网络失败（${String(e?.message).slice(0, 60)}）`);
+    eq(sawSignal, calls, '每次请求都带了时限');
+    assert(Date.now() - t0 < 10_000, `有界：${Date.now() - t0} ms 内结束`);
+    delete process.env.SUPERINTERN_LLM_TIMEOUT_MS;
   } finally { globalThis.fetch = realFetch; }
 }
 
@@ -153,6 +200,17 @@ section('3. 编排器：厂商错误 → 干净地停，节点退回 pending，*
   try { await run(db2, t2, [new TypeError('真 bug')]); } catch (e) { threw = e; }
   assert(threw instanceof TypeError, '非基础设施异常照旧抛出 —— 真 bug 不该被藏进"优雅处理"');
   db.close(); db2.close();
+  // 容器管理命令失败（运行时掉了、镜像没了）同样不是节点的错 —— 原来回给模型当工具错误，或算作节点崩溃扣重试
+  const { db: db3, taskId: t3, nodeId: n3 } = fixture();
+  const sx = new SandboxError('docker exec 失败：Error response from daemon: No such container', { cmd: 'docker exec' });
+  const r3 = await run(db3, t3, [toolCall('list_dir', { path: '.' }), sx]);
+  eq(r3.kind, 'sandbox_error', '沙箱出错：结果 kind = sandbox_error');
+  const nn = db3.one(`SELECT status, retry_count FROM nodes WHERE id=?`, n3);
+  eq(nn.status, 'pending', '节点退回 pending');
+  eq(nn.retry_count, 0, '不计重试');
+  eq(audits(db3, 'sandbox_error', n3).length, 1, '一条 sandbox_error 审计挂在节点上');
+  eq(db3.one(`SELECT status FROM tasks WHERE id=?`, t3).status, 'running', '任务不冻结 —— 守护进程按退避再拉');
+  db3.close();
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -221,6 +279,22 @@ section('4. 编排器：硬边界 → limit_hard_failed，计一次重试，审�
   eq(lb.length, 1, 'limit_breached 审计恰好一条 —— 容器侧只抛不记，编排器记（原来两边各记一条）');
   eq(lb[0].on_hit, 'hard_fail', '审计标明 hard_fail');
   eq(db.one(`SELECT count(*) AS n FROM questions WHERE task_id=?`, taskId).n, 0, '不生成问题 —— 硬边界不进提问分支');
+  db.close();
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+section('4b. 真 bug（例如能力表拒绝）：编排器照炸，退出原因进审计轨');
+// ═══════════════════════════════════════════════════════════════════════════
+{
+  const { db, taskId } = fixture();
+  const bug = new CapabilityError('会话角色 {role} 没在能力表里登记（core/capabilities.mjs）：先写清它读什么输入、能不能碰凭据、能不能对外改东西', { role: 'x' });
+  let caught = null;
+  try { await run(db, taskId, [toolCall('list_dir', { path: '.' }), bug]); } catch (e) { caught = e; }
+  assert(caught instanceof CapabilityError, '不是基础设施错误：照旧抛出去，不被"优雅处理"藏起来');
+  const ex = audits(db, 'orchestrator_exit', taskId).at(-1);
+  assert(ex?.kind === 'crash' && ex.error?.name === 'CapabilityError' && ex.error.capability === true && /没在能力表里登记/.test(ex.error.message),
+    `退出审计记下崩溃原因（${ex?.kind} / ${ex?.error?.name}）`);
+  assert(Number.isFinite(ex?.elapsedMs), '这一段跑了多久也记下（活动时长照算）');
   db.close();
 }
 

@@ -13,7 +13,8 @@
 
 import { spawnSync } from 'node:child_process';
 import { audit } from '../db/db.mjs';
-import { tl, I18nError } from '../i18n/index.mjs';
+import { redact } from './redact.mjs';
+import { tl, I18nError, N_ } from '../i18n/index.mjs';
 
 export const CHANNEL_ENV = {
   ntfy: 'NTFY_URL',              // 例：https://ntfy.sh/<topic>
@@ -72,6 +73,8 @@ export function buildRequest(channel, { title, text }) {
  * @returns {Promise<Array<{kind, ok, status?, error?}>>}
  */
 export async function notify(db, { taskId, kind, title, text, ref = null, channels, fetchFn = globalThis.fetch, spawn = spawnSync }) {
+  // 通知发到第三方（ntfy、飞书、企业微信……），正文和标题先脱敏
+  title = redact(title); text = redact(text);
   const receipts = [];
   for (const ch of channels ?? []) {
     let r;
@@ -104,6 +107,60 @@ export async function notify(db, { taskId, kind, title, text, ref = null, channe
   return receipts;
 }
 
+/** 一拍里新出现的熔断 / 换用备用 / 恢复审计 → 给管理员的一条通知；没有值得说的返回 null。
+ *  再次打开（试探失败、冷却翻倍）不发：第一次打开已经说过，冷却期间看板 / bind 里看得到。
+ *  恢复只在开过 5 分钟以上时说一声 —— 短暂抖一下就好了的，人不用知道。 */
+export function llmHealthNotice(rows, lang = 'zh') {
+  const L = lang, lines = [];
+  let opened = 0;
+  for (const a of rows) {
+    const p = a.payload ?? {};
+    if (a.action === 'llm_breaker_opened' && !p.reopened) {
+      opened++;
+      lines.push(tl(L, '{key} 连着出错，系统暂时不调用它，{s} 秒后再试（{err}）', { key: a.targetId, s: Math.round((p.coolMs ?? 0) / 1000), err: `${p.status ? `HTTP ${p.status} ` : ''}${String(p.error ?? '').slice(0, 120)}` }));
+    } else if (a.action === 'llm_fallback_used') {
+      lines.push(tl(L, '{tier} 档已从 {from} 换用备用模型 {to}', { tier: p.tier ?? '?', from: p.from ?? a.targetId, to: p.to ?? '?' }));
+    } else if (a.action === 'llm_breaker_closed' && (p.openForMs ?? 0) >= 5 * 60_000) {
+      lines.push(tl(L, '{key} 恢复了（停了 {m} 分钟）', { key: a.targetId, m: Math.round(p.openForMs / 60_000) }));
+    }
+  }
+  if (!lines.length) return null;
+  const hint = opened ? `\n\n${tl(L, '这是服务商那边的问题，不是 key 或配置。配了备用模型的档会自动换用；没配的，要用它的步骤会停下等它恢复（不算失败），配上备用后马上接着做：node src/cli.mjs bind fallback <tier>=<服务商/模型>；现状：node src/cli.mjs bind')}` : '';
+  return { title: `[SuperIntern] ${opened ? tl(L, '模型服务商出问题了') : tl(L, '模型服务商状况有变化')}`, text: lines.join('\n') + hint, ref: 'llm_health', lines };
+}
+
+/** 运行期不变量的名字（通知、命令行用；看板另有一份按界面语言的） */
+export const INVARIANT_NAMES = {
+  liveness: N_('每个没结束的任务都说得出在等谁'),
+  projection: N_('状态与审计轨对得上、库层护栏都在'),
+  executor_paths: N_('任务里的 AI 碰不到系统自己的数据'),
+  budget: N_('花费没有超过上限'),
+  leases: N_('标着「正在处理」的任务和项目，都真有进程在处理'),
+};
+
+/** 不成立时说出了什么事（规矩本身是肯定句，后面接"不成立"会读反；与看板同一套说法） */
+export const INVARIANT_PROBLEMS = {
+  liveness: N_('有任务说不出在等谁'),
+  projection: N_('状态与审计轨对不上，或库层护栏少了'),
+  executor_paths: N_('有任务里的 AI 碰得到系统自己的数据'),
+  budget: N_('有花费超过了上限、却没被拦下'),
+  leases: N_('有任务或项目标着「正在处理」，占着它的进程已经不在了'),
+};
+
+/** 一拍里不变量的转换 → 给管理员的一条通知 */
+export function invariantNotice(transitions, lang = 'zh') {
+  const L = lang;
+  const name = (id) => tl(L, INVARIANT_NAMES[id] ?? id);
+  const bad = transitions.filter((t) => t.to === 'violated'), good = transitions.filter((t) => t.to === 'restored');
+  const lines = [
+    ...bad.map((t) => tl(L, '{problem}（{n} 处）', { problem: tl(L, INVARIANT_PROBLEMS[t.id] ?? t.id), n: t.n })),
+    ...good.map((t) => tl(L, '恢复了：{name}', { name: name(t.id) })),
+  ];
+  if (!lines.length) return null;
+  return { title: `[SuperIntern] ${bad.length ? tl(L, '运行期自检：{n} 项不成立', { n: bad.length }) : tl(L, '运行期自检：恢复正常')}`,
+    text: `${lines.join('\n')}${bad.length ? `\n\n${tl(L, '详情：看板「设置 → 运行状况」，或 node src/cli.mjs invariants')}` : ''}`, ref: 'invariants', lines };
+}
+
 /** 退出原因 → 一条通知。只覆盖"需要人做点什么"的那几种；complete 也推，好让人知道可以签收了。
  *  `lang`：部署级广播，调用方传 contentLang(db)（0.2.0）。 */
 export function outcomeNotice(r, taskId, lang = 'zh') {
@@ -117,6 +174,8 @@ export function outcomeNotice(r, taskId, lang = 'zh') {
   if (k === 'limit_breached') return { title: `[SuperIntern] ${tl(L, '硬上限触顶，任务冻结')}`, ref: r.questionId ?? null,
     text: `${r.breach?.human ?? ''}\n${tl(L, '加额：{cmd} <新值>', { cmd: `node src/cli.mjs limit ${taskId} --${String(r.breach?.key ?? '').replace('limit.', '')}` })}` };
   if (k === 'limit_hard_failed') return { title: `[SuperIntern] ${tl(L, '硬边界触顶（不支持加额）')}`, ref: null, text: `${r.breach?.human ?? ''}\n${r.why ?? ''}` };
+  if (k === 'sandbox_error') return { title: `[SuperIntern] ${tl(L, '沙箱出了问题，任务停了')}`, ref: null,
+    text: `${String(r.error?.message ?? '').slice(0, 300)}\n${tl(L, '不是这一步的错，节点不计重试。开着守护进程的话它会隔一阵自动再拉；一直不好就到服务器上看看 Docker / Podman（镜像在不在、容器起不起得来）。')}` };
   if (k === 'provider_error' && r.error?.config) return { title: `[SuperIntern] ${tl(L, '模型配置有问题，任务停了')}`, ref: null,
     text: `${String(r.error.message ?? '').slice(0, 300)}\n${tl(L, '没有发出请求，节点不计重试。改绑：node src/cli.mjs bind set {tier}=<服务商/模型>，或看板"设置 → 模型分配"', { tier: r.error.tier ?? '<tier>' })}` };
   if (k === 'provider_error') {
@@ -125,9 +184,12 @@ export function outcomeNotice(r, taskId, lang = 'zh') {
     const e = r.error ?? {};
     const head = `${e.vendor}/${e.model}${e.status ? ` HTTP ${e.status}` : tl(L, '（网络）')}${L === 'en' ? ': ' : '：'}${String(e.message ?? '').slice(0, 200)}`;
     const rebind = tl(L, 'node src/cli.mjs bind set {tier}=<服务商/模型>，或看板"设置 → 模型分配"（下个步骤起生效）', { tier: e.tier ?? '<tier>' });
+    // 换用过备用模型仍失败的、没配备用模型的，各说一句
+    const fb = e.fallback ? `\n${tl(L, '已自动换用这一档的备用模型 {to}，也失败了。', { to: e.fallback.to })}`
+      : `\n${tl(L, '给这一档配一个别家的备用模型，下次这家出问题时自动换：node src/cli.mjs bind fallback {tier}=<服务商/模型>', { tier: e.tier ?? '<tier>' })}`;
     return e.retryable
       ? { title: `[SuperIntern] ${tl(L, '厂商暂时不可用，任务停了')}`, ref: null,
-        text: `${head}\n${tl(L, '节点不计重试。开着守护进程的话它会隔一阵自动再拉；一直不好就换一家：{rebind}', { rebind })}` }
+        text: `${head}\n${tl(L, '节点不计重试。开着守护进程的话它会隔一阵自动再拉；一直不好就换一家：{rebind}', { rebind })}${fb}` }
       : { title: `[SuperIntern] ${tl(L, '厂商拒绝了请求，需换绑或检查 key')}`, ref: null,
         text: `${head}\n${tl(L, '节点不计重试；守护进程不会自己重试这种错，改绑或换 key 后它会立刻再拉。检查这家的 key / 权限（看板"设置 → 服务商"的"检查"），或换一家：{rebind}', { rebind })}` };
   }

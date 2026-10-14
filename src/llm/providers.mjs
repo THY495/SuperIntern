@@ -4,7 +4,7 @@
 // 适配器只做翻译，不做业务判断。所有厂商差异都必须在这里被吸收干净，
 // 上层（编排器、执行 loop）永远只见 canonical 形状。
 
-import { TIER_BINDING, MODEL_CATALOG, tierEntry, GEMINI_THINKING_BUDGET } from './canonical.mjs';
+import { GEMINI_THINKING_BUDGET } from './canonical.mjs';
 
 // 停止原因的统一取值域。厂商各自的字符串在 adapter 里映射到这里；
 // 映射不到的一律原样透出（宁可让上层看见陌生值，也不要静默归到 end_turn）。
@@ -36,7 +36,8 @@ export const anthropic = {
         const content = m.results.map((r) => ({
           type: 'tool_result',
           tool_use_id: r.callId,
-          content: r.content,
+          // 图片（应用验收截图）放进同一个 tool_result 的内容数组里
+          content: r.images?.length ? [{ type: 'text', text: String(r.content) }, ...r.images.map((im) => ({ type: 'image', source: { type: 'base64', media_type: im.mediaType, data: im.data } }))] : r.content,
           ...(r.isError ? { is_error: true } : {}),
         }));
         // 滚动断点：工具循环里，**已经发生过的历史**同样是稳定前缀。
@@ -205,6 +206,9 @@ export const openaiChat = {
         for (const r of m.results) {
           messages.push({ role: 'tool', tool_call_id: r.callId, content: String(r.content) });
         }
+        // 图片（应用验收截图）：role:'tool' 只收文字，图跟在全部工具结果之后单独一条 user 消息（网关与各家兼容端点都认这个形状）
+        const imgs = m.results.flatMap((r) => r.images ?? []);
+        if (imgs.length) messages.push({ role: 'user', content: [{ type: 'text', text: '（上面工具结果附带的图片）' }, ...imgs.map((im) => ({ type: 'image_url', image_url: { url: `data:${im.mediaType};base64,${im.data}` } }))] });
       } else if (m.role === 'assistant') {
         const text = m.content.filter((b) => b.type === 'text').map((b) => b.text).join('');
         const calls = m.content.filter((b) => b.type === 'tool_call');
@@ -340,7 +344,10 @@ export const openaiResponses = {
       if (m.role === 'tool_results') {
         // 工具结果不是"消息"，是与消息平级的 item —— 与另外三家的建模都不同
         for (const r of m.results) {
-          input.push({ type: 'function_call_output', call_id: r.callId, output: String(r.content) });
+          // 图片（应用验收截图）：output 可以是内容数组
+          input.push({ type: 'function_call_output', call_id: r.callId, output: r.images?.length
+            ? [{ type: 'input_text', text: String(r.content) }, ...r.images.map((im) => ({ type: 'input_image', image_url: `data:${im.mediaType};base64,${im.data}` }))]
+            : String(r.content) });
         }
       } else if (m.role === 'assistant') {
         const text = m.content.filter((b) => b.type === 'text').map((b) => b.text).join('');
@@ -461,9 +468,11 @@ export const gemini = {
       if (m.role === 'tool_results') {
         contents.push({
           role: 'user',
-          parts: m.results.map((r) => ({
+          parts: [...m.results.map((r) => ({
             functionResponse: { name: r.name, response: { result: r.content } },   // 靠 name 而非 ID 对齐
           })),
+          // 图片（应用验收截图）：同一条 user 内容里跟在函数结果后面
+          ...m.results.flatMap((r) => (r.images ?? []).map((im) => ({ inlineData: { mimeType: im.mediaType, data: im.data } })))],
         });
       } else {
         const parts = [];
@@ -587,6 +596,52 @@ export function makeFake(script) {
   };
 }
 
+/**
+ * 按请求特征取回复的假模型。顺序脚本（makeFake）的毛病：回复按调用次序一条条发，
+ * 代码里任何地方多一次模型调用（多一个检查、多一个分类），后面每一条都错位一格 —— 失败出在毫不相干的断言上。
+ * 这里每个角色一队回复（每次调用都带 canon.role，见各调用点），别的角色多调几次不影响这一队：
+ *
+ *   makeRoleFake({
+ *     executor: [call('write_file', …), call('submit_handoff', …)],   // 数组：按序取，取完再要就报错
+ *     verifier: (canon, n) => verdict('pass'),                           // 函数：每次现算（n = 这一角色第几次被调，从 0 起）
+ *     '*': textReply('ok'),                                              // 兜底：没列出的角色都用它（不写就报错）
+ *   })
+ *
+ * 报错会写明是哪个角色、第几次、现有哪几队 —— 而不是一句 "script exhausted"。
+ * @param {Record<string, Array<object|Error>|((canon: object, n: number) => object)|object>} byRole
+ */
+export function makeRoleFake(byRole) {
+  const seen = {};
+  const calls = [];
+  const pick = (spec, canon, n, role) => {
+    if (typeof spec === 'function') return spec(canon, n);
+    if (Array.isArray(spec)) {
+      if (n >= spec.length) throw new Error(`fake provider: 角色 ${role} 的第 ${n + 1} 次调用没有准备回复（这一队只有 ${spec.length} 条）`);
+      return spec[n];
+    }
+    return spec;
+  };
+  return {
+    id: 'fake',
+    endpoint: () => 'fake://local',
+    headers: () => ({}),
+    buildRequest: (canon) => canon,
+    parseResponse: (wire) => wire,
+    /** 每次调用的 { role, n }（测试可以断言"谁被调了几次"）。 */
+    calls,
+    respond(canon) {
+      const role = canon.role ?? '(未标角色)';
+      const n = seen[role] = (seen[role] ?? -1) + 1;
+      calls.push({ role, n });
+      if (role in byRole) return pick(byRole[role], canon, n, role);
+      if ('*' in byRole) return pick(byRole['*'], canon, n, role);
+      throw new Error(`fake provider: 角色 ${role} 被调用了，但没有为它准备回复（现有：${Object.keys(byRole).join('、') || '无'}）`);
+    },
+    nextScripted() { throw new Error('makeRoleFake 按角色取回复，不按顺序'); },
+    reset() { for (const k of Object.keys(seen)) delete seen[k]; calls.length = 0; },
+  };
+}
+
 /** adapter 名 → 实现。厂商与 adapter 是多对一，但绑定发生在**档位**上而非厂商上。 */
 export const PROVIDERS = {
   anthropic,
@@ -595,18 +650,3 @@ export const PROVIDERS = {
   gemini,
 };
 
-/**
- * 档位 → adapter 实现。
- * 解析单位是档位而非厂商：同一厂商内不同模型可能说不同协议，
- * 只按厂商解析会在运行期变成一个费解的 HTTP 404。
- */
-export function resolveAdapter(tier, binding = TIER_BINDING, catalog = MODEL_CATALOG) {
-  const { adapter, key } = tierEntry(tier, binding, catalog);
-  const a = PROVIDERS[adapter];
-  if (!a) throw new Error(`${key} references unimplemented adapter '${adapter}'`);
-  return a;
-}
-
-export function resolveModel(tier, binding = TIER_BINDING, catalog = MODEL_CATALOG) {
-  return tierEntry(tier, binding, catalog).model;
-}

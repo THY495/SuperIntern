@@ -9,10 +9,12 @@
 // 凭证**不进库、不回显**：服务商只记 .env 变量名，这里只回答"填了没有"。
 // 改动全部记审计（endpoint_saved / model_saved / binding_set …）：同一份代码在不同部署上跑的模型不同，复现要连这些一起看。
 
-import { VENDORS, MODEL_CATALOG, TIER_BINDING, SINGLE_VENDOR_BINDINGS, TIERS, EFFORTS } from './canonical.mjs';
+import { VENDORS, MODEL_CATALOG, TIER_BINDING, SINGLE_VENDOR_BINDINGS, TIERS, EFFORTS, LLM_ROLES, makerOf } from './canonical.mjs';
 import { PROVIDERS } from './providers.mjs';
 import { audit, now } from '../db/db.mjs';
 import { tl, contentLang, I18nError } from '../i18n/index.mjs';
+import { withTimeout } from '../core/http.mjs';
+import { makeHealth } from './health.mjs';
 
 export const ADAPTERS = ['openai-chat', 'openai-responses', 'anthropic', 'gemini'];
 
@@ -148,8 +150,12 @@ export function removeEndpoint(db, { id, userId, vendors = VENDORS }) {
 function boundTiersOfEndpoint(db, id, { vendors, catalog = MODEL_CATALOG } = {}) {
   const cat = catalogOf(db, { catalog, vendors });
   const b = bindingOf(db).binding;
-  return TIERS.filter((t) => cat[b[t]]?.vendor === id).map((t) => ({ tier: t, key: b[t] }));
+  const fb = bindingOf(db).fallbacks;
+  return [...TIERS.filter((t) => cat[b[t]]?.vendor === id).map((t) => ({ tier: t, key: b[t] })), ...boundRolesOf(db, { vendor: id, catalog, vendors }),
+    ...TIERS.filter((t) => fb[t] && cat[fb[t]]?.vendor === id).map((t) => ({ tier: t, key: fb[t], fallback: true }))];
 }
+// 某个模型被哪几档当备用：停用 / 删除前要先换掉，否则主模型出事时备用当场失效
+const fallbackOf = (db, key) => { const fb = bindingOf(db).fallbacks; return TIERS.filter((t) => fb[t] === key).map((t) => ({ tier: t, key, fallback: true })); };
 
 /** key 填没填（只看在不在，值不出这个函数）。 */
 export function keyPresence(endpoints, env = process.env) {
@@ -181,7 +187,7 @@ export async function listEndpointModels(e, { env = process.env, fetchFn = globa
   const headers = key ? headersFor(adapter, e, key) : {};
   delete headers['content-type'];
   try {
-    const res = await fetchFn(modelsUrlOf(e), { headers });
+    const res = await fetchFn(modelsUrlOf(e), withTimeout({ headers }));
     if (!res.ok) return { rows: [], error: `HTTP ${res.status}${!key ? tl(lang, '（未配置 API 密钥）') : ''}`, noKey: !key };
     const body = await res.json();
     const per = (x) => (x == null ? null : Math.round(Number(x) * 1e6 * 1e4) / 1e4);   // $/token → $/M token，四位小数够了，去掉浮点尾巴
@@ -211,8 +217,8 @@ export async function testEndpoint(db, { id, model = null, env = process.env, fe
   const adapter = PROVIDERS[entry.adapter ?? e.adapter];
   const canon = { tier: 'x', maxTokens: 16, messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }] };
   try {
-    const res = await fetchFn(adapter.endpoint(entry.model, e.baseUrl), { method: 'POST', headers: headersFor(adapter, e, key),
-      body: JSON.stringify(adapter.buildRequest({ ...canon, gateway: e.gateway, providerPrefs: entry.providerPrefs }, entry.model)) });
+    const res = await fetchFn(adapter.endpoint(entry.model, e.baseUrl), withTimeout({ method: 'POST', headers: headersFor(adapter, e, key),
+      body: JSON.stringify(adapter.buildRequest({ ...canon, gateway: e.gateway, providerPrefs: entry.providerPrefs }, entry.model)) }));
     if (res.ok) return { ok: true, status: res.status, message: tl(lang, '连接成功'), model: entry.model };
     const body = await res.json().catch(() => ({}));
     return { ok: false, status: res.status, message: `HTTP ${res.status}: ${String(body.error?.message ?? body.message ?? '').slice(0, 160)}`, model: entry.model };
@@ -258,7 +264,8 @@ export function bindable(entry, endpoints, lang = 'zh') {
 }
 
 // "x 档正在使用 y" 的清单（嵌在报错里，按内容语言写）
-const boundList = (bound, L) => bound.map((b) => tl(L, '{tier} 档正在使用 {key}', { tier: b.tier, key: b.key })).join(tl(L, '，'));
+// 角色单独绑定也算"在用"
+const boundList = (bound, L) => bound.map((b) => (b.role ? tl(L, '角色 {role} 单独绑着 {key}', { role: b.role, key: b.key }) : b.fallback ? tl(L, '{tier} 档的备用模型是 {key}', { tier: b.tier, key: b.key }) : tl(L, '{tier} 档正在使用 {key}', { tier: b.tier, key: b.key }))).join(tl(L, '，'));
 const boundErr = (bound, L) => new I18nError('{list}，请先修改模型分配再停用', { list: boundList(bound, L) });
 
 function validatePricing(p) {
@@ -303,8 +310,8 @@ export function saveModel(db, { key, fields = {}, origin = 'user', userId, actor
   const enabled = fields.enabled !== undefined ? !!fields.enabled : (before?.enabled ?? true);
   if (before?.enabled && !enabled) {   // 与服务商同一条规则：有档位在用就停不了（否则一点"停用"某档当场失效）
     const b = bindingOf(db).binding;
-    const tiers = TIERS.filter((t) => b[t] === key);
-    if (tiers.length) throw boundErr(tiers.map((t) => ({ tier: t, key })), contentLang(db));
+    const bound = [...TIERS.filter((t) => b[t] === key).map((t) => ({ tier: t, key })), ...boundRolesOf(db, { key, catalog, vendors }), ...fallbackOf(db, key)];
+    if (bound.length) throw boundErr(bound, contentLang(db));
   }
   const same = (a, b) => JSON.stringify(a ?? null) === JSON.stringify(b ?? null);
   const inherit = (v, d) => (def && same(v, d) ? null : v);
@@ -334,6 +341,8 @@ export function removeModel(db, { key, userId, catalog = MODEL_CATALOG, vendors 
   const b = bindingOf(db).binding;
   const tiers = TIERS.filter((t) => b[t] === key);
   if (tiers.length) throw new I18nError('{tiers} 档正在使用 {key}，请先修改模型分配再删除', { tiers: tiers.join(' / '), key });
+  const roles = [...boundRolesOf(db, { key, catalog, vendors }), ...fallbackOf(db, key)];
+  if (roles.length) throw new I18nError('{list}，请先修改模型分配再删除', { list: boundList(roles, contentLang(db)) });
   if (!db.one(`SELECT key FROM llm_models WHERE key=?`, key)) throw new I18nError('{id} 是内置默认值，没有可删除的本地修改；如不再使用，请停用', { id: key });
   db.tx(() => {
     db.run(`DELETE FROM llm_models WHERE key=?`, key);
@@ -347,10 +356,10 @@ export function removeModel(db, { key, userId, catalog = MODEL_CATALOG, vendors 
 /** 生效绑定：{ binding: {light,standard,heavy}, efforts: {tier: effort|null}, source: 'db'|'default', missing: [tier…] } */
 export function bindingOf(db, { defaults = TIER_BINDING } = {}) {
   const rows = db.all(`SELECT * FROM llm_bindings`);
-  const binding = { ...defaults }, efforts = { light: null, standard: null, heavy: null }, missing = [];
-  for (const r of rows) { binding[r.tier] = r.model_key; efforts[r.tier] = r.effort ?? null; }
+  const binding = { ...defaults }, efforts = { light: null, standard: null, heavy: null }, fallbacks = { light: null, standard: null, heavy: null }, missing = [];
+  for (const r of rows) { binding[r.tier] = r.model_key; efforts[r.tier] = r.effort ?? null; fallbacks[r.tier] = r.fallback_key ?? null; }
   for (const t of TIERS) if (!rows.some((r) => r.tier === t)) missing.push(t);
-  return { binding, efforts, source: rows.length ? 'db' : 'default', missing, updatedAt: rows.length ? Math.max(...rows.map((r) => r.updated_at)) : null };
+  return { binding, efforts, fallbacks, source: rows.length ? 'db' : 'default', missing, updatedAt: rows.length ? Math.max(...rows.map((r) => r.updated_at)) : null };
 }
 
 /** 改一档。校验：模型在生效目录里、能绑（见 bindable）、推理强度在模型推理强度取值内。记审计 binding_set。 */
@@ -374,12 +383,38 @@ export function setBinding(db, { tier, modelKey, effort = undefined, userId, act
   const t = now();
   {
     db.run(`INSERT INTO llm_bindings (tier,model_key,effort,updated_at,updated_by) VALUES (?,?,?,?,?)
-            ON CONFLICT(tier) DO UPDATE SET model_key=excluded.model_key, effort=excluded.effort, updated_at=excluded.updated_at, updated_by=excluded.updated_by`,
+            ON CONFLICT(tier) DO UPDATE SET model_key=excluded.model_key, effort=excluded.effort, updated_at=excluded.updated_at, updated_by=excluded.updated_by,
+              fallback_key=CASE WHEN fallback_key=excluded.model_key THEN NULL ELSE fallback_key END`,   // 备用升成主模型：备用清掉
       tier, modelKey, eff, t, userId);
     audit(db, { actorKind, actorId: userId, action: 'binding_set', targetType: 'binding', targetId: tier,
       payload: { from: cur.binding[tier] ?? null, to: modelKey, effortFrom: cur.efforts[tier], effort: eff, fromSource: cur.source } });
   }
   return bindingOf(db);
+  }, { immediate: true });
+}
+
+/**
+ * 给一档配备用模型：主模型熔断或重试用尽时自动换用。modelKey=null 清掉。
+ * 校验：能绑、不是这一档的主模型本身。最好是另一家（同一家挂了备用也一起挂），不是硬要求 —— 只有一家时给个同家的更便宜型号也比没有强。
+ */
+export function setFallback(db, { tier, modelKey, userId, actorKind = 'user', catalog = MODEL_CATALOG, vendors = VENDORS }) {
+  if (!TIERS.includes(tier)) throw new I18nError('档位无效：{tier}（应为 {tiers}）', { tier, tiers: TIERS.join(' / ') });
+  return db.tx(() => {
+    const cur = bindingOf(db);
+    if (modelKey != null) {
+      const cat = catalogOf(db, { catalog, vendors });
+      const why = bindable(cat[modelKey], endpointsOf(db, { vendors }), contentLang(db));
+      if (why) throw new I18nError('无法分配 {key}：{why}', { key: modelKey, why });
+      if (modelKey === cur.binding[tier]) throw new I18nError('备用模型不能是这一档的主模型本身（{key}）', { key: modelKey });
+    }
+    const t = now();
+    // 这一档还没有库里的行（用着代码默认值）：连主模型一起写下来，免得备用挂在一个不存在的行上
+    db.run(`INSERT INTO llm_bindings (tier,model_key,effort,fallback_key,updated_at,updated_by) VALUES (?,?,?,?,?,?)
+            ON CONFLICT(tier) DO UPDATE SET fallback_key=excluded.fallback_key, updated_at=excluded.updated_at, updated_by=excluded.updated_by`,
+      tier, cur.binding[tier], cur.efforts[tier], modelKey ?? null, t, userId);
+    audit(db, { actorKind, actorId: userId, action: 'binding_fallback_set', targetType: 'binding', targetId: tier,
+      payload: { from: cur.fallbacks[tier] ?? null, to: modelKey ?? null, primary: cur.binding[tier] } });
+    return bindingOf(db);
   }, { immediate: true });
 }
 
@@ -431,12 +466,108 @@ export function bindingProblems(db, { env = process.env, catalog = MODEL_CATALOG
   return out;
 }
 
+// ── 按角色绑定──────────────────────────────────────────────────────
+//
+// 档位仍是底子：角色没单独绑，就走它的档位（LLM_ROLES）；单独绑了，就用那个模型、不看档位。
+// 验收员另有一条策略（设置 deploy.verifier_vendor）：没单独绑、而它的档位与这一步执行器落在同一家时，换一家 ——
+// 独立验收要的是"另一双眼睛"，同一家的模型往往有同一种盲点（canonical.mjs 三层结构的初衷）。
+
+/** 生效的角色绑定：{ role: { key, effort } }，只含单独绑了的 */
+export function roleBindingOf(db) {
+  return Object.fromEntries(db.all(`SELECT role, model_key, effort FROM llm_role_bindings`).map((r) => [r.role, { key: r.model_key, effort: r.effort ?? null }]));
+}
+
+/** 单独绑定一个角色；modelKey = null 表示取消（回到档位）。校验与档位绑定同一套（bindable、推理强度取值）。记审计 role_binding_set。 */
+export function setRoleBinding(db, { role, modelKey, effort = null, userId, actorKind = 'user', catalog = MODEL_CATALOG, vendors = VENDORS }) {
+  if (!Object.hasOwn(LLM_ROLES, role)) throw new I18nError('角色无效：{role}（应为 {roles}）', { role, roles: Object.keys(LLM_ROLES).join(' / ') });
+  return db.tx(() => {
+    const cur = roleBindingOf(db)[role] ?? null;
+    const t = now();
+    if (modelKey == null) {
+      db.run(`DELETE FROM llm_role_bindings WHERE role=?`, role);
+    } else {
+      const entry = catalogOf(db, { catalog, vendors })[modelKey];
+      const why = bindable(entry, endpointsOf(db, { vendors }), contentLang(db));
+      if (why) throw new I18nError('无法分配 {key}：{why}', { key: modelKey, why });
+      if (effort != null) {
+        const allowed = entry.efforts ?? EFFORTS;
+        if (!EFFORTS.includes(effort)) throw new I18nError('推理强度无效：{effort}（应为 {efforts}）', { effort, efforts: EFFORTS.join(' / ') });
+        if (!allowed.length) throw new I18nError('{key} 不支持推理强度参数，请将推理强度留空', { key: modelKey });
+        if (!allowed.includes(effort)) throw new I18nError('{key} 的推理强度只能是 {efforts}', { key: modelKey, efforts: allowed.join(' / ') });
+      }
+      db.run(`INSERT INTO llm_role_bindings (role,model_key,effort,updated_at,updated_by) VALUES (?,?,?,?,?)
+              ON CONFLICT(role) DO UPDATE SET model_key=excluded.model_key, effort=excluded.effort, updated_at=excluded.updated_at, updated_by=excluded.updated_by`,
+        role, modelKey, effort, t, userId);
+    }
+    audit(db, { actorKind, actorId: userId, action: 'role_binding_set', targetType: 'binding', targetId: role,
+      payload: { from: cur?.key ?? null, to: modelKey ?? null, effortFrom: cur?.effort ?? null, effort: modelKey == null ? null : effort } });
+    return roleBindingOf(db);
+  }, { immediate: true });
+}
+
+/** 哪些角色单独绑在某个模型 / 某家服务商上（停用、删除前查；与档位同一条规则：在用就不许停） */
+function boundRolesOf(db, { key = null, vendor = null, catalog, vendors }) {
+  const rb = roleBindingOf(db);
+  const cat = vendor ? catalogOf(db, { catalog, vendors }) : null;
+  return Object.entries(rb).filter(([, b]) => (key ? b.key === key : cat[b.key]?.vendor === vendor)).map(([role, b]) => ({ role, key: b.key }));
+}
+
+/**
+ * 验收员用哪个模型。"换一家"比的是**模型出自哪家**（makerOf），不是走哪个服务商：
+ * 全走 OpenRouter 时，Kimi 与经网关的 Claude 是两家；直连 Claude 与经网关的 Claude 是同一家。
+ * @param executorKey 这一步执行器用的模型（目录键）；没有时退回 executorVendor 按服务商推
+ * @param policy 'different'（默认：同一家时换一家）/ 'same'（不强求）
+ * @param avoid 再避开哪些出品方（两个验收员会签时，第二个避开第一个的 maker）
+ * @returns { key, vendor, maker, executorMaker, source: 'role'|'tier'|'policy', sameMaker, note }
+ *   note：'only_maker' = 能用的只有一家的模型，只好同一家；'role_same' = 人单独绑的验收模型恰好与执行器同一家（照人的意思，不换）
+ */
+export function pickVerifierModel(reg, { executorKey = null, executorVendor = null, policy = 'different', avoid = [], env = process.env }) {
+  const { catalog, vendors, binding } = reg;
+  const makerOfKey = (k) => makerOf(catalog[k], vendors);
+  const execMaker = executorKey && catalog[executorKey] ? makerOfKey(executorKey) : makerOf(executorVendor ? { vendor: executorVendor } : null, vendors);
+  const out = (key, source, note = null) => ({ key, vendor: catalog[key]?.vendor ?? null, maker: makerOfKey(key), executorMaker: execMaker,
+    source, sameMaker: makerOfKey(key) === execMaker, note });
+  const own = reg.roleBinding?.verifier;
+  if (own) return out(own.key, 'role', makerOfKey(own.key) === execMaker ? 'role_same' : null);
+  const base = binding[LLM_ROLES.verifier];
+  const bad = new Set([execMaker, ...avoid].filter(Boolean));
+  if (policy === 'same' || !bad.has(makerOfKey(base))) return out(base, 'tier');
+  // 候选模型，按顺序取第一个能用、出品方不在避开之列的（网关一个服务商下挂着多家出品方，所以逐个模型判）：
+  //   ① 部署已经在用的服务商（别的档位绑着的，配过、跑过）优先，其余有 key 的在后；
+  //   ② 直连服务商里：它自己的"验收那一档"（SINGLE_VENDOR_BINDINGS）→ 部署别的档位已绑着的它家模型 → 它家目录里其余能绑的；
+  //   ③ 网关里只有部署已绑着的模型算"用过"；没绑过的排到所有直连之后 —— 网关通不代表它挂的每家都通
+  //      （上游会被地区拦），目录顺序也不按价位排，先挑到的可能是最贵的一档。
+  const usable = (v) => vendors[v]?.enabled !== false && !!(vendors[v]?.keyEnv && env[vendors[v].keyEnv]);
+  const inUse = [...new Set(Object.values(binding).map((k) => catalog[k]?.vendor))];
+  const order = [...inUse, ...Object.keys(vendors).filter((v) => !inUse.includes(v))].filter((v) => v && usable(v));
+  const ok = (k) => k && catalog[k] && !bindable(catalog[k], vendors) && !bad.has(makerOfKey(k));
+  const boundOf = (v) => Object.values(binding).filter((k) => catalog[k]?.vendor === v);
+  const restOf = (v) => Object.keys(catalog).filter((k) => catalog[k].vendor === v);
+  const candidates = [
+    ...order.flatMap((v) => (vendors[v].gateway ? boundOf(v) : [SINGLE_VENDOR_BINDINGS[v]?.[LLM_ROLES.verifier], ...boundOf(v), ...restOf(v)])),
+    ...order.filter((v) => vendors[v].gateway).flatMap(restOf),
+  ];
+  const pick = candidates.find(ok);
+  return pick ? out(pick, 'policy') : out(base, 'tier', 'only_maker');
+}
+
+/** 每个角色现在实际用什么（设置页显示"生效值 + 来自哪一层"） */
+export function rolesView(db, { catalog = MODEL_CATALOG, vendors = VENDORS } = {}) {
+  const b = bindingOf(db).binding, rb = roleBindingOf(db);
+  return Object.entries(LLM_ROLES).map(([role, tier]) => {
+    const own = rb[role];
+    return { role, tier, override: own ? { key: own.key, effort: own.effort } : null,
+      effective: own ? own.key : tier ? b[tier] : null, source: own ? 'role' : tier ? 'tier' : 'per_step' };
+  });
+}
+
 // ── 给客户端 / 目录检查用的一揽子 ──────────────────────────────────────────
 
-/** LlmClient 的构造参数：{ vendors, catalog, binding, tierEfforts }。每次建客户端调一次 = 每个节点重读库。 */
+/** LlmClient 的构造参数：{ vendors, catalog, binding, tierEfforts, roleBinding }。每次建客户端调一次 = 每个节点重读库。 */
 export function registryFor(db, { catalog = MODEL_CATALOG, vendors = VENDORS, defaults = TIER_BINDING } = {}) {
   const b = bindingOf(db, { defaults });
-  return { vendors: endpointsOf(db, { vendors }), catalog: catalogOf(db, { catalog, vendors }), binding: b.binding, tierEfforts: b.efforts, bindingSource: b.source };
+  return { vendors: endpointsOf(db, { vendors }), catalog: catalogOf(db, { catalog, vendors }), binding: b.binding, tierEfforts: b.efforts, bindingSource: b.source, roleBinding: roleBindingOf(db),
+    fallbacks: b.fallbacks, health: makeHealth(db) };   // 备用模型、共享的熔断 / 退避
 }
 
 /** 目录检查用：只查启用的模型、启用的服务商。 */

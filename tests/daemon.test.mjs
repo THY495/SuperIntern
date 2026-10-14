@@ -121,6 +121,19 @@ section('4. 厂商错误 / 崩溃：退避');
   started(id); exited(id, 'provider_error');
   eq(assess(id, { at: now() }).reason, 'backoff:provider_error#1', '归零后从第 1 次数起');
 
+  // 沙箱出错退出的，与厂商错误同一张退避表
+  const sx = mkTask();
+  started(sx); exited(sx, 'sandbox_error', { error: { cmd: 'docker exec', message: 'No such container' } });
+  eq(assess(sx, { at: now() }).reason, 'backoff:sandbox_error#1', '沙箱出错：先等');
+  eq(assess(sx, { at: now() + RETRY_BACKOFF_MS[0] + 1 }).reason, 'run:retry:sandbox_error#1', '等够了自己再拉');
+
+  // 厂商暂时不可用退出的，人配了备用：立刻再拉
+  const un = mkTask();
+  started(un); exited(un, 'provider_error', { error: { status: null, retryable: true, blocked: 'open', tier: 'light' } });
+  eq(assess(un, { at: now() }).reason, 'backoff:provider_error#1', '厂商暂停调用中退出：照常退避');
+  audit(db, { actorKind: 'user', action: 'binding_fallback_set', targetType: 'binding', targetId: 'light', payload: { to: 'anthropic/claude-haiku-4-5' } });
+  eq(assess(un, { at: now() }).reason, 'run:config_fixed:binding_fallback_set', '配了备用 → 立刻再拉，不等退避');
+
   // 配置问题退出的：注册表改过就立刻再拉（那几条审计是部署级的，不挂在任务上）；没改过照常退避
   const g = mkTask();
   started(g); exited(g, 'provider_error', { error: { config: true, tier: 'heavy', message: 'heavy 档绑的 x 已停用' } });
@@ -285,6 +298,64 @@ section('7. 看板与守护进程共用启动器');
   eq(db4.one(`SELECT count(*) n FROM audit_log WHERE action='runtime_up'`).n, 1, '恢复也记一条');
   d.stop?.();
   db4.close();
+}
+
+section('模型服务商暂停调用 / 换用备用 / 恢复 → 守护进程按水位捡起来告诉管理员，重启不重报');
+{
+  const db5 = openDb(':memory:');
+  ensureOwner(db5);
+  const launcher = makeLauncher(db5, { home: HOME, spawnFn: () => ({ pid: 1, exitCode: null, on() {} }) });
+  // 启动前的旧事：不该报
+  audit(db5, { actorKind: 'system', action: 'llm_breaker_opened', targetType: 'llm_endpoint', targetId: 'old', payload: { fails: 5, coolMs: 60000 } });
+  const sent = [], events = [];
+  const notifyOpts = { env: { NTFY_URL: 'https://ntfy.example/si' }, fetchFn: async (url, init) => { sent.push({ url, title: decodeURIComponent(init.headers.title), body: init.body }); return { ok: true, status: 200 }; } };
+  const d = startDaemon(db5, { home: HOME, launcher, intervalMs: 3600_000, alive: dead, runtime: null, notifyOpts, onEvent: (e) => events.push(e) });
+  await d.tick();
+  eq(sent.length, 0, '启动前的旧审计不报');
+  audit(db5, { actorKind: 'system', action: 'llm_breaker_opened', targetType: 'llm_endpoint', targetId: 'deepseek', payload: { fails: 5, coolMs: 60000, status: 503, error: 'overloaded' } });
+  audit(db5, { actorKind: 'system', action: 'llm_fallback_used', targetType: 'llm_endpoint', targetId: 'deepseek', payload: { from: 'deepseek/deepseek-flash', to: 'openrouter/kimi-k3@moonshotai', tier: 'standard' } });
+  await d.tick();
+  eq(sent.length, 1, '一拍里的几件事合成一条通知');
+  assert(/deepseek/.test(sent[0]?.body ?? '') && /openrouter\/kimi-k3/.test(sent[0]?.body ?? '') && /bind fallback/.test(sent[0]?.body ?? ''), '正文说了哪家停了、换到了谁、怎么配备用');
+  assert(events.some((e) => e.type === 'llm_health' && e.lines.length === 2), '守护进程日志里也有两行');
+  await d.tick();
+  eq(sent.length, 1, '同一批不重报');
+  audit(db5, { actorKind: 'system', action: 'llm_breaker_opened', targetType: 'llm_endpoint', targetId: 'deepseek', payload: { reopened: true, fails: 6, coolMs: 120000 } });
+  audit(db5, { actorKind: 'system', action: 'llm_breaker_closed', targetType: 'llm_endpoint', targetId: 'x', payload: { openForMs: 30_000 } });
+  await d.tick();
+  eq(sent.length, 1, '再次打开（试探失败）、短暂停一下就恢复的：不发');
+  audit(db5, { actorKind: 'system', action: 'llm_breaker_closed', targetType: 'llm_endpoint', targetId: 'deepseek', payload: { openForMs: 10 * 60_000 } });
+  await d.tick();
+  assert(sent.length === 2 && /恢复了/.test(sent[1].body), '停了 10 分钟后恢复：说一声');
+  d.stop?.();
+  // 重启：水位从当前最大 id 起，不把旧事再报一遍
+  const d2 = startDaemon(db5, { home: HOME, launcher, intervalMs: 3600_000, alive: dead, runtime: null, notifyOpts });
+  await d2.tick();
+  eq(sent.length, 2, '重启后不重报');
+  d2.stop?.();
+  db5.close();
+}
+
+section('一拍出错：不抛出去（不变成未处理的 rejection 带走进程），记审计、报事件，下一拍照常');
+{
+  const db3 = openDb(':memory:');
+  ensureOwner(db3);
+  const launcher = makeLauncher(db3, { home: HOME, spawnFn: () => ({ pid: 1, exitCode: null, on() {} }) });
+  const events = [];
+  let boom = true;
+  const d = startDaemon(db3, { home: HOME, launcher, intervalMs: 3600_000, onEvent: (e) => events.push(e), alive: dead, runtime: null,
+    clock: () => { if (boom) throw new Error('时钟坏了（模拟一拍中途的异常）'); return now(); } });
+  let threw = null, r;
+  try { r = await d.tick(); } catch (e) { threw = e; }
+  assert(threw === null && r === null, 'tick 没有抛出，返回 null');
+  assert(events.filter((e) => e.type === 'tick_failed').map((e) => e.error).join('|') === '时钟坏了（模拟一拍中途的异常）', '事件流里报了 tick_failed');
+  const row = db3.one(`SELECT payload FROM audit_log WHERE action='daemon_tick_failed'`);
+  assert(row && JSON.parse(row.payload).error.includes('时钟坏了'), '审计里有 daemon_tick_failed，带错误与调用栈');
+  boom = false;
+  r = await d.tick();
+  assert(r && Array.isArray(r.launched), '下一拍照常跑完');
+  d.stop();
+  db3.close();
 }
 
 db.close();

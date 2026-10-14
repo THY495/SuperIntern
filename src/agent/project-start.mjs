@@ -11,6 +11,7 @@
 
 import { applyEgressDefaults } from '../core/egress.mjs';
 import { newId, now, audit } from '../db/db.mjs';
+import { insertProject, updateProject } from '../db/projects.mjs';
 import { initProjectRepo, PROJECT_TASK_RUNTIME_MS } from '../core/project.mjs';
 import { setLimit } from '../core/limits.mjs';
 import { startFromIdea } from './elicitor.mjs';
@@ -32,15 +33,13 @@ export function startProject(db, { userId, goal, doneDefinition, plan = null, ti
 
   if (planText) {
     const r = startProjectFromBrief(db, { userId, brief: planText, source, home, base, title: ttl, empty });
-    db.run(`UPDATE projects SET goal=?, done_definition=? WHERE id=?`, g, d, r.projectId);
+    updateProject(db, r.projectId, { goal: g, doneDefinition: d });
     return { ...r, firstTaskId: r.carrierId, planned: true };
   }
 
   const projectId = newId('pj');
   const { repo, branch, baseRef } = initProjectRepo({ home, projectId, source, base, empty });
-  db.run(`INSERT INTO projects (id,owner_id,title,brief,goal,done_definition,repo,branch,base_ref,source,status,draft_version,created_at)
-          VALUES (?,?,?,?,?,?,?,?,?,?,'active',0,?)`,
-    projectId, userId, ttl, goalBrief(g, d, contentLang(db)), g, d, repo, branch, baseRef, (source ? String(source) : null), now());
+  insertProject(db, { id: projectId, ownerId: userId, title: ttl, brief: goalBrief(g, d, contentLang(db)), goal: g, doneDefinition: d, repo, branch, baseRef, source: source ? String(source) : null, status: 'active' });
   audit(db, { actorKind: 'user', actorId: userId, action: 'project_created', targetType: 'project', targetId: projectId,
     payload: { title: ttl, repo, branch, baseRef, source: (source ? String(source) : null), fromGoal: true } });
   applyEgressDefaults(db, { projectId, userId });   // 管理员勾过的默认放行源

@@ -2,6 +2,8 @@
 
 import { now, audit } from '../db/db.mjs';
 import { tl, contentLang } from '../i18n/index.mjs';
+import { procKind } from './lifetimes.mjs';
+import { payerOf } from './spend.mjs';
 
 /**
  * 把客户端内存账本**排空**并写进 usage_ledger。
@@ -22,16 +24,24 @@ export function flushLedger(db, client, { taskId, nodeId = null, role }) {
   }
   const entries = client.ledger.splice(0, client.ledger.length);
   let microUsd = 0;
+  // 记在谁头上（口径见 core/spend.mjs）：一次落账算一次
+  const payer = entries.length ? payerOf(db, taskId) : null;
   for (const e of entries) {
     microUsd += e.microUsd;
     db.run(`INSERT INTO usage_ledger
               (task_id,node_id,role,model_tier,provider,model_id,upstream,
                input_tokens,cache_read_tokens,cache_write_tokens,output_tokens,reasoning_tokens,
-               micro_usd,billing,billing_fallback,ts)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-      taskId, nodeId, role, e.tier, e.vendor, e.model, e.upstream ?? null,
+               micro_usd,billing,billing_fallback,ts,proc_kind,proc_pid,payer_id,payer_scope,started_at,duration_ms,attempts)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+      taskId, nodeId, e.role ?? role, e.tier, e.vendor, e.model, e.upstream ?? null,
       e.inputTokens, e.cacheReadTokens, e.cacheWriteTokens, e.outputTokens, e.reasoningTokens,
-      e.microUsd, e.billing, e.billingFallback ? 1 : 0, now());
+      e.microUsd, e.billing, e.billingFallback ? 1 : 0, e.at ?? now(), procKind(), process.pid, payer.payerId, payer.scope,
+      e.startedAt ?? null, e.durationMs ?? null, e.attempts ?? null);
+  }
+  // 工具调用的耗时（perf-g4 埋点）：和账一起落，同一个 task / node
+  for (const t of (client.toolLog ?? []).splice(0)) {
+    db.run(`INSERT INTO tool_calls (task_id,node_id,role,round,tool,category,started_at,duration_ms,exit_code,ok,proc_pid) VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
+      taskId, nodeId, t.role ?? role, t.round, t.tool, t.category ?? null, t.startedAt, t.durationMs, t.exitCode == null ? null : Number(t.exitCode), t.ok ? 1 : 0, process.pid);
   }
   return { rows: entries.length, microUsd };
 }

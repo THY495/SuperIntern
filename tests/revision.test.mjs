@@ -263,6 +263,19 @@ section('4. 确认门：按**花费金额**算，不按节点数');
     constitution_patch: { goal: '改成 JSON 导出' } } });
   assert(consti.gate?.includes('触及宪法层'), '带 constitution_patch → 一律触发门（agent 无权自改宪法块）');
   eq(consti.ratio, 0, '此时作废比例是 0 —— 两个触发器互相独立');
+
+  // 契约改动只写"改成什么"，人看不出"多了一个目录"之外还"顺手删了一个"
+  eq(db.run(`UPDATE constitutions SET scope_paths=? WHERE task_id=? AND superseded_at IS NULL`, JSON.stringify(['cfg2json/', 'README.md']), taskId).changes, 1, '（测试前提：任务有一份现行契约）');
+  const sp = gateOf(db, { taskId, nodes, rev: { impact: ids.map((i) => mark(i, 'unaffected')), constitution_patch: { scope_paths: ['cfg2json/', 'export/'], goal: '改成 JSON 导出' }, rationale: 'r' } });
+  const spText = renderDiff(sp, { impact: ids.map((i) => mark(i, 'unaffected')), constitution_patch: { scope_paths: ['cfg2json/', 'export/'], goal: '改成 JSON 导出' }, rationale: 'r' });
+  assert(/\+ export\/　（新增）/.test(spText), '路径改动：新增的那条标 +');
+  assert(/- README\.md　（\*\*去掉\*\*）/.test(spText), '路径改动：去掉的那条标 - 且加粗 —— 只写改后的值时这一条是看不见的');
+  assert(spText.includes('不变：cfg2json/'), '路径改动：没动的也列出来，人不用自己对');
+  assert(/原来：.+\n\s+改成：改成 JSON 导出/.test(spText), '文字字段写"原来 → 改成"');
+  db.run(`UPDATE constitutions SET scope_paths='[]' WHERE task_id=? AND superseded_at IS NULL`, taskId);
+  const sp0 = renderDiff(gateOf(db, { taskId, nodes, rev: { impact: ids.map((i) => mark(i, 'unaffected')), constitution_patch: { scope_paths: ['export/'] } } }),
+    { impact: ids.map((i) => mark(i, 'unaffected')), constitution_patch: { scope_paths: ['export/'] }, rationale: 'r' });
+  assert(sp0.includes('原来没列路径') && !sp0.includes('原来的一条都没留'), '原来没列路径：写成"原来按文字判断"，不写成"一条都没留"（空不等于什么都不许动）');
   db.close();
 }
 

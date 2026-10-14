@@ -262,6 +262,17 @@ section('6. 分类前置：没给 kind 由分类器判，显式给时分类器�
     content: [{ type: 'text', text: JSON.stringify(o) }],
     usage: { inputTokens: 10, outputTokens: 5 } });
 
+  // ⓪ 先认人、再花钱：令牌无效时分类器（一次付费的模型调用）根本不被调
+  {
+    const { db, taskId } = fixture();
+    const client = clsClient([clsResp({ kind: 'correction', urgency: 'normal', confidence: 0.9, why: 'x' })]);
+    let err = null;
+    try { await sayWithClassifier(db, { taskId, body: '把范围改一下', plaintextToken: 'not-a-token', llmClient: client }); } catch (e) { err = e; }
+    assert(err && /令牌无效/.test(err.message), '⓪ 无效令牌 → 拒绝');
+    eq(db.one(`SELECT count(*) n FROM usage_ledger WHERE task_id=?`, taskId).n, 0, '⓪ 分类器没被调用（账本里没有这次花费）');
+    db.close();
+  }
+
   // ① 不给 kind 且高置信 correction → 落库 kind=correction、kind_source=classifier
   {
     const { db, taskId, plaintext } = fixture();

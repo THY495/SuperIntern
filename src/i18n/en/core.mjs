@@ -57,7 +57,7 @@ export default {
   'Gemini 3.x 的多轮工具调用必须原样回传 thought_signature，否则返回 HTTP 400': 'Gemini 3.x multi-turn tool calls must send thought_signature back unchanged, otherwise the API returns HTTP 400',
   'preview 模型，可能下线（gemini-3-pro-preview 已返回 404）': 'Preview model that may be withdrawn (gemini-3-pro-preview already returns 404)',
   'thinking 占用 maxOutputTokens；额度不足时返回 MALFORMED_FUNCTION_CALL 而非 MAX_TOKENS': 'Thinking uses maxOutputTokens; when the budget runs out it returns MALFORMED_FUNCTION_CALL instead of MAX_TOKENS',
-  '输出单价约为直连 DeepSeek-pro 的 17 倍；推理 token 计入输出 token，需预留足够的 maxTokens': 'Output price is about 17x direct DeepSeek-pro; reasoning tokens count as output tokens, so leave enough maxTokens',
+  '输出单价约为直连 DeepSeek-pro 的 4 倍（按 DeepSeek 峰时价；谷时约 8 倍）；推理 token 计入输出 token，需预留足够的 maxTokens': 'Output price is about 4x direct DeepSeek-pro (at DeepSeek peak prices; about 8x off-peak); reasoning tokens count as output tokens, so leave enough maxTokens',
   '固定上游为 Anthropic，行为与直连一致，多经过一层网关；计费与余额在网关侧': 'Pinned to Anthropic as the upstream; behaves like a direct connection with one extra gateway hop; billing and balance are on the gateway side',
   '默认路由：实测由 Amazon Bedrock / Azure / Google Vertex 等 7 个上游之一响应': 'Default routing: in practice served by one of 7 upstreams such as Amazon Bedrock / Azure / Google Vertex',
   '上游与直连不同，直连不可用时可作为备用通路': 'Different upstream from the direct connection; can serve as a fallback when the direct connection is unavailable',
@@ -88,4 +88,14 @@ export default {
   "目录无漂移。": "No drift in the catalog.",
   "{n} 项需要人看一眼。目录只由人改：看板\"设置 → 模型列表\"或 node src/cli.mjs catalog set。": "{n} item(s) need a human look. Only people change the catalog: “Settings → Models” on the board, or node src/cli.mjs catalog set.",
   "拉取失败：{e}": "Fetch failed: {e}",
+  // HTTP 加固
+  "请求体太大（上限 {n} 字节）": "Request body too large (limit {n} bytes)",
+  "请求体不是合法的 JSON": "Request body is not valid JSON",
+  "服务器内部错误（已记录）": "Internal server error (logged)",
+  '无 key，跳过收图实测': 'No key; skipped the image test',
+  '收图实测：看得懂截图，与目录一致': 'Image test: reads screenshots, matching the catalog',
+  '收图实测：看得懂截图，但目录没标 vision —— 验收员现在只拿得到文字版页面；核实后可在目录里标上': 'Image test: reads screenshots, but the catalog does not mark it as vision — the verifier currently only gets the text version of pages; mark it in the catalog once confirmed',
+  '收图实测：目录标了 vision，实际看不了图 —— {r}': 'Image test: the catalog marks vision, but it cannot read images — {r}',
+  '收图实测：看不了图，与目录一致（{r}）': 'Image test: cannot read images, matching the catalog ({r})',
+  '收图实测失败 —— {r}': 'Image test failed — {r}',
 };

@@ -33,12 +33,17 @@
 
 import { hasMark, markOf } from '../i18n/marks.mjs';
 import { tl, contentLang, userLang, I18nError } from '../i18n/index.mjs';
-import { newId, now, audit, insertEdge, authenticate } from '../db/db.mjs';
+import { newId, now, audit, insertEdge, supersedeEdges, authenticate } from '../db/db.mjs';
+import { insertUserMessage } from '../db/messages.mjs';
 import { routeQuestion, advanceRoute, leadOf, requesterOf } from './routing.mjs';
 import { recordFromQuestion } from './decisions.mjs';
 import { CHOICES_MARK, choicesSide } from './choices.mjs';
 // 方案会签按判读的方向归并，判读只有一份（agent/approval.mjs 只依赖 core，不成环）
 import { approvalThreadOf, readVerdict, reservationOf } from '../agent/approval.mjs';
+import { transition } from '../db/state.mjs';
+import { linkInstruction } from './provenance.mjs';
+import { insertQuestion, setRecipients, setRouteParties, markResolved, resolutionOf } from './questions.mjs';
+export { resolutionOf };
 
 /** 事项按类型解决后的钩子（签收要写参数、打回要发修正）。由各模块注册，避免循环依赖。 */
 export const RESOLUTION_HOOKS = {};
@@ -103,9 +108,11 @@ export function recordAnswer(db, { questionId, body, stance = 'answer', agreesWi
     return recordLateAnswer(db, { q, auth, body, stance, at, lead });
   }
   if (!open && !supersede) {
-    throw q.status === 'answered'
-      ? new I18nError('事项 {id} 状态为 {status}，不接受答复。该事项已有结论；如需更改，请走修正流程提交计划变更。', { id: questionId, status: q.status })
-      : new I18nError('事项 {id} 状态为 {status}，不接受答复。', { id: questionId, status: q.status });
+    // 输掉竞争的一方（两个人几乎同时答、或页面没刷新）要知道是谁、何时定的，不只是一个状态名
+    const r = resolutionOf(db, q);
+    throw Object.assign(q.status === 'answered'
+      ? new I18nError('事项 {id} 已由 {who} 于 {when} 答复，不再接受答复。如需更改，请走修正流程提交计划变更。', { id: questionId, who: r.who, when: r.when })
+      : new I18nError('事项 {id} 已由 {who} 于 {when} {how}，不再接受答复。', { id: questionId, who: r.who, when: r.when, how: r.how }), { status: 409, handled: r });
   }
   if (q.status === 'escalated' && q.decision_type !== 'conflict' && db.one(`SELECT id FROM questions WHERE origin_question_id=? AND status IN ('open','escalated')`, q.id) && !isLead) {
     throw new I18nError('事项 {id} 正在冲突处理中，请等待冲突事项的结论', { id: questionId });
@@ -139,9 +146,7 @@ export function recordAnswer(db, { questionId, body, stance = 'answer', agreesWi
   const aid = newId('a');
   return db.tx(() => {
     // trust_label='user-authenticated' 受库层 CHECK 把守：缺 token_id 或 sender_id 直接 ABORT。
-    db.run(`INSERT INTO messages (id,task_id,sender_id,body,kind,kind_source,urgency,urgency_source,trust_label,token_id,received_at)
-            VALUES (?,?,?,?,'answer','explicit','normal','explicit','user-authenticated',?,?)`,
-    mid, q.task_id, auth.user_id, body, auth.token_id, at);
+    insertUserMessage(db, { id: mid, taskId: q.task_id, senderId: auth.user_id, tokenId: auth.token_id, body, kind: 'answer', receivedAt: at });
     db.run(`INSERT INTO answers (id,question_id,user_id,message_id,body,stance,agrees_with,created_at) VALUES (?,?,?,?,?,?,?,?)`,
       aid, q.id, auth.user_id, mid, body, stance, target?.id ?? null, at);
     audit(db, { actorKind: 'user', actorId: auth.user_id, action: 'answer_recorded', targetType: 'question', targetId: q.id,
@@ -154,9 +159,9 @@ export function recordAnswer(db, { questionId, body, stance = 'answer', agreesWi
     if (supersede) {
       const prev = answersOf(db, q.id).filter((a) => a.id !== aid && COUNTED.includes(a.stance));
       for (const a of prev) db.run(`UPDATE answers SET stance='superseded', updated_at=? WHERE id=?`, at, a.id);
-      db.run(`UPDATE edges SET superseded_at=?, valid_to=? WHERE to_id=? AND relation='answers' AND superseded_at IS NULL`, at, at, q.id);
+      supersedeEdges(db, { to: q.id, relation: 'answers', t: at });
       insertEdge(db, mid, q.id, 'answers', at);
-      db.run(`UPDATE questions SET resolved_at=? WHERE id=?`, at, q.id);
+      markResolved(db, q.id, at);
       audit(db, { actorKind: 'user', actorId: auth.user_id, action: 'answer_superseded', targetType: 'question', targetId: q.id,
         payload: { messageId: mid, previous: prev.map((a) => ({ answerId: a.id, userId: a.user_id, body: a.body.slice(0, 300) })), notify: [lead, ...prev.map((a) => a.user_id)].filter(Boolean) } });
       return { ...base, resolved: true, superseded: prev.length, finalBody: body, stillOpen: openCount(db, q.task_id) };
@@ -168,7 +173,11 @@ export function recordAnswer(db, { questionId, body, stance = 'answer', agreesWi
     // 负责人的这一下只是其中一个签字，按会签结算。要越过会签，把别人的签字位「转交」给自己。
     // 另两个例外：别人提的需求的签收（负责人签了替不了提出人）、负责人自己提的计划变更
     // （自己批自己不算）—— 负责人这一下也只是一票，交给 settleBlock 按那两条规则结算。
-    if (isLead && !isCosign(db, q, route) && !leadIsOneVote(db, q, auth.user_id)) {
+    // 有顺带的人、负责人回的是"还差 / 要改"：不当场定案、不把顺带的人写的"还差什么"判成 dissent，交给 settleBlock 合在一起。
+    // 负责人回批准 / 放弃：照常当场定案，顺带的人写的不同意见按越过处理（留档 + 通知）。
+    const th = sideOnlyOf(route).size ? approvalThreadOf(db, q.id) : null;
+    const leadMerges = !!th && stance === 'answer' && readVerdict(body, th.labels) === 'feedback';
+    if (isLead && !leadMerges && !isCosign(db, q, route) && !leadIsOneVote(db, q, auth.user_id)) {
       const win = target ?? { message_id: mid, body, user_id: auth.user_id };
       const others = writtenOf(db, q.id).filter((a) => a.id !== aid && a.user_id !== auth.user_id && a.id !== target?.id);
       // 这里留着一次文字比对，**只决定标签不决定结论**：负责人写了与某条一字不差的答复时，
@@ -253,21 +262,33 @@ function finalBodyOf(q, side, lang = 'zh') {
 
 /** 这条是配了会签的方案批准吗：方案批准类、状态机认得、路由里某一段不止一人且要多于一人表态。 */
 const isCosign = (db, q, route) => ['contract_approval', 'signoff'].includes(q.decision_type)
-  // 法定人数 all，或写成大于 1 的数字（例：配的是"3"，否则负责人一答就定案，另外两人的票用不上）
-  && (route?.rows ?? []).some((r) => (r.recipients ?? []).length > 1 && (r.quorum === 'all' || Number(r.quorum) > 1))
-  // 签收（例：配的是"负责人 + 提需求的人，都要签"，否则负责人一答就定案，提需求的人的那一票用不上）、
-  // 计划变更（否则负责人在变更卡片上一点就生效，其他人的批准是摆设）也按会签结算
+  // 法定人数 all，或写成大于 1 的数字（原来配成"3"时，负责人一答就定案，另外两人的票没用上）
+  && (route?.rows ?? []).some((r) => !r.advisory && (r.recipients ?? []).length > 1 && (r.quorum === 'all' || Number(r.quorum) > 1))
+  // 签收（原来配成"两个人都要签"时，负责人一答就定案，提需求的人的那一票没用上）、
+  // 计划变更（同样：负责人在变更卡片上一点就生效，另外两位的批准是摆设）也按会签结算
   && (q.decision_type === 'signoff' || !!approvalThreadOf(db, q.id) || isRevisionQuestion(db, q.id));
 const isRevisionQuestion = (db, qid) => !!db.one(`SELECT 1 FROM revisions WHERE question_id=?`, qid);
+/** 只是顺带收到的人（routeQuestion 的 advisory 段）：能答，但不计数、不拍板。 */
+export function sideOnlyOf(route) {
+  const rows = route?.rows ?? [];
+  const counted = new Set(rows.filter((r) => !r.advisory).flatMap((r) => r.recipients ?? []));
+  return new Set(rows.filter((r) => r.advisory).flatMap((r) => r.recipients ?? []).filter((u) => !counted.has(u)));
+}
+/** 顺带的人那几条里，只有"还差什么"（判读为要改）有用：拍板的人也回"还差"时一起交给 AI；他们回的批准 / 放弃不计。 */
+const sideFeedback = (db, q, a, side) => {
+  if (!side.has(a.user_id)) return true;
+  const th = approvalThreadOf(db, q.id);
+  return !!th && readVerdict(a.body, th.labels) === 'feedback';
+};
 const revisionProposerOf = (db, qid) => db.one(`SELECT m.sender_id FROM revisions r JOIN messages m ON m.id=r.message_id WHERE r.question_id=?`, qid)?.sender_id ?? null;
 /**
  * 给界面用：这条事项上 settleBlock 的两条额外规则落在谁身上 ——
- * mustSign：必须有此人那一票（别人提的需求的签收）；selfExcluded：此人那一票不计（自己提的计划变更、名单里还有别人）。
+ * mustSign：必须有这几个人各自那一票（别人提的需求的签收；一个任务可能同时是几个人提的）；selfExcluded：此人那一票不计（自己提的计划变更、名单里还有别人）。
  */
 export function voteRulesOf(db, q) {
   const addressed = Array.isArray(q.addressed_to) ? q.addressed_to : JSON.parse(q.addressed_to || '[]');
-  let mustSign = null, selfExcluded = null;
-  if (q.decision_type === 'signoff') { const [req] = requesterOf(db, q.task_id); if (req && addressed.includes(req)) mustSign = req; }
+  let mustSign = [], selfExcluded = null;
+  if (q.decision_type === 'signoff') mustSign = requesterOf(db, q.task_id).filter((u) => addressed.includes(u));
   if (q.decision_type === 'contract_approval' && isRevisionQuestion(db, q.id)) {
     const p = revisionProposerOf(db, q.id);
     if (p && addressed.some((u) => u !== p)) selfExcluded = p;
@@ -277,10 +298,10 @@ export function voteRulesOf(db, q) {
 /** 负责人的答复只算一票（不当场定案）的两种情形；规则本身在 settleBlock 里。 */
 const leadIsOneVote = (db, q, lead) => {
   const { mustSign, selfExcluded } = voteRulesOf(db, db.one(`SELECT * FROM questions WHERE id=?`, q.id));
-  return (!!mustSign && mustSign !== lead) || selfExcluded === lead;
+  return mustSign.some((u) => u !== lead) || selfExcluded === lead;
 };
-/** 计划变更事项的答案空间：批准（可带保留意见）/ 驳回。与 revision.mjs 的应用钩子同一口径。 */
-export const revisionSide = (b) => (readVerdict(b) === 'approve' ? 'approve' : 'reject');
+/** 计划变更事项的答案空间：批准（可带保留意见）/ 要改（重出一版）/ 不改了。与 revision.mjs 的应用钩子同一口径。 */
+export const revisionSide = (b) => { const v = readVerdict(b); return v === 'approve' || v === 'abandon' ? v : 'feedback'; };
 
 /**
  * 方案会签的归并。只管三台状态机判读的那类批准事项（approvalThreadOf 认得的）；计划变更那种走按钮，不在此列。
@@ -320,8 +341,7 @@ function cosign(db, { q, written, at }) {
   const last = written.at(-1);
   const src = db.one(`SELECT token_id FROM messages WHERE id=?`, last.message_id);
   const mid = newId('m');
-  db.run(`INSERT INTO messages (id,task_id,sender_id,body,kind,kind_source,urgency,urgency_source,trust_label,token_id,received_at)
-          VALUES (?,?,?,?,'answer','explicit','normal','explicit','user-authenticated',?,?)`, mid, q.task_id, last.user_id, body, src?.token_id ?? null, at);
+  insertUserMessage(db, { id: mid, taskId: q.task_id, senderId: last.user_id, tokenId: src?.token_id ?? null, body, kind: 'answer', receivedAt: at });
   for (const a of written) insertEdge(db, mid, a.message_id, 'derived_from', at);
   audit(db, { actorKind: 'system', action: 'cosign_merged', targetType: 'question', targetId: q.id,
     payload: { messageId: mid, sides: sides.map((s) => ({ userId: s.a.user_id, verdict: s.v })), human: tl(L, '会签：{list}', { list: sides.map((s) => { const name = who(s.a);
@@ -361,14 +381,16 @@ function settleBlock(db, { q, at, base, answerId = null }) {
   // 谁提的需求谁签收：提出人在签收人里时，必须有提出人那一票 —— 负责人可以一起签，但替不了。
   // 否则：签收配成"负责人 + 提需求的人"、法定人数 1，负责人先签，就把别人提的需求替提出人签掉了。
   // 提出人自己点了"不归我"（弃权）就不在收件人里了，这条不再拦。
-  if (mustSign && !counted.some((a) => a.user_id === mustSign)) pending.push({ scope: '需求提出人', need: 1, have: 0, requester: mustSign });
+  for (const u of mustSign) if (!counted.some((a) => a.user_id === u)) pending.push({ scope: '需求提出人', need: 1, have: 0, requester: u });
   if (pending.length) {
     audit(db, { actorKind: 'system', action: 'answer_pending_quorum', targetType: 'question', targetId: q.id, payload: { pending, answerId } });
     return { ...base, resolved: false, pending, stillOpen: openCount(db, q.task_id) };
   }
   // 够数。冲突事项里"撤回"是放弃自己的立场（历史上是一句文字，现在也可以用弃权动作，见 recordAbstain）。
+  const side = sideOnlyOf(route);
   const written = all.filter((a) => a.stance === 'answer'
-    && !(q.decision_type === 'conflict' && (isWithdraw(a.body) || all.some((x) => x.user_id === a.user_id && x.stance === 'withdrawn'))));
+    && !(q.decision_type === 'conflict' && (isWithdraw(a.body) || all.some((x) => x.user_id === a.user_id && x.stance === 'withdrawn')))
+    && sideFeedback(db, fresh, a, side));
   // 方案会签：几个人批同一份方案，按判读的方向归并 —— 都批准 = 批准（各人的保留意见合在一起），
   // 有人要改 = 出下一版（各人要改的话合在一起）；只有"有人放弃、有人不放弃"才是真分歧，走冲突。
   // 原来按文字归并：一个回"A"、一个回"A 保留：…"就成了冲突事项 —— 会签没法用。
@@ -415,8 +437,7 @@ function recordAbstain(db, { q, auth, body, at, lead, addressed }) {
     ? (note ? tl(L, '撤回：不再坚持自己的立场（{note}）', { note }) : tl(L, '撤回：不再坚持自己的立场'))
     : (note ? tl(L, '弃权：这条不归我（{note}）', { note }) : tl(L, '弃权：这条不归我'));
   return db.tx(() => {
-    db.run(`INSERT INTO messages (id,task_id,sender_id,body,kind,kind_source,urgency,urgency_source,trust_label,token_id,received_at)
-            VALUES (?,?,?,?,'answer','explicit','normal','explicit','user-authenticated',?,?)`, mid, q.task_id, auth.user_id, text, auth.token_id, at);
+    insertUserMessage(db, { id: mid, taskId: q.task_id, senderId: auth.user_id, tokenId: auth.token_id, body: text, kind: 'answer', receivedAt: at });
     db.run(`INSERT INTO answers (id,question_id,user_id,message_id,body,stance,created_at) VALUES (?,?,?,?,?,?,?)`,
       aid, q.id, auth.user_id, mid, text, isConflict ? 'withdrawn' : 'abstain', at);
     const base = { messageId: mid, answerId: aid, questionId: q.id, nodeId: q.node_id, userId: auth.user_id, decisionType: q.decision_type, stance: 'abstain' };
@@ -439,7 +460,7 @@ function recordAbstain(db, { q, auth, body, at, lead, addressed }) {
       route.rows = route.rows.filter((r) => r.recipients.length);
       route.abstained = [...(route.abstained ?? []), auth.user_id];
     }
-    db.run(`UPDATE questions SET addressed_to=?, route=? WHERE id=?`, JSON.stringify(left), route ? JSON.stringify(route) : q.route, q.id);
+    setRecipients(db, q.id, { addressedTo: left, route: route ?? q.route });
     audit(db, { actorKind: 'user', actorId: auth.user_id, action: 'answer_abstained', targetType: 'question', targetId: q.id,
       payload: { note, left, droppedChains: dropped, notify: [lead].filter((u) => u && u !== auth.user_id) } });
 
@@ -453,8 +474,7 @@ function recordAbstain(db, { q, auth, body, at, lead, addressed }) {
       }
       if (lead && lead !== auth.user_id) {
         const row = { rule_id: null, scope: '*', recipients: [lead], quorum: '1', conflict_policy: 'block', timeout_action: 'hang', timeout_after: null, last: true, from_abstention: true };
-        db.run(`UPDATE questions SET addressed_to=?, route=? WHERE id=?`, JSON.stringify([lead]),
-          JSON.stringify({ ...(route ?? { stage: 0, chains: [] }), rows: [row] }), q.id);
+        setRecipients(db, q.id, { addressedTo: [lead], route: { ...(route ?? { stage: 0, chains: [] }), rows: [row] } });
         audit(db, { actorKind: 'system', action: 'question_rerouted', targetType: 'question', targetId: q.id,
           payload: { why: tl(L, '收件人全部弃权，且路由没有下一顺位'), to: [lead] } });
         return { ...base, resolved: false, reassigned: [lead], stillOpen: openCount(db, q.task_id) };
@@ -478,8 +498,7 @@ function recordLateAnswer(db, { q, auth, body, stance: action = 'answer', at, le
   const stance = differs ? 'dissent' : 'comment';
   const mid = newId('m'), aid = newId('a');
   return db.tx(() => {
-    db.run(`INSERT INTO messages (id,task_id,sender_id,body,kind,kind_source,urgency,urgency_source,trust_label,token_id,received_at)
-            VALUES (?,?,?,?,'answer','explicit','normal','explicit','user-authenticated',?,?)`, mid, q.task_id, auth.user_id, body, auth.token_id, at);
+    insertUserMessage(db, { id: mid, taskId: q.task_id, senderId: auth.user_id, tokenId: auth.token_id, body, kind: 'answer', receivedAt: at });
     db.run(`INSERT INTO answers (id,question_id,user_id,message_id,body,stance,created_at) VALUES (?,?,?,?,?,?,?)`, aid, q.id, auth.user_id, mid, body, stance, at);
     const notify = [...new Set([lead, effective?.sender_id].filter((u) => u && u !== auth.user_id))];
     audit(db, { actorKind: 'user', actorId: auth.user_id, action: differs ? 'late_dissent_noted' : 'late_agreement_noted', targetType: 'question', targetId: q.id,
@@ -529,9 +548,11 @@ function conflictImpact(db, q) {
 /** 事项已决：挂 answers 边、置 answered、解冻分支与任务、跑类型钩子；冲突事项还要回写原事项。 */
 function resolve(db, { q, messageId, finalBody, by, at, base, how }) {
   insertEdge(db, messageId, q.id, 'answers', at);
-  db.run(`UPDATE questions SET status='answered', resolved_at=?, route_due_at=NULL WHERE id=?`, at, q.id);
+  // 出处：对某一步提的问，答复就是那一步接着做的依据
+  if (q.node_id) linkInstruction(db, { nodeId: q.node_id, messageId, at });
+  transition(db, 'questions', q.id, 'answered', { set: { resolved_at: at, route_due_at: null } });
   // 分支解冻。**不置 ready 只置 pending**：就绪与否由 readyNodes 按依赖现算。
-  if (q.node_id) db.run(`UPDATE nodes SET status='pending' WHERE id=? AND status='blocked'`, q.node_id);
+  if (q.node_id) transition(db, 'nodes', q.node_id, 'pending', { from: ['blocked'], onMismatch: 'skip' });
   let origin = null;
   if (q.decision_type === 'conflict' && q.origin_question_id) {
     origin = db.one(`SELECT * FROM questions WHERE id=?`, q.origin_question_id);
@@ -545,15 +566,15 @@ function resolve(db, { q, messageId, finalBody, by, at, base, how }) {
       const winner = writtenOf(db, origin.id).find((a) => a.user_id === by);
       if (!winner) db.run(`INSERT INTO answers (id,question_id,user_id,message_id,body,stance,created_at) VALUES (?,?,?,?,?,'answer',?)`, newId('a'), origin.id, by, messageId, finalBody, at);
       insertEdge(db, winner?.message_id ?? messageId, origin.id, 'answers', at);
-      db.run(`UPDATE questions SET status='answered', resolved_at=?, route_due_at=NULL WHERE id=?`, at, origin.id);
-      if (origin.node_id) db.run(`UPDATE nodes SET status='pending' WHERE id=? AND status='blocked'`, origin.node_id);
+      transition(db, 'questions', origin.id, 'answered', { set: { resolved_at: at, route_due_at: null } });
+      if (origin.node_id) transition(db, 'nodes', origin.node_id, 'pending', { from: ['blocked'], onMismatch: 'skip' });
       audit(db, { actorKind: 'system', action: 'conflict_resolved', targetType: 'question', targetId: origin.id,
         payload: { conflictId: q.id, how, by, finalBody: finalBody.slice(0, 300), dissent: losers.map((a) => ({ userId: a.user_id, body: a.body.slice(0, 300) })) } });
     }
   }
   // 任务解冻的条件是**没有别的问题还开着**，不是"这个问题答了"。
   const stillOpen = openCount(db, q.task_id);
-  if (!stillOpen) db.run(`UPDATE tasks SET status='running' WHERE id=? AND status='waiting'`, q.task_id);
+  if (!stillOpen) transition(db, 'tasks', q.task_id, 'running', { from: ['waiting'], onMismatch: 'skip' });
   audit(db, { actorKind: 'user', actorId: by, action: 'question_answered', targetType: 'question', targetId: q.id,
     payload: { messageId, nodeId: q.node_id, level: q.level, decisionType: q.decision_type, how, stillOpen, body: String(finalBody).slice(0, 800), pid: process.pid } });
   const target = origin ?? q;
@@ -590,14 +611,13 @@ function raiseConflict(db, { q, answers, at }) {
 - **撤回**自己的立场（点「撤回」）—— 效果和附议一样（以对方为准），挑一个点就行；
 - **重申**自己的立场（写下答复）—— 双方都重申即仍不一致，转负责人裁定。
 超时未达成一致也会转负责人裁定。`);
-  db.run(`INSERT INTO questions (id,task_id,node_id,level,level_source,text,default_action,asked_at,timeout_at,status,origin_question_id)
-          VALUES (?,?,?,3,'hard_rule',?,NULL,?,NULL,'open',?)`, id, q.task_id, q.node_id, text, at, q.id);
+  insertQuestion(db, { id, taskId: q.task_id, nodeId: q.node_id, level: 3, text, askedAt: at, originQuestionId: q.id });
   insertEdge(db, id, q.id, 'derived_from', at);
   const r = routeQuestion(db, { questionId: id, decisionType: 'conflict', typeSource: 'hard_rule', parties, at });
-  db.run(`UPDATE questions SET route=json_set(route,'$.parties',json(?)) WHERE id=?`, JSON.stringify(parties), id);
+  setRouteParties(db, id, parties);
   // 原事项进冲突处理：级别超时钟停掉（否则 Ⅱ 级会在冲突未决时按默认走），结论由冲突事项回写。
-  db.run(`UPDATE questions SET status='escalated', timeout_at=NULL, route_due_at=NULL WHERE id=?`, q.id);
-  db.run(`UPDATE tasks SET status='waiting' WHERE id=? AND status IN ('running','waiting')`, q.task_id);
+  transition(db, 'questions', q.id, 'escalated', { set: { timeout_at: null, route_due_at: null } });
+  transition(db, 'tasks', q.task_id, 'waiting', { from: ['running', 'waiting'], onMismatch: 'skip' });
   audit(db, { actorKind: 'system', action: 'conflict_raised', targetType: 'question', targetId: q.id,
     payload: { conflictId: id, parties, addressedTo: r.answerers, dueAt: r.dueAt, stances: answers.map((a) => ({ userId: a.user_id, body: a.body.slice(0, 300) })) } });
   return id;
@@ -607,6 +627,12 @@ function raiseConflict(db, { q, answers, at }) {
  * 旁观者 / 任何人对已决事项的留言：附在事项上（answers.stance='comment'），不进决策。
  * 挂在已决事项上的留言：审计 dissent_noted，进负责人摘要。
  */
+/** 记一条答复行（answers 表只由本模块写；别处要记——排队说明、超时默认——都经这里）。userId null = 系统。 */
+export function insertAnswer(db, { id = newId('a'), questionId, userId = null, messageId = null, body, stance, agreesWith = null, at = now() }) {
+  db.run(`INSERT INTO answers (id,question_id,user_id,message_id,body,stance,agrees_with,created_at) VALUES (?,?,?,?,?,?,?,?)`, id, questionId, userId, messageId, body, stance, agreesWith, at);
+  return id;
+}
+
 export function commentOnQuestion(db, { questionId, messageId, userId, body, at = now() }) {
   const q = db.one(`SELECT id, status, task_id FROM questions WHERE id=?`, questionId);
   if (!q) throw new I18nError('事项不存在：{id}', { id: questionId });

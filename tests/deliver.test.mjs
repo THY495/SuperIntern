@@ -124,6 +124,7 @@ section('3. 开 PR 的请求形状（假 GitHub）');
   eq(body.head, `v0/${f.taskId}`, 'head 是任务分支');
   eq(body.title, '加 ESM 配置', '标题 = 任务标题');
   assert(body.body.includes('由 SuperIntern 交付') && body.body.includes('自作主张'), '正文含终版报告与交付说明');
+  assert(/## 溯源[\s\S]*\| 步骤 \| 落实的条款 \| 指令来源 \| 对应提交 \|/.test(body.body) && /交付：/.test(body.body), 'PR 正文带溯源表（GitHub 上 squash 也不丢）');
   eq(post.init.headers.authorization, 'Bearer tok', 'token 只进请求头');
   eq(JSON.parse(f.db.one(`SELECT value FROM params WHERE task_id=? AND key='delivery.pr_url' AND superseded_at IS NULL`, f.taskId).value),
     'https://github.com/o/r/pull/7', '参数 delivery.pr_url');
@@ -132,7 +133,7 @@ section('3. 开 PR 的请求形状（假 GitHub）');
   const calls2 = [];
   const r2 = await deliverTask(f.db, { taskId: f.taskId, workspace: f.ws, remote: 'https://github.com/o/r.git', pr: true, token: '',
     userId: f.owner.userId, fetchFn: fakeGithub(calls2) });
-  assert(/GITHUB_TOKEN/.test(r2.prSkipped) && calls2.length === 0, '没 token：不碰 API，提示去填 .env');
+  assert(/设置 → 连接/.test(r2.prSkipped) && calls2.length === 0, '没有能调 GitHub 接口的连接：不碰 API，说清去哪里加');
   f.db.close();
 }
 
@@ -167,6 +168,8 @@ section('5. 签收正文带产物证据：第一次比工作区起点，返工�
   const first = raiseSignoffQuestion(f.db, { taskId: f.taskId, head: f.head, branch: `v0/${f.taskId}`, dir: f.ws });
   const t1 = f.db.one(`SELECT text FROM questions WHERE id=?`, first.questionId).text;
   assert(t1.includes('## 产物') && t1.includes('本任务的全部改动'), '第一次签收：正文带本任务全部改动');
+  // 过程里出过的岔子置顶在产物之前（这个任务一帆风顺：也明说"没有例外"）
+  assert(t1.includes('## 签收前先看这些\n没有例外') && t1.indexOf('## 签收前先看这些') < t1.indexOf('## 产物'), '签收前先看这些：在产物之前，没有例外也说一句');
   assert(t1.includes('a.txt') && t1.includes('+2'), '贴了文件名与实际行 —— 签收人不用去猜"改没改"');
 
   // 返工：再提交一次，重新进签收

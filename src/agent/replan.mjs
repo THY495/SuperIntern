@@ -31,7 +31,7 @@
 
 import { withOutputLang, contentLang, tl } from '../i18n/index.mjs';
 import { runToolLoop } from '../llm/client.mjs';
-import { textOf } from '../llm/canonical.mjs';
+import { textOf, LLM_ROLES } from '../llm/canonical.mjs';
 import { newId, now, audit } from '../db/db.mjs';
 import { validateNodeSet, constitutionText } from './planner.mjs';
 import { overruledContractRules, renderOverruled } from '../core/decisions.mjs';
@@ -119,6 +119,7 @@ const SUBMIT_REVISION = {
             risk_tier: { type: 'string', enum: ['low', 'normal', 'high'] },
             model_tier: { type: 'string', enum: ['light', 'standard', 'heavy'] },
             depends_on: { type: 'array', items: { type: 'string' } },
+            ui_checks: { type: 'array', items: { type: 'string' }, description: '有界面的节点：这一步做完后，要在**运行起来的页面上**看到或点到才算数的事项，每条一句，写清在哪页、做什么、应看到什么（如"在 /todos 填标题点添加，列表多出这一条"）。验收员会把应用起起来逐条点验。没有界面的节点（后端、命令行、测试、文档）不填。至多 8 条' },
           },
           required: ['key', 'title', 'spec', 'acceptance', 'risk_tier', 'model_tier', 'depends_on'],
         },
@@ -479,7 +480,7 @@ ${lines.join('\n')}
 }
 
 export async function replan(db, {
-  client, taskId, constitution, message, nodes, tier = 'heavy', maxAttempts = 3, ablatePrompt = false, verdicts = [],
+  client, taskId, constitution, message, nodes, tier = LLM_ROLES.replanner, maxAttempts = 3, ablatePrompt = false, verdicts = [],
 }) {
   const nodeList = nodes.map((n) => `- \`${n.id}\`　[${n.status}]　${n.title}\n`
     + `    规格：${String(n.spec).slice(0, 300)}\n`
@@ -526,7 +527,7 @@ ${renderVerdicts(db, verdicts)}
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     let out = null;
     const loop = await runToolLoop(client, {
-      tier, system: withOutputLang(systemPrompt(ablatePrompt), contentLang(db)), messages, tools: [SUBMIT_REVISION, RAISE_QUESTION],
+      role: 'replanner', tier, system: withOutputLang(systemPrompt(ablatePrompt), contentLang(db)), messages, tools: [SUBMIT_REVISION, RAISE_QUESTION],
       maxTokens: 16000, effort: 'high',
     }, {
       submit_revision: async (args) => {

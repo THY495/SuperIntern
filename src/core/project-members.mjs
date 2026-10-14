@@ -8,6 +8,7 @@
 // （唯一的例外仍是强制交接，见 handover.mjs）。旁观者可以是项目成员（为了可见性），但不能加任务。
 
 import { now, audit } from '../db/db.mjs';
+import { updateProject } from '../db/projects.mjs';
 import { recordGoalChange } from './decisions.mjs';
 import { I18nError } from '../i18n/index.mjs';
 
@@ -61,7 +62,7 @@ export function setVisibility(db, { projectId, visibility, by }) {
   requireOwner(p, by);
   if (!VISIBILITIES[visibility]) throw new I18nError('可见性只能是：{values}', { values: Object.keys(VISIBILITIES).join(' / ') });
   if (p.visibility === visibility) return { projectId, visibility, changed: false };
-  db.run(`UPDATE projects SET visibility=? WHERE id=?`, visibility, projectId);
+  updateProject(db, projectId, { visibility });
   audit(db, { actorKind: 'user', actorId: by, action: 'project_visibility_changed', targetType: 'project', targetId: projectId, payload: { from: p.visibility, to: visibility } });
   return { projectId, visibility, changed: true };
 }
@@ -114,7 +115,7 @@ export function editProjectGoal(db, { projectId, goal = null, doneDefinition = n
   if (!g) throw new I18nError('项目目标不能为空');
   if (!d) throw new I18nError('完成定义不能为空');
   if (g === p.goal && d === p.done_definition) return { projectId, changed: false };
-  db.run(`UPDATE projects SET goal=?, done_definition=? WHERE id=?`, g, d, projectId);
+  updateProject(db, projectId, { goal: g, doneDefinition: d });
   audit(db, { actorKind: 'user', actorId: by, action: 'project_goal_changed', targetType: 'project', targetId: projectId,
     payload: { before: { goal: p.goal, doneDefinition: p.done_definition }, after: { goal: g, doneDefinition: d } } });
   // 决定登记：目标只有一份，新的一定取代旧的 —— recordGoalChange 自己把上一条置作废。

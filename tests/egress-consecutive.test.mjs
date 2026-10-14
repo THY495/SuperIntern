@@ -1,6 +1,6 @@
 // 出网连续被拒次数 → 触顶路径（gate）：计数**持久化于 params**、跨进程累计。
 //
-// 跑：node tests/egress-consecutive.test.mjs（末尾以子进程再跑 m4 回归）。
+// 跑：node tests/egress-consecutive.test.mjs
 //
 // 观测源：出口代理写的审计 JSONL（guard.py 每一条出网尝试落一行 allowed 真假）。
 // 编排器每次体检前把自 params 游标起新增的行喂给计数（denied +1 / allowed 归零），
@@ -230,9 +230,6 @@ section('4. advance 无模块级状态：两次推进之间不传对象，计数
 rmSync(TMP, { recursive: true, force: true });
 console.log(`\n${'═'.repeat(72)}\n出网连续被拒计数测试：${pass} 通过，${fail} 失败\n${'═'.repeat(72)}`);
 
-console.log('\n── 回归：node tests/budget-audit.test.mjs ──');
-const m4 = spawnSync(process.execPath, [join(ROOT, 'tests', 'budget-audit.test.mjs')], { encoding: 'utf8' });
-console.log(m4.stdout.slice(-1400));
-if (m4.status !== 0) console.error(m4.stderr);
-console.log(`m4 退出码：${m4.status}`);
-process.exit(fail || m4.status ? 1 : 0);
+// 原来这里以子进程再跑一遍 m4 回归 —— `run.mjs --all` 下 m4 因此跑两遍，汇总行还被 m4 的那一行顶掉
+//。m4 自己是一个套件，交给运行器跑。
+process.exit(fail ? 1 : 0);

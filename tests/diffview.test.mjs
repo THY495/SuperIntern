@@ -10,7 +10,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { openDb, ensureOwner, audit } from '../src/db/db.mjs';
 import { createProject } from '../src/core/project.mjs';
-import { addUser } from '../src/core/users.mjs';
+import { addUser, reissueToken } from '../src/core/users.mjs';
+import { disableUser } from '../src/core/handover.mjs';
 import { setVisibility } from '../src/core/project-members.mjs';
 import { parseGitDiff, taskRange, deliveryRange, viewOf, linesOf, DIFF_LIMITS, rangeFor, roundSinceOf } from '../src/core/diffview.mjs';
 import { setParam } from '../src/core/params.mjs';
@@ -110,6 +111,63 @@ try {
     r = await getAs(fe.plaintext, p);
     eq(r.status, 404, `项目只对成员可见时，无关成员拿不到：${p.replace(tid, '<任务>').replace(P.projectId, '<项目>')}`);
   }
+  // 写接口同样先过可见性（原来只查 GET，看不见任务的人照样能给它发指令 / 暂停 / 签收）
+  const postAs = (tok, p, body) => fetch(base + p, { method: 'POST', headers: { 'content-type': 'application/json', 'sec-fetch-site': 'same-origin', 'x-superintern-token': tok }, body: JSON.stringify(body) })
+    .then(async (x) => ({ status: x.status, ...(await x.json()) }));
+  for (const [action, body] of [['say', { body: '改成蓝色', kind: 'instruction' }], ['pause', {}], ['signoff', { accept: true }]]) {
+    r = await postAs(fe.plaintext, `/api/tasks/${tid}/${action}`, body);
+    eq(r.status, 404, `无关成员 POST ${action} → 404（不泄露任务存在）`);
+  }
+  eq(db.one(`SELECT count(*) n FROM messages WHERE task_id=? AND body='改成蓝色'`, tid).n, 0, '那条指令没有落库');
+  // 实时推送：看不见的任务的审计行不推给他（原来动作 + 对象 id 广播给所有连着的人）
+  const sse = async (tok) => {
+    const ac = new AbortController();
+    const res = await fetch(`${base}/api/events`, { headers: { 'x-superintern-token': tok }, signal: ac.signal });
+    const reader = res.body.getReader(); const dec = new TextDecoder(); let buf = '';
+    return { ac, async rowsWithin(ms) {
+      const until = Date.now() + ms; const rows = [];
+      while (Date.now() < until) {
+        const chunk = await Promise.race([reader.read(), new Promise((r2) => setTimeout(() => r2({ timeout: true }), until - Date.now()))]);
+        if (chunk.timeout || chunk.done) break;
+        buf += dec.decode(chunk.value);
+        for (const m of buf.matchAll(/event: change\ndata: (.*)\n\n/g)) rows.push(...JSON.parse(m[1]).rows);
+        buf = buf.slice(buf.lastIndexOf('\n\n') + 2);
+      }
+      return rows;
+    } };
+  };
+  const sFe = await sse(fe.plaintext), sOwner = await sse(owner.plaintext);
+  await new Promise((r2) => setTimeout(r2, 150));
+  audit(db, { actorKind: 'system', action: 'sse_probe', targetType: 'task', targetId: tid });
+  const [rowsFe, rowsOwner] = await Promise.all([sFe.rowsWithin(800), sOwner.rowsWithin(800)]);
+  sFe.ac.abort(); sOwner.ac.abort();
+  assert(rowsOwner.some((x) => x.action === 'sse_probe' && x.target_id === tid), '负责人收到这条审计行');
+  assert(!rowsFe.some((x) => x.target_id === tid), '看不见项目的成员收不到');
+
+  // 吊销 / 停用即断（2026-10-12）：原来身份只在建连时认一次，令牌吊销后开着的页面照收推送
+  const watch = async (tok) => {
+    const ac = new AbortController();
+    const res = await fetch(`${base}/api/events`, { headers: { 'x-superintern-token': tok }, signal: ac.signal });
+    const reader = res.body.getReader(); const dec = new TextDecoder(); let text = '';
+    const ended = (async () => { for (;;) { const c = await reader.read().catch(() => ({ done: true })); if (c.done) return true; text += dec.decode(c.value); } })();
+    return { ac, ended, text: () => text };
+  };
+  const reissued = addUser(db, { name: '后端', role: 'member', byUserId: owner.userId });
+  const toDisable = addUser(db, { name: '测试', role: 'member', byUserId: owner.userId });
+  const wR = await watch(reissued.plaintext), wD = await watch(toDisable.plaintext), wO = await watch(owner.plaintext);
+  await new Promise((r2) => setTimeout(r2, 250));
+  const t0 = Date.now();
+  reissueToken(db, { userId: reissued.userId, byUserId: owner.userId });   // 旧令牌作废
+  disableUser(db, { userId: toDisable.userId, byUserId: owner.userId });  // 人被停用（令牌一并吊销）
+  const timeout = (ms) => new Promise((r2) => setTimeout(() => r2(false), ms));
+  const [endR, endD] = await Promise.all([Promise.race([wR.ended, timeout(2000)]), Promise.race([wD.ended, timeout(2000)])]);
+  assert(endR && /event: revoked/.test(wR.text()), `令牌被重发（旧令牌吊销）→ 开着的推送收到 revoked 并断开（${Date.now() - t0} ms 内）`);
+  assert(endD && /event: revoked/.test(wD.text()), '人被停用 → 开着的推送收到 revoked 并断开');
+  audit(db, { actorKind: 'system', action: 'sse_after_revoke', targetType: 'user', targetId: owner.userId });
+  await new Promise((r2) => setTimeout(r2, 300));
+  assert(!/sse_after_revoke/.test(wR.text() + wD.text()), '断开之后的变化不会再推给他们');
+  assert(/sse_after_revoke/.test(wO.text()) && !/event: revoked/.test(wO.text()), '没被吊销的人照常收、不受影响');
+  wO.ac.abort(); wR.ac.abort(); wD.ac.abort();
 } finally { await w.close?.(); }
 
 section('6 · 这一轮（返工签收）：上次请求签收时的头 → 现在，集成带进来的单列');
@@ -138,6 +196,8 @@ section('6 · 这一轮（返工签收）：上次请求签收时的头 → 现�
   eq(viewOf(rangeFor(db, { taskId: tid, home: HOME, scope: 'all' })).files.some((f) => f.path === 'other.txt'), false, '全部：也不算别人的（归属基线是 merge-base）');
   eq(linesOf(rr, { path: 'other.txt', from: 1 }).ok, false, '这一轮的取行也不给别人的文件');
   // 老数据：没有 signoff.since 这一行，从 signoff.head 的历史里找
+  // 那时的库也没有 params 的只增触发器（v16 重建时丢了、v23 补回），模拟老库就先拿掉它
+  db.raw.exec(`DROP TRIGGER IF EXISTS trg_params_no_delete`);
   db.run(`DELETE FROM params WHERE task_id=? AND key='signoff.since'`, tid);
   eq(roundSinceOf(db, tid), firstHead, '老数据回退：从签收头历史里找上一个不同的头');
 }

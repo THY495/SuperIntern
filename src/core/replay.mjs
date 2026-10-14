@@ -14,10 +14,11 @@
 // 找不到就是一个洞，如实报出来，而不是让它安静地不存在。
 
 import { I18nError } from '../i18n/index.mjs';
+import { LIFECYCLE, LIFE_OPEN, LIFE_SHUT } from './lifetimes.mjs';
+import { auditPayload } from '../db/audit-payload.mjs';
 
 const fmtUsd = (micro) => `$${(micro / 1e6).toFixed(6)}`;
 const fmtTs = (ms) => new Date(ms).toISOString().replace('T', ' ').slice(0, 19);
-const j = (s) => { try { return JSON.parse(s || '{}'); } catch { return {}; } };
 
 /**
  * 拉齐一次任务的全部可复盘素材。
@@ -35,9 +36,13 @@ export function replay(db, taskId) {
   // ⚠️ 按 `id`（AUTOINCREMENT）排序而不是 `ts`：同毫秒写入在 SQLite 里顺序不定。
   //    本项目的约定：**取顺序必须带唯一列**。
   const qIds = new Set(db.all(`SELECT id FROM questions WHERE task_id=?`, taskId).map((r) => r.id));
-  const events = db.all(`SELECT * FROM audit_log ORDER BY id`)
+  // payload 解析一次、按 payload_v 升到当前形状
+  const events = db.all(`SELECT * FROM audit_log ORDER BY id`).map((e) => ({ ...e, p: auditPayload(e) }))
     .filter((e) => e.target_id === taskId || nodeIds.has(e.target_id) || qIds.has(e.target_id)
-      || j(e.payload).taskId === taskId);
+      || e.p.taskId === taskId
+      // 项目规划器的寿命挂在项目上，但它的花费记在本任务（规划载体）名下 —— 不带上这两行，那几笔钱就成了"落在寿命之外"
+      || (task.project_id && e.target_id === task.project_id
+        && (e.action === LIFECYCLE['project-plan'].start || e.action === LIFECYCLE['project-plan'].exit)));
 
   // 每一次**会花钱的进程寿命**。恢复语义的机械证据就住在这里：
   // 若干段 started…exit，pid 各不相同 —— 一个进程从头跑到尾是证明不了恢复语义的。
@@ -45,16 +50,18 @@ export function replay(db, taskId) {
   // ⚠️ 规划器也算一段。它此前没有括号，于是"每一分钱都落在某次寿命里吗"这条
   // 自检曾因此报红：一个任务的 planner 花费落在所有区间之外。
   // 松开检查是最容易的做法，也是错的 —— 该补的是括号，不是把尺子改短。
-  const OPEN = { orchestrator_started: 'orchestrator', planner_started: 'planner' };
-  const SHUT = { orchestrator_exit: 'orchestrator', planner_exit: 'planner' };
+  // 四种会花钱的进程全算（core/lifetimes.mjs 一份表）。原来这里自己抄了只含编排器与规划器的两种，
+  // 追问器、项目规划器花的钱在真实库里成了上百条"落在所有寿命之外"。
+  const OPEN = LIFE_OPEN;
+  const SHUT = LIFE_SHUT;
   const lives = [];
   for (const e of events) {
     if (OPEN[e.action]) {
-      lives.push({ role: OPEN[e.action], pid: j(e.payload).pid, startedTs: e.ts,
+      lives.push({ role: OPEN[e.action], pid: e.p.pid, startedTs: e.ts,
         endedTs: null, kind: null, elapsedMs: null, events: [] });
     } else if (SHUT[e.action]) {
       const cur = [...lives].reverse().find((l) => l.role === SHUT[e.action] && l.endedTs === null);
-      if (cur) { cur.endedTs = e.ts; cur.kind = j(e.payload).kind; cur.elapsedMs = j(e.payload).elapsedMs ?? null; }
+      if (cur) { cur.endedTs = e.ts; cur.kind = e.p.kind; cur.elapsedMs = e.p.elapsedMs ?? null; }
     }
     const cur = lives.at(-1);
     if (cur) cur.events.push(e);
@@ -99,13 +106,25 @@ function integrity(db, { taskId, task, nodes, lives, events, questions }) {
       : `${lives.length} 次寿命全部 started…exit 配对`, lives.length);
 
   // ② 花掉的每一分钱都要落在某次寿命里。落在外面 = 有代码在没有括号的地方调 LLM。
+  //    账本自 v24 起记了"哪个进程花的"（proc_kind + proc_pid）：
+  //    · 由启动器拉起的那四种进程花的 → 必须落在**同一个 pid** 的那段寿命里（比时间窗口严：撞上别的进程的寿命不算）；
+  //    · 看板 / 守护进程 / 其它 CLI 命令直接花的（分类、决定比对、汇报……）→ 本来就没有寿命括号，算"知道是谁花的"，详情里单列；
+  //    · 老行两列为空 → 退回按时间窗口判（任一段寿命覆盖即可）。
   const spans = lives.map((l) => [l.startedTs, l.endedTs ?? Infinity]);
-  const spendRows = db.one(`SELECT count(*) AS n FROM usage_ledger WHERE task_id=?`, taskId).n;
-  const orphanSpend = db.all(`SELECT id, ts, role, micro_usd FROM usage_ledger WHERE task_id=?`, taskId)
-    .filter((r) => !spans.some(([a, b]) => r.ts >= a && r.ts <= b));
-  add(orphanSpend.length === 0, '花费都落在某次进程寿命内',
-    orphanSpend.length ? `${orphanSpend.length} 条落在所有寿命区间之外（如 ${orphanSpend[0].role}@${fmtTs(orphanSpend[0].ts)}）`
-      : `全部 ${spendRows} 条都在区间内`, spendRows);
+  const rowsAll = db.all(`SELECT id, ts, role, micro_usd, proc_kind, proc_pid FROM usage_ledger WHERE task_id=?`, taskId);
+  const spendRows = rowsAll.length;
+  const launched = new Set(Object.keys(LIFECYCLE));
+  const inOwnLife = (r) => lives.some((l) => l.pid === r.proc_pid && r.ts >= l.startedTs && r.ts <= (l.endedTs ?? Infinity));
+  const outside = [];
+  let elsewhere = 0;
+  for (const r of rowsAll) {
+    if (r.proc_kind && launched.has(r.proc_kind)) { if (!inOwnLife(r)) outside.push(r); }
+    else if (r.proc_kind) elsewhere++;
+    else if (!spans.some(([a, b]) => r.ts >= a && r.ts <= b)) outside.push(r);
+  }
+  add(outside.length === 0, '花费都落在某次进程寿命内',
+    outside.length ? `${outside.length} 条对不上任何一段寿命（如 ${outside[0].role}@${fmtTs(outside[0].ts)}${outside[0].proc_kind ? `，记的是 ${outside[0].proc_kind}#${outside[0].proc_pid}` : ''}）`
+      : `全部 ${spendRows} 条都对得上${elsewhere ? `（其中 ${elsewhere} 条是看板 / 守护进程直接花的）` : ''}`, spendRows);
 
   // ③ done 的节点必须有交接记录。库层触发器已经强制，这里是**独立复核**：
   //    复盘不该相信被复盘对象自己的护栏。
@@ -139,7 +158,10 @@ function integrity(db, { taskId, task, nodes, lives, events, questions }) {
 
   // ⑥ 任务置 done 必须有 task_done 审计。状态列可以被任何一条 UPDATE 写成 done，
   //    审计轨是 append-only —— 两边对不上说明有人绕过了编排器。
-  add(task.status !== 'done' || actions.includes('task_done'), '置 done 有对应审计',
+  //    自 v25 起状态只能经 db/state.mjs 的 transition() 改，每次都留一行审计（编排器写 task_done，规划载体等写 status_changed）。
+  const doneAudited = actions.includes('task_done')
+    || events.some((e) => e.action === 'status_changed' && e.target_id === taskId && e.p.to === 'done');
+  add(task.status !== 'done' || doneAudited, '置 done 有对应审计',
     task.status === 'done'
       ? (actions.includes('task_done') ? '有 task_done' : '⚠️ 任务是 done 但审计轨里没有 task_done —— 有人绕过了编排器')
       : `任务当前是 ${task.status}，不适用`, task.status === 'done' ? 1 : 0);
@@ -165,9 +187,12 @@ function integrity(db, { taskId, task, nodes, lives, events, questions }) {
   }
   const skipSpans = [];
   for (const e of events) {
-    if (e.action === 'sandbox_skipped') skipSpans.push([e.ts, j(e.payload).pid]);
+    if (e.action === 'sandbox_skipped') skipSpans.push([e.ts, e.p.pid]);
   }
-  const runEvents = events.filter((e) => outcomeActions.has(e.action) || e.action === 'task_verify_failed');
+  // 只算执行器的产出：追问器 / 规划器 / 重规划器也会 question_raised，可它们本来就跑在宿主上、不进沙箱 ——
+  // 原来混在一起算，真实库里十几次"答不出跑在哪"全是它们。
+  const runEvents = events.filter((e) => (outcomeActions.has(e.action) && (e.action !== 'question_raised' || e.actor_id === 'executor'))
+    || e.action === 'task_verify_failed');
   const bare = runEvents.filter((e) => !sbSpans.some(([a, b]) => e.ts >= a && e.ts <= b));
   const unaccounted = bare.filter((e) => !skipSpans.some(([ts]) => ts <= e.ts));
   add(unaccounted.length === 0, '每次执行都答得出跑在哪',
@@ -208,7 +233,7 @@ export function renderReplay(r) {
   p(`\n## 时间线`);
   let lastPid = null;
   for (const e of r.events) {
-    const pl = j(e.payload);
+    const pl = e.p;
     if (pl.pid && pl.pid !== lastPid) { p(`  ── pid ${pl.pid} ──`); lastPid = pl.pid; }
     p(`  ${fmtTs(e.ts)} [${e.actor_kind}${e.actor_id ? `/${e.actor_id}` : ''}] ${e.action}`
       + `${e.target_id ? ` → ${e.target_id}` : ''}${summarize(e.action, pl)}`);

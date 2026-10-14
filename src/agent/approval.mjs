@@ -18,6 +18,8 @@ import { tl, contentLang } from '../i18n/index.mjs';
 import { newId, now, audit } from '../db/db.mjs';
 import { getParam } from '../core/params.mjs';
 import { routeQuestion } from '../core/routing.mjs';
+import { transition } from '../db/state.mjs';
+import { insertQuestion } from '../core/questions.mjs';
 
 // 中英都认（0.2.0）：答复的语言不看设置 —— 部署是英文、有人顺手写中文，照样读得懂；反之亦然。
 const approvalRe = /^\s*[（(]?(A|批准|同意|approve|approved|ok|okay|yes|lgtm|looks good|confirm|confirmed|通过|可以)[)）]?[。！!.\s]*$/i;
@@ -105,6 +107,9 @@ export function approvalThreadOf(db, questionId) {
     return { taskId, kind: review ? 'review' : 'append', reached, labels: reached ? REACHED_LABELS : review ? REVIEW_LABELS : {} };
   }
   if (getParam(db, taskId, 'draft.approval_question') === questionId) return { taskId, kind: 'draft', reached: false, labels: {} };
+  // 计划变更（修正提案）的批准：A 批准 / B 要改（重出一版）/ C 不改了 —— 与上面三台状态机同一套判读、同一份回显与会签归并
+  // （原来只分批 / 驳两态，B 写了新方向也被当作"作罢"，人的话全丢）
+  if (db.one(`SELECT 1 FROM revisions WHERE question_id=? AND status='proposed'`, questionId)) return { taskId, kind: 'revision', reached: false, labels: {} };
   return null;
 }
 
@@ -115,7 +120,7 @@ const clip = (s, n = 40) => { const t = String(s ?? '').replace(/\s+/g, ' ').tri
  * 返回 { verdict, label, text }：label 是短标签（历史状态用），text 是整段说明。
  * `lang`：判读说明随事项走，按内容语言写（调用方传 contentLang(db)；默认中文）。
  */
-export function describeReading({ body, labels = {}, reached = false, tense = 'did', lang = 'zh' }) {
+export function describeReading({ body, labels = {}, reached = false, tense = 'did', lang = 'zh', kind = null, side = false, sideAsks = [] }) {
   const L = lang;
   const verdict = readVerdict(body, labels);
   const resv = reservationOf(body);
@@ -129,15 +134,17 @@ export function describeReading({ body, labels = {}, reached = false, tense = 'd
     text = tl(L, '{head}：已经达成（E）。这一版提的任务都不做，项目按已达成处理（填了项目级验收命令的，系统先跑一遍，过了才算）；之后可以交付。', { head });
   } else if (verdict === 'approve') {
     label = reached ? tl(L, '确认达成') : tl(L, '批准');
-    text = reached ? tl(L, '{head}：确认达成（A）。填了项目级验收命令的，系统先跑一遍，过了才算达成；之后可以交付。', { head }) : tl(L, '{head}：批准（A）。这一版方案照原样生效。', { head });
+    text = reached ? tl(L, '{head}：确认达成（A）。填了项目级验收命令的，系统先跑一遍，过了才算达成；之后可以交付。', { head })
+      : kind === 'revision' ? tl(L, '{head}：批准（A）。够数后这份计划变更生效，任务接着跑。', { head }) : tl(L, '{head}：批准（A）。这一版方案照原样生效。', { head });
     if (resv) text += '\n' + tl(L, '「{resv}」记成保留意见：不挡任何东西，只留在项目的约定清单上。', { resv: clip(resv) });
   } else if (verdict === 'abandon') {
     const shelve = reached || !!labels.reached;   // 达成确认 / 复盘提的任务方案：放弃 = 复盘先放着，项目停滞
-    label = shelve ? tl(L, '先放着') : tl(L, '放弃');
-    text = shelve ? tl(L, '{head}：先放着（C）。项目不标达成、转为停滞，等人添加任务、宣布达成或中止。{extra}', { head, extra: labels.reached ? tl(L, '只是不要这些任务、项目其实已经达成：回「E」。') : '' }) : tl(L, '{head}：放弃（C）。这一版方案作废，不再出新版。', { head });
+    label = shelve ? tl(L, '先放着') : kind === 'revision' ? tl(L, '不要这份变更') : tl(L, '放弃');
+    text = shelve ? tl(L, '{head}：先放着（C）。项目不标达成、转为停滞，等人添加任务、宣布达成或中止。{extra}', { head, extra: labels.reached ? tl(L, '只是不要这些任务、项目其实已经达成：回「E」。') : '' })
+      : kind === 'revision' ? tl(L, '{head}：不要这份变更（C）。那条修正作罢，计划原样不动。', { head }) : tl(L, '{head}：放弃（C）。这一版方案作废，不再出新版。', { head });
   } else {
-    label = reached ? tl(L, '还差东西') : tl(L, '要改');
-    text = tl(L, '{head}：{what} —— 你写的这段话会原样交给 AI，按它出下一版方案，再来问你（要等 AI 重写一版，通常几分钟，花一次模型调用的钱）。', { head, what: reached ? tl(L, '还差东西（B）') : tl(L, '要改（B）') });
+    label = reached ? tl(L, '还差东西') : kind === 'revision' ? tl(L, '重出一版') : tl(L, '要改');
+    text = tl(L, '{head}：{what} —— 你写的这段话会原样交给 AI，按它出下一版方案，再来问你（要等 AI 重写一版，通常几分钟，花一次模型调用的钱）。', { head, what: reached ? tl(L, '还差东西（B）') : kind === 'revision' ? tl(L, '重出一版（B）') : tl(L, '要改（B）') });
     if (lead) {
       text += hedge
         ? '\n' + tl(L, '你以「{lead}」开头，但后面有「{hedge}」这样要改的话，所以不算批准。', { lead, hedge })
@@ -145,6 +152,13 @@ export function describeReading({ body, labels = {}, reached = false, tense = 'd
       text += tl(L, '只想批准：只回「A」；批准但想留一句话：先回 A，另起一行写「保留：…」（不挡任何东西）。');
     }
   }
+  // 拍板的人回批准 / 放弃，而顺带收到的人已经写了还差什么：说清那几句不会交给 AI，以及一起做的路
+  if (!side && sideAsks.length && verdict === 'feedback') text += '\n' + tl(L, '{names} 写的还差什么也会一起交给 AI。', { names: sideAsks.join(tl(L, '、')) });
+  if (!side && sideAsks.length && verdict !== 'feedback') text +='\n' + tl(L, '{names} 写的还差什么不会交给 AI：留档为不同意见，并通知{names}。要一起做，回「还差东西」写上，或附议那一条。', { names: sideAsks.join(tl(L, '、')) });
+  // 顺带收到的人：拍板的不是他，照拍板的人写后果是在骗他
+  if (side) text = verdict === 'feedback'
+    ? tl(L, '{head}：{what} —— 你是顺带收到的：拍板的人也回「还差东西」时，你这段话会一起交给 AI 出下一版；拍板的人确认达成或先放着，你这段话留档，并通知你。', { head, what: label })
+    : tl(L, '{head}：{what}。但你是顺带收到的，这一下不计数 —— 拍板的是「待…答复」里的人；想补充就直接写还差什么。', { head, what: label });
   return { verdict, label, text, reservation: resv, lead };
 }
 
@@ -152,8 +166,8 @@ export function describeReading({ body, labels = {}, reached = false, tense = 'd
  * 状态机读答复的唯一入口：判读 + 留痕（approval_read）。返回 readVerdict 的结果。
  * 留痕挂在任务上（进任务页的活动流），payload 带 questionId —— 事项历史按它标"系统理解为…"。
  */
-export function readApproval(db, { taskId, questionId, body, labels = {}, reached = false, userId = null, version = null }) {
-  const r = describeReading({ body, labels, reached, lang: contentLang(db) });
+export function readApproval(db, { taskId, questionId, body, labels = {}, reached = false, userId = null, version = null, kind = null }) {
+  const r = describeReading({ body, labels, reached, lang: contentLang(db), kind });
   audit(db, { actorKind: 'system', actorId: 'approval', action: 'approval_read', targetType: 'task', targetId: taskId,
     payload: { questionId, verdict: r.verdict, label: r.label, human: r.label, lead: r.lead, reached, version, by: userId } });
   return r.verdict;
@@ -188,7 +202,8 @@ export function confirmBeforeRevising(db, { taskId, questionId, body, version, r
 
   const qid = newId('q'), t = now();
   // 确认事项送给原来那条的同一批人（方案分段会签时，前缀决定了哪几个人要签）
-  let prevPrefixes = null; try { prevPrefixes = JSON.parse(db.one('SELECT route FROM questions WHERE id=?', questionId)?.route ?? 'null')?.prefixes ?? null; } catch { /* 没有路由信息：按任务默认 */ }
+  let prevPrefixes = null, prevAdvisory = null;
+  try { const r = JSON.parse(db.one('SELECT route FROM questions WHERE id=?', questionId)?.route ?? 'null'); prevPrefixes = r?.prefixes ?? null; prevAdvisory = r?.advisory ?? null; } catch { /* 没有路由信息：按任务默认 */ }
   const L = contentLang(db);
   const v = version != null ? `v${version}` : tl(L, '上一版');
   const text = [
@@ -204,10 +219,9 @@ export function confirmBeforeRevising(db, { taskId, questionId, body, version, r
     reached ? tl(L, '- 先放着：回「C」。') : tl(L, '- 放弃这份方案：回「C」。'),
   ].join('\n');
   db.tx(() => {
-    db.run(`INSERT INTO questions (id,task_id,node_id,level,level_source,text,default_action,asked_at,timeout_at,status)
-            VALUES (?,?,NULL,3,'hard_rule',?,NULL,?,NULL,'open')`, qid, taskId, text, t);
-    routeQuestion(db, { questionId: qid, decisionType: 'contract_approval', typeSource: 'hard_rule', prefixes: prevPrefixes, at: t });
-    db.run(`UPDATE tasks SET status='waiting' WHERE id=?`, taskId);
+    insertQuestion(db, { id: qid, taskId: taskId, level: 3, text: text, askedAt: t });
+    routeQuestion(db, { questionId: qid, decisionType: 'contract_approval', typeSource: 'hard_rule', prefixes: prevPrefixes, advisory: prevAdvisory, at: t });
+    transition(db, 'tasks', taskId, 'waiting');
     audit(db, { actorKind: 'system', actorId: 'approval', action: 'approval_confirm_raised', targetType: 'task', targetId: taskId,
       payload: { questionId: qid, after: questionId, version, body: String(body) } });
   });

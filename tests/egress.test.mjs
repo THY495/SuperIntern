@@ -1,5 +1,6 @@
 // 回归：出口白名单代理
 //
+// @needs: docker, net
 // 跑：node tests/egress.test.mjs
 // 前置：docker/podman 在跑；`docker build -t superintern/sandbox:v0.1 sandbox/` 做过。
 //       CA 与派生镜像本文件会自己准备（都是幂等的）。
@@ -24,8 +25,9 @@ import { join, resolve } from 'node:path';
 import { openDb, ensureOwner, newId, now } from '../src/db/db.mjs';
 import { LocalExecutor } from '../src/core/executor.mjs';
 import { ContainerExecutor, makeSandbox, detectRuntime, SANDBOX_IMAGE, ensureFlavorImage } from '../src/core/container.mjs';
-import { EGRESS_GROUPS, setEgressGroups, egressGroupsOf, hostsOf, ensureCa, ensureCaImage,
+import { EGRESS_GROUPS, setEgressGroups, egressGroupsOf, hostsOf, ensureCa, ensureCaImage, removeCaImages,
   EgressProxy, ingestEgressAudit, raiseEgressQuestion, openEgressQuestions, deniedHosts } from '../src/core/egress.mjs';
+import { addSourceCredential } from '../src/core/egress-creds.mjs';
 
 let pass = 0, fail = 0;
 const section = (t) => console.log(`\n${'─'.repeat(72)}\n${t}\n${'─'.repeat(72)}`);
@@ -33,6 +35,7 @@ const ok = (m) => { pass++; console.log(`  [PASS] ${m}`); };
 const bad = (m, e) => { fail++; console.log(`  [FAIL] ${m}${e ? `\n         ${e}` : ''}`); };
 const assert = (c, m) => (c ? ok(m) : bad(m));
 const eq = (a, b, m) => (a === b ? ok(m) : bad(m, `期望 ${JSON.stringify(b)}，实得 ${JSON.stringify(a)}`));
+const has = (s, sub, m) => (String(s).includes(sub) ? ok(m) : bad(m, `输出里没有 ${JSON.stringify(sub)}：${String(s).slice(0, 200)}`));
 const rejects = (fn, m) => {
   try { fn(); bad(m, '期望被拒绝，但成功了'); }
   catch (e) { ok(`${m}\n         └ ${String(e.message).split('\n')[0].slice(0, 110)}`); }
@@ -49,6 +52,8 @@ process.on('exit', () => {
   const rm = (args) => { try { execFileSync(rt?.cli ?? 'docker', args, { stdio: 'ignore' }); } catch { /* 尽力 */ } };
   for (const e of execs) { rm(['rm', '-f', e.name]); if (e.egress) rm(['rm', '-f', e.egress.name]); }
   for (const e of execs) { if (e.egress) rm(['network', 'rm', e.egress.network]); }
+  // 这次新生成的 CA 派生出的镜像：每跑一次一个新 CA，不删会越攒越多（攒到过 580 多个）
+  try { if (rt) removeCaImages(rt.cli, join(HOME, 'ca')); } catch { /* 尽力 */ }
   try { rmSync(TMP, { recursive: true, force: true }); } catch { /* 尽力 */ }
 });
 
@@ -182,14 +187,20 @@ execs.push(ctrG);
   const allowed = await nodeIn(ctrG, wsG,
     'fetch("https://api.github.com/zen").then(async r=>console.log("ALLOW-OK",r.status,(await r.text()).slice(0,30)))'
     + '.catch(e=>console.log("ALLOW-FAIL",e.message,"|",e.cause?.message))');
-  assert(/ALLOW-OK 200/.test(allowed), `白名单内的 HTTPS 通了：${allowed.slice(0, 120)}`);
+  // GitHub 匿名 API 每小时 60 次，一天跑几遍全套就会用完：上游回"rate limit exceeded"的 403 同样证明请求穿过了代理、
+  // 到了 GitHub（代理自己拒绝时回的是 "egress denied"）。只认这两种，别的一律算不通。
+  assert(/ALLOW-OK 200/.test(allowed) || (/ALLOW-OK 403/.test(allowed) && /rate limit/i.test(allowed)),
+    `白名单内的 HTTPS 通了（到了上游${/rate limit/i.test(allowed) ? '，上游限流' : ''}）：${allowed.slice(0, 120)}`);
   assert(!/self.signed|unable to verify|UNABLE_TO_/i.test(allowed),
     '证书链可信 —— CA 烘焙进系统信任库那一步真的生效了');
 
   // 同一件事换个工具再验一次。全靠 node 的话，一个 undici 特有的坑就会被读成"没网"。
-  const viaCurl = await ctrG.execute({ file: 'curl', args: ['-sS', '-o', '/dev/null',
+  const viaCurl = await ctrG.execute({ file: 'curl', args: ['-sS', '-o', '/dev/null', '-D', '-',
     '-w', 'CURL-%{http_code}', 'https://api.github.com/zen'] }, wsG, { timeoutMs: 45_000 });
-  assert(/CURL-200/.test(viaCurl.stdout), `curl 也通（${viaCurl.stdout.trim()}）—— 换一套 CA 机制仍成立`);
+  const curlCode = /CURL-(\d+)/.exec(viaCurl.stdout)?.[1];
+  // 同上：GitHub 限流时回 403 并带 x-ratelimit-remaining: 0 头 —— 那是上游的头，代理的拒绝不带
+  assert(curlCode === '200' || (curlCode === '403' && /x-ratelimit-remaining:\s*0/i.test(viaCurl.stdout)),
+    `curl 也通（CURL-${curlCode}${curlCode === '403' ? '，上游限流' : ''}）—— 换一套 CA 机制仍成立`);
 
   // E3：白名单外，CONNECT 阶段就拒
   const denied = await nodeIn(ctrG, wsG,
@@ -273,9 +284,11 @@ section('5. E6 凭证注入：粒度是 (host, path 前缀, method)，审计记�
   // 这一条防的是：按整个 host 无条件注入会破坏无需认证的路径，
   // 而失败信息完全指不到真实原因。粒度必须是 (host, path 前缀, method)。
   const miss = await nodeIn(ctr, ws,
-    'fetch("https://api.github.com/zen").then(async r=>console.log("MISS",r.status))'
+    'fetch("https://api.github.com/zen").then(async r=>console.log("MISS",r.status,(await r.text()).slice(0,60)))'
     + '.catch(e=>console.log("ERR",e.cause?.message))');
-  assert(/MISS 200/.test(miss), `不匹配 path 前缀的请求**不注入**，匿名访问照常成功：${miss.slice(0, 60)}`);
+  // 匿名限流（403 rate limit）同样说明没注入：注入了坏令牌回的是 401 Bad credentials
+  assert(/MISS 200/.test(miss) || (/MISS 403/.test(miss) && /rate limit/i.test(miss)),
+    `不匹配 path 前缀的请求**不注入**，匿名访问照常成功${/rate limit/i.test(miss) ? '（上游匿名限流，仍是匿名）' : ''}：${miss.slice(0, 80)}`);
 
   const st = await ctr.stop();
   eq(st.egress.injected, 1, '只注入了一次 —— 粒度真的按 path 前缀区分了');
@@ -286,6 +299,44 @@ section('5. E6 凭证注入：粒度是 (host, path 前缀, method)，审计记�
 
   const jsonl = readFileSync(proxy.auditFile, 'utf8');
   assert(!/ghp_FAKE/.test(jsonl), 'JSONL 里也没有令牌值 —— 会把令牌写进日志的凭证隔离，隔离的只是沙箱不是磁盘');
+  db.close();
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+section('5b. B8 最小权限注入：源的凭据只进代理；带凭据的沙箱只能读（git 拉取除外）');
+// ═══════════════════════════════════════════════════════════════════════════
+
+{
+  // 凭据配在 npm 源上（假令牌）；github 没有凭据，但同一个沙箱带着凭据 → 它也被收窄成只读
+  const FAKE = 'Bearer npm_FAKE_B8_TOKEN_FOR_TEST_ONLY_0000000';
+  const { db, taskId, userId } = fixture(['github', 'npm']);
+  addSourceCredential(db, { sourceId: 'npm', secret: FAKE, byUserId: userId });
+  const ws = mkws('ws-b8');
+  const ctr = await makeSandbox(db, { taskId, home: HOME });
+  execs.push(ctr);
+  await ctr.start(ws);
+
+  const env = await nodeIn(ctr, ws, 'console.log("SEES", Object.values(process.env).some((v) => String(v).includes("npm_FAKE")))');
+  has(env, 'SEES false', '沙箱的环境变量里没有令牌');
+  await nodeIn(ctr, ws, 'fetch("https://registry.npmjs.org/-/whoami").then(r=>console.log("WHO",r.status)).catch(e=>console.log("ERR",e.cause?.message))');
+  const post = await nodeIn(ctr, ws,
+    'fetch("https://api.github.com/gists",{method:"POST",body:"{}"}).then(async r=>console.log("POST",r.status,(await r.text()).slice(0,60))).catch(e=>console.log("ERR",e.cause?.message))');
+  assert(/POST 403/.test(post) && /read-only/.test(post), `带凭据的沙箱里写请求被代理拒（github 原本可写，收窄成只读）：${post.slice(0, 90)}`);
+  const clone = await ctr.execute({ file: 'git', args: ['clone', '--quiet', '--depth', '1', 'https://github.com/octocat/Hello-World.git', '/tmp/hw'] }, ws, { timeoutMs: 90_000 });
+  eq(clone.code, 0, `git clone 照常能用（POST …/git-upload-pack 算读）${clone.code ? `：${clone.stderr.slice(0, 120)}` : ''}`);
+  // 推送：直接发 POST …/git-receive-pack（git push 本身会先在 GET 上因没有令牌而停，证明不了代理拦）
+  const push = await nodeIn(ctr, ws,
+    'fetch("https://github.com/octocat/Hello-World.git/git-receive-pack",{method:"POST",body:"0000"}).then(async r=>console.log("PUSH",r.status,(await r.text()).slice(0,60))).catch(e=>console.log("ERR",e.cause?.message))');
+  assert(/PUSH 403/.test(push) && /read-only/.test(push), `推送（POST …/git-receive-pack）被代理拒：${push.slice(0, 90)}`);
+
+  const jsonl = readFileSync(ctr.egress.auditFile, 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l));
+  assert(jsonl.some((r) => r.host === 'registry.npmjs.org' && r.action === 'injected'), '发往 npm 源的读请求，代理带上了凭据（出网审计 action=injected）');
+  assert(!jsonl.some((r) => r.host?.endsWith('github.com') && r.action === 'injected'), '发往别的源的请求不带');
+  const st = await ctr.stop();
+  assert(st, '沙箱收尾');
+  const row = db.one(`SELECT payload FROM audit_log WHERE target_id=? AND action='sandbox_credentials'`, taskId);
+  assert(row && /api\.github\.com/.test(row.payload) && /narrowedToReadOnly/.test(row.payload), '审计记下注入了哪份凭据、哪些地址被收窄成只读');
+  assert(!/npm_FAKE/.test(row?.payload ?? '') && !/npm_FAKE/.test(readFileSync(ctr.egress.auditFile, 'utf8')), '审计载荷与出网 JSONL 里都没有令牌值');
   db.close();
 }
 

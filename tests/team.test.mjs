@@ -54,7 +54,9 @@ try {
   let r = await call('GET', '/api/session');
   eq([r.status, r.body.team, r.body.loggedIn], [200, true, false], '会话状态：团队模式、未登录');
   eq(r.body.admins, ['负责人'], '没登录时只告诉你管理员是谁（去找他要令牌），别的一概不给');
-  eq(Object.keys(r.body).sort(), ['admins', 'loggedIn', 'team'], '会话状态接口没有多余字段');
+  // 另给登录页要用的 GitHub 登录开没开（开了才带组织名）与会话时长 —— 都不是秘密
+  eq(Object.keys(r.body).sort(), ['admins', 'github', 'limits', 'loggedIn', 'team'], '会话状态接口没有多余字段');
+  eq([r.body.github.enabled, r.body.github.org, Object.keys(r.body.limits).sort().join()], [false, null, 'idleHours,maxDays'], 'GitHub 登录没开：不给组织名；会话时长只有两个数');
   r = await call('GET', '/');
   eq(r.status, 200, '页面本身能打开（里面没有数据，只有登录框）');
   for (const p of ['/api/tasks', '/api/me', '/api/digest', '/api/projects', '/api/users', '/api/events']) {
@@ -140,26 +142,39 @@ section('7 · 本机模式不变');
 section('7b · 交付凭证与新项目默认放行，都能在页面上做（原来只能改服务器上的 .env / 每个项目各勾一次）');
 {
   const { writeFileSync: wf, readFileSync: rf } = await import('node:fs');
-  const envFile = join(TMP, 'test.env'); wf(envFile, 'OTHER=1\n');
-  const fakeEnv = {};
+  const envFile = join(TMP, 'test.env'); wf(envFile, 'OTHER=1\nGITHUB_TOKEN=ghp_old_env_token\n');
+  const fakeEnv = { GITHUB_TOKEN: 'ghp_old_env_token' };
   const w4 = await startWeb(db, { home: HOME, port: 0, tokenPlain: owner.plaintext, pollMs: 100, team: true, publicUrl: `https://${PUB}`, envFile, env: fakeEnv });
   port = w4.port;
   try {
+    // 交付凭证改成「连接」—— 所有人都能看（部署级的与自己的）、能给自己加；部署级的只有管理员能加；明文只进不出
     const oc = cookieOf(await call('POST', '/api/login', { body: { token: owner.plaintext } }));
     const fc = cookieOf(await call('POST', '/api/login', { body: { token: fe.plaintext } }));
-    let r = await call('GET', '/api/secrets', { headers: { cookie: fc } });
-    eq(r.status, 403, '成员看不了交付凭证');
-    r = await call('GET', '/api/secrets', { headers: { cookie: oc } });
-    eq([r.status, r.body.GITHUB_TOKEN], [200, false], '管理员：未填');
-    r = await call('POST', '/api/secrets', { headers: { cookie: oc }, body: { name: 'GITHUB_TOKEN', value: 'ghp_fake_for_test' } });
-    eq([r.status, r.body.result?.GITHUB_TOKEN], [200, true], '管理员填了 → 已填');
-    assert(!JSON.stringify(r.body).includes('ghp_fake'), '响应里没有回显值');
-    assert(/^GITHUB_TOKEN=ghp_fake_for_test$/m.test(rf(envFile, 'utf8')) && /^OTHER=1$/m.test(rf(envFile, 'utf8')), '写进 .env，别的行不动');
-    eq(fakeEnv.GITHUB_TOKEN, 'ghp_fake_for_test', '当前进程立即生效（交付时读得到）');
-    const au = db.one(`SELECT payload FROM audit_log WHERE action='secret_set' ORDER BY id DESC LIMIT 1`);
-    assert(au && !au.payload.includes('ghp_fake'), '审计只记"填了"，不记值');
-    r = await call('POST', '/api/secrets', { headers: { cookie: oc }, body: { name: 'DEEPSEEK_API_KEY', value: 'x' } });
-    eq(r.status, 400, '只能设 GITHUB_TOKEN（模型 key 走模型设置那一页）');
+    let r = await call('POST', '/api/connections', { headers: { cookie: fc }, body: { action: 'add', kind: 'token', name: '部署令牌', secret: 'ghp_fake_for_test' } });
+    assert(r.status === 400 && /管理员/.test(r.body.error), '成员加不了部署级连接');
+    r = await call('POST', '/api/connections', { headers: { cookie: fc }, body: { action: 'add', kind: 'token', scope: 'mine', name: '我的令牌', secret: 'ghp_member_fake_1234' } });
+    eq([r.status, r.body.result?.hint], [200, '…1234'], '成员给自己加一条：只回 hint');
+    r = await call('POST', '/api/connections', { headers: { cookie: oc }, body: { action: 'add', kind: 'token', name: '部署令牌', secret: 'ghp_fake_for_test', pathGlob: 'acme/*' } });
+    eq(r.status, 200, '管理员加部署级连接');
+    r = await call('GET', '/api/connections', { headers: { cookie: fc } });
+    const names = r.body.rows.map((x) => x.name);
+    assert(names.includes('部署令牌') && names.includes('我的令牌') && names.includes('GITHUB_TOKEN（.env）'), '成员看得到部署级的、自己的、.env 那一条');
+    const envRow = r.body.rows.find((x) => x.fromEnv);
+    assert(envRow.hint === null && !envRow.canRevoke, '成员看不到 .env 令牌的末 4 位、清不掉它');
+    r = await call('GET', '/api/connections', { headers: { cookie: oc } });
+    assert(!JSON.stringify(r.body).includes('ghp_fake_for_test') && !JSON.stringify(r.body).includes('ghp_member_fake') && !JSON.stringify(r.body).includes('ghp_old_env'), '列表里没有任何明文');
+    eq(r.body.prefixes, ['superintern/', 'v0/'], '页面上能说清系统只推哪些分支');
+    const au = db.all(`SELECT payload FROM audit_log WHERE action IN ('credential_added','secret_set')`).map((x) => x.payload).join('\n');
+    assert(!au.includes('ghp_fake') && !au.includes('ghp_member'), '审计不记值');
+    r = await call('POST', '/api/connections', { headers: { cookie: fc }, body: { action: 'revoke', id: 'env:GITHUB_TOKEN' } });
+    eq(r.status, 403, '成员清不掉 .env 里的 GITHUB_TOKEN');
+    r = await call('POST', '/api/connections', { headers: { cookie: oc }, body: { action: 'revoke', id: 'env:GITHUB_TOKEN' } });
+    eq(r.status, 200, '管理员清掉 .env 里的 GITHUB_TOKEN');
+    assert(!/^GITHUB_TOKEN=./m.test(rf(envFile, 'utf8')) && /^OTHER=1$/m.test(rf(envFile, 'utf8')) && !fakeEnv.GITHUB_TOKEN, '写回 .env（别的行不动），当前进程立即生效');
+    r = await call('POST', '/api/connections', { headers: { cookie: fc }, body: { action: 'check', remote: join(TMP, 'no-such-remote.git') } });
+    eq([r.status, r.body.result?.local, r.body.result?.canRead], [200, true, false], '预检：读不了的远端如实说读不了');
+    r = await call('POST', '/api/connections', { headers: { cookie: fc }, body: { action: 'check', remote: '--upload-pack=evil' } });
+    eq(r.status, 400, '预检的远端地址不许以 - 开头（git 选项注入）');
 
     const { addSource } = await import('../src/core/egress.mjs');
     const src = addSource(db, { name: '清华 PyPI', hosts: ['pypi.tuna.tsinghua.edu.cn'], userId: owner.userId });
@@ -183,6 +198,29 @@ section('8 · 运行健康：容器运行时不在，看板说出来');
     const r = await call('GET', '/api/tasks', { host: '127.0.0.1' });
     eq([r.status, r.body.runtime?.ok, r.body.runtime?.why], [200, false, 'failed to connect to the docker API'], '任务列表带上运行时状态（页面据此在顶部报警）');
   } finally { await w3.close?.(); }
+}
+
+section('9 · 同一台机器上两个看板：cookie 按主机名分、不按端口分，不能串');
+{
+  // 对外地址带端口的团队看板：cookie 名带上端口，另一个端口上的看板发的 si_token 它不认，它发的别的看板也收不到同名的
+  const w5 = await startWeb(db, { home: HOME, port: 0, tokenPlain: owner.plaintext, pollMs: 60_000, team: true, publicUrl: 'http://localhost:7560' });
+  port = w5.port;
+  try {
+    let r = await call('POST', '/api/login', { host: 'localhost:7560', body: { token: fe.plaintext } });
+    const c5 = cookieOf(r);
+    eq(c5.split('=')[0], 'si_token_7560', '对外地址带端口 → cookie 名 si_token_7560');
+    r = await call('GET', '/api/me', { host: 'localhost:7560', headers: { cookie: c5 } });
+    eq([r.status, r.body.id], [200, fe.userId], '带自己的 cookie 照常认');
+    r = await call('GET', '/api/me', { host: 'localhost:7560', headers: { cookie: `si_token=${c5.split('=')[1]}` } });
+    eq(r.status, 401, '同名不同端口的 cookie（别的看板的）不认');
+  } finally { await w5.close?.(); }
+  // 本机模式不发 cookie，也不读：浏览器里留着同一主机上团队看板的 cookie，本机看板照样是起看板的人（原来 401、弹出登录页）
+  const w6 = await startWeb(db, { home: HOME, port: 0, tokenPlain: owner.plaintext, pollMs: 60_000 });
+  port = w6.port;
+  try {
+    const r = await call('GET', '/api/me', { host: '127.0.0.1', headers: { cookie: 'si_token=belongs-to-another-board' } });
+    eq([r.status, r.body.id], [200, owner.userId], '本机模式忽略 cookie：仍是起看板的人');
+  } finally { await w6.close?.(); }
 }
 
 db.close();

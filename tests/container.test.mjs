@@ -1,5 +1,6 @@
 // 回归：ContainerExecutor —— 容器沙箱的验收
 //
+// @needs: docker
 // 跑：node tests/container.test.mjs
 // 前置：装了 docker 或 podman 且 daemon 在跑；镜像 superintern/sandbox:v0.1 已构建
 //       （docker build -t superintern/sandbox:v0.1 sandbox/）
@@ -297,6 +298,38 @@ section('7. C4 任务间零共享');
   const listed = listSandboxes(rt.cli);
   assert(listed.some((s) => s.taskId === 't_ctrtest_a') && listed.some((s) => s.taskId === 't_ctrtest_b'),
     `按 label 列得出遗留沙箱（当前 ${listed.length} 个）—— 崩溃后能清扫`);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+section('7b. 工作区的 .git 只读：沙箱写不了钩子和仓库配置');
+// ═══════════════════════════════════════════════════════════════════════════
+// 宿主上的 git 会读 .git 里的钩子和配置（core.fsmonitor 等能执行命令）。沙箱写得了 .git = 能在宿主上跑命令。
+
+{
+  const wsG = mkws('task-g');
+  const g = (...a) => execFileSync('git', a, { cwd: wsG, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+  g('init', '-q', '-b', 'main');
+  writeFileSync(join(wsG, 'f.txt'), 'v1');
+  g('add', '-A'); g('-c', 'user.name=x', '-c', 'user.email=x@x', 'commit', '-q', '-m', 'init');
+
+  // 按旧规矩（没有 policy 标签）起着的同名容器：start 要删了重建，不能复用
+  const ctrG = new ContainerExecutor({ taskId: 't_ctrtest_g' });
+  execs.push(ctrG);
+  execFileSync(rt.cli, ['run', '-d', '--name', ctrG.name, '--label', 'superintern.task=t_ctrtest_g', '-v', `${wsG}:/workspace`, SANDBOX_IMAGE, 'sleep', 'infinity'], { stdio: 'ignore' });
+  const info = await ctrG.start(wsG);
+  eq(info.how, 'created', '旧规矩起的容器被删了重建（复用就会留着可写的 .git）');
+
+  const w = async (code) => (await ctrG.execute({ file: 'node', args: ['-e', code] }, wsG, {})).stdout;
+  has(await w('try{require("node:fs").writeFileSync(".git/hooks/pre-commit","#!/bin/sh\\necho pwned");console.log("WROTE")}catch(e){console.log("DENIED:"+e.code)}'),
+    'DENIED', '沙箱里写 .git/hooks 由内核拒');
+  has(await w('try{require("node:fs").appendFileSync(".git/config","\\n[core]\\n\\tfsmonitor = touch /tmp/x\\n");console.log("WROTE")}catch(e){console.log("DENIED:"+e.code)}'),
+    'DENIED', '沙箱里改 .git/config 由内核拒');
+  const cfg = await ctrG.execute({ file: 'git', args: ['config', 'core.fsmonitor', 'touch /tmp/x'] }, wsG, {});
+  assert(cfg.code !== 0, `沙箱里 git config 写不进去（退出码 ${cfg.code}）`);
+  has(await w('require("node:fs").writeFileSync("f.txt","v2");console.log("WROTE")'), 'WROTE', '工作区其余部分照常可写');
+  const st = await ctrG.execute({ file: 'git', args: ['status', '--porcelain'] }, wsG, {});
+  has(st.stdout, 'f.txt', '沙箱里 git status 照常能用（看得到改动）');
+  assert(!readFileSync(join(wsG, '.git', 'config'), 'utf8').includes('fsmonitor'), '宿主上的 .git/config 没被改');
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

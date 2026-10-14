@@ -29,11 +29,15 @@
 import { routeQuestion, requireAuthorized } from './routing.mjs';
 import { ANSWER_GUARDS } from './answers.mjs';
 import { now, newId, audit, insertEdge } from '../db/db.mjs';
-import { getParam, getProjectParam, setProjectParam } from './params.mjs';
+import { getParam, getProjectParam, setProjectParam, writeParam } from './params.mjs';
 import { budgetState, raiseProjectBudget, BUDGET_KEY } from './project-settings.mjs';
+import { spendBreach, raiseMonthlyBudget } from './spend.mjs';
 import { egressDenialStateOf } from './egress.mjs';
 import { tl, contentLang, N_, I18nError } from '../i18n/index.mjs';
+import { diagnosisBlock } from './diagnose.mjs';
 import { markOf } from '../i18n/marks.mjs';
+import { transition } from '../db/state.mjs';
+import { insertQuestion } from './questions.mjs';
 
 // 用 N_ 登记过的原文（label / advice / 层级名）按变量查：抽取器只认字面量，所以不写成 tl(L, 变量)。
 const tlN = tl;
@@ -75,7 +79,9 @@ export const LIMITS = {
     // ⚠️ 是**累计运行时长**，不是"建任务到现在"的挂钟。挂起等人是这个系统的正常
     // 状态，可能等三天；按墙上时钟算，每一个提过问题的任务最终都会被自己的闸门打死,
     // 而那是在惩罚人回得慢。所以只累加编排器真正在跑的那些区间。
-    read: (db, taskId, ctx) => priorRuntimeMs(db, taskId) + (now() - (ctx?.startedAt ?? now())),
+    // 本次寿命已经跑了多久：编排器传进来的单调秒表；没给（看板读数）就是 0
+    // 只给了起点时刻的调用方（老接口）退回墙钟差，并夹到 ≥0 —— 墙钟往回拨时不会算出负的时长
+    read: (db, taskId, ctx) => priorRuntimeMs(db, taskId) + (ctx?.elapsed ? ctx.elapsed() : ctx?.startedAt ? Math.max(0, now() - ctx.startedAt) : 0),
   },
   'limit.llm_calls': {
     on_hit: 'gate',
@@ -124,17 +130,8 @@ export const LIMITS = {
   'limit.context_tokens': {
     on_hit: 'gate',
     def: 150_000, label: N_('单次请求上下文长度'), fmt: (n, lang = 'zh') => `${(n / 1000).toFixed(1)}k ${lang === 'en' ? 'tokens' : 'token'}`,
-    // ── 为什么补这一维 ──────────────
-    // 实测：节点上下文峰值 106k / 200k 窗口 = 53%，从没触发过 75% 驱逐阈值。
-    // 也就是说**上下文压缩现在没有证据支撑**，不该做。
-    //
-    // 但同一组数照出了另一件事：现在挡住上下文爆掉的是 `maxIterations=20`——
-    // 每次工具调用约涨 6.2k，17 次到 106k，20 次约 125k。把 maxIterations 调到 30
-    // （对更难的任务是完全合理的动作）就是约 190k，直接撞窗口。
-    // **那是一道意外的护栏：它挡住了一个它并不知道自己在挡的东西。**
-    // 它没有名字、没有断言、不在这张表里，改它的人不会知道自己同时改掉了
-    // 上下文天花板；撞上之后的表现是厂商 400 或 stopped='context_exceeded'，
-    // 归因方向指向"请求构造错了"。这一维就是给那道无名护栏一个名字。
+    // 请求上下文可能随工具调用持续增长，需要独立上限，不能只靠迭代次数限制。
+    // 自动压缩用于托底，仍然超限时应先拆分步骤，再考虑提高上限。
     //
     // 150k = 200k 窗口的 75%（驱逐阈值），是**没有模型信息时的保守常数**。
     // 按模型封顶：MODEL_CATALOG[key].contextWindow 填了（只填厂商文档核实过的）就取
@@ -145,7 +142,17 @@ export const LIMITS = {
     // 不用"全任务历史峰值"：某个节点峰过一次不该永久毒化这个任务 ——
     // 那和 node_retries 不同，重试次数是节点的持久属性，上下文峰值是一个过去的瞬间。
     read: (_db, _taskId, ctx) => ctx?.peakContextTokens ?? 0,
-    advice: N_('建议：上下文达到上限时，通常不应选择 (A) 提高上限。\n某类步骤频繁达到上下文上限，说明规划粒度过粗，应在细化步骤时将其拆小，而不是依赖压缩上下文。\n请先判断该步骤能否拆成两步；确实无法拆分时（例如必须一次读完一份大规格）再提高上限，并确认所分配模型的上下文窗口足够（本上限不随模型自动调整）。'),
+    advice: N_('建议：上下文达到上限时，通常不应选择 (A) 提高上限。\n某类步骤频繁达到上下文上限，说明规划粒度过粗，应在细化步骤时将其拆小；自动整理只是托底，整理之后仍然超限说明这一步装不下。\n请先判断该步骤能否拆成两步；确实无法拆分时（例如必须一次读完一份大规格）再提高上限，并确认所分配模型的上下文窗口足够（本上限不随模型自动调整）。'),
+  },
+  'limit.compact_tokens': {
+    // 上下文整理（托底）。撞到它**不触顶、不提问**：先整理再继续（on_hit='compact'，checkLimits 跳过）。
+    // 默认 120k：实际运行峰值 106k，略高于它，正常运行不触发；又低于 context_tokens 的 150k。
+    // 生效值 = min(这里的值, 生效的 context 上限 × 0.8)，见 compactThresholdOf。0 = 关闭（撞到 context 上限就作废重来）。
+    on_hit: 'compact', allowZero: true,
+    def: 120_000, label: N_('自动整理线'),
+    fmt: (n, lang = 'zh') => (n === 0 ? (lang === 'en' ? 'off' : '关闭') : `${(n / 1000).toFixed(1)}k ${lang === 'en' ? 'tokens' : 'token'}`),
+    // "用量"是这个任务整理过几次（看板上限栏显示）
+    read: (db, taskId) => db.one(`SELECT count(*) n FROM audit_log a JOIN nodes n ON n.id=a.target_id WHERE a.action='context_compacted' AND a.target_type='node' AND n.task_id=?`, taskId)?.n ?? 0,
   },
   // 不设 'limit.egress.groups'（放行几类软件源的上限）：它拦的是人自己的放行动作（名单只有人能改），
   // 再让同一个人确认一遍；数量也表达不了风险（npm+GitHub 与 PyPI+crates 都是 2 类）。放行哪些由项目联网的勾选表达。
@@ -256,14 +263,47 @@ export const projectLimits = (db, projectId, lang = 'zh') => Object.entries(LIMI
  */
 export function setProjectLimit(db, { projectId, key, value, userId }) {
   if (!LIMITS[key]) throw new I18nError('上限项无效：{key}（应为 {keys}）', { key, keys: Object.keys(LIMITS).join(' / ') });
-  if (value !== null && !(Number.isFinite(Number(value)) && Number(value) > 0)) throw new I18nError('{label}：值要是正数（清空则回落到部署默认）', { label: tlN(contentLang(db), LIMITS[key].label) });
+  const zeroOk = !!LIMITS[key].allowZero;
+  if (value !== null && !(Number.isFinite(Number(value)) && (Number(value) > 0 || (zeroOk && Number(value) === 0)))) {
+    const label = tlN(contentLang(db), LIMITS[key].label);
+    if (zeroOk) throw new I18nError('{label}：值要是正数，或 0（关闭）；清空则回落到部署默认', { label });
+    throw new I18nError('{label}：值要是正数（清空则回落到部署默认）', { label });
+  }
   const v = value === null ? null : Number(value);
+  if (v) checkCompactAgainstContext(db, { key, value: v, compact: key === 'limit.compact_tokens' ? v : projectValue(db, projectId, 'limit.compact_tokens'), context: key === 'limit.context_tokens' ? v : projectValue(db, projectId, 'limit.context_tokens') });
   return db.tx(() => {
     const id = setProjectParam(db, { projectId, key, value: v, by: { kind: 'user', id: userId }, governance: 'constitutional' });
     audit(db, { actorKind: 'user', actorId: userId, action: 'project_limit_set', targetType: 'project', targetId: projectId,
       payload: { key, value: v, cleared: v === null } });
     return id;
   });
+}
+
+const projectValue = (db, projectId, key) => paramLimit(getProjectParam(db, projectId, key)) ?? LIMITS[key].def;
+/**
+ * 保存时校验：设整理线时，它要低于上下文上限，否则整理永远轮不到 —— 撞到上下文上限就作废重来了。
+ * 0（关闭）不查。**改上下文上限时不查**：调低上下文上限是正当操作，运行时整理线自动压到它的八成（compactThresholdOf）。
+ */
+function checkCompactAgainstContext(db, { key, compact, context }) {
+  if (key !== 'limit.compact_tokens') return;
+  if (!compact || !context || compact < context) return;
+  const L = contentLang(db), f = LIMITS['limit.context_tokens'].fmt;
+  throw new I18nError('自动整理线（{compact}）要低于单次请求上下文上限（{context}）：不然整理永远轮不到，撞到上下文上限这一步就作废重来了', { compact: f(compact, L), context: f(context, L) });
+}
+
+/** 整理线比生效的上下文上限低多少：留出一轮工具结果的余量（一轮最多涨约 30k）。 */
+export const COMPACT_CONTEXT_RATIO = 0.8;
+/**
+ * 自动整理线的**生效值**：人设的 / 默认的，再压到生效的上下文上限 × 0.8 以内（上下文上限本身已按模型窗口的 75% 封顶）。
+ * 返回 { at, set, source, context }：at = null 表示关闭；source = 'off' | 'param' | 'default' | 'context' | 'model'。
+ */
+export function compactThresholdOf(db, taskId, { contextWindow = null } = {}) {
+  const chain = limitChain(db, taskId, 'limit.compact_tokens');
+  const ctx = contextCapOf(db, taskId, { contextWindow });
+  if (!chain.value) return { at: null, set: 0, source: 'off', context: ctx };
+  const byContext = Math.floor(ctx.cap * COMPACT_CONTEXT_RATIO);
+  if (byContext < chain.value) return { at: byContext, set: chain.value, source: ctx.source === 'model' ? 'model' : 'context', context: ctx };
+  return { at: chain.value, set: chain.value, source: chain.source === 'deploy' ? 'default' : 'param', context: ctx };
 }
 
 /** 窗口的多少作为上限：75% 驱逐阈值。 */
@@ -287,6 +327,7 @@ export function contextCapOf(db, taskId, { contextWindow = null } = {}) {
  */
 export function checkLimits(db, taskId, ctx = {}) {
   for (const [key, d] of Object.entries(LIMITS)) {
+    if (d.on_hit === 'compact') continue;   // 整理线不是上限：撞到它先整理再继续
     const limit = limitOf(db, taskId, key);
     const actual = d.read(db, taskId, ctx);
     if (actual >= limit) {
@@ -305,6 +346,13 @@ export function checkLimits(db, taskId, ctx = {}) {
         human: tl(contentLang(db), '项目累计花费已达预算闸：{state}', { state: b.human }) };
     }
   }
+  // 按人 / 按部署的月度预算：再往外两层，同样排在任务自己的闸门之后
+  const sb = spendBreach(db, taskId);
+  if (sb && sb.scope !== 'project') {
+    const L = contentLang(db);
+    return { key: `monthly_budget.${sb.scope}`, ...sb, label: sb.scope === 'person' ? N_('个人月度预算') : N_('部署月度预算'),
+      human: tl(L, '{what}已达上限：本月已花 {spent}，预算 {cap}', { what: tl(L, sb.scope === 'person' ? '个人月度预算' : '部署月度预算'), spent: fmtUsd(sb.actual), cap: fmtUsd(sb.limit) }) };
+  }
   return null;
 }
 
@@ -315,14 +363,12 @@ export function setLimit(db, { taskId, key, value, userId }) {
   if (!LIMITS[key]) throw new I18nError('上限项无效：{key}（应为 {keys}）', { key, keys: Object.keys(LIMITS).join(' / ') });
   // 上限是"预算上限"决策类型：谁能改查路由表，不查 role —— 否则旋钮可调但不生效。
   if (userId) requireAuthorized(db, { taskId, decisionType: 'budget', userId });
+  const n = Number(value);
+  if (!Number.isFinite(n) || n < 0) throw new I18nError('{label}：值要是非负数', { label: tlN(contentLang(db), LIMITS[key].label) });
+  if (n) checkCompactAgainstContext(db, { key, compact: key === 'limit.compact_tokens' ? n : limitOf(db, taskId, 'limit.compact_tokens'), context: key === 'limit.context_tokens' ? n : limitOf(db, taskId, 'limit.context_tokens') });
   const t = now();
   return db.tx(() => {
-    db.run(`UPDATE params SET superseded_at=?, valid_to=? WHERE task_id=? AND key=? AND superseded_at IS NULL`,
-      t, t, taskId, key);
-    const id = newId('p');
-    db.run(`INSERT INTO params (id,task_id,key,value,layer,governance_class,set_by_kind,set_by_id,
-              valid_from,recorded_at) VALUES (?,?,?,?,'task','constitutional','user',?,?,?)`,
-      id, taskId, key, JSON.stringify(value), userId, t, t);
+    const id = writeParam(db, { taskId, key, value, by: { kind: 'user', id: userId }, governance: 'constitutional', at: t });
     audit(db, { actorKind: 'user', actorId: userId, action: 'limit_set',
       targetType: 'task', targetId: taskId, payload: { key, value } });
     return id;
@@ -368,12 +414,18 @@ ANSWER_GUARDS.budget = (db, { question, body }) => {
 };
 
 export function raiseLimitQuestion(db, { taskId, nodeId = null, breach }) {
+  // 按人 / 部署月度预算：一个人一个月一条、部署一个月一条，发给管理员
+  if (breach.scope === 'person' || breach.scope === 'deployment') {
+    const q = raiseMonthlyBudget(db, { taskId, breach });
+    transition(db, 'tasks', taskId, 'waiting');
+    return { questionId: q.questionId, text: q.text ?? null, reused: !!q.existed };
+  }
   // 同一任务、同一项上限已经有一条开着的事项：不再挂第二条（否则同一条"单步骤重试次数已达上限"会挂出好几条）
   if (breach.scope !== 'project') {
     const open = db.all(`SELECT id, text FROM questions WHERE task_id=? AND decision_type='budget' AND status IN ('open','escalated') ORDER BY asked_at`, taskId)
       .find((q) => limitKeyOf(db, q.id) === breach.key);
     if (open) {
-      db.run(`UPDATE tasks SET status='waiting' WHERE id=?`, taskId);
+      transition(db, 'tasks', taskId, 'waiting');
       return { questionId: open.id, text: open.text, reused: true };
     }
   }
@@ -381,7 +433,7 @@ export function raiseLimitQuestion(db, { taskId, nodeId = null, breach }) {
   // 而且一个项目只报一次 —— 每个任务各报一条会把收件箱刷满）。冻住任务这一步在下面统一做。
   if (breach.scope === 'project') {
     const q = raiseProjectBudget(db, { projectId: breach.projectId, taskId });
-    db.run(`UPDATE tasks SET status='waiting' WHERE id=?`, taskId);
+    transition(db, 'tasks', taskId, 'waiting');
     return { questionId: q.questionId, text: q.text ?? null };
   }
   const t = now();
@@ -399,9 +451,15 @@ export function raiseLimitQuestion(db, { taskId, nodeId = null, breach }) {
   const from = chain.source === 'task' ? tl(L, '本任务单独设过')
     : chain.source === 'project' ? tl(L, '本项目的默认值（部署默认是 {deploy}）', { deploy: LIMITS[breach.key].fmt(chain.deploy, L) })
       : tl(L, '部署默认（本项目与本任务都没有单独设过）');
+  // 单步骤重试撞顶：附上那一步的诊断与还剩的缺陷 —— 人要知道是停滞、反复，还是卡在环境上，处置完全不同。
+  // 调用方没给步骤时取重试次数最多的那一步（这一维本来就是按它算的）
+  const retryNode = breach.key === 'limit.node_retries'
+    ? (nodeId ?? db.one(`SELECT id FROM nodes WHERE task_id=? ORDER BY retry_count DESC, id LIMIT 1`, taskId)?.id ?? null) : null;
+  const diag = retryNode ? diagnosisBlock(db, retryNode, L) : '';
   const text = `${markOf(L, 'limit')}${breach.human}\n\n`
     + `${tl(L, '这个上限来自：{from}。', { from })}\n`
     + `${tl(L, '任务已暂停，不再消耗资源。本事项由系统直接生成，未调用模型。')}\n\n`
+    + (diag ? `${diag}\n\n` : '')
     + (advice ? `${advice}\n\n` : '')
     // 选项并列摆着，人会以为"回个字母"就是完成了操作 —— 把"操作在任务页上"放到选项前面
     + `${tl(L, '**在这里回复只是确认，真正的操作在任务页上**：要继续，先去任务页最下面的「上限」把「{name}」那一行调高并保存，再回 A；不跑了，就去任务页点「中止」。', { name })}\n\n`
@@ -430,13 +488,11 @@ export function raiseLimitQuestion(db, { taskId, nodeId = null, breach }) {
   return db.tx(() => {
     // Ⅲ 级：无默认动作、无超时。库层 CHECK 也会这么要求 —— 这里写死是为了
     // 让"硬规则定级"这件事在代码里看得见，不是靠 CHECK 兜底才碰巧对。
-    db.run(`INSERT INTO questions (id,task_id,node_id,level,level_source,text,default_action,
-              asked_at,timeout_at,status) VALUES (?,?,?,3,'hard_rule',?,NULL,?,NULL,'open')`,
-      id, taskId, nodeId, text, t);
+    insertQuestion(db, { id, taskId, nodeId, level: 3, text, askedAt: t });
     if (origin) insertEdge(db, id, origin, 'derived_from', t);
     if (nodeId) insertEdge(db, id, nodeId, 'about_node', t);
     routeQuestion(db, { questionId: id, decisionType: 'budget', typeSource: 'hard_rule', at: t });
-    db.run(`UPDATE tasks SET status='waiting' WHERE id=?`, taskId);
+    transition(db, 'tasks', taskId, 'waiting');
     audit(db, { actorKind: 'system', action: 'limit_breached', targetType: 'task', targetId: taskId,
       payload: { pid: process.pid, questionId: id, nodeId, ...breach } });
     return { questionId: id, text };

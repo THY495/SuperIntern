@@ -11,6 +11,7 @@
 
 import { execFile } from 'node:child_process';
 import { tl } from '../i18n/index.mjs';
+import { monoNow } from './clock.mjs';
 
 // why 显示在看板顶部的提示条与通知里：按 lang 写（调用方传内容语言；可以是函数，每次探测时再取，改了设置不用重启）。
 const langOf = (lang) => (typeof lang === 'function' ? lang() : lang);
@@ -47,14 +48,15 @@ export function makeRuntimeHealth({ ttlMs = 30_000, lang = 'zh', probe = () => p
   let last = null, pending = null, downSince = null;
   const refresh = () => {
     // downSince：从哪一刻起不在（页面上写"发现于几点"：没有时间就判断不了是不是已经等太久了）
-    const keep = (r) => { downSince = r.ok ? null : (downSince ?? r.checkedAt); last = { ...r, downSince }; return last; };
+    // 缓存是否过期用单调时钟判；checkedAt 照旧是给人看的时间戳
+    const keep = (r) => { downSince = r.ok ? null : (downSince ?? r.checkedAt); last = { ...r, downSince, checkedMono: monoNow() }; return last; };
     if (!pending) pending = probe().then(keep, (e) => keep({ ok: false, why: String(e.message), checkedAt: Date.now() }))
       .finally(() => { pending = null; });
     return pending;
   };
   return {
-    current() { if (!last || Date.now() - last.checkedAt > ttlMs) refresh(); return last; },
-    async fresh() { if (!last || Date.now() - last.checkedAt > ttlMs) await refresh(); return last; },
+    current() { if (!last || monoNow() - last.checkedMono > ttlMs) refresh(); return last; },
+    async fresh() { if (!last || monoNow() - last.checkedMono > ttlMs) await refresh(); return last; },
     refresh,
   };
 }

@@ -16,7 +16,10 @@ import { CACHE_FLOORS } from '../llm/canonical.mjs';
 import { relevantDecisions, renderDecisions, scopeHints, overruledContractRules, renderOverruled } from '../core/decisions.mjs';
 import { egressContext } from '../core/egress.mjs';
 import { getParam } from '../core/params.mjs';
-import { parallelText } from '../core/parallel.mjs';
+import { parallelText, lockedPathsFor, coveredBy } from '../core/parallel.mjs';
+import { PREVIEW_FILE } from '../core/preview.mjs';
+import { uiChecksOf } from '../db/nodes.mjs';
+import { testsAllowedFor } from '../core/test-guard.mjs';
 
 /**
  * 粗略 token 估算。中英混排按 3.5 字符/token——只用于装配审计与缓存门槛校验，
@@ -98,6 +101,24 @@ function verifyGateText(db, taskId) {
       : '');
 }
 
+/**
+ * 界面条目：验收员会把应用跑起来、在页面上逐条点验。执行器要知道两件事：验收看的是页面上的结果，不是代码；
+ * 应用怎么起由仓库根的 si-preview.json 说了算（没有就得写 —— 交接时机械检查；并行模块任务里它归骨架，只读）。
+ */
+function uiChecksText(db, taskId, node) {
+  const ui = uiChecksOf(node);
+  if (!ui.length) return '';
+  const locked = coveredBy(PREVIEW_FILE, lockedPathsFor(db, taskId));
+  return `
+
+## 界面条目（验收员会把应用跑起来，在页面上逐条点验）
+${ui.map((x, i) => `${i + 1}. ${x}`).join('\n')}
+
+验收员照仓库根的 ${PREVIEW_FILE} 起服务、开页面${locked
+    ? `。本任务里这份文件归骨架维护、只读；照它能起来的样子做，起不来就在交接记录的 known_issues 里写明。`
+    : `：交接前它必须在、而且照它能把应用起起来（start 起后端 / 前端的命令，每条一个后台进程、监听 127.0.0.1；url 前端地址；ready 后端一个返回 200 的地址；seed 可选的样例数据命令；pages 要看的页）。没有它，交接会被拒收。`}`;
+}
+
 export function assembleExecutor(db, { taskId, nodeId, tier, vendorId, maxIterations = 20, recipe = 'executor/v0-four-part' }) {
   const node = db.one(`SELECT * FROM nodes WHERE id=? AND task_id=?`, nodeId, taskId);
   if (!node) throw new Error(`节点不存在或不属于该任务：${nodeId}`);
@@ -153,7 +174,9 @@ ${node.spec}
 ## 验收标准
 ${node.acceptance}
 
-验收标准是**机械判定**的：你要么让它成立，要么说清为什么不成立。不要自己放宽它。`;
+验收标准是**机械判定**的：你要么让它成立，要么说清为什么不成立。不要自己放宽它。
+验收标准、仓库里原有的测试、规格之间互相冲突，怎么做都满足不了全部时：**不要改测试去迁就实现**，
+调用 raise_question（kind=impossible），引出冲突各方的原文、写清你试过的做法，由人决定改哪一方。${uiChecksText(db, taskId, node)}`;
 
   // ── 段③：依赖节点的交接记录 ─────────────────────────────────────────
   // 走 edges 取依赖，不在 nodes 表留关系副本。上游没完成就没有交接记录可读——
@@ -238,7 +261,30 @@ ${resume.answer
 这条答复**具有指令效力**（指令效力只授予认证通道）。它推翻简报里与之
 冲突的计划。照它做，不要再就同一件事重新提问。`
     : `⚠️ 尚无答复。问题状态 ${resume.question.status}${resume.question.default_action
-      ? `，超时默认动作是：${resume.question.default_action}` : ''}。`}`;
+      ? `，超时默认动作是：${resume.question.default_action}` : ''}。`}${(() => {
+      // 人答复时一并放行了这一步对原有测试的改动 —— 明说放行了哪几个（只有这几个），免得它把一句答复当成"测试随便改"
+      const allowed = [...testsAllowedFor(db, nodeId)];
+      return allowed.length ? `\n\n## 人已放行的测试改动\n\n人允许你这一步改这几个任务开始前就有的测试：${allowed.map((p) => `\`${p}\``).join('、')}。`
+        + '只限这几个文件；改的时候照答复的意思改，别的原有测试照旧不动。' : '';
+    })()}`;
+  }
+
+  // ── 段③″：上一次没收尾────────────────────────────────────────────
+  // 这一步上一次跑到头 / 崩溃 / 被掐停，没交接也没提问：上一次的对话丢了，写进工作区的文件还在。
+  // 不说的话，重开的执行器看见一堆来历不明的改动（"查不到来源"），要么当成别人的不敢动，要么白白重写。
+  const unfinished = lastUnfinished(db, nodeId);
+  let seg3u = null;
+  if (unfinished) {
+    const why = { node_stalled: `跑满了轮次也没交接`, node_crashed: `进程中途出错退出`, node_aborted: `被上限掐停` }[unfinished.action];
+    const left = unfinished.left ?? null;
+    seg3u = `# 这一步上一次没做完
+
+上一次做这一步时${why}，被退回重来。上一次的对话没有留下，但它写进工作区的文件都还在。
+${left === null ? '工作区里没提交的改动多半就是上一次的你留下的。' : left.length
+    ? `当时工作区里（相对这一步开始时）有这些改动，是**上一次的你**留下的，不是别人的：\n${left.map((p) => `- \`${p}\``).join('\n')}`
+    : '当时工作区里还没有改动。'}
+先读一读现状：能用的接着做，不对的改掉或删掉；不要当成来历不明的东西绕开，也不要不看就从头重写。${unfinished.narrativeRef ? `
+上一次的完整过程（每一次工具调用与结果）在 \`${unfinished.narrativeRef}\`，需要时 grep。` : ''}`;
   }
 
   // ── 段④：按需检索区 ───────────────────────────────────────────────────
@@ -255,7 +301,7 @@ ${resume.answer
 ## 你的轮次预算
 
 最多 ${maxIterations} 轮工具调用。到点还没调用 submit_handoff 或 raise_question，
-本节点算**未收尾**，退回重来——之前做的活不算数。所以：先把边界之内的事做完并交接，
+本节点算**未收尾**，退回重来——这一次的对话丢掉，只有写进工作区的文件留下。所以：先把边界之内的事做完并交接，
 **不要顺手去做别的节点的活**，也不要在收不了尾的时候硬撑到最后一轮。`;
 
   // ── 缓存断点决策 ───────────────────────────────────────────────────
@@ -263,7 +309,7 @@ ${resume.answer
   // **静默失效**：请求成功、无警告、命中恒为 0，看起来就像"这家不支持缓存"。
   // 所以这里宁可不挂断点，也要把"为什么没挂"记进装配审计——省钱要能被审计，
   // 不能只是一个看起来很合理的配方。
-  const stable = seg1 + seg2 + seg3 + (seg3r ?? '');
+  const stable = seg1 + seg2 + seg3 + (seg3r ?? '') + (seg3u ?? '');
   const stableTokens = estimateTokens(stable);
   const floor = CACHE_FLOORS[vendorId] ?? Infinity;
   const cacheStable = stableTokens >= floor;
@@ -312,6 +358,7 @@ ${resume.answer
     { type: 'text', text: seg3, cache: false },
   ];
   if (seg3r) blocks.push({ type: 'text', text: seg3r, cache: false });
+  if (seg3u) blocks.push({ type: 'text', text: seg3u, cache: false });
   blocks[blocks.length - 1].cache = cacheStable;   // ← 断点
   // ← 断点之后。收件箱是易变段：一条新消息不该让整个缓存前缀作废。
   if (segInbox) blocks.push({ type: 'text', text: segInbox });
@@ -329,6 +376,18 @@ ${resume.answer
 }
 
 /**
+ * 上下文整理重建出来的上下文也是一次装配：记一条，配方 `<role>+compact`，条目是首条消息 / 事实 / 简报 / 保留的几轮。
+ * 返回装配 id（写进 context_compacted 审计）。
+ */
+export function recordCompactionAssembly(db, { role, tier, nodeId, items, tokenEstimate }) {
+  const v = db.one(`SELECT c.version FROM nodes n JOIN constitutions c ON c.task_id=n.task_id AND c.superseded_at IS NULL WHERE n.id=? ORDER BY c.version DESC LIMIT 1`, nodeId)?.version ?? 0;
+  const id = newId('ca');
+  db.run(`INSERT INTO context_assemblies (id,ts,role,recipe,constitution_version,model_tier,items,token_estimate) VALUES (?,?,?,?,?,?,?,?)`,
+    id, now(), role, `${role}+compact`, v, tier ?? '-', JSON.stringify(items), Math.round(tokenEstimate));
+  return id;
+}
+
+/**
  * 取本节点最近一次挂起留下的复工简报，连同它的问题与（若有）答复。
  *
  * 答复不从 questions 表读——问题表只记状态，答复正文住在 inbox（`messages`），
@@ -336,6 +395,15 @@ ${resume.answer
  * 而 `messages` 是唯一带 token_id / trust_label 的表。让装配层从这里读，
  * "谁说的、凭什么算数"才是可查的，而不是一个没有出处的 TEXT 字段。
  */
+/** 这一步最近一次执行器收场是不是"没收尾"（跑到头 / 崩溃 / 被掐停）；是的话给出留下的文件与叙事路径 */
+function lastUnfinished(db, nodeId) {
+  const r = db.one(`SELECT action, payload FROM audit_log WHERE target_id=? AND action IN ('node_stalled','node_crashed','node_aborted','node_done','question_raised','handoff_rejected')
+                    ORDER BY id DESC LIMIT 1`, nodeId);
+  if (!r || !['node_stalled', 'node_crashed', 'node_aborted'].includes(r.action)) return null;
+  let p = {}; try { p = JSON.parse(r.payload ?? '{}'); } catch { /* 坏行：照样说没收尾，不给清单 */ }
+  return { action: r.action, left: Array.isArray(p.left) ? p.left : null, narrativeRef: p.narrativeRef ?? null };
+}
+
 function loadResume(db, nodeId) {
   const briefing = db.one(
     `SELECT * FROM briefings WHERE node_id=? AND superseded_at IS NULL ORDER BY recorded_at DESC LIMIT 1`,

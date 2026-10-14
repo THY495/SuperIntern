@@ -1,19 +1,20 @@
 // 交付与签收：任务 done 之后，把分支推到远端、开 PR、由人签收。
 //
 // 设计：agent 提交"完成声明 + 终版报告"，人可接受或打回；**高风险任务强制人工签收**；
-// 典型场景 = 存量 repo + issue → 测试通过的分支 / PR + 人工签收。
+// v1 验收场景 = 存量 repo + issue → 测试通过的分支 / PR + 人工签收。
 //
 // 三条边界：
 //   - 只交付 **done** 的任务：done 的定义是"节点全部交接合格 + 任务级验收命令过"，交付不再另判。
 //   - 开 PR 是**对外承诺**（强制审批那一类）：含 high 风险节点的任务，没有人签收就不开 PR；push 到分支不算对外承诺。
 //   - PR 正文只从真相源来：最近一份 task_done 汇报（模板或模型写的都行）。没有就现场按事实渲染，不另调模型。
 //
-// 令牌：GITHUB_TOKEN 从环境 / .env 来，**只检查在不在，不打印**。没有就 push 完停下来，告诉人去填。
+// 凭据：按"动作 + 远端 + 点交付的人"从连接里现场挑一份（core/credentials.mjs），审计记下用了哪一份；
+// 推送只走 core/push.mjs 的护栏。没有能调 GitHub 接口的连接就 push 完停下来，告诉人去哪里加。
 // 打回 = 一条 correction 消息（走修正流水线重规划），不是另一条状态机分支 —— 打回的本质就是"要求改"。
 
-import { execFileSync } from 'node:child_process';
 import { audit, newId, now, insertEdge } from '../db/db.mjs';
-import { recordAnswer, RESOLUTION_HOOKS } from './answers.mjs';
+import { insertUserMessage } from '../db/messages.mjs';
+import { recordAnswer, RESOLUTION_HOOKS, resolutionOf } from './answers.mjs';
 import { routeQuestion, requireAuthorized } from './routing.mjs';
 import { gatherSince, renderFacts, renderSelfDecided } from '../agent/reporter.mjs';
 import { deferSignoff, deferredSignoffs } from './project-settings.mjs';
@@ -23,14 +24,18 @@ import { holdForCheck } from './inbox.mjs';
 import { tl, contentLang, userLang, I18nError } from '../i18n/index.mjs';
 import { markOf } from '../i18n/marks.mjs';
 
-const git = (cwd, ...args) => execFileSync('git', args, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
+import { git, gitRaw, safePositional } from './git.mjs';
+import { HTTP_TIMEOUT_MS } from './http.mjs';
+import { transition } from '../db/state.mjs';
+import { insertQuestion } from './questions.mjs';
+import { writeParam } from './params.mjs';
+import { resolveCredential, noCredentialText, parseRemote } from './credentials.mjs';
+import { taskProvenanceMarkdown } from './provenance-render.mjs';
+const userName = (db, id) => (id ? db.one(`SELECT display_name FROM users WHERE id=?`, id)?.display_name ?? null : null);
+import { pushBranch } from './push.mjs';
+import { signoffExceptions, renderExceptions } from './signoff-exceptions.mjs';
 
-const setParam = (db, { taskId, key, value, userId }) => {
-  const t = now();
-  db.run(`UPDATE params SET superseded_at=?, valid_to=? WHERE task_id=? AND key=? AND superseded_at IS NULL`, t, t, taskId, key);
-  db.run(`INSERT INTO params (id,task_id,key,value,layer,governance_class,set_by_kind,set_by_id,valid_from,recorded_at)
-          VALUES (?,?,?,?,'task','constitutional','user',?,?,?)`, newId('p'), taskId, key, JSON.stringify(value), userId, t, t);
-};
+const setParam = (db, { taskId, key, value, userId }) => writeParam(db, { taskId, key, value, by: { kind: 'user', id: userId }, governance: 'constitutional' });
 const getParam = (db, taskId, key) => {
   const row = db.one(`SELECT value FROM params WHERE task_id=? AND key=? AND superseded_at IS NULL ORDER BY recorded_at DESC, rowid DESC LIMIT 1`, taskId, key);
   return row ? JSON.parse(row.value) : null;
@@ -69,6 +74,63 @@ export function pushEnv(remote, token = process.env.GITHUB_TOKEN) {
     Object.assign(env, { GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'http.https://github.com/.extraheader', GIT_CONFIG_VALUE_0: `AUTHORIZATION: basic ${basic}` });
   }
   return env;
+}
+
+/**
+ * 这次交付用哪份连接。`token` 显式给了（测试）就用它、不走解析；否则按连接解析。
+ * 返回的东西用完要 cleanup()（SSH 密钥的临时文件）。
+ */
+export async function connectFor(db, { remote, action, actorId, token = undefined, env = process.env, fetchFn = globalThis.fetch, workflows = false, skip = [] }) {
+  if (token !== undefined) {
+    return { target: parseRemote(remote), credential: token ? { id: null, name: 'explicit', kind: 'token' } : null, gitEnv: pushEnv(remote, token || undefined),
+      apiToken: token || null, apiBase: 'https://api.github.com', tried: [], cleanup: () => {} };
+  }
+  return resolveCredential(db, { remote, action, actorId, env, fetchFn, workflows, skip });
+}
+
+/**
+ * 解析连接并推送。两种情况换一份再推：
+ *   - 挑中的连接推不上去（鉴权 / 权限不够）：跳过它、换下一份（一份只授权了一两个仓库、范围却填成全部的个人令牌，
+ *     原来会把它主人的所有交付都卡死在"推不了"上）。审计记 credential_push_failed。
+ *   - GitHub App 推改了 .github/workflows/ 的提交被拒（安装令牌默认不带 workflows 权限）：带上 workflows 权限重签一次再推。
+ * @returns {Promise<object>} 连接解析结果（开 PR 要用 apiToken；用完 cleanup）
+ */
+export async function connectAndPush(db, { dir, remote, src, branch, action, actorId, token, env, fetchFn, internal = false }) {
+  const L = contentLang(db);
+  const skipped = [];
+  let workflows = false;
+  let conn = await connectFor(db, { remote, action, actorId, token, env, fetchFn });
+  for (let round = 0; ; round++) {
+    try {
+      pushBranch(db, { dir, remote, src, branch, env: conn.gitEnv, internal, actorId });
+      conn.tried = [...skipped.map(({ name, why }) => ({ name, why })), ...conn.tried];
+      return conn;
+    } catch (e) {
+      conn.cleanup();
+      const canRetry = token === undefined && round < 6;
+      if (e.code === 'WORKFLOW_SCOPE' && canRetry && conn.app && !workflows) {
+        workflows = true;
+        conn = await connectFor(db, { remote, action, actorId, env, fetchFn, workflows, skip: skipped.map((x) => x.id) });
+        if (!conn.app) throw new I18nError('{error}。{why}', { error: e.message, why: noCredentialText(db, conn) });
+        continue;
+      }
+      if (e.code === 'PUSH_AUTH' && canRetry && conn.credential?.id) {
+        const why = tl(L, '推不上去（{error}），换下一份', { error: String(e.message).split('：').pop().slice(0, 160) });
+        skipped.push({ id: conn.credential.id, name: conn.credential.name, why });
+        audit(db, { actorKind: actorId ? 'user' : 'system', actorId, action: 'credential_push_failed', targetType: 'credential', targetId: conn.credential.id,
+          payload: { remote, branch, name: conn.credential.name } });
+        conn = await connectFor(db, { remote, action, actorId, env, fetchFn, workflows, skip: skipped.map((x) => x.id) });
+        conn.tried = [...skipped.map(({ name, why: w }) => ({ name, why: w })), ...conn.tried];
+        if (!conn.credential) throw new I18nError('{error}。{why}', { error: e.message, why: noCredentialText(db, conn) });
+        continue;
+      }
+      // 没有连接、用服务器上 git 自己的凭据也没推上：把"试过哪些、去哪里加"一并说出来（护栏拒绝的不加：跟凭据无关）
+      if (!conn.credential && conn.target.scheme !== 'local' && !e.pushRefused) {
+        throw new I18nError('{error}。{why}', { error: e.message, why: noCredentialText(db, conn) });
+      }
+      throw e;
+    }
+  }
 }
 
 export const hasHighRisk = (db, taskId) =>
@@ -174,6 +236,8 @@ export function raiseSignoffQuestion(db, { taskId, head, branch = null, dir = nu
   // 选项块的形状（请选一条：/ Please pick one: 起头，紧接 (A)(B)(C) 三行）看板按它换成按钮说明，英文译文必须同形
   const text = `${markOf(L, 'signoff')}${tl(L, '任务「{title}」已完成，产物在 {branch} @ {head}。', { title: task?.title ?? taskId, branch: branch ?? tl(L, '工作区分支'), head: String(head ?? '').slice(0, 8) || tl(L, '（未知 commit）') })}\n\n`
     + (prev === 'accepted' && prevHead && prevHead !== head ? `${tl(L, '注意：上次签收对应 {head}，此后产物已变更，该签收已作废，需要重新签收。', { head: prevHead.slice(0, 8) })}\n\n` : '')
+    // 过程里出过的岔子置顶在产物之前（看板按结构另画一份，这里给命令行 / 通知看）
+    + `${renderExceptions(signoffExceptions(db, taskId), L)}\n\n`
     + (evidence ? `${evidence}\n\n` : '')
     + tl(L, '请选一条：\n(A) 接受：点「接受」\n(B) 打回：点「打回…」写理由（理由会作为修正指令，任务据此重新规划）\n(C) 先看清楚：看下面的「改动」「页面截图」，或任务页的「日志」，看完再选');
   return db.tx(() => {
@@ -181,9 +245,8 @@ export function raiseSignoffQuestion(db, { taskId, head, branch = null, dir = nu
       setParam(db, { taskId, key: 'signoff.status', value: 'void', userId: null });
       audit(db, { actorKind: 'system', action: 'signoff_voided', targetType: 'task', targetId: taskId, payload: { signedHead: prevHead, newHead: head } });
     }
-    if (cur) db.run(`UPDATE questions SET status='withdrawn', resolved_at=? WHERE id=?`, at, cur.id);
-    db.run(`INSERT INTO questions (id,task_id,node_id,level,level_source,text,default_action,asked_at,timeout_at,status)
-            VALUES (?,?,NULL,3,'hard_rule',?,NULL,?,NULL,'open')`, id, taskId, text, at);
+    if (cur) transition(db, 'questions', cur.id, 'withdrawn', { set: { resolved_at: at } });
+    insertQuestion(db, { id: id, taskId: taskId, level: 3, text: text, askedAt: at });
     const r = routeQuestion(db, { questionId: id, decisionType: 'signoff', typeSource: 'hard_rule', at });
     setParam(db, { taskId, key: 'signoff.head', value: head ?? null, userId: null });
     // 这一轮从哪儿起（看板改动对比的"这一轮"口径用）：返工 = 上次请求签收时的头；第一次签收显式写 null（不是"没记"）
@@ -210,8 +273,7 @@ RESOLUTION_HOOKS.signoff = (db, { question, finalBody, by, messageId, at }) => {
   // 所以不存在"系统替人签名"的路径。别把这个模式推广到任何不是同一人、同一决策的地方。
   const tok = db.one(`SELECT token_id FROM messages WHERE id=?`, messageId)?.token_id ?? null;
   const mid = newId('m');
-  db.run(`INSERT INTO messages (id,task_id,sender_id,body,kind,kind_source,urgency,urgency_source,trust_label,token_id,received_at)
-          VALUES (?,?,?,?,'correction','explicit','urgent','explicit','user-authenticated',?,?)`, mid, taskId, by, `${markOf(contentLang(db), 'signoffRejected')}${reason}`, tok, at);
+  insertUserMessage(db, { id: mid, taskId, senderId: by, tokenId: tok, body: `${markOf(contentLang(db), 'signoffRejected')}${reason}`, kind: 'correction', urgency: 'urgent', receivedAt: at });
   insertEdge(db, mid, messageId, 'derived_from', at);
   // 打回理由接下来要和已登记的决定比对（调用方在 recordAnswer 之后跑），比对完之前这条修正先别被拉走。
   // 只在真有可比的决定时才标 —— 否则比对必然跳过，标了只是白等。比对器没跑到（进程死了）时到点自己放行。
@@ -221,7 +283,7 @@ RESOLUTION_HOOKS.signoff = (db, { question, finalBody, by, messageId, at }) => {
   // （否则打回签收后任务一直没有动静；手动模式下人会自己 run，所以不容易暴露）。
   const was = db.one(`SELECT status FROM tasks WHERE id=?`, taskId)?.status;
   if (was === 'done') {
-    db.run(`UPDATE tasks SET status='running' WHERE id=?`, taskId);
+    transition(db, 'tasks', taskId, 'running');
     audit(db, { actorKind: 'user', actorId: by, action: 'task_resumed', targetType: 'task', targetId: taskId, payload: { from: 'done', to: 'running', via: 'signoff_rejected' } });
   }
   audit(db, { actorKind: 'user', actorId: by, action: 'task_signed_off', targetType: 'task', targetId: taskId, payload: { accepted: false, reason, messageId: mid, head, questionId: question.id } });
@@ -243,7 +305,7 @@ export function finalReport(db, taskId) {
  * @param {object} o  { taskId, workspace, remote?, branch?, pr?, base?, token?, fetchFn?, userId }
  */
 export async function deliverTask(db, { taskId, workspace, remote = null, branch = null, pr = false, base = null,
-  token = process.env.GITHUB_TOKEN, fetchFn = globalThis.fetch, userId = null }) {
+  token = undefined, env = process.env, fetchFn = globalThis.fetch, userId = null, internal = false }) {
   const task = db.one(`SELECT * FROM tasks WHERE id=?`, taskId);
   if (!task) throw new I18nError('任务不存在：{id}', { id: taskId });
   if (task.status !== 'done') {
@@ -251,7 +313,7 @@ export async function deliverTask(db, { taskId, workspace, remote = null, branch
   }
   const L = contentLang(db);
   if (userId) requireAuthorized(db, { taskId, decisionType: 'delivery', userId });   // 交付是决策类型之一：查路由表，不查 role
-  const target = remoteFor(db, taskId, remote);
+  const target = safePositional(remoteFor(db, taskId, remote));
   const head = git(workspace, 'rev-parse', 'HEAD');
   const br = branch ?? git(workspace, 'rev-parse', '--abbrev-ref', 'HEAD');
   if (git(workspace, 'status', '--porcelain')) throw new I18nError('工作区有未提交的改动，请先处理后再交付');
@@ -269,29 +331,25 @@ export async function deliverTask(db, { taskId, workspace, remote = null, branch
       : new I18nError('任务包含高风险步骤，创建 PR 前必须先完成签收');
   }
 
-  // 不许交互提示凭据（会挂死一个无人值守的进程），120 秒没推完就算失败。
-  // 远端是 GitHub HTTPS 且有 token：push 也用 token（走 http.extraheader，只进环境变量，不进命令行、不进 git config）。
-  try {
-    execFileSync('git', ['push', '--force-with-lease', target, `HEAD:refs/heads/${br}`],
-      { cwd: workspace, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 120_000,
-        env: pushEnv(target, token) });
-  } catch (e) {
-    throw new I18nError('推送到 {target} 失败：{error}', { target, error: String(e.stderr ?? e.message).trim().split('\n').slice(-3).join(' / ') });
-  }
-  const out = { remote: target, branch: br, head, pushedAt: now(), pr: null, prSkipped: null };
+  // 推送：连接按"动作 + 远端 + 点交付的人"现场解析；护栏在 core/push.mjs（只推自己的分支、不推默认分支、不强推）。
+  // 推到本机的项目仓库（项目推进时）是 internal：系统自己的地盘，不受护栏约束。禁交互、有时限都在 git 封装里。
+  const conn = await connectAndPush(db, { dir: workspace, remote: target, src: 'HEAD', branch: br, action: pr && gh ? 'pr' : 'push', actorId: userId, token, env, fetchFn, internal });
+  const out = { remote: target, branch: br, head, pushedAt: now(), pr: null, prSkipped: null, credential: conn.credential };
 
+  conn.cleanup();   // SSH 密钥的临时文件推完就删；开 PR 用的是内存里的 API 令牌
   if (pr) {
     if (!gh) out.prSkipped = tl(L, '远端不是 GitHub（{target}），已推送，未创建 PR', { target });
-    else if (!token) out.prSkipped = tl(L, '未设置 GITHUB_TOKEN：已推送，未创建 PR。在 .env 中设置后重新交付即可');
+    else if (!conn.apiToken) out.prSkipped = tl(L, '已推送，未创建 PR：没有能调用 GitHub 接口的连接。到「设置 → 连接」加一个 GitHub App 或令牌后重新交付即可');
     else {
+      const token = conn.apiToken;
       const report = finalReport(db, taskId);
-      const baseBranch = base ?? (await defaultBranch(gh, token, fetchFn));
-      const res = await fetchFn(`https://api.github.com/repos/${gh.owner}/${gh.repo}/pulls`, {
+      const baseBranch = base ?? (await defaultBranch(gh, token, fetchFn, conn.apiBase));
+      const res = await fetchFn(`${conn.apiBase}/repos/${gh.owner}/${gh.repo}/pulls`, { signal: AbortSignal.timeout(HTTP_TIMEOUT_MS),
         method: 'POST',
         headers: { authorization: `Bearer ${token}`, accept: 'application/vnd.github+json', 'content-type': 'application/json',
           'user-agent': 'superintern' },
         body: JSON.stringify({ title: task.title, head: br, base: baseBranch,
-          body: `${report.summary}\n\n${report.body}\n\n---\n`
+          body: `${report.summary}\n\n${report.body}\n\n${tl(L, '## 溯源')}\n\n${taskProvenanceMarkdown(db, taskId, { L, dir: workspace, delivery: { by: userName(db, userId), credential: conn.credential?.name ?? null } })}\n\n---\n`
             + tl(L, '由 SuperIntern 交付：任务 `{taskId}`，分支 `{branch}` @ {head}。正文取自真相源（{source}），不是模型现场写的。', { taskId, branch: br, head: head.slice(0, 8), source: report.source }) }),
       });
       const json = await res.json().catch(() => ({}));
@@ -303,12 +361,12 @@ export async function deliverTask(db, { taskId, workspace, remote = null, branch
   setParam(db, { taskId, key: 'delivery.remote', value: target, userId });
   setParam(db, { taskId, key: 'delivery.head', value: head, userId });
   audit(db, { actorKind: 'user', actorId: userId, action: 'task_delivered', targetType: 'task', targetId: taskId,
-    payload: { ...out, highRisk, signoff } });
+    payload: { ...out, highRisk, signoff, ...(internal ? { internal } : {}) } });
   return out;
 }
 
-async function defaultBranch(gh, token, fetchFn) {
-  const res = await fetchFn(`https://api.github.com/repos/${gh.owner}/${gh.repo}`, {
+async function defaultBranch(gh, token, fetchFn, apiBase = 'https://api.github.com') {
+  const res = await fetchFn(`${apiBase}/repos/${gh.owner}/${gh.repo}`, { signal: AbortSignal.timeout(HTTP_TIMEOUT_MS),
     headers: { authorization: `Bearer ${token}`, accept: 'application/vnd.github+json', 'user-agent': 'superintern' } });
   const json = await res.json().catch(() => ({}));
   return json.default_branch ?? 'main';
@@ -327,7 +385,18 @@ export function signOff(db, { taskId, accept, reason = null, plaintextToken, use
   requireAuthorized(db, { taskId, decisionType: 'signoff', userId });
   // 事项不在（老任务、或 done 时还没有这条机制）就按 done 时的 head 现建一条，再答它。
   let q = openSignoffQuestion(db, taskId);
-  if (!q) { raiseSignoffQuestion(db, { taskId, head: doneHeadOf(db, taskId) }); q = openSignoffQuestion(db, taskId); }
+  if (!q) {
+    // 这一轮 done 已经签过了：两个人前后脚点签收、或页面没刷新，后到的一方原来会现建一条新的签收事项再签一次 ——
+    // 点的是"打回"的话，就把已经签收通过的任务打回去了。签收事项是在最近一次进入 done 之后提的、且已结，就是这一轮签过了。
+    const lastDone = db.one(`SELECT max(ts) t FROM audit_log WHERE target_id=? AND action='status_changed' AND json_extract(payload,'$.to')='done'`, taskId)?.t ?? null;
+    const prev = db.one(`SELECT * FROM questions WHERE task_id=? AND decision_type='signoff' ORDER BY asked_at DESC, rowid DESC LIMIT 1`, taskId);
+    if (prev && !['open', 'escalated'].includes(prev.status) && (lastDone == null || prev.asked_at >= lastDone)) {
+      const r = resolutionOf(db, prev);
+      throw Object.assign(new I18nError('任务 {id} 这一轮已由 {who} 于 {when} 签收（{body}），不再重复签收', { id: taskId, who: r.who, when: r.when,
+        body: String(db.one(`SELECT body FROM answers WHERE question_id=? AND stance='answer' ORDER BY created_at DESC LIMIT 1`, prev.id)?.body ?? r.how).slice(0, 60) }), { status: 409, handled: r });
+    }
+    raiseSignoffQuestion(db, { taskId, head: doneHeadOf(db, taskId) }); q = openSignoffQuestion(db, taskId);
+  }
   // 代人写的答复正文按内容语言（与 signoffAnswer 归一后的形状一致）
   const en = contentLang(db) === 'en';
   const r = recordAnswer(db, { questionId: q.id, body: accept ? (en ? 'Accept' : '接受') : (en ? `Reject: ${reason.trim()}` : `打回：${reason.trim()}`), plaintextToken });

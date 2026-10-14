@@ -6,14 +6,31 @@ on:
   pull_request:
 
 jobs:
-  linux:
+  syntax:
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: 24
+      - name: node --check every module
+        run: |
+          set -e
+          for f in $(git ls-files '*.mjs'); do node --check "$f"; done
+
+  linux:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        node: ['22.13', '24']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
       - name: git identity for tests
         run: |
           git config --global user.name "ci"
@@ -24,3 +41,21 @@ jobs:
           docker pull mitmproxy/mitmproxy:latest
       - name: tests (all suites, including container and egress)
         run: node tests/run.mjs --all
+
+  # Windows runners only have Windows containers, so the suites that need the Linux
+  # sandbox image are left out here. The runner lists every suite it skipped; a
+  # skipped suite is reported, never counted as passed. The Linux job covers them.
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: git identity for tests
+        run: |
+          git config --global user.name "ci"
+          git config --global user.email "ci@example.invalid"
+      - name: tests (without docker)
+        run: node tests/run.mjs --all --without docker
