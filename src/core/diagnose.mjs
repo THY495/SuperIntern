@@ -23,7 +23,7 @@ export const DEFECT_CATEGORIES = {
   // 验收员
   acceptance: N_('验收标准未满足'), spec: N_('偏离规格或契约'), decision: N_('该问人的事自己定了'), test: N_('测试问题'), quality: N_('其他问题'),
   // 机械校验
-  scope: N_('越界改动'), shared: N_('改了共享路径'), artifact: N_('产物不对'), field: N_('交接记录缺项'), git: N_('算不出改动'),
+  scope: N_('越界改动'), shared: N_('改了共享路径'), rules: N_('改了项目规则或钩子文件'), artifact: N_('产物不对'), field: N_('交接记录缺项'), git: N_('算不出改动'),
   // 两边都有
   assumption: N_('假设'),
   environment: N_('环境问题'),

@@ -127,7 +127,7 @@ export default {
   "执行": "execution",
   "正在{verb}": "In progress: {verb}",
   "等待答复：{n} 条待决事项（见下方）": "Waiting for replies: {n} open items (see below)",
-  "已暂停：点击「继续」后才会推进": "Paused: won't advance until you click “Resume”",
+  "已暂停：点击「继续」后才会推进。要改方向，先在下面发一条修正：继续后先按它改计划，存起来的改动按新计划取舍": "Paused: nothing moves until you click Continue. To change direction, send a correction below first: on Continue the plan is changed according to it first, and the stored changes are kept or dropped to fit the new plan.",
   "自动运行已停止重试（连续失败 {n} 次）。排查日志后点击「立即重试」": "Auto-run stopped retrying ({n} failures in a row). Check the logs, then click “Retry now”",
   "模型服务商拒绝了请求（如密钥无效）：请在「设置」中修正，修正后自动继续": "The model provider rejected the request (e.g. an invalid key): fix it in Settings and it will continue automatically",
   "上一次运行已停下，等待处理：查看日志与待决事项，或发送消息说明下一步": "The last run stopped and needs attention: check the logs and open items, or send a message saying what to do next",

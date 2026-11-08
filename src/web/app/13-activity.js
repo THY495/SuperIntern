@@ -13,11 +13,11 @@ const ACTION_NAMES = { status_changed: T('状态变化'), process_crashed: T('�
   project_task_started: T('开工（项目里的任务）'), project_task_merged: T('合进项目分支'), project_task_drift: T('开工时项目里已经合进了别的改动（已提示 AI）'), project_task_integrated: T('集成进项目分支'),
   project_task_integrate_conflict: T('集成时有冲突'), project_task_integrate_verify_failed: T('集成后验收没过'), project_task_redone: T('重做'), project_task_regression_refreshed: T('更新了回归义务'),
   answer_recorded: T('记录答复'), decision_check_done: T('核对了已有决定'), node_diagnosed: T('判了一次收敛情况'), handoff_test_changes: T('交上来的改动里改了测试'),
-  context_compacted: T('上下文太长，整理了一次'), context_compaction_failed: T('上下文整理没成（照原样接着做）'), compaction_escalated: T('上下文整理了几次还是不够，转给人') };
+  task_rewound: T('从某一步重来'), node_rewound: T('步骤退回重做'), context_compacted: T('上下文太长，整理了一次'), context_compaction_failed: T('上下文整理没成（照原样接着做）'), compaction_escalated: T('上下文整理了几次还是不够，转给人') };
 // 系统内部的起止记录：默认不列（勾「显示全部」才列）。还没有中文名的动作也算这一类 —— 默认视图里不出现英文。
 const ACTIVITY_NOISE = new Set(['sandbox_started', 'sandbox_stopped', 'sandbox_skipped', 'run_launched_from_web', 'elicitor_started', 'elicitor_exit', 'planner_started', 'planner_exit',
   'orchestrator_started', 'orchestrator_exit', 'plan_attempt', 'draft_attempt', 'replan_attempt', 'answer_recorded', 'decision_check_done', 'handoff_verified', 'notification_sent',
-  'report_generated', 'question_informed_added', 'project_task_regression_refreshed', 'node_reclaimed', 'egress_credential_injected', 'status_changed', 'node_diagnosed']);
+  'report_generated', 'question_informed_added', 'project_task_regression_refreshed', 'node_reclaimed', 'egress_credential_injected', 'status_changed', 'node_diagnosed', 'node_rewound']);
 const isNoise = (action) => ACTIVITY_NOISE.has(action) || /_launched_by_daemon$/.test(action) || !ACTION_NAMES[action];
 function renderActivity() {
   const items = [];

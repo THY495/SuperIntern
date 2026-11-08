@@ -10,13 +10,16 @@
 //   holder：主机 + pid + 进程起点时刻 —— pid 复用了也认得出不是同一个进程
 
 import { hostname } from 'node:os';
+import { isMainThread, threadId } from 'node:worker_threads';
 import { performance } from 'node:perf_hooks';
 import { now } from './db.mjs';
 import { I18nError } from '../i18n/index.mjs';
 
 export const LEASE_TTL_MS = 120_000;      // 两分钟没续约就算放弃（编排器每 30 秒续一次，等模型的时候事件循环是空的，续得上）
 export const LEASE_RENEW_MS = 30_000;
-export const HOLDER = `${hostname()}:${process.pid}:${Math.round(performance.timeOrigin)}`;
+// worker 线程（core/offthread.mjs）与主线程同一个 pid、同一个 timeOrigin：不带线程号的话，主线程会把 worker 正持有的租约当成
+// 自己的而重入（看板编辑规则文件与 worker 里的项目推进同时动一个项目）。主线程不带后缀，标识与原来一样。
+export const HOLDER = `${hostname()}:${process.pid}:${Math.round(performance.timeOrigin)}${isMainThread ? '' : `:t${threadId}`}`;
 
 export class LeaseHeldError extends I18nError {
   constructor(resource, row) {

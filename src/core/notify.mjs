@@ -14,6 +14,8 @@
 import { spawnSync } from 'node:child_process';
 import { audit } from '../db/db.mjs';
 import { redact } from './redact.mjs';
+import { sendMail, parseSmtpUrl, mailReady } from './smtp.mjs';
+import { mailReplyFor } from './mail-reply.mjs';
 import { tl, I18nError, N_ } from '../i18n/index.mjs';
 
 export const CHANNEL_ENV = {
@@ -22,6 +24,7 @@ export const CHANNEL_ENV = {
   dingtalk: 'DINGTALK_WEBHOOK',  // 钉钉自定义机器人 webhook
   wecom: 'WECOM_WEBHOOK',        // 企业微信群机器人 webhook
   cmd: 'NOTIFY_CMD',             // 本地命令：<cmd> <title> <taskId> <ref>
+  email: 'MAIL_TO',              // 部署级邮箱：发信服务器另配 SMTP_URL + MAIL_FROM（见 smtp.mjs）
 };
 
 /** 从环境读通道。空值跳过。`extraCmd` 是 CLI 的 --notify <cmd>。 */
@@ -29,6 +32,7 @@ export function channelsFromEnv(env = process.env, extraCmd = null) {
   const out = [];
   for (const [kind, key] of Object.entries(CHANNEL_ENV)) {
     const v = String(env[key] ?? '').trim();
+    if (kind === 'email' && !mailReady(env)) continue;   // 没配发信服务器，MAIL_TO 不算通道
     if (v) out.push({ kind, target: v });
   }
   if (extraCmd) out.push({ kind: 'cmd', target: String(extraCmd) });
@@ -50,11 +54,12 @@ export function splitArgv(line) {
 }
 
 /** 各家的请求形状。返回 {url, init}。 */
-export function buildRequest(channel, { title, text }) {
+export function buildRequest(channel, { title, text, link = null }) {
+  if (link) text = `${text}\n\n${link}`;   // 事项链接：单独一行，飞书 / 钉钉 / 企微会把它变成可点的
   const body = `${title}\n${text}`;
   switch (channel.kind) {
     case 'ntfy':
-      return { url: channel.target, init: { method: 'POST', headers: { 'content-type': 'text/plain; charset=utf-8', title: encodeURIComponent(title) }, body: text } };
+      return { url: channel.target, init: { method: 'POST', headers: { 'content-type': 'text/plain; charset=utf-8', title: encodeURIComponent(title), ...(link ? { click: link } : {}) }, body: text } };
     case 'feishu':
       return { url: channel.target, init: { method: 'POST', headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ msg_type: 'text', content: { text: body } }) } };
@@ -72,13 +77,24 @@ export function buildRequest(channel, { title, text }) {
  * @param {object} o { taskId, kind, title, text, ref, channels, fetchFn, spawn }
  * @returns {Promise<Array<{kind, ok, status?, error?}>>}
  */
-export async function notify(db, { taskId, kind, title, text, ref = null, channels, fetchFn = globalThis.fetch, spawn = spawnSync }) {
+export async function notify(db, { taskId, kind, title, text, ref = null, link = null, channels, env = process.env, sendMailFn = sendMail, fetchFn = globalThis.fetch, spawn = spawnSync }) {
   // 通知发到第三方（ntfy、飞书、企业微信……），正文和标题先脱敏
   title = redact(title); text = redact(text);
   const receipts = [];
   for (const ch of channels ?? []) {
     let r;
-    if (ch.kind === 'cmd') {
+    if (ch.kind === 'email') {
+      // 邮件：发信服务器从 .env 读；收件人只记域名（地址是个人信息，不进审计）
+      try {
+        // 邮件答复：发给某个人、等他答、这类能回信答的事项，带一枚只属于这个人 × 这件事的答复令牌
+        const mr = mailReplyFor(db, { ch, kind, ref, env });
+        const res = await sendMailFn(parseSmtpUrl(env.SMTP_URL), { from: env.MAIL_FROM, to: ch.target, subject: title,
+          text: [text, link, mr?.footer].filter(Boolean).join('\n\n'),
+          headers: { 'X-SuperIntern-Ref': ref ?? '' }, ...(mr ? { replyTo: mr.replyTo, messageId: mr.messageId } : {}) });
+        r = { kind: 'email', ok: !!res?.ok, status: null, error: null };
+      } catch (e) { r = { kind: 'email', ok: false, status: e.smtpCode ?? null, error: String(e.message).slice(0, 120) }; }
+      r.host = String(ch.target).split('@')[1]?.toLowerCase() ?? '?';
+    } else if (ch.kind === 'cmd') {
       // 命令可以带参数（`node C:/x/sink.cjs`），末尾追加 <title> <taskId> <ref>。不经 shell。
       // ⚠️ Windows 上 .cmd/.bat 不经 shell 起不来（Node 拒 EINVAL）；包成 node 脚本或 exe。
       const [file, ...pre] = splitArgv(ch.target);
@@ -86,7 +102,7 @@ export async function notify(db, { taskId, kind, title, text, ref = null, channe
       r = { kind: 'cmd', ok: !out.error && out.status === 0, status: out.status ?? null, error: out.error?.message ?? null };
     } else {
       try {
-        const { url, init } = buildRequest(ch, { title, text });
+        const { url, init } = buildRequest(ch, { title, text, link });
         const res = await fetchFn(url, { ...init, signal: AbortSignal.timeout(15_000) });
         let ok = res.ok;
         // 飞书 / 钉钉 / 企微 都是 HTTP 200 + 正文里的 code 表示成败
@@ -102,7 +118,7 @@ export async function notify(db, { taskId, kind, title, text, ref = null, channe
     }
     receipts.push(r);
     audit(db, { actorKind: 'system', action: 'notification_sent', targetType: 'task', targetId: taskId,
-      payload: { channel: r.kind, host: r.host ?? null, ok: r.ok, status: r.status, error: r.error, notifyKind: kind, ref } });
+      payload: { channel: r.kind, host: r.host ?? null, ok: r.ok, status: r.status, error: r.error, notifyKind: kind, ref, userId: ch.userId ?? null } });   // userId：个人通道才有（按人数打断次数）
   }
   return receipts;
 }

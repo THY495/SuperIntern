@@ -5,27 +5,42 @@ function setPane(p) {
   document.querySelectorAll('#snav button').forEach((b) => b.classList.toggle('on', b.dataset.pane === p));
   document.querySelectorAll('#viewSettings section.pane').forEach((x) => x.classList.toggle('hide', x.dataset.pane !== p));
   if (p === 'routing') { routingCtx = { key: '', box: '#routing', tag: '#routingTag' }; renderRouting(); }
-  else if (p === 'users') renderUsers(); else if (p === 'sessions') void renderSessions(); else if (p === 'spend') void renderSpend(); else if (p === 'egress') void renderEgressCat(); else if (p === 'conn') void renderConnections(); else if (p === 'health') void renderHealthCard(); else if (p === 'time') void renderTimeCard(); else void renderLlm();
+  else if (p === 'users') renderUsers(); else if (p === 'sessions') void renderSessions(); else if (p === 'spend') void renderSpend(); else if (p === 'egress') void renderEgressCat(); else if (p === 'conn') void renderConnections(); else if (p === 'health') void renderHealthCard(); else if (p === 'time') void renderTimeCard(); else if (p === 'notify') void renderSignalPrefs(); else void renderLlm();
 }
 function applyView() {
   // 新建项目是一个独立的页（用户试用 2026-09-22）：原来是叠在当前页上方的一块，下面还露着刚才打开的项目 / 收件箱，容易看混。
-  for (const [v, id] of [['inbox', '#viewInbox'], ['task', '#viewTask'], ['project', '#viewProject'], ['settings', '#viewSettings'], ['projset', '#viewProjSet'], ['new', '#newWrap']]) $(id).classList.toggle('hide', view !== v);
+  for (const [v, id] of [['inbox', '#viewInbox'], ['report', '#viewReport'], ['task', '#viewTask'], ['project', '#viewProject'], ['settings', '#viewSettings'], ['projset', '#viewProjSet'], ['new', '#newWrap']]) $(id).classList.toggle('hide', view !== v);
   $('#sideMain').classList.toggle('hide', view === 'settings' || view === 'projset');
   $('#sideSettings').classList.toggle('hide', view !== 'settings');
   $('#sideProjSet').classList.toggle('hide', view !== 'projset');
   document.querySelectorAll('.task-only').forEach((el) => { el.style.display = view === 'task' ? '' : 'none'; });
+  document.body.classList.toggle('quick', view === 'task' && !!QUICK);
+  $('#quickBar').classList.toggle('hide', !(view === 'task' && QUICK));
   $('#shell').classList.remove('side-open');
 }
 /** 地址栏的 # 就是位置：#inbox / #settings / #p/<项目> / #p/<项目>/settings / #<任务>；认不出的回收件箱。 */
 async function route() {
   const h = decodeURIComponent(location.hash.slice(1));
-  const ps = h.match(/^p\/(.+)\/settings$/);
+  // 快速答复：#q/<事项> → 先问它在哪个任务里；看不见的（或已经没了）回收件箱并说一声
+  let qWhere = null;
+  const qm = h.match(/^q\/(.+)$/);
+  QUICK = null;
+  if (qm && me) {
+    try { qWhere = (await api(`/api/questions/${encodeURIComponent(qm[1])}/where`)).taskId; QUICK = qm[1]; }
+    catch { toast(T('打不开这件事：链接里的事项不存在，或者你不在它所在的项目里（已经处理完的事项照样打得开）。要看的话，请项目负责人把你加进项目'), true); }
+  }  const ps = h.match(/^p\/(.+)\/settings$/);
   const sp1 = h.match(/^settings\/(\w+)$/);   // #settings/<页签>：从别处直接跳到设置里的某一页（例如收件箱里"快到期的连接"）
   if (sp1 && me && me.role !== 'observer') { view = 'settings'; pane = sp1[1]; }
   else if (h === 'settings' && me && me.role !== 'observer') { view = 'settings'; if (me.role !== 'lead') pane = 'users'; }
   else if (ps && projects.some((p) => p.id === ps[1])) { view = 'projset'; curProject = ps[1]; }
   else if (h.startsWith('p/') && projects.some((p) => p.id === h.slice(2))) { view = 'project'; curProject = h.slice(2); }
   else if (h === 'new' && me?.canCreate) view = 'new';
+  else if (h === 'report' || /^report\/\d+-\d+$/.test(h)) {   // 状态报告；#report/<从>-<到>：「你不在时」那一段
+    view = 'report';
+    const m = h.match(/^report\/(\d+)-(\d+)$/);
+    if (m) { REPORT.from = Number(m[1]); REPORT.to = Number(m[2]); } else { REPORT.from = REPORT.to = null; }
+  }
+  else if (qWhere) { view = 'task'; if (cur !== qWhere) { detail = null; $('#log').hidden = true; $('#traceOut').innerHTML = ''; } cur = qWhere; }
   else if (tasksCache.some((t) => t.id === h)) { view = 'task'; if (cur !== h) { detail = null; $('#log').hidden = true; $('#traceOut').innerHTML = ''; } cur = h; }
   else if (/^[^/]+\/node\/[^/]+$/.test(h) && tasksCache.some((t) => t.id === h.split('/')[0])) {   // 提交 / PR 里的追溯链接直达某一步
     const [tid, , nid] = h.split('/'); view = 'task'; if (cur !== tid) { detail = null; $('#log').hidden = true; $('#traceOut').innerHTML = ''; } cur = tid; pendingNode = nid; PROV_OPEN = true;
@@ -34,6 +49,8 @@ async function route() {
   applyView();
   if (view === 'settings') setPane(pane);
   if (view === 'new') { loadRepos(); setTimeout(() => $('#newGoal').focus(), 0); }
+  if (view === 'report') void renderReport();
+  if (me && !route.seenOnce) { route.seenOnce = true; void noteSeenNow(true); }   // 打开看板本身就算「在看」
   await refresh();
   // 路由表是表单，不能跟着 SSE 重画：进项目设置时按当前分区画一次；离开则解绑
   if (view === 'projset') { renderProjSet(); setPsPane(psPane); }

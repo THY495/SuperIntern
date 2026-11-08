@@ -329,10 +329,16 @@ export const clearAppCache = () => APP_CACHE.clear();
 /** 这次动作要的最小权限。 */
 export function appPermissions(action, { workflows = false } = {}) {
   if (action === 'read') return { contents: 'read', metadata: 'read' };
+  // 交付后回路盯 PR：状态、评论、检查、提交状态、Actions 日志，全是读。poll_basic 是 App 没给 CI 那几项时的退路
+  if (action === 'poll') return { metadata: 'read', pull_requests: 'read', checks: 'read', statuses: 'read', actions: 'read' };
+  if (action === 'poll_basic') return { metadata: 'read', pull_requests: 'read' };
+  // 入站：带标签的 issue 变成添加任务的草稿 —— 只读 issue
+  if (action === 'poll_issues') return { metadata: 'read', issues: 'read' };
   return { contents: 'write', metadata: 'read', ...(action === 'pr' ? { pull_requests: 'write' } : {}), ...(workflows ? { workflows: 'write' } : {}) };
 }
 
 class Skip extends Error {}
+const READ_ACTIONS = new Set(['read', 'poll', 'poll_basic', 'poll_issues']);
 
 async function appInstallationToken(db, row, target, { action, workflows, fetchFn, at }) {
   const meta = JSON.parse(row.meta);
@@ -395,7 +401,7 @@ export async function resolveCredential(db, { remote, action = 'push', actorId =
   const L = contentLang(db);
   const out = { target, credential: null, gitEnv: baseEnv(env), apiToken: null, apiBase: GH_API, tried: [], cleanup: () => {} };
   if (target.scheme === 'local') return out;
-  if (!actorId && action !== 'read') throw new I18nError('系统自己发起的动作只能读远端，不能推送');
+  if (!actorId && !READ_ACTIONS.has(action)) throw new I18nError('系统自己发起的动作只能读远端，不能推送');
   const order = getSetting(db, 'deploy.credential_order');
   const rows = masterKey(db) ? db.all(`SELECT * FROM credentials WHERE revoked_at IS NULL AND host=?`, target.host) : [];
   const live = rows.filter((r) => globMatch(r.path_glob, target.path));

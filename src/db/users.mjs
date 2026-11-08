@@ -10,7 +10,7 @@ export function insertUser(db, { id, displayName, role, domainTags = [], created
 }
 
 /** 能经这里改的列。 */
-const FIELDS = { displayName: 'display_name', role: 'role', domainTags: 'domain_tags', lang: 'lang', disabledAt: 'disabled_at', budgetUsdMonth: 'budget_usd_month', githubLogin: 'github_login', commitEmail: 'commit_email', githubId: 'github_id', tz: 'tz' };
+const FIELDS = { displayName: 'display_name', role: 'role', domainTags: 'domain_tags', lang: 'lang', disabledAt: 'disabled_at', budgetUsdMonth: 'budget_usd_month', githubLogin: 'github_login', commitEmail: 'commit_email', seenAt: 'seen_at', awayFrom: 'away_from', awayTo: 'away_to', githubId: 'github_id', tz: 'tz', signalPrefs: 'signal_prefs', pushPrefs: 'push_prefs' };
 
 /** 改成员的若干列：只改给了的（undefined = 不动）。domainTags 给数组。 */
 export function updateUser(db, userId, fields) {
@@ -25,7 +25,7 @@ export function updateUser(db, userId, fields) {
 
 /**
  * 签发一枚令牌（库里只存哈希；明文由调用方交给人，只此一次）。
- * kind：cli / session / service；scope：read / write；expiresAt：绝对过期（null = 不过期）；idleMs：闲置多久失效；parentId：会话的来源令牌。
+ * kind：cli / session / service / mail（邮件答复令牌，authenticate 默认不认）；scope：read / write；expiresAt：绝对过期（null = 不过期）；idleMs：闲置多久失效；parentId：会话的来源令牌。
  */
 export function insertToken(db, { id, userId, plaintext, issuedBy, issuedAt = now(), name = null, kind = 'cli', scope = 'write', expiresAt = null, idleMs = null, parentId = null }) {
   db.run(`INSERT INTO tokens (id,user_id,token_hash,issued_by,issued_at,name,kind,scope,expires_at,idle_ms,parent_id) VALUES (?,?,?,?,?,?,?,?,?,?,?)`,

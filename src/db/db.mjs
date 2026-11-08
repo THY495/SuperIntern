@@ -1006,6 +1006,145 @@ BEGIN SELECT RAISE(ABORT, 'edges: append-only, only superseded_at/valid_to may b
   (raw) => {
     if (!raw.prepare(`SELECT 1 FROM pragma_table_info('assumptions') WHERE name='audience'`).get()) raw.exec(`ALTER TABLE assumptions ADD COLUMN audience TEXT CHECK (audience IN ('user','developer'))`);
   },
+  // v47 → v48（2026-10-19，中途打断）：人中止任务 / 管理员急停可以当场取消进行中的模型调用。被取消的那一次厂商多半照样计费，
+  //   而我们拿不到用量 —— 按"输入照估、输出打满"记一笔估算（闸门宁可多算），这一列标出哪几行是估的，复盘与花费页认得出来。
+  (raw) => {
+    if (!raw.prepare(`SELECT 1 FROM pragma_table_info('usage_ledger') WHERE name='estimated'`).get()) raw.exec(`ALTER TABLE usage_ledger ADD COLUMN estimated INTEGER NOT NULL DEFAULT 0 CHECK (estimated IN (0,1))`);
+  },
+  // v48 → v49（2026-11-08 信号分级）：不成为事项的信号（超时替人定了、别人动了你的事、部署出故障……）统一进发件箱。
+  //   signals 一条一件事（登记过的信号名 + 所属类）；signal_recipients 每个收件人一行，记下发出时按项目监督模式 + 个人偏好
+  //   解析出的介入方式：notify = 推送，record = 只留记录（看板可查）。推送由守护进程 / tick 认领后发，认领即 pushed_at（至多一次）。
+  //   users.signal_prefs：个人对各类信号的"通知 / 备案"偏好（只能在底线之上调自己的）。
+  (raw) => {
+    raw.exec(`CREATE TABLE IF NOT EXISTS signals (
+      id          TEXT PRIMARY KEY,
+      name        TEXT NOT NULL,
+      class       TEXT NOT NULL,
+      project_id  TEXT REFERENCES projects(id),
+      task_id     TEXT REFERENCES tasks(id),
+      ref         TEXT,
+      title       TEXT NOT NULL,
+      text        TEXT NOT NULL,
+      fallback    INTEGER NOT NULL DEFAULT 0 CHECK (fallback IN (0,1)),   -- 没有人收得到推送时退到部署级通道（.env）
+      created_at  INTEGER NOT NULL,
+      pushed_at   INTEGER                                                  -- 认领推送的时刻；NULL = 还没推（或不用推）
+    ) STRICT;
+    CREATE INDEX IF NOT EXISTS idx_signals_unpushed ON signals(created_at) WHERE pushed_at IS NULL;
+    CREATE INDEX IF NOT EXISTS idx_signals_task ON signals(task_id, created_at);
+    CREATE TABLE IF NOT EXISTS signal_recipients (
+      signal_id   TEXT NOT NULL REFERENCES signals(id),
+      user_id     TEXT NOT NULL REFERENCES users(id),
+      tier        TEXT NOT NULL CHECK (tier IN ('notify','record')),
+      read_at     INTEGER,
+      PRIMARY KEY (signal_id, user_id)
+    ) STRICT;
+    CREATE INDEX IF NOT EXISTS idx_signal_recipients_user ON signal_recipients(user_id, signal_id);`);
+    if (!raw.prepare(`SELECT 1 FROM pragma_table_info('users') WHERE name='signal_prefs'`).get()) raw.exec(`ALTER TABLE users ADD COLUMN signal_prefs TEXT NOT NULL DEFAULT '{}' CHECK (json_valid(signal_prefs) AND json_type(signal_prefs) = 'object')`);
+  },
+  // v49 → v50（2026-11-08）：决策类型加「安全审批」（security）—— 审批门禁、策略钩子要确认、MCP 工具要批准。
+  //   原来这些按"规格取舍"派人、8 小时后默认不同意。questions 与 routing_rules 的枚举 CHECK 各多一个值（重建表：SQLite 改不了已有约束）。
+  //   已存的路由表里没有 security 的行：读的时候按"系统卡住"那几行补（routing.rulesOf）。
+  (raw) => {
+    const add = (body) => body.replace(/'conflict',\s*'ops'\)/, "'conflict','ops','security')");
+    const plan = ['questions', 'routing_rules'].filter((t) => !/'security'/.test(raw.prepare(`SELECT sql FROM sqlite_master WHERE type='table' AND name=?`).get(t)?.sql ?? ''))
+      .map((table) => ({ table, rewrite: add }));
+    if (plan.length) rebuildTables(raw, plan, { suffix: '_v50' });
+  },
+  // v50 → v51（2026-11-08 推送节奏）：推送不再在产生点各推各的，统一进按人的推送队列。
+  //   push_queue 一行 = 要推给某个人的一件事（一条通知档信号，或一条等他答 / 抄送他的事项）。紧急的马上推（受推送限额），
+  //   不紧急的攒到工作时间里按汇总间隔合成一条推。认领即 sent_at（至多一次）；sent_as 记怎么推出去的（单条 / 汇总 / 没有通道）。
+  //   users.push_prefs：个人的工作时间、汇总间隔、推送限额（空 = 跟部署默认）。
+  (raw) => {
+    raw.exec(`CREATE TABLE IF NOT EXISTS push_queue (
+      id          TEXT PRIMARY KEY,
+      user_id     TEXT NOT NULL REFERENCES users(id),
+      kind        TEXT NOT NULL,                                            -- 信号名，或 question.addressed / question.informed
+      source      TEXT NOT NULL CHECK (source IN ('signal','question')),
+      source_id   TEXT NOT NULL,
+      urgent      INTEGER NOT NULL CHECK (urgent IN (0,1)),
+      exempt      INTEGER NOT NULL DEFAULT 0 CHECK (exempt IN (0,1)),       -- 不受推送限额（Ⅲ 级、部署健康）
+      capped      INTEGER NOT NULL DEFAULT 0 CHECK (capped IN (0,1)),       -- 紧急但撞了限额，排进下一次汇总的最前面
+      group_key   TEXT NOT NULL,
+      project_id  TEXT REFERENCES projects(id),
+      task_id     TEXT REFERENCES tasks(id),
+      title       TEXT NOT NULL,
+      text        TEXT NOT NULL,
+      created_at  INTEGER NOT NULL,
+      sent_at     INTEGER,
+      sent_as     TEXT CHECK (sent_as IN ('single','digest','none','moot')),   -- none = 这个人没有通道；moot = 推之前事项已经结了
+      batch_id    TEXT
+    ) STRICT;
+    CREATE INDEX IF NOT EXISTS idx_push_queue_pending ON push_queue(user_id, created_at) WHERE sent_at IS NULL;
+    CREATE INDEX IF NOT EXISTS idx_push_queue_sent ON push_queue(user_id, sent_at);`);
+    if (!raw.prepare(`SELECT 1 FROM pragma_table_info('users') WHERE name='push_prefs'`).get()) raw.exec(`ALTER TABLE users ADD COLUMN push_prefs TEXT NOT NULL DEFAULT '{}' CHECK (json_valid(push_prefs) AND json_type(push_prefs) = 'object')`);
+  },
+  // v51 → v52（2026-11-08 邮件答复）：直接回推送邮件就算答复。
+  //   答复令牌就是 tokens 里的一种（kind='mail'）：答复写成消息时要挂签发令牌（messages 的硬约束，指令溯源锚点），
+  //   复用这张表就不用另开一条认证路。authenticate 默认不认它（只有邮件答复那条路认），所以随邮件转发出去也调不了接口。
+  //   mail_reply_tokens：令牌属于哪个人 × 哪件事、用掉没有；mail_inbound：收到的每封信处理过一次（按 Message-ID 去重）和结果。
+  //   都不存邮箱地址：发件地址只存哈希（限回信频率用）和域名。
+  (raw) => {
+    if (!/'mail'/.test(raw.prepare(`SELECT sql FROM sqlite_master WHERE type='table' AND name='tokens'`).get()?.sql ?? '')) {
+      rebuildTables(raw, [{ table: 'tokens', rewrite: (b) => b.replace("CHECK (kind IN ('cli','session','service'))", "CHECK (kind IN ('cli','session','service','mail'))") }], { suffix: '_v52' });
+    }
+    raw.exec(`CREATE TABLE IF NOT EXISTS mail_reply_tokens (
+      token_id    TEXT PRIMARY KEY REFERENCES tokens(id),
+      user_id     TEXT NOT NULL REFERENCES users(id),
+      question_id TEXT NOT NULL REFERENCES questions(id),
+      created_at  INTEGER NOT NULL,
+      used_at     INTEGER
+    ) STRICT;
+    CREATE INDEX IF NOT EXISTS idx_mail_reply_tokens_q ON mail_reply_tokens(question_id, user_id);
+    CREATE TABLE IF NOT EXISTS mail_inbound (
+      id          TEXT PRIMARY KEY,
+      msg_key     TEXT NOT NULL UNIQUE,                 -- Message-ID（没有就整封信的哈希）：同一封只处理一次
+      from_hash   TEXT,                                 -- 发件地址的哈希：限"给同一个地址回说明信"的频率
+      from_domain TEXT,
+      token_id    TEXT REFERENCES tokens(id),
+      question_id TEXT REFERENCES questions(id),
+      user_id     TEXT REFERENCES users(id),
+      outcome     TEXT NOT NULL,
+      replied     INTEGER NOT NULL DEFAULT 0 CHECK (replied IN (0,1)),
+      received_at INTEGER NOT NULL
+    ) STRICT;
+    CREATE INDEX IF NOT EXISTS idx_mail_inbound_from ON mail_inbound(from_hash, received_at);`);
+  },
+  // v52 → v53（2026-11-08 状态报告）：定期给每人一份"这段时间发生了什么"。
+  //   status_reports：每人每个时刻点（slot_at）一份，记这份覆盖的时段与详略、范围（正文不存，看板随时现算）；UNIQUE 保证一个时刻点只发一次。
+  //   push_queue.source 多一个 'report'：报告走推送队列（受工作时间与推送限额管），但单条推、不并进汇总。
+  (raw) => {
+    raw.exec(`CREATE TABLE IF NOT EXISTS status_reports (
+      id          TEXT PRIMARY KEY,
+      user_id     TEXT NOT NULL REFERENCES users(id),
+      slot_at     INTEGER NOT NULL,
+      since       INTEGER NOT NULL,
+      until       INTEGER NOT NULL,
+      detail      TEXT NOT NULL CHECK (detail IN ('exceptions','summary','full')),
+      scope       TEXT NOT NULL CHECK (scope IN ('mine','all')),
+      quiet       INTEGER NOT NULL CHECK (quiet IN (0,1)),
+      created_at  INTEGER NOT NULL,
+      UNIQUE (user_id, slot_at)
+    ) STRICT;`);
+    if (!/'report'/.test(raw.prepare(`SELECT sql FROM sqlite_master WHERE type='table' AND name='push_queue'`).get()?.sql ?? '')) {
+      rebuildTables(raw, [{ table: 'push_queue', rewrite: (b) => b.replace("CHECK (source IN ('signal','question'))", "CHECK (source IN ('signal','question','report'))") }], { suffix: '_v53' });
+    }
+  },
+  // v53 → v54（2026-11-08 「你不在时」）：离开一段时间后第一次回到看板，顶上一条这段时间的状态报告。
+  //   seen_at：最后一次在看板上（页面可见、有过操作时由看板报上来；SSE 触发的自动刷新不算，否则看板开着过夜就永远"没离开"）；
+  //   away_from / away_to：认出来的那段离开（关掉提示前一直在；再离开一次就接着往前算）。
+  (raw) => {
+    for (const [c, def] of [['seen_at', 'seen_at INTEGER'], ['away_from', 'away_from INTEGER'], ['away_to', 'away_to INTEGER']]) {
+      if (!raw.prepare(`SELECT 1 FROM pragma_table_info('users') WHERE name=?`).get(c)) raw.exec(`ALTER TABLE users ADD COLUMN ${def}`);
+    }
+  },
+  // v54 → v55（2026-11-08 发版前补）：禁默认的几类（结构矛盾、方案批准、签收、上限、联网、意见不一致、安全审批、系统卡住）
+  //   从 routeQuestion 起一律没有默认，但那是路由时才套；升级前就开着、存着默认动作的事项到期仍会替人定。
+  //   这里对还开着的这几类做一次与 dropDefault 相同的清理（类型清单照当时的 DECISION_TYPES.noDefault 写死：迁移不跟着代码变）。
+  (raw) => {
+    raw.exec(`UPDATE questions SET default_action=NULL, level=CASE WHEN level=1 THEN 2 ELSE level END
+      WHERE status IN ('open','escalated') AND (default_action IS NOT NULL OR level=1)
+        AND decision_type IN ('structural','contract_approval','signoff','budget','egress','conflict','security','ops')`);
+  },
 ];
 
 /**
@@ -1192,7 +1331,7 @@ export function ensureOwner(db, displayName = 'local-owner') {
   const existing = db.one(`SELECT id FROM users WHERE role='lead' AND disabled_at IS NULL ORDER BY created_at LIMIT 1`)
     ?? db.one(`SELECT id FROM users WHERE role='lead' ORDER BY created_at LIMIT 1`);   // 全停用了也不再建一个新的
   if (existing) {
-    const tk = db.one(`SELECT id FROM tokens WHERE user_id=? AND revoked_at IS NULL`, existing.id);
+    const tk = db.one(`SELECT id FROM tokens WHERE user_id=? AND revoked_at IS NULL AND kind<>'mail'`, existing.id);
     return { userId: existing.id, tokenId: tk?.id ?? null, plaintext: null };
   }
   const userId = newId('u');
@@ -1216,17 +1355,19 @@ export const TOKEN_TOUCH_MS = 60_000;
  * 有效 = 没吊销、成员没停用、没过绝对期限、没闲置超时；会话（parent_id 非空）还要它的来源令牌也没吊销、没过期 ——
  * 吊销一枚令牌，用它登录换来的浏览器会话跟着失效。
  * 顺带记"最后在何时何处用过"（看板上"我的会话与令牌"看得到），同一枚令牌一分钟内只写一次。
+ * 邮件答复令牌（kind='mail'）只在 mail=true 时认、而且那时只认它：它随邮件发出去，可能被转发，
+ * 不能拿来调看板或 CLI 的接口；邮件答复那条路也不认别的令牌。
  */
-export function authenticate(db, plaintext, { at = now(), ip = null, touch = true } = {}) {
+export function authenticate(db, plaintext, { at = now(), ip = null, touch = true, mail = false } = {}) {
   if (!plaintext) return null;
   const r = db.one(
     `SELECT k.id AS token_id, k.user_id, k.kind, k.scope, k.last_used_at, k.last_ip, u.kind AS user_kind
      FROM tokens k JOIN users u ON u.id=k.user_id
-     WHERE k.token_hash=? AND k.revoked_at IS NULL AND u.disabled_at IS NULL
+     WHERE k.token_hash=? AND k.revoked_at IS NULL AND u.disabled_at IS NULL AND (k.kind = 'mail') = ?
        AND (k.expires_at IS NULL OR k.expires_at > ?)
        AND (k.idle_ms IS NULL OR coalesce(k.last_used_at, k.issued_at) + k.idle_ms > ?)
        AND (k.parent_id IS NULL OR EXISTS (SELECT 1 FROM tokens p WHERE p.id=k.parent_id AND p.revoked_at IS NULL AND (p.expires_at IS NULL OR p.expires_at > ?)))`,
-    sha256(plaintext), at, at, at);
+    sha256(plaintext), mail ? 1 : 0, at, at, at);
   if (!r) return null;
   if (touch && (r.last_used_at == null || at - r.last_used_at >= TOKEN_TOUCH_MS || (ip && ip !== r.last_ip))) {
     try { db.run(`UPDATE tokens SET last_used_at=?, last_ip=coalesce(?, last_ip) WHERE id=?`, at, ip, r.token_id); } catch { /* 记不上不影响认证 */ }

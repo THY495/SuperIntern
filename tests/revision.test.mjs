@@ -264,7 +264,7 @@ section('4. 确认门：按**花费金额**算，不按节点数');
   assert(consti.gate?.includes('触及宪法层'), '带 constitution_patch → 一律触发门（agent 无权自改宪法块）');
   eq(consti.ratio, 0, '此时作废比例是 0 —— 两个触发器互相独立');
 
-  // 契约改动只写"改成什么"，人看不出"多了一个目录"之外还"顺手删了一个"
+  // 走查发现：契约改动只写"改成什么"，人看不出"多了一个目录"之外还"顺手删了一个"
   eq(db.run(`UPDATE constitutions SET scope_paths=? WHERE task_id=? AND superseded_at IS NULL`, JSON.stringify(['cfg2json/', 'README.md']), taskId).changes, 1, '（测试前提：任务有一份现行契约）');
   const sp = gateOf(db, { taskId, nodes, rev: { impact: ids.map((i) => mark(i, 'unaffected')), constitution_patch: { scope_paths: ['cfg2json/', 'export/'], goal: '改成 JSON 导出' }, rationale: 'r' } });
   const spText = renderDiff(sp, { impact: ids.map((i) => mark(i, 'unaffected')), constitution_patch: { scope_paths: ['cfg2json/', 'export/'], goal: '改成 JSON 导出' }, rationale: 'r' });

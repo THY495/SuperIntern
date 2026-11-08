@@ -18,7 +18,8 @@ import { recordAnswer, RESOLUTION_HOOKS, resolutionOf } from './answers.mjs';
 import { routeQuestion, requireAuthorized } from './routing.mjs';
 import { gatherSince, renderFacts, renderSelfDecided } from '../agent/reporter.mjs';
 import { deferSignoff, deferredSignoffs } from './project-settings.mjs';
-import { contributionOf } from './workspace.mjs';
+import { contributionOf, baseHeadOf } from './workspace.mjs';
+import { gateHooks, reasonLines, lazySandbox, askKey } from './hooks.mjs';
 import { hasComparableDecisions } from './decisions.mjs';
 import { holdForCheck } from './inbox.mjs';
 import { tl, contentLang, userLang, I18nError } from '../i18n/index.mjs';
@@ -27,6 +28,7 @@ import { markOf } from '../i18n/marks.mjs';
 import { git, gitRaw, safePositional } from './git.mjs';
 import { HTTP_TIMEOUT_MS } from './http.mjs';
 import { transition } from '../db/state.mjs';
+import { acquireLease, releaseLease, startHeartbeat } from '../db/lease.mjs';
 import { insertQuestion } from './questions.mjs';
 import { writeParam } from './params.mjs';
 import { resolveCredential, noCredentialText, parseRemote } from './credentials.mjs';
@@ -34,6 +36,7 @@ import { taskProvenanceMarkdown } from './provenance-render.mjs';
 const userName = (db, id) => (id ? db.one(`SELECT display_name FROM users WHERE id=?`, id)?.display_name ?? null : null);
 import { pushBranch } from './push.mjs';
 import { signoffExceptions, renderExceptions } from './signoff-exceptions.mjs';
+import { recordDeliveredPr, notePrPushed, prOf, prStateOf } from './pr-watch.mjs';
 
 const setParam = (db, { taskId, key, value, userId }) => writeParam(db, { taskId, key, value, by: { kind: 'user', id: userId }, governance: 'constitutional' });
 const getParam = (db, taskId, key) => {
@@ -301,11 +304,61 @@ export function finalReport(db, taskId) {
 }
 
 /**
+ * 交付前的策略钩子（fail-closed）。拦下 → 抛错，没有推送。要人确认 → 抛错，e.hookAsk = 确认码；
+ * 点交付的人看过钩子的话，带上 hookAck: [确认码] 再交付一次。确认码绑着那一份理由：钩子说的变了就要重新确认，
+ * 拦下的不认确认码。"任务改了钩子文件"也是要人确认的一种：确认后照改过的版本跑一遍（又要确认就再问一次）。
+ */
+export async function deliverGate(db, { taskId, projectId = null, workspace, ref, makeExec = null, payload = {}, hookAck = [], userId = null }) {
+  const L = contentLang(db);
+  const acks = [].concat(hookAck ?? []).map(String);
+  const tr = (k, p) => tl(L, k, p);
+  // 改过的钩子文件那一问的确认码只看文件列表 —— 先按不放行跑，认得这个码再照新版本跑
+  let r = await gateHooks(db, { event: 'PreDeliver', taskId, projectId, workspace, ref, makeExec, payload });
+  if (r?.tampered?.length && acks.includes(askKey(r, []))) {
+    audit(db, { actorKind: userId ? 'user' : 'system', actorId: userId, action: 'deliver_hook_acked', targetType: 'task', targetId: taskId, payload: { projectId, tampered: r.tampered } });
+    r = await gateHooks(db, { event: 'PreDeliver', taskId, projectId, workspace, ref, makeExec, payload, allowTamper: true });
+  }
+  if (!r || r.decision === 'allow') return r;
+  const lines = r.tampered?.length ? [] : reasonLines(r, tr);
+  const why = lines.length ? lines.map((x) => `- ${x}`).join('\n') : tl(L, '- （钩子没写理由）');
+  if (r.decision === 'deny') {
+    throw Object.assign(r.failed
+      ? new I18nError('交付前的策略钩子自己没跑成（脚本崩了、超时、输出看不懂，或者没核准），不是检查没过，没有推送：\n{why}\n先把钩子修好再交付', { why })
+      : new I18nError('交付前的策略钩子拦下了，没有推送：\n{why}', { why }), { hookDeny: true, hookFailed: !!r.failed });
+  }
+  const key = askKey(r, lines);
+  if (acks.includes(key)) {
+    audit(db, { actorKind: userId ? 'user' : 'system', actorId: userId, action: 'deliver_hook_acked', targetType: 'task', targetId: taskId, payload: { projectId, key, reasons: lines } });
+    return r;
+  }
+  throw Object.assign(r.tampered?.length
+    ? new I18nError('交付前要你确认：这个任务改了策略钩子文件（{files}），改过的钩子还没有跑。确认后照改过的版本跑一遍再推送', { files: r.tampered.join(tl(L, '、')) })
+    : new I18nError('交付前的策略钩子要你确认：\n{why}', { why }), { hookAsk: key });
+}
+/** 给钩子看的远端地址：去掉 URL 里可能带着的账号口令 */
+const bareRemote = (u) => String(u ?? '').replace(/\/\/[^@/]*@/, '//');
+
+/**
  * 交付。push 总是做；`pr` 为真时开 PR（要 token、要 GitHub 远端、高风险要签收）。
  * @param {object} o  { taskId, workspace, remote?, branch?, pr?, base?, token?, fetchFn?, userId }
  */
-export async function deliverTask(db, { taskId, workspace, remote = null, branch = null, pr = false, base = null,
-  token = undefined, env = process.env, fetchFn = globalThis.fetch, userId = null, internal = false }) {
+export async function deliverTask(db, opts) {
+  // 项目推进合并时调（internal）：那头已经拿着这个任务的租约
+  if (opts.internal) return deliverTaskHeld(db, opts);
+  // 人点交付 / CI 修好之后再推：拿这个任务的租约，与编排器（人发来修正、守护进程拉起它）互斥。
+  // 交付前的策略钩子可能跑一阵（起沙箱），原来这期间编排器提交的新东西会被一起推出去 —— 推的是推送那一刻的 HEAD，
+  // PR 正文写的却是开头读的那个头。现在推的就是开头核过签收的那个提交。
+  const res = `task:${opts.taskId}`;
+  let lease;
+  try { lease = acquireLease(db, res, { meta: { pid: process.pid, op: 'deliver' } }); }
+  catch (e) { if (e.leaseHeld) throw Object.assign(new I18nError('没有交付：这个任务正在被处理（AI 在改它，或系统正在把它合并进项目）。等任务页顶上不再显示「在跑」再点交付 —— 交付出去的必须是签收时看过的那一版，不能带上正在改的东西'), { status: 409, busy: true }); throw e; }
+  const stop = startHeartbeat(db, res, lease.epoch);
+  try { return await deliverTaskHeld(db, opts); }
+  finally { stop(); try { releaseLease(db, res, lease.epoch); } catch { /* 会自然到期 */ } }
+}
+
+async function deliverTaskHeld(db, { taskId, workspace, remote = null, branch = null, pr = false, base = null,
+  token = undefined, env = process.env, fetchFn = globalThis.fetch, userId = null, tokenId = null, autofix = true, internal = false, home = null, makeExec = null, hookAck = [] }) {
   const task = db.one(`SELECT * FROM tasks WHERE id=?`, taskId);
   if (!task) throw new I18nError('任务不存在：{id}', { id: taskId });
   if (task.status !== 'done') {
@@ -331,13 +384,26 @@ export async function deliverTask(db, { taskId, workspace, remote = null, branch
       : new I18nError('任务包含高风险步骤，创建 PR 前必须先完成签收');
   }
 
+  // 交付前的策略钩子：推到本机项目仓库（internal）不过 —— 那一步前面有合并前钩子
+  if (!internal) {
+    const ref = baseHeadOf(db, taskId) ?? 'HEAD';
+    let changed = [];
+    try { changed = git(workspace, 'diff', '--name-only', ref, 'HEAD').split('\n').filter(Boolean); } catch { changed = []; }
+    await deliverGate(db, { taskId, projectId: task.project_id ?? null, workspace, ref, hookAck, userId,
+      makeExec: makeExec ?? (home ? lazySandbox(db, taskId, home) : null),
+      payload: { target: 'task', task: { id: taskId, title: task.title }, remote: bareRemote(target), branch: br, head, pr: !!pr, changed_files: changed } });
+  }
+
   // 推送：连接按"动作 + 远端 + 点交付的人"现场解析；护栏在 core/push.mjs（只推自己的分支、不推默认分支、不强推）。
   // 推到本机的项目仓库（项目推进时）是 internal：系统自己的地盘，不受护栏约束。禁交互、有时限都在 git 封装里。
-  const conn = await connectAndPush(db, { dir: workspace, remote: target, src: 'HEAD', branch: br, action: pr && gh ? 'pr' : 'push', actorId: userId, token, env, fetchFn, internal });
+  const conn = await connectAndPush(db, { dir: workspace, remote: target, src: head, branch: br, action: pr && gh ? 'pr' : 'push', actorId: userId, token, env, fetchFn, internal });
   const out = { remote: target, branch: br, head, pushedAt: now(), pr: null, prSkipped: null, credential: conn.credential };
 
   conn.cleanup();   // SSH 密钥的临时文件推完就删；开 PR 用的是内存里的 API 令牌
-  if (pr) {
+  // 这个分支已经开着 PR（再次交付，比如修 CI 之后）：推送就更新了它，不再开一个（GitHub 会回 422）
+  const open = !internal && gh ? openPrFor(db, { taskId }, gh, br) : null;
+  if (open) { out.pr = { url: open.url, number: open.number, base: open.base, updated: true }; notePrPushed(db, { taskId, head }); }
+  if (pr && !open) {
     if (!gh) out.prSkipped = tl(L, '远端不是 GitHub（{target}），已推送，未创建 PR', { target });
     else if (!conn.apiToken) out.prSkipped = tl(L, '已推送，未创建 PR：没有能调用 GitHub 接口的连接。到「设置 → 连接」加一个 GitHub App 或令牌后重新交付即可');
     else {
@@ -356,6 +422,7 @@ export async function deliverTask(db, { taskId, workspace, remote = null, branch
       if (!res.ok) throw new I18nError('创建 PR 失败：HTTP {status} {body}', { status: res.status, body: JSON.stringify(json).slice(0, 300) });
       out.pr = { url: json.html_url, number: json.number, base: baseBranch };
       setParam(db, { taskId, key: 'delivery.pr_url', value: json.html_url, userId });
+      recordDeliveredPr(db, { taskId, gh, pr: out.pr, branch: br, head, userId, tokenId, signed: signoff === 'accepted', autofix });
     }
   }
   setParam(db, { taskId, key: 'delivery.remote', value: target, userId });
@@ -363,6 +430,14 @@ export async function deliverTask(db, { taskId, workspace, remote = null, branch
   audit(db, { actorKind: 'user', actorId: userId, action: 'task_delivered', targetType: 'task', targetId: taskId,
     payload: { ...out, highRisk, signoff, ...(internal ? { internal } : {}) } });
   return out;
+}
+
+/** 这个仓库、这个分支上记着的、还开着（或还没看过）的 PR */
+export function openPrFor(db, ref, gh, branch) {
+  const p = prOf(db, ref);
+  if (!p || p.owner !== gh.owner || p.repo !== gh.repo || p.branch !== branch) return null;
+  const st = prStateOf(db, ref)?.state;
+  return st === 'merged' || st === 'closed' ? null : p;
 }
 
 async function defaultBranch(gh, token, fetchFn, apiBase = 'https://api.github.com') {

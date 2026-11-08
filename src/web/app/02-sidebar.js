@@ -37,6 +37,7 @@ function renderSide() {
   if (digestData && act > (renderSide.lastAct ?? act)) announce(T('待你处理的事项：{n} 件', { n: act }));
   if (digestData) renderSide.lastAct = act;
   $('#sideNav').innerHTML = `<a class="srow${view === 'inbox' ? ' on' : ''}" href="#inbox" aria-label="${esc(act ? T('收件箱（待你处理 {n} 件）', { n: act }) : T('收件箱'))}"><span class="t">${T('收件箱')}</span>${act ? `<span class="badge">${esc(act)}</span>` : ''}</a>`
+    + `<a class="srow${view === 'report' ? ' on' : ''}" href="#report"><span class="t">${T('状态报告')}</span></a>`
     + (liveP.length ? `<div class="sgrp">${T('项目')}</div>${liveP.map(projRow).join('')}` : '')
     + (liveT.length ? `<div class="sgrp" title="${T('早先创建的、不属于任何项目的任务。现在新建的工作都是项目，这里只会减少不会增加')}">${T('独立任务（旧）')}</div>${liveT.map((t) => taskRow(t, false)).join('')}` : '')
     + (!liveP.length && !liveT.length ? `<div class="small mute" style="padding:10px 8px">${onlyMine ? T('没有与你有关的进行中任务') : T('暂无进行中的任务')}</div>` : '')
@@ -103,6 +104,7 @@ function deliverEvidenceHtml(p) {
   const range = e.stat
     ? `<div class="small">${T('要推出去的是 {range}：<b>{n}</b> 个提交，头 {head}', { range: `<span class="mono">${esc(e.stat.range)}</span>`, n: esc(e.stat.commits), head: `<span class="mono">${esc(String(e.stat.head).slice(0, 8))}</span>` })}</div>
        <details style="margin-top:4px"><summary class="small">${T('改了哪些文件')}</summary><pre class="small" style="white-space:pre-wrap;margin:6px 0 0">${esc(e.stat.diffstat || T('（没有差异）'))}</pre></details>${byTaskHtml(e.byTask, p.id)}`
+    : e.pending ? `<div class="small mute">${T('正在读这次要推出去的改动（项目刚收工或刚重启时第一次要算一会儿，几秒后自动刷新出来）')}</div>`
     : `<div class="small bad">${T('读不到项目仓库（路径不在、不是 git 仓库、或者权限不够）—— 说不出这次要推的是什么。先别点，去机器上看一眼 {repo}', { repo: `<span class="mono">${esc(p.repo)}</span>` })}</div>`;
   // ⚠「通过」两个字的可信度不能建立在**沉默**上。既然不一致时会报警，
   // 一致时就该把这个判断正面打出来 —— 否则人是在用"没看见警告"推断"大概是一份"。

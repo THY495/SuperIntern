@@ -114,8 +114,8 @@ function signoffBodyHtml(q) {
 function renderTaskDiff() {
   const t = detail.task;
   if (!detail.workspace) { $('#taskDiff').innerHTML = `<span class="small mute">${T('还没开工，没有改动')}</span>`; return; }
-  // 缓存键跟着"可能产生新提交的事"走：步骤完成、交接、合并、变基、工作区重建、签收请求。没变就不动这一块（展开状态原样留着）。
-  const mark = Math.max(0, ...detail.audits.filter((a) => /node_done|handoff|merged|rebase|workspace_created|signoff_requested/.test(a.action)).map((a) => a.id));
+  // 缓存键跟着"可能改变代码的事"走：步骤完成、交接、合并、变基、工作区重建、签收请求、从某一步重来（代码回退）。没变就不动这一块（展开状态原样留着）。
+  const mark = Math.max(0, ...detail.audits.filter((a) => /node_done|handoff|merged|rebase|workspace_created|signoff_requested|task_rewound/.test(a.action)).map((a) => a.id));
   const key = `task:${t.id}:${mark}`;
   if ($('#taskDiff .dv-slot')?.dataset.dk === key) return;
   $('#taskDiff').innerHTML = dvSlot(key, `/api/tasks/${t.id}/diff`, `/api/tasks/${t.id}/diff_lines`, { scopes: true });
@@ -156,8 +156,22 @@ function renderQuestions() {
   const stanceName = (s) => ({ answer: T('答复'), agree: T('附议'), abstain: T('弃权（不归我）'), dissent: T('异议（已记录）'), comment: T('评论'), withdrawn: T('已撤回'), superseded: T('已被新答复取代') }[s] ?? s);
   const typed = Object.fromEntries([...document.querySelectorAll('#questions textarea[data-q]')].map((i) => [i.dataset.q, i.value]));
   const focused = document.activeElement?.dataset?.q ?? null;
-  $('#questions').innerHTML = detail.questions.slice(0, 20).map((q) => {
+// 快速答复里能直接答的几类：本来就是一段文字的答复。签收、安全审批、方案批准、上限、联网放行要看完整页面再定
+const QUICK_OK = new Set(['spec_choice', 'structural', 'ops', 'conflict']);
+const QUICK_WHY = () => ({ signoff: T('签收要看改动和页面截图'), security: T('安全审批要看清是哪条命令、会做什么'), contract_approval: T('方案要看全文'),
+  budget: T('追加上限是花钱的决定'), egress: T('联网放行要看清放的是哪里'), delivery: T('交付要看这次推出去的是什么') });
+function quickFullHtml(q) {
+  return `<div class="small" style="margin-top:8px">${esc(QUICK_WHY()[q.decision_type] ?? T('这类事'))}${T('，不在快速答复里处理。')} <a href="#${esc(detail.task.id)}"><b>${T('打开完整的任务页')}</b></a></div>`;
+}
+function renderQuickBar() {
+  const t = detail.task, p = t.project_id ? projects.find((x) => x.id === t.project_id) : null;
+  $('#quickBar').innerHTML = `<div class="row small" style="gap:8px;flex-wrap:wrap"><b>${T('快速答复')}</b><span class="mute">${p ? `${esc(p.title)} › ` : ''}${esc(t.title)}</span><span class="grow"></span>
+    <a href="#${esc(t.id)}">${T('看整个任务')}</a> · <a href="#inbox">${T('收件箱')}</a></div>
+    <div class="small mute" style="margin-top:4px">${T('这里只显示链接指向的这一件，答复和在任务页上答完全一样。要几个人答、还差谁，写在卡片上；先看「当前进展」再答。')}</div>`;
+}
+  $('#questions').innerHTML = (QUICK ? detail.questions.filter((q) => q.id === QUICK) : detail.questions.slice(0, 20)).map((q) => {
     const isOpen = ['open', 'escalated'].includes(q.status);
+    const fullOnly = QUICK && !QUICK_OK.has(q.decision_type);
     // 原事项进了冲突处理：答复在冲突事项里收，这里只显示状态（负责人仍可直接裁定）。
     const inConflict = q.status === 'escalated' && q.decision_type !== 'conflict';
     const answeredByMe = me && q.answers.some((a) => a.userId === me.id && ['answer', 'agree'].includes(a.stance));
@@ -167,8 +181,8 @@ function renderQuestions() {
     const waitingOthers = isOpen && !inConflict && answeredByMe && q.addressed_to.filter((u) => !side.has(u) && !q.answers.some((a) => a.userId === u && ['answer', 'agree'].includes(a.stance))).map(nameOf);
     // 能附议的是别人自己写的那几条（附议不是新立场，不能附议附议）。
     const others = q.answers.filter((a) => a.stance === 'answer' && a.userId && (!me || a.userId !== me.id));
-    const canAnswer = isOpen && me && me.role !== 'observer' && (forMe || sideMe || isLead());
-    const canTransfer = isOpen && !inConflict && me && (forMe || isLead());
+    const canAnswer = !fullOnly && isOpen && me && me.role !== 'observer' && (forMe || sideMe || isLead());
+    const canTransfer = !fullOnly && isOpen && !inConflict && me && (forMe || isLead());
     // 已经表态的人不该还留在"待 X 答复"里（明明答了，抬头却还写着待他答复，自相矛盾）
     const acted = new Set(q.answers.filter((a) => ['answer', 'agree'].includes(a.stance) && a.userId).map((a) => a.userId));
     const stillOwed = q.addressed_to.filter((u) => !acted.has(u) && !side.has(u));
@@ -183,8 +197,8 @@ function renderQuestions() {
     return `<div class="item ${forMe ? 'mine' : isOpen ? 'flag' : ''}"><div class="row small mute"><span class="pill ${esc(q.status)}"${q.reading ? ` title="${q.reading.final ? T('系统把这条答复读成了「{label}」，并已照此处理', { label: esc(T(q.reading.label)) }) : T('系统把这条答复读成了「{label}」，稍后照此处理', { label: esc(T(q.reading.label)) })}"` : ''}>${q.reading && !isOpen ? T('已答复：{label}', { label: esc(T(q.reading.label)) }) : esc(stName(q.status, q))}</span> ${esc(kind)}${who ? ` · ${who}` : ''} · ${T('{ago}前', { ago: ago(q.asked_at) })}
       ${isOpen ? [wait, routeWait].filter(Boolean).map((x) => `· ${x}`).join(' ') : ''}${q.default_action ? ` · <span title="${q.remainingMs != null ? T('到期仍没有人答复时，系统按这条默认处理，并在下一份报告里标注') : T('这条事项没有设时限，默认动作不会自动执行 —— 只有人答复才会有结论')}">${T('默认：{action}', { action: esc(q.default_action).slice(0, 60) })}${q.remainingMs == null && isOpen ? T('（无时限，不会自动执行）') : ''}</span>` : ''}${forMe ? ` · <b style="color:var(--run)">${T('待你处理')}</b>` : sideMe ? ` · ${T('你可以补充（不必答）')}` : waitingOthers && waitingOthers.length ? ` · ${T('你已答复，待 {names}', { names: esc(waitingOthers.join(T('、'))) })}` : ''}</div>
       ${q.decision_type === 'signoff' && isOpen ? signoffBodyHtml(q) : `<div class="body">${qBodyHtml(q.text, q.decision_type, 'task')}</div>`}
-      ${q.decision_type === 'signoff' && isOpen ? `<div class="small" style="margin-top:4px">${detail.preview && !detail.preview.skipped ? `<a href="#previewCard" data-godiff="previewCard">${T('看页面截图 ↓')}</a> · ` : ''}<a href="#diffCard" data-godiff="diffCard">${T('看改动 ↓')}</a> <span class="mute">—— ${detail.preview && !detail.preview.skipped ? T('下方两张卡片：做出来的页面长什么样，和逐行取自代码的改动') : T('下方「改动」卡片，逐行取自代码')}</span></div>` : ''}
-      ${q.briefing ? `<details><summary>${T('当前进展')}</summary><div class="body small">${esc(q.briefing.work_done)}\n\n${T('收到答复后：{plan}', { plan: esc(q.briefing.plan_after_answer) })}</div></details>` : ''}
+      ${q.decision_type === 'signoff' && isOpen && !QUICK ? `<div class="small" style="margin-top:4px">${detail.preview && !detail.preview.skipped ? `<a href="#previewCard" data-godiff="previewCard">${T('看页面截图 ↓')}</a> · ` : ''}<a href="#diffCard" data-godiff="diffCard">${T('看改动 ↓')}</a> <span class="mute">—— ${detail.preview && !detail.preview.skipped ? T('下方两张卡片：做出来的页面长什么样，和逐行取自代码的改动') : T('下方「改动」卡片，逐行取自代码')}</span></div>` : ''}
+      ${q.briefing ? `<details${QUICK ? ' open' : ''}><summary>${T('当前进展')}</summary><div class="body small">${esc(q.briefing.work_done)}\n\n${T('收到答复后：{plan}', { plan: esc(q.briefing.plan_after_answer) })}</div></details>` : ''}
       ${q.answers.length ? `<div class="small" style="margin-top:4px">${q.answers.map((a) => (['agree', 'abstain', 'withdrawn'].includes(a.stance)
         // 这几种的正文本身就说清了是什么（"附议 X 的答复：…"、"弃权：…"），再加一次标签就成了"弃权：弃权：…"
         ? `<div><b>${esc(a.name)}</b> ${esc(a.body).slice(0, 200)}</div>`
@@ -203,8 +217,9 @@ function renderQuestions() {
         q.decision_type === 'structural' && !detail.task.merged_at ? `<label class="small" style="display:block;margin-top:4px" title="${T('答复本身改不了这个任务的契约（范围、规则、验收标准）。勾上之后，这段答复会同时作为一条「修正」提交：系统据此给出计划变更，触及契约的按路由表批准后生效。只是在现有范围内给出路的话，不用勾。勾上等于答完再到下面「发送」里选「修正」发一遍，只是一次做完。')}"><input type="checkbox" data-alsocorr="${esc(q.id)}"> ${T('同时作为计划变更提交 —— 要改范围、规则或验收标准时勾上（光在答复里写，改不了）')}</label>` : ''}${
         // 这一步改了任务开始前就有的测试、还没放行 —— 答复时一并放行（不勾 = 不放行，系统照常标注 / 打回）
         q.testPaths?.length ? `<label class="small" style="display:block;margin-top:4px"><input type="checkbox" data-allowtests="${esc(q.id)}"> ${T('允许这一步改这些任务开始前就有的测试（已经改了的也算放行）：{paths}', { paths: esc(q.testPaths.join(T('、'))) })}<span class="mute">${T('。')}${q.testGuard === 'reject' ? T('不勾：这些改动交上来会被打回；要撤回就在答复里说') : T('不勾：照常交给 AI 验收判断，系统不会自动撤回；要撤回就在答复里说')}</span></label>` : ''}`
-        : canTransfer ? `<div class="row" style="margin-top:6px"><button data-tr="${esc(q.id)}" title="${T('指定另一个人来答；转交后你不再是接收人。与「不归我」的区别：这条仍然要有人答，只是换个人答')}">${T('转交')}</button></div>` : ''}${lostDraftHtml(q, canAnswer)}</div>`;
-  }).join('') || `<span class="mute small">${T('无')}</span>`;
+        : canTransfer ? `<div class="row" style="margin-top:6px"><button data-tr="${esc(q.id)}" title="${T('指定另一个人来答；转交后你不再是接收人。与「不归我」的区别：这条仍然要有人答，只是换个人答')}">${T('转交')}</button></div>` : ''}${fullOnly && isOpen ? quickFullHtml(q) : ''}${lostDraftHtml(q, canAnswer)}</div>`;
+  }).join('') || (QUICK ? `<span class="mute small">${T('这件事不在这个任务的最近事项里了（可能已经处理完）。')} <a href="#${esc(detail.task.id)}">${T('看整个任务')}</a></span>` : `<span class="mute small">${T('无')}</span>`);
+  if (QUICK) renderQuickBar();
   for (const i of document.querySelectorAll('#questions textarea[data-q]')) {
     const v = typed[i.dataset.q] || DRAFTS.get(i.dataset.q)?.text;
     if (v) i.value = v;
@@ -259,7 +274,13 @@ function renderQuestions() {
     const pick = prompt(T('转交给（输入成员名称）：\n{list}', { list: users.map((u) => `  ${u.display_name}（${roleName(u.role)}）`).join('\n') })); if (!pick) return;
     const u = users.find((x) => x.display_name === pick.trim() || x.id === pick.trim()); if (!u) return toast(T('未找到该成员'), true);
     const reason = prompt(T('为什么转给 {name}？（可留空；会显示在这条事项的活动记录里，对方能看到）', { name: u.display_name })); if (reason === null) return;
-    try { await api(`/api/questions/${b.dataset.tr}/transfer`, { to: [`user:${u.id}`], reason }); toast(T('已转交给 {name}', { name: u.display_name })); refresh(); } catch (e) { toast(e.message, true); }
+    // 带上这一页上看到的收件人：打开之后别人已经转过，服务端 409 说清谁转给了谁，不在旧页面上把它盖掉
+    const seen = detail.questions.find((x) => x.id === b.dataset.tr)?.addressed_to ?? null;
+    try {
+      const r = await api(`/api/questions/${b.dataset.tr}/transfer`, { to: [`user:${u.id}`], reason, expectTo: seen });
+      const dropped = (r?.result?.droppedVotes ?? []).map(nameOf);
+      toast(dropped.length ? T('已转交给 {name}。{who} 的答复已作废（不在新的接收人里），需要新的接收人重新答', { name: u.display_name, who: dropped.join(T('、')) }) : T('已转交给 {name}', { name: u.display_name })); refresh();
+    } catch (e) { toast(e.message, true); refresh(); }
   });
 }
 // 走查：卡片上看不出"批准"点下去是立刻生效还是要等别人 —— 直接写还差谁（与事项上的同一口径）

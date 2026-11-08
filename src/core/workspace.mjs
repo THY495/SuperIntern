@@ -13,7 +13,7 @@ import { execFileSync } from 'node:child_process';
 import { existsSync, mkdirSync, rmSync, readFileSync, writeFileSync, readdirSync } from 'node:fs';
 import { resolve, join } from 'node:path';
 import { audit, newId } from '../db/db.mjs';
-import { writeParam, clearParam } from './params.mjs';
+import { writeParam, clearParam, getParam } from './params.mjs';
 import { gitRaw as gitRawBase } from './git.mjs';
 import { I18nError, tl } from '../i18n/index.mjs';
 import { managementPaths, exposedBy } from './mgmt-paths.mjs';
@@ -58,6 +58,113 @@ export function nodeBaseline(db, { taskId, nodeId, workspace, actorId = 'executo
 /** 这一段工作结束（done，或修正改了规格要重做）：基线作废，下一段重取。 */
 export function clearNodeBaseline(db, { taskId, nodeId }) {
   clearParam(db, { taskId, key: BASE_KEY(nodeId) });
+}
+
+/**
+ * 在途工作（修正流水线第 3 步）：一步跑到一半被打断（人暂停 / 中止 / 紧急修正、部署级急停、轮级闸门掐停）时，
+ * 工作区里它还没提交的改动。
+ *
+ * 为什么不原地留着（假模型原来就是原地留着、靠"上一次没做完"那一段告诉执行器）：打断之后下一个跑的未必是这一步 ——
+ * 紧急修正会重规划，可能先插一个新步骤、可能把这一步作废、可能改它的规格。原地留着，下一个步骤的交接就会把
+ * 这些改动算成自己的（越界、或者出处错），作废的那一步留下的半成品还会混进别的提交。
+ *
+ * 所以：收起来 = 存成一个挂在 HEAD 上的提交（`refs/superintern/parked/<步骤>`，不在任何分支上，git 历史保底、可查可恢复），
+ * 工作区还原到 HEAD；这一步下一次开跑时放回来。被修正作废的步骤不再放回，ref 留着（"放弃不删代码"）。
+ * 依赖目录与已在 info/exclude 里的东西不收（它们不算谁的改动，见 DEP_EXCLUDES）；build/、out/ 这类构建产物也不收、不清。
+ * 崩溃（进程被杀）来不及收：那条路照旧原地留着、靠 假模型的说明。
+ */
+const PARK_KEY = (nodeId) => `node.${nodeId}.parked`;
+export const parkedRef = (nodeId) => `refs/superintern/parked/${nodeId}`;
+const parkKeep = () => [...BUILD_DIRS];   // BUILD_DIRS 在下面才声明：用到时再取
+const gitIdx = (dir, idx, ...args) => gitRawBase(dir, args, { timeout: WS_GIT_TIMEOUT_MS, env: { ...process.env, GIT_INDEX_FILE: idx } }).trim();
+
+/** 收起这一步的在途工作。工作区没有可收的改动 → null；收了 → { sha, files }。只在没有执行器在跑这一步时调。 */
+export function parkInflight(db, { taskId, nodeId, workspace, reason = null }) {
+  if (!workspace || !existsSync(workspace)) return null;
+  let head;
+  try { head = headOf(workspace); } catch { return null; }   // 非 git 工作区：无从收起，照旧原地留着
+  if (!gitRaw(workspace, 'status', '--porcelain').trim()) return null;
+  const idx = resolve(workspace, git(workspace, 'rev-parse', '--git-path', `si-park-${process.pid}.index`));
+  try {
+    gitIdx(workspace, idx, 'read-tree', 'HEAD');
+    gitIdx(workspace, idx, 'add', '-A', '--', '.', ...parkKeep().map((d) => `:(exclude,glob)**/${d}/**`));
+    const tree = gitIdx(workspace, idx, 'write-tree');
+    if (tree === git(workspace, 'rev-parse', 'HEAD^{tree}')) return null;   // 只剩构建产物：不算在途工作
+    const files = git(workspace, 'diff-tree', '-r', '--name-only', head, tree).split('\n').filter(Boolean);
+    const sha = git(workspace, '-c', 'user.name=SuperIntern', '-c', 'user.email=agent@superintern.local',
+      'commit-tree', tree, '-p', head, '-m', `superintern: ${nodeId} 的在途工作（${reason ?? 'interrupted'}）`);
+    git(workspace, 'update-ref', parkedRef(nodeId), sha);
+    // 先存好、再清：上面任何一步失败都走不到这里，工作区原样不动
+    git(workspace, 'reset', '-q', '--hard', 'HEAD');
+    git(workspace, 'clean', '-fdq', ...parkKeep().flatMap((d) => ['-e', `${d}/`]));
+    writeParam(db, { taskId, key: PARK_KEY(nodeId), value: { sha, head, files, reason }, by: { kind: 'agent', id: 'orchestrator' }, governance: 'execution' });
+    audit(db, { actorKind: 'system', action: 'inflight_parked', targetType: 'node', targetId: nodeId, payload: { ref: parkedRef(nodeId), sha, head, files: files.slice(0, 40), n: files.length, reason } });
+    return { sha, files };
+  } finally { try { rmSync(idx, { force: true }); } catch { /* 尽力 */ } }
+}
+
+/**
+ * 这一步开跑时把收起的在途工作放回工作区（基线已经取过之后调）。没有 → null；
+ * 放回了 → { restored: true, files }；放不回（期间 HEAD 动过、两边改了同一处）→ { restored: false, ref, files } ——
+ * ref 留着，执行器从说明里知道去哪看。不论成败都不再自动重试（不然每次开跑都撞一次）。
+ */
+export function restoreInflight(db, { taskId, nodeId, workspace }) {
+  const p = getParam(db, taskId, PARK_KEY(nodeId));
+  if (!p?.sha || !workspace || !existsSync(workspace)) return null;
+  clearParam(db, { taskId, key: PARK_KEY(nodeId), by: { kind: 'agent', id: 'executor' } });
+  const ref = parkedRef(nodeId);
+  if (!hasCommit(workspace, p.sha)) {
+    audit(db, { actorKind: 'system', action: 'inflight_restore_failed', targetType: 'node', targetId: nodeId, payload: { ref, sha: p.sha, files: p.files ?? [], error: 'missing' } });
+    return { restored: false, ref: null, files: p.files ?? [] };
+  }
+  const patch = resolve(workspace, git(workspace, 'rev-parse', '--git-path', `si-park-${process.pid}.patch`));
+  try {
+    writeFileSync(patch, gitRawBase(workspace, ['diff', '--binary', p.head, p.sha], { timeout: WS_GIT_TIMEOUT_MS, encoding: 'buffer' }));
+    git(workspace, 'apply', '--whitespace=nowarn', patch);
+  } catch (e) {
+    audit(db, { actorKind: 'system', action: 'inflight_restore_failed', targetType: 'node', targetId: nodeId, payload: { ref, sha: p.sha, files: p.files ?? [], error: String(e.stderr ?? e.message).slice(0, 400) } });
+    return { restored: false, ref, files: p.files ?? [] };
+  } finally { try { rmSync(patch, { force: true }); } catch { /* 尽力 */ } }
+  try { git(workspace, 'update-ref', '-d', ref); } catch { /* 留着也无妨 */ }
+  audit(db, { actorKind: 'system', action: 'inflight_restored', targetType: 'node', targetId: nodeId, payload: { sha: p.sha, files: (p.files ?? []).slice(0, 40), n: (p.files ?? []).length } });
+  return { restored: true, files: p.files ?? [] };
+}
+
+/** 被修正作废的步骤：收起的在途工作不再放回，ref 留着（git 里找得回来）。返回 { ref, files } 或 null。 */
+export function setAsideInflight(db, { taskId, nodeId, why = null }) {
+  const p = getParam(db, taskId, PARK_KEY(nodeId));
+  if (!p?.sha) return null;
+  clearParam(db, { taskId, key: PARK_KEY(nodeId), by: { kind: 'agent', id: 'replanner' } });
+  audit(db, { actorKind: 'system', action: 'inflight_set_aside', targetType: 'node', targetId: nodeId, payload: { ref: parkedRef(nodeId), sha: p.sha, files: (p.files ?? []).slice(0, 40), n: (p.files ?? []).length, why } });
+  return { ref: parkedRef(nodeId), sha: p.sha, files: p.files ?? [] };
+}
+
+/**
+ * 从这里重来（core/rewind.mjs）：工作区回到 base。先存、再回退 —— ref 指向回退前的样子：
+ * 工作区干净时就是原来的头；有没提交的改动时是挂在原来的头上的一个提交（与 parkInflight 同一个收法，依赖目录与构建产物不收）。
+ * 只在没有编排器在跑这个任务时调（调用方拿着任务租约）。→ { sha, dirty: [路径] }
+ */
+export function rewindWorkspace(dir, { base, ref, message }) {
+  const head = headOf(dir);
+  if (!hasCommit(dir, base)) throw new I18nError('工作区里没有提交 {sha}', { sha: String(base).slice(0, 8) });
+  let sha = head, dirty = [];
+  if (gitRaw(dir, 'status', '--porcelain').trim()) {
+    const idx = resolve(dir, git(dir, 'rev-parse', '--git-path', `si-rewind-${process.pid}.index`));
+    try {
+      gitIdx(dir, idx, 'read-tree', 'HEAD');
+      gitIdx(dir, idx, 'add', '-A', '--', '.', ...parkKeep().map((d) => `:(exclude,glob)**/${d}/**`));
+      const tree = gitIdx(dir, idx, 'write-tree');
+      if (tree !== git(dir, 'rev-parse', 'HEAD^{tree}')) {
+        dirty = git(dir, 'diff-tree', '-r', '--name-only', head, tree).split('\n').filter(Boolean);
+        sha = git(dir, '-c', 'user.name=SuperIntern', '-c', 'user.email=agent@superintern.local', 'commit-tree', tree, '-p', head, '-m', message);
+      }
+    } finally { try { rmSync(idx, { force: true }); } catch { /* 尽力 */ } }
+  }
+  git(dir, 'update-ref', ref, sha);
+  // 先存好、再回退：上面任何一步失败都走不到这里，工作区原样不动
+  git(dir, 'reset', '-q', '--hard', base);
+  git(dir, 'clean', '-fdq', ...parkKeep().flatMap((d) => ['-e', `${d}/`]));
+  return { sha, dirty };
 }
 
 /** 任务工作区建立时的 commit（`workspace_created` 审计里的 head）—— 读的正是下面 `ensureWorkspace` 写的那条。 */
@@ -149,7 +256,7 @@ export function changedSince(dir, base) {
  */
 export const pinLineEndings = (dir) => git(dir, 'config', 'core.autocrlf', 'false');
 
-export const DEP_EXCLUDES = ['node_modules/', '.venv/', 'venv/', '__pycache__/', '*.pyc', '.pytest_cache/', '.mypy_cache/', '.npm/', '.cache/', 'dist-newstyle/', '.si-preview/', '.si-outputs/', '*.db', '*.sqlite', '*.sqlite3', '*.db-journal', '*.db-wal', '*.db-shm',
+export const DEP_EXCLUDES = ['node_modules/', '.venv/', 'venv/', '__pycache__/', '*.pyc', '.pytest_cache/', '.mypy_cache/', '.npm/', '.cache/', 'dist-newstyle/', '.si-preview/', '.si-outputs/', '.si-skills/', '*.db', '*.sqlite', '*.sqlite3', '*.db-journal', '*.db-wal', '*.db-shm',
   'dist/', 'coverage/', '.next/', '.nuxt/', '.vite/', '.turbo/', '.parcel-cache/', '*.tsbuildinfo',
   // 测试工具跑一遍就会写出来的产物（比如 Playwright 失败时往 frontend/test-results/ 写 .last-run.json、error-context.md，
   // 交接次次被范围校验判越界，直到撞重试上限）。它们与 coverage/ 同类：跑测试的副产物，不是谁的改动。

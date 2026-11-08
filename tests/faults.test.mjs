@@ -167,9 +167,11 @@ section('⑧ 合并：快进失败 / 合并完还没记下就崩了 —— 不�
   setFaults([{ point: 'git', times: 1, match: (ctx) => (ctx.args ?? []).join(' ') === 'rev-parse HEAD' && gitx(P.repo, 'rev-parse', P.branch) === head1 }]);
   let e2 = null; try { await adv(); } catch (e) { e2 = e; }
   clearFaults();
-  eq([!!e2, ...merged(), gitx(P.repo, 'rev-parse', P.branch) === head1], [true, false, 0, true], '合并做了、记下之前崩了：项目分支已到位，merged_at 与审计还没有');
+  // 认领（merged_at）挪到快进之前做提交点 —— 认领之后人的修正 / 中止看到的就是"已合并"；崩了由下一拍照认领补齐
+  eq([!!e2, ...merged(), gitx(P.repo, 'rev-parse', P.branch) === head1], [true, true, 0, true], '合并做了、记下之前崩了：认领已记、项目分支已到位，合并审计还没有');
   const r = await adv();
-  eq([r.reason, ...merged()], ['merged', true, 1], '重跑一遍：补记 merged_at、合并审计恰好一条（推送与快进都是幂等的）');
+  eq([r.reason, r.recovered, ...merged()], ['merged', true, true, 1], '重跑一遍：照认领补齐，合并审计恰好一条（快进是幂等的）');
+  eq(db.one(`SELECT count(*) n FROM audit_log WHERE action='project_merge_claim_undone' AND target_id=?`, t1).n, 1, '前面那次快进失败撤过一次认领，留了审计');
   db.close();
 }
 

@@ -111,7 +111,7 @@ section('⑥ 命令行：db backup → db restore → db check');
 {
   const p = join(TMP, 'f', 'state.db');
   const db = openDb(p); ensureOwner(db); marker(db, 'cli-before'); db.close();
-  const cli = (...a) => spawnSync(process.execPath, ['--no-warnings', join(ROOT, 'src', 'cli.mjs'), ...a, '--db', p], { encoding: 'utf8', env: { ...process.env, SUPERINTERN_HOME: join(TMP, 'f') } });
+  const cli = (...a) => spawnSync(process.execPath, ['--no-warnings', join(ROOT, 'src', 'cli.mjs'), ...a, '--db', p], { encoding: 'utf8', env: { ...process.env, SUPERINTERN_HOME: join(TMP, 'f'), SUPERINTERN_ENV_FILE: 'none' } });
   const b = cli('db', 'backup');
   assert(b.status === 0, `db backup 成功（${b.stdout.trim().slice(0, 80)}）`, b.stderr);
   const file = listBackups(p).find((x) => x.tag === 'manual')?.file;

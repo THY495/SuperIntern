@@ -59,6 +59,15 @@ export const TRANSITIONS = {
   decision_registry: { active: ['void'], void: [] },
 };
 
+/**
+ * 人按住的状态：任务被人暂停 / 中止之后，只有人的放行动作（恢复、重开 —— 调用时带 release: true）能把它带出来。
+ * 别的写入（编排器挂起时写 waiting、规划器写完方案写 running、答复落地写 running……）碰上它们就**跳过**并记一行审计：
+ * 原来这些都是不看前置状态的写，暂停期间模型那一次调用回来是个提问，任务就被写回 waiting，暂停悄悄没了；
+ * 规划途中被中止，规划完照样写 running，守护进程接着拉执行器、接着花钱。
+ * 去 aborted 不受限（暂停中的任务可以直接中止）；去 done 本来就不在迁移表里，照旧报错。
+ */
+export const HELD = { tasks: ['suspended', 'aborted'] };
+
 /** 审计里的 target_type（单数）。 */
 const TARGET = { tasks: 'task', nodes: 'node', questions: 'question', projects: 'project', revisions: 'revision', handover_requests: 'handover_request', decision_registry: 'decision' };
 
@@ -81,9 +90,10 @@ export class StaleStateError extends I18nError {
  *   setSql      同时写的表达式（只给代码里的常量，例如 'retry_count=retry_count+1'；不接受外部输入）
  *   audit       { action, actorKind, actorId, payload } —— 换掉默认的 status_changed；from / to 并进 payload
  *   reason      写进默认审计的一句话
+ *   release     人的放行动作（恢复、重开）：允许把任务带出 HELD 里的状态
  * @returns {{changed: boolean, from: string|null, skipped?: boolean}}
  */
-export function transition(db, table, id, to, { from = null, onMismatch = 'throw', set = {}, setSql = null, audit = null, reason = null } = {}) {
+export function transition(db, table, id, to, { from = null, onMismatch = 'throw', set = {}, setSql = null, audit = null, reason = null, release = false } = {}) {
   if (!TRANSITIONS[table]) throw new Error(`不是带状态的表：${table}`);
   return db.tx(() => {
     const row = db.one(`SELECT status FROM ${table} WHERE id=?`, id);
@@ -98,6 +108,11 @@ export function transition(db, table, id, to, { from = null, onMismatch = 'throw
     if (from && !from.includes(cur)) {
       if (onMismatch === 'skip') return { changed: false, from: cur, skipped: true };
       throw new StaleStateError(table, id, cur, to);
+    }
+    if (HELD[table]?.includes(cur) && to !== 'aborted' && !release && canTransition(table, cur, to)) {
+      writeAudit(db, { actorKind: audit?.actorKind ?? 'system', actorId: audit?.actorId ?? null, action: 'status_change_held', targetType: TARGET[table], targetId: id,
+        payload: { from: cur, to, wanted: audit?.action ?? 'status_changed', ...(reason ? { reason } : {}) } });
+      return { changed: false, from: cur, skipped: true, held: true };
     }
     if (!canTransition(table, cur, to)) throw new I18nError('{table} {id}：不允许从 {from} 改成 {to}', { table, id, from: cur, to });
     // 写入防护：本进程持有某任务的租约时，对它的任务 / 步骤状态写入先核对代数 —— 被接管了就不许再写

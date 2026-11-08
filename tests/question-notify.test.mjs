@@ -11,6 +11,7 @@
 import { openDb, ensureOwner, newId, now } from '../src/db/db.mjs';
 import { applyTemplate, rulesOf, saveRules, routeQuestion, advanceRoute, transferQuestion } from '../src/core/routing.mjs';
 import { notifyPendingQuestions, setUserChannel } from '../src/core/users.mjs';
+import { setSetting } from '../src/core/settings.mjs';
 
 let pass = 0, fail = 0;
 const ok = (m) => { pass++; console.log(`  [PASS] ${m}`); };
@@ -20,6 +21,9 @@ const section = (s) => console.log(`\n── ${s}`);
 
 const db = openDb(':memory:');
 const lead = ensureOwner(db, 'lead').userId;
+// 这里测"推给谁"，不测"什么时候推"（推送节奏另有测试）：随时推、不攒、不限额
+const anytime = (d, userId) => { for (const [key, value] of [['deploy.work_start_hour', 0], ['deploy.work_end_hour', 24], ['deploy.work_days_only', false], ['deploy.digest_every_min', 0], ['deploy.push_cap_per_hour', 0]]) setSetting(d, { key, value, userId }); };
+anytime(db, lead);
 const t0 = now();
 const addUser = (name, tags = []) => {
   const id = newId('u');
@@ -95,6 +99,7 @@ section('⑤ 升级（v29 → v30）：已经推过的旧事项不重推');
              VALUES ('q_done', 't_1', 2, 'classifier', 'q', 'd', 1, 'open', '["u_a"]', 5), ('q_new', 't_1', 2, 'classifier', 'q', 'd', 1, 'open', '["u_a"]', NULL)`);
     old.close();
     const d = openDb(p);
+    anytime(d, 'u_l');
     eq(JSON.parse(d.one(`SELECT notified_to FROM questions WHERE id='q_done'`).notified_to), ['u_a'], '推过的旧事项：notified_to 回填为当时的收件人');
     pushed.length = 0;
     await notifyPendingQuestions(d, { env: {}, fetchFn });

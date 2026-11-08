@@ -103,10 +103,14 @@ The project owner decides who can add tasks to a project and who can see it unde
 
 To revoke someone's access: **disable** them under Settings → Members (all their tokens and logins are invalidated immediately), or **regenerate their token** (the old one is invalidated immediately).
 
-## 4. Two administrator settings
+## 4. Administrator settings
 
 - **Network catalog (Settings → Network catalog):** on servers in mainland China, add domestic npm / PyPI mirrors and tick "Allowed by default for new projects". New projects can then install dependencies as soon as they are created, without each project owner enabling them separately.
-- **Connections (Settings → Connections):** to push results to GitHub, add a GitHub App (recommended) or a token here. Values are stored encrypted in the database; the page shows only the last few characters / the fingerprint. To push to an internal Git service, add a token or SSH key; if none is added, the server's own git credentials are used. See the [Connections](deploy.en.md#connections-delivery-credentials) section in deploy.en.md.
+- **Connections (Settings → Connections):** to push results to GitHub, add a GitHub App (recommended) or a token here. Values are stored encrypted in the database; the page shows only the last few characters / the fingerprint. To push to an internal Git service, add a token or SSH key; if none is added, the server's own git credentials are used. See the [Connections](deploy.en.md#connections-delivery-credentials) section in deploy.en.md. For the system to watch delivered PRs and take in GitHub issues, the GitHub App needs a few more read permissions; see "GitHub loop" in deploy.en.md.
+- **Deployment time zone (Settings → Time and calendar):** be sure to set it to where the team is (see section 6 below). Members who have not set their own time zone get their working hours and status report times from it; if it is not set either, UTC is used.
+- **Deployment defaults for pushes and status reports (Settings → My notifications):** working hours, digest interval, rate limit and how often status reports are sent. Each person can change their own; the same page shows how often each member was interrupted in the last 7 days. See "Notifications and pushes" and "Status reports" in deploy.en.md.
+- **Email (optional):** set up sending in `.env` (`SMTP_URL`, `MAIL_FROM`) and members can have notifications sent to their own address; add `IMAP_URL` and they can answer by replying to the email. See "Email channel and reply by email" in deploy.en.md.
+- Item links in pushes use the `--public-url` address. For provenance links in commits and PRs to point to the board too, set the dashboard address under Settings → Connections.
 
 ## 5. System status and announcements
 
@@ -119,7 +123,7 @@ To revoke someone's access: **disable** them under Settings → Members (all the
 
 - **Settings → Time and calendar:** an administrator sets the **deployment time zone** (such as `Asia/Shanghai`) and **holidays and make-up workdays**. When the "1bd" (one business day) timeout in the routing table is due, when the duty roster hands over and the day monthly budgets roll over all follow the deployment time zone. If it is not set, UTC is used, which is 8 hours off for a deployment in China; System status warns about this.
 - Holidays, one per line: `2026-10-01..2026-10-07 国庆`; make-up workdays are written `2026-10-11 班`. Remember to add the next year each year (System status warns when the list has run out).
-- Each member can set **their own time zone** on the same page; it affects only the times they see. Times in the web UI are labeled with their time zone.
+- Each member can set **their own time zone** on the same page: times in the web UI are shown in it (labeled with their time zone), and it also sets that member's working hours and status report times.
 - **Duty swaps:** below the duty roster in project settings (or the default decision routing), use "Add cover": someone covers whole days, and the rotation is not affected. Each cover says whom it replaces (who would have been on duty on those days by rotation), so you can check the dates.
 - The duty roster takes effect only when it is used in the routing table: add "On-call (per rotation)" to the recipients of a "By decision type" row.
 
@@ -136,8 +140,11 @@ To revoke someone's access: **disable** them under Settings → Members (all the
 - **Intercepted GitHub login callbacks:** the state in the callback must match a cookie in the browser that started the login, and PKCE is used as well. The user token GitHub returns is used only to ask "who are you" and is invalidated right after; it is never stored.
 - **Invalid-token attempts:** 20 failed attempts from one source within 10 minutes block that source for 10 minutes. Behind the proxy, the source uses X-Forwarded-For, so one user's failures do not block everyone.
 - **Permissions are still per person:** who can change models, add people, approve plans, sign off and deliver is decided by roles and the routing table, the same as in local mode.
+- **Forwarded links in pushes:** links carry no credentials, so opening one requires the usual login; the reply token in an email can only be used to answer that one item by email, cannot call any API, expires after 72 hours and is void once used.
+- **Repository hooks and MCP servers reaching the host:** repository hooks and all MCP servers run only in the task's sandbox; hooks that run on the host can only be changed by people with access to the server and are approved by content, so a changed hook does not run until approved again; when an MCP server's configuration or tool list changes, the AI loses access until the lead approves it again.
 
 **Remaining limitations:**
 
 - **If XSS still slips into a page:** a script cannot read the token, but it can send requests as the current user. The CSP and escaping checks above were done in-house, with no third-party audit. Styles still allow inline use (the page relies on it heavily), so injected styles can change how the page looks.
+- **Reply by email trusts the sender address:** a reply must carry the one-time token from the push email, come from the registered address, and not be marked as a DMARC / SPF failure by the receiving server. If the receiving server does not run these checks, someone who has the original push email can answer by forging the sender. Teams that need strict control over answers should not set `IMAP_URL`.
 - **Public internet exposure:** there is no multifactor authentication, account lockout policy, audit alerting or hardening against internet-wide scanning. Deploy on an intranet only.

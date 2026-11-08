@@ -359,7 +359,8 @@ export function checkLimits(db, taskId, ctx = {}) {
 /**
  * 设一个上限。宪法层参数 —— 库层 CHECK 保证 `set_by_kind='user'`，agent 结构上改不了。
  */
-export function setLimit(db, { taskId, key, value, userId }) {
+/** expect：改的人打开页面时看到的值（看板传）。对不上 = 打开之后别人改过 —— 409 说清谁、何时改成了多少，不在旧值上盖（上限按路由表可以有好几个人能改）。 */
+export function setLimit(db, { taskId, key, value, userId, expect = null }) {
   if (!LIMITS[key]) throw new I18nError('上限项无效：{key}（应为 {keys}）', { key, keys: Object.keys(LIMITS).join(' / ') });
   // 上限是"预算上限"决策类型：谁能改查路由表，不查 role —— 否则旋钮可调但不生效。
   if (userId) requireAuthorized(db, { taskId, decisionType: 'budget', userId });
@@ -368,6 +369,12 @@ export function setLimit(db, { taskId, key, value, userId }) {
   if (n) checkCompactAgainstContext(db, { key, compact: key === 'limit.compact_tokens' ? n : limitOf(db, taskId, 'limit.compact_tokens'), context: key === 'limit.context_tokens' ? n : limitOf(db, taskId, 'limit.context_tokens') });
   const t = now();
   return db.tx(() => {
+    if (expect != null && Number(expect) !== limitOf(db, taskId, key)) {
+      const last = db.one(`SELECT l.ts, u.display_name FROM audit_log l LEFT JOIN users u ON u.id=l.actor_id WHERE l.action='limit_set' AND l.target_id=? AND json_extract(l.payload,'$.key')=? ORDER BY l.id DESC LIMIT 1`, taskId, key);
+      const L = contentLang(db);
+      throw Object.assign(new I18nError('没有保存：「{label}」在你打开之后已被 {who} 于 {when} 改成 {now}。页面已刷新；仍要用你的值，就重新输入并保存（会覆盖 {who} 改的 {now}）', {
+        label: tlN(L, uiName(key)), who: last?.display_name ?? tl(L, '别人'), when: last ? `${new Date(last.ts).toISOString().slice(0, 16).replace('T', ' ')} UTC` : tl(L, '刚才'), now: LIMITS[key].fmt ? LIMITS[key].fmt(limitOf(db, taskId, key), L) : String(limitOf(db, taskId, key)) }), { status: 409, conflict: true });
+    }
     const id = writeParam(db, { taskId, key, value, by: { kind: 'user', id: userId }, governance: 'constitutional', at: t });
     audit(db, { actorKind: 'user', actorId: userId, action: 'limit_set',
       targetType: 'task', targetId: taskId, payload: { key, value } });

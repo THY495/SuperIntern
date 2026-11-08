@@ -14,7 +14,7 @@ import { recordAnswer, answersOf } from '../src/core/answers.mjs';
 import { permissionsOf, renderPermissions } from '../src/core/permissions.mjs';
 import { questionsToNotify } from '../src/core/questions.mjs';
 import { setSetting } from '../src/core/settings.mjs';
-import { buildDigest, renderDigest, renderHandover, sendHandoverNotice, scheduledDigests } from '../src/core/digest.mjs';
+import { buildDigest, renderDigest, renderHandover, sendHandoverNotice } from '../src/core/digest.mjs';
 
 let pass = 0, fail = 0;
 const section = (t) => console.log(`\n${'─'.repeat(72)}\n${t}\n${'─'.repeat(72)}`);
@@ -253,7 +253,6 @@ section('6. 停用前必须交接；一步做完');
   const ch = executeHandover(db, { fromUserId: bob.id, toUserId: alice.id, scope: { all: true }, byUserId: lead, thenDisable: true });
   assert(ch.disabled && !!db.one(`SELECT disabled_at FROM users WHERE id=?`, bob.id).disabled_at, '交接 + 停用一步做完');
   assert(usersView(db).find((u) => u.id === bob.id).disabledAt, '成员视图标出已停用');
-  eq((await scheduledDigests(db, { every: '30m', env: {}, fetchFn: async () => ({ ok: true, status: 200 }) })).some((d) => d.userId === bob.id), false, '停用的人不收定时摘要');
   db.close();
 }
 

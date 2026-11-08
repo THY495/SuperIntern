@@ -28,6 +28,7 @@ import { timeoutFor } from './timeouts.mjs';
 import { record } from './decisions.mjs';
 import { transition } from '../db/state.mjs';
 import { insertQuestion, setRecipients } from './questions.mjs';
+import { tierOf, trySignal } from './signals.mjs';
 
 export const CHOICES_MARK = '【AI 替你定了几件事】';
 const REVIEWED_KEY = 'task.choices_reviewed';
@@ -48,7 +49,7 @@ const clip = (s, n) => { const t = String(s ?? '').replace(/\s+/g, ' ').trim(); 
  * 幂等：挂过的假设记在 task.choices_reviewed，重做之后只挂新的。
  */
 export function raiseChoiceReviews(db, { taskId, at = now() }) {
-  const task = db.one(`SELECT id, title FROM tasks WHERE id=?`, taskId);
+  const task = db.one(`SELECT id, title, project_id FROM tasks WHERE id=?`, taskId);
   if (!task) return [];
   const seen = new Set(getParam(db, taskId, REVIEWED_KEY) ?? []);
   const all = db.all(`SELECT id, node_id, subject_key, statement, verification, audience, recorded_at FROM assumptions
@@ -63,8 +64,17 @@ export function raiseChoiceReviews(db, { taskId, at = now() }) {
   for (const a of fresh) groups[domainOf(a)].push(a);
   const out = [];
   const L = contentLang(db);
+  // 监督模式：逐项审批 = 决策（不带默认、答之前不合并）；抽检 = 不挡路的过目事项（到期按"沿用"了结）；
+  // 例外管理 = 不挂事项，只留一条记录（看板「通知」里查得到，任务页「活动」照旧列着"系统代为决定"）
+  const tier = tierOf(db, 'ai_choices', { projectId: task.project_id });
+  const blocking = tier === 'decide';
   db.tx(() => {
-    for (const [domain, items] of Object.entries(groups)) {
+    if (tier !== 'decide' && tier !== 'notify') {
+      trySignal(db, 'choices.made', { to: ['owner'], taskId, at, title: tl(L, '[SuperIntern] AI 在「{title}」里自己定了 {n} 件事', { title: task.title, n: fresh.length }),
+        text: fresh.slice(0, MAX_ITEMS).map((a, i) => `${i + 1}. ${clip(a.statement, 220)}`).join('\n') });
+      audit(db, { actorKind: 'system', action: 'choices_recorded', targetType: 'task', targetId: taskId, payload: { assumptionIds: fresh.map((a) => a.id), mode: 'exception' } });
+    }
+    for (const [domain, items] of (tier === 'decide' || tier === 'notify' ? Object.entries(groups) : [])) {
       if (!items.length) continue;
       const qid = newId('q');
       const shown = items.slice(0, MAX_ITEMS);
@@ -75,24 +85,24 @@ export function raiseChoiceReviews(db, { taskId, at = now() }) {
         ...shown.flatMap((a, i) => [`${i + 1}. ${clip(a.statement, 220)}`, `   ${tl(L, '它的依据：{basis}', { basis: clip(a.verification, 160) })}`]),
         ...(items.length > shown.length ? [tl(L, '……另有 {n} 件，见任务页「活动」里的"系统代为决定"。', { n: items.length - shown.length })] : []),
         '',
-        tl(L, '这条不影响任务照常签收、合并。怎么答：'),
+        blocking ? tl(L, '项目的监督模式是「逐项审批」：你答之前，这个任务不会合并进项目分支（签收照常）。怎么答：') : tl(L, '这条不影响任务照常签收、合并。怎么答：'),
         tl(L, '- 都行：回「A」（代表上面几件全部同意，不是选第几条）。这几件记进项目的约定清单，以后的任务照着来。'),
         tl(L, '- 有要改的：直接写改成什么（比如"2 改成：高 / 中 / 低 倒过来显示"）。系统替你「添加任务」去改 —— 这个任务照常签收、合并，改动放在后面单独做、单独批。'),
         tl(L, '- 只想补一句说明、不要求改：以「说明：」开头写。只记下来给后面的人看，不会引出任何改动。'),
-        tl(L, '- 不答：到期按"沿用 AI 的选择"了结。'),
+        ...(blocking ? [] : [tl(L, '- 不答：到期按"沿用 AI 的选择"了结。')]),
       ].join('\n');
       const ttl = timeoutFor(db, taskId, 2);
-      insertQuestion(db, { id: qid, taskId, level: 2, text, defaultAction: tl(L, '沿用 AI 的选择，不改'), askedAt: at, timeoutAt: ttl ? at + ttl : null });
+      insertQuestion(db, { id: qid, taskId, level: 2, text, defaultAction: blocking ? null : tl(L, '沿用 AI 的选择，不改'), askedAt: at, timeoutAt: ttl ? at + ttl : null });
       // 主题键的开头也算（frontend.priority.label → frontend）：原话里常常没有路径（只看原话，界面上的取舍会落不到管界面的人手上）
       const keyDirs = items.map((a) => String(a.subject_key).match(/^(frontend|backend|client|server|web|api|ui|app)[._/-]/i)?.[1]?.toLowerCase()).filter(Boolean);
       const pf = [...new Set([...prefixesIn(items.map((a) => `${a.subject_key} ${a.statement}`).join('\n')), ...keyDirs])];
       routeQuestion(db, { questionId: qid, decisionType: domain, typeSource: 'hard_rule', prefixes: pf.length ? pf : null, at });
       leadOnlyInformed(db, { questionId: qid, taskId });
       audit(db, { actorKind: 'system', action: 'choices_review_raised', targetType: 'task', targetId: taskId,
-        payload: { questionId: qid, domain, assumptionIds: items.map((a) => a.id), human: domain === 'structural'
+        payload: { questionId: qid, domain, blocking, assumptionIds: items.map((a) => a.id), human: domain === 'structural'
           ? tl(L, '{n} 件 AI 自选的事交给结构那一行的人过目', { n: items.length })
           : tl(L, '{n} 件 AI 自选的事交给规格那一行的人过目', { n: items.length }) } });
-      out.push({ questionId: qid, domain, count: items.length });
+      out.push({ questionId: qid, domain, count: items.length, blocking });
     }
     setParam(db, { taskId, key: REVIEWED_KEY, value: [...new Set([...seen, ...all.map((a) => a.id)])], by: BY, governance: 'execution' });   // 被取代的旧说法也算看过了
   });
@@ -179,3 +189,8 @@ export function answerChoices(db, { question, finalBody, by, messageId, at = now
     payload: { messageId: mid, kind: 'correction', kindSource: 'explicit', urgency: 'urgent', urgencySource: 'explicit', via: 'choices_review' } });
   return { handled: true, correction: mid };
 }
+
+/** 逐项审批下挂的过目事项还没答：这个任务先不合并。签收照常 —— 签收看的是做得对不对，过目看的是 AI 自己拍的板认不认。 */
+export const choicesHolding = (db, taskId) => !!db.one(`SELECT 1 FROM questions q WHERE q.task_id=? AND q.status IN ('open','escalated')
+  AND EXISTS (SELECT 1 FROM audit_log l WHERE l.action='choices_review_raised' AND l.target_type='task' AND l.target_id=q.task_id
+              AND json_extract(l.payload,'$.questionId')=q.id AND json_extract(l.payload,'$.blocking')=1) LIMIT 1`, taskId);

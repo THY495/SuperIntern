@@ -60,7 +60,7 @@ function bindLostDrafts() {
   });
   box.querySelectorAll('[data-lostcorr]').forEach((b) => b.onclick = () => {
     const qid = b.dataset.lostcorr;
-    $('#sayBody').value = DRAFTS.get(qid)?.text ?? ''; $('#sayKind').value = 'correction'; $('#sayAbout').value = qid;
+    $('#sayBody').value = DRAFTS.get(qid)?.text ?? ''; $('#sayKind').value = 'correction'; $('#sayKind').dispatchEvent(new Event('change')); $('#sayAbout').value = qid;
     DRAFTS.delete(qid); renderQuestions();
     $('#sayBody').scrollIntoView({ behavior: 'smooth', block: 'center' }); $('#sayBody').focus();
     toast(T('草稿已填进「发送」框，类别是「修正」；看一眼再点「发送」'), false, 6000);
@@ -74,7 +74,7 @@ async function refresh() {
 async function refreshInner() {
   if (view === 'task' && cur) {
     detail = await api(`/api/tasks/${cur}`);
-    renderHeader(); renderConstitution(); renderDag(); renderPreview(); renderTaskDiff(); renderQuestions(); renderRevision(); renderActivity(); renderInbox(); renderReports(); renderLimits();
+    renderHeader(); renderTaskPr(); renderConstitution(); renderDag(); renderPreview(); renderTaskDiff(); renderQuestions(); renderRevision(); renderActivity(); renderInbox(); renderReports(); renderLimits();
   }
   await renderDigest();   // 收件箱本身，也是侧栏上"等你"计数的来源
   renderSide(); renderCtx();

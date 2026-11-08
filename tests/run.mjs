@@ -54,7 +54,8 @@ for (const n of names) {
   // 只有部分小节要 docker / 外网的套件（整套没标 @needs）也要知道"这次不许用"：经环境变量传下去，
   // 由它们自己跳过那几节并打印"跳过"（下面会汇总出来）。Windows 的 CI 机器有 docker 引擎、却只有 Windows 容器，
   // 光探"有没有 docker"会误判成能跑。
-  const env = { ...process.env, ...(without.length ? { SUPERINTERN_TEST_WITHOUT: without.join(',') } : {}) };
+  // 套件里拉起的 CLI 子进程不读仓库的 .env（开发者自己的通知通道与 key：读了就会真发通知）
+  const env = { ...process.env, SUPERINTERN_ENV_FILE: 'none', ...(without.length ? { SUPERINTERN_TEST_WITHOUT: without.join(',') } : {}) };
   const r = spawnSync(process.execPath, [file], { encoding: 'utf8', cwd: join(HERE, '..'), timeout: timeoutMs, killSignal: 'SIGKILL', maxBuffer: 256 * 1024 * 1024, env });
   const ms = Date.now() - t0;
   const out = (r.stdout ?? '') + (r.stderr ?? '');

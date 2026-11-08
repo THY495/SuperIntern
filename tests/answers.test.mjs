@@ -7,7 +7,7 @@
 // 路由行时限到期 next / default 各走各的。
 
 import { openDb, ensureOwner, newId, now, insertEdge } from '../src/db/db.mjs';
-import { recordAnswer, answersOf } from '../src/core/answers.mjs';
+import { recordAnswer, answersOf, waitingOn } from '../src/core/answers.mjs';
 import { recordMessage } from '../src/core/inbox.mjs';
 import { applyTemplate, saveRules, rulesOf, routeQuestion, setDutyCalendar } from '../src/core/routing.mjs';
 import { sweepTimeouts } from '../src/core/timeouts.mjs';
@@ -77,9 +77,11 @@ section('1. 法定人数：一人答不生效；两人一致才生效');
   const task = mkTask();
   const node = mkNode(task);
   const q = mkQ(task, { nodeId: node });
+  eq([waitingOn(db, q).left.sort(), waitingOn(db, q).need], [[alice.id, bob.id].sort(), 2], '在等谁（看板）：两人都还没答、差 2 票');
   const r1 = recordAnswer(db, { questionId: q, body: 'A', plaintextToken: alice.plaintext });
   eq(r1.resolved, false, 'alice 一人答：未决');
   eq(r1.pending, [{ scope: '*', need: 2, have: 1 }], '差一人');
+  eq([waitingOn(db, q).left, waitingOn(db, q).need], [[bob.id], 1], '在等谁：与结算同一个算法 —— 还差 bob 一票');
   eq(status(q), 'open', '问题仍 open');
   eq(db.one(`SELECT status FROM nodes WHERE id=?`, node).status, 'blocked', '节点仍挂起');
   const r2 = recordAnswer(db, { questionId: q, body: ' a ', plaintextToken: bob.plaintext });

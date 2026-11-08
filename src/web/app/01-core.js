@@ -42,6 +42,8 @@ const ago = (ts) => { const s = Math.max(0, (Date.now() - ts) / 1000); return s 
 const sp = (w) => `${/^[\x00-\x7f]/.test(w) ? ' ' : ''}${w}${/[\x00-\x7f]$/.test(w) ? ' ' : ''}`;
 const dur = (ms) => { if (ms == null) return '—'; if (ms <= 0) return T('已到期'); const m = ms / 60000; return m < 60 ? T('{n} 分钟', { n: m | 0 }) : m < 1440 ? T('{n} 小时', { n: (m / 60).toFixed(1) }) : T('{n} 天', { n: (m / 1440).toFixed(1) }); };
 let cur = null, detail = null, refreshTimer = null, me = null, routingData = null;
+// 快速答复：推送里的事项链接 #q/<事项> 打开的单件模式。是任务页的一种显示，答复走同一张卡片、同一个接口
+let QUICK = null;
 
 let toastTimer = null;
 document.addEventListener('keydown', (e) => {
@@ -122,9 +124,23 @@ async function api(path, body) {
   const j = await r.json();
   if (r.status === 401 && j.login) { showLogin(); throw new Error(T('请先登录')); }   // 团队模式：会话没了（退出 / 令牌被吊销）
   // 别人在你打开之后改过：把这一块重新载入成最新的，让人在它上面重做（提示由调用方 toast）
-  if (r.status === 409 && j.conflict) setTimeout(() => { if (path.startsWith('/api/routing')) renderRouting(); else if (path.startsWith('/api/llm')) renderLlm(true); }, 0);
+  // 任务 / 事项上的（上限、转交……）：整页刷新成最新 —— 报错里说的"页面已刷新"就是这一下
+  if (r.status === 409 && j.conflict) setTimeout(() => { if (path.startsWith('/api/routing')) renderRouting(); else if (path.startsWith('/api/llm')) renderLlm(true); else if (/^\/api\/(tasks|questions)\//.test(path)) void refresh(); }, 0);
   if (!r.ok) { const e = new Error(j.error || r.statusText); e.data = j; throw e; }   // 报错文字随语言变，要判断的看 e.data 里的字段
   return j;
+}
+// 交付前的策略钩子要人确认：把钩子的话给人看，同意就带上确认码再发一次。确认码绑着那一份理由，变了服务端会再问
+async function withHookAck(send) {
+  const acks = [];
+  for (;;) {
+    try { return await send(acks); }
+    catch (e) {
+      const k = e.data?.hookAsk;
+      if (!k || acks.includes(k) || acks.length >= 3) throw e;
+      if (!confirm(`${e.message}\n\n${T('看过没问题，继续交付？')}`)) throw new Error(T('没有交付'));
+      acks.push(k);
+    }
+  }
 }
 async function act(action, body, msg) {
   if (!cur) return;

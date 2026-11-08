@@ -24,6 +24,7 @@ import { lockedPathsFor, coveredBy, sharedPathsOf } from './parallel.mjs';
 import { contractGaps } from './contract-coverage.mjs';
 import { prefixesOf, scopeFilesOf } from './routing.mjs';
 import { raiseChoiceReviews, CHOICES_MARK } from './choices.mjs';
+import { trySignal } from './signals.mjs';
 
 /** 这条开着的事项挡不挡执行（见 run 里 pending 那一行）。停等 / 空转的标记与 liveness.mjs 一致（不 import，免得成环）。 */
 export const blocksExecution = (q) => q.decision_type !== 'signoff'
@@ -54,6 +55,11 @@ import { sweepTimeouts } from './timeouts.mjs';
 import { escalationFor, recordEscalation } from './escalate.mjs';
 import { pidAlive } from './proc.mjs';
 import { transition } from '../db/state.mjs';
+import { checkRulesIfChanged } from './project-rules.mjs';
+import { CHECK_TIER } from './decision-check.mjs';
+
+/** 执行一步期间多久看一次"任务被中止 / 部署被急停"。看到就掐断进行中的模型调用；查一次是两条主键查询 */
+const CANCEL_POLL_MS = Number(process.env.SUPERINTERN_CANCEL_POLL_MS) || 2000;
 import { acquireLease, releaseLease, leaseOf, setFence, clearFence, startHeartbeat, HOLDER } from '../db/lease.mjs';
 import { estimateCallMicro, reserveCall, releaseReservation } from './spend.mjs';
 import { stopwatch } from './clock.mjs';
@@ -71,6 +77,8 @@ export const PREVIEW_NODE_KEY = 'preview.auto_node';
 export const PREVIEW_NODE = {
   // 显示在看板步骤图上：插入节点时按内容语言翻（键是这句中文原文，与 PREVIEW_FILE 同值，写成字面量才登记得上）
   title: N_('写页面截图说明（si-preview.json）'),
+  // 推给负责人的那句"为什么系统自己加了这一步"
+  why: N_('这个任务改了界面，却没有截图说明，签收的人就看不到页面。加的这一步只写说明文件，写完照常请你签收。'),
   // 规格与验收也按内容语言写：系统补的这一步显示在看板的步骤详情里，英文部署里不该冒出一段中文
   spec: (L) => tl(L, '仓库里有界面（前端），但根目录还没有 {file}，签收的人因此看不到做出来的页面。按沙箱说明写一份 {file}：start（起后端、起前端的命令，每条一个后台进程，监听 127.0.0.1）、url（前端地址）、ready（后端一个能返回 200 的地址）、seed（可选：服务起来后放几条样例数据的命令，每条可写成字符串数组，例如用 curl 调新建接口 —— 空列表证明不了功能）、pages（要截的页，至多 6 页）。只改 {file}（需要样例数据脚本时可以新加一个）；不要自己起浏览器截图，不要提交图片 —— 截图由系统按这份文件做，放到签收页上。', { file: PREVIEW_FILE }),
   acceptance: (L) => tl(L, '仓库根目录有 {file}：合法 JSON，start 非空、url 是 http://127.0.0.1:端口、pages 非空；在沙箱里按 start 实际起一遍服务，url 与 ready 里每个地址都返回 2xx（交接记录里贴出这几次请求的结果）。', { file: PREVIEW_FILE }),
@@ -81,6 +89,7 @@ export const PREVIEW_NODE = {
 export const PREVIEW_SEED_NODE_KEY = 'preview.seed_node';
 export const PREVIEW_SEED_NODE = {
   title: N_('给页面截图补样例数据（si-preview.json 的 seed）'),
+  why: N_('页面接了后端，但截图时库是空的，签收的人只看得到空列表。加的这一步只写样例数据脚本，只在系统截图时运行。'),
   spec: (L) => tl(L, '{file} 里的页面接了后端，但没写 seed：系统截图时库是空的，签收的人只看得到空列表。补一条或几条 seed（至多 3 条，每条一个进程、不经 shell）：服务起来之后往里放几条有代表性的样例数据 ——例如写一个样例数据脚本（通过后端的新建接口写入，或直接写库），或用 curl 调新建接口。样例要覆盖页面上主要的几种状态。脚本开头先检查环境变量 SI_PREVIEW=1（系统截图时会设），不是就退出并说明 —— 免得有人对真跑着的后端执行、把示例数据写进真库。只改 {file} 与新加的样例数据脚本；不要自己截图、不要提交图片或数据库文件。', { file: PREVIEW_FILE }),
   acceptance: (L) => tl(L, '{file} 的 seed 非空；在沙箱里按 start 起服务、带 SI_PREVIEW=1 跑一遍 seed 后，列表接口返回的数据不为空；不带 SI_PREVIEW=1 跑，样例数据脚本拒绝运行、不写数据（交接记录里贴出这几次的结果）。', { file: PREVIEW_FILE }),
   // seed 写了、但引用的脚本不在了（被当作越界改动撤回）—— 同一步，开头说清是哪几个文件
@@ -120,6 +129,7 @@ export function seedPlacement(db, taskId, L = contentLang(db)) {
 export const CONTRACT_NODE_KEY = 'contract.coverage_node';
 export const CONTRACT_NODE = {
   title: N_('把规格里的接口补全进契约'),
+  why: N_('契约文件漏了规格里写死的几处接口，别的任务会照着不完整的契约做。加的这一步只补契约，不实现业务。'),
   spec: (L, files, gaps) => `${tl(L, '契约文件（{files}）与规格对不上 —— 规格里写死的这些，契约里没有：', { files: files.join(tl(L, '、')) })}\n- ${gaps.join('\n- ')}\n`
     + tl(L, '照规格原文把它们补进契约文件（路径、方法、查询参数、请求 / 响应字段、状态码）；契约测试若逐项核对接口，也把这几处加上。只改契约文件与契约测试；桩跟着契约补上能跑的占位即可，不要实现业务。'),
   acceptance: (L) => tl(L, '契约文件里有上面列出的每一处；契约测试与根验收照样通过（交接记录里贴出结果）。'),
@@ -283,6 +293,8 @@ async function orchestrateTask(db, {
   const startedAt = now();
   const elapsed = stopwatch();   // 时长用单调时钟；startedAt 只作时间戳
   const DEPLOY_PAUSED = 'deploy.paused';
+  // 人的打断：轮级闸门返回这几个原因串，执行器把它们原样记进 node_aborted、装配据此说给重开的执行器听（assemble.ABORT_WHY）
+  const TASK_PAUSED = 'task.paused', TASK_ABORTED = 'task.aborted', STEER = 'steer.urgent';
   const finish = (kind, extra = {}) => {
     // elapsedMs 不是给人看的装饰：limits.priorRuntimeMs 真的从这里读。
     // 让一条活着的护栏依赖审计轨，轨烂了当场就会被发现，而不是等到复盘时。
@@ -425,7 +437,7 @@ async function orchestrateTask(db, {
     if (task.status === 'done' && !reopen) {
       return finish('complete', { cycles: cycle - 1, completed, already: true });
     }
-    // 人在看板上按了暂停 / 中止（控制杆）：状态就是指令，编排器每轮开头读到就退出。
+    // 人在看板上按了暂停 / 中止：状态就是指令，编排器每轮开头读到就退出。
     // 暂停不是挂起（suspended 由人设、waiting 由问题设），恢复也不是答题 —— 是人再按一次。
     if (task.status === 'suspended') return finish('paused', { cycles: cycle - 1, completed, why: tl(L, '任务被人暂停；恢复：cli 或看板 resume') });
     if (task.status === 'aborted') return finish('aborted_by_user', { cycles: cycle - 1, completed, why: tl(L, '任务被人中止') });
@@ -437,7 +449,7 @@ async function orchestrateTask(db, {
     const breach = checkLimits(db, taskId, limitsCtx());
     if (breach) return breachOut(breach);
 
-    // ⓪′ 人发来的修正/新指令（五步修正流水线）。**必须在挑节点之前处理。**
+    // ⓪′ 人发来的修正/新指令（五步流水线）。**必须在挑节点之前处理。**
     //
     // 为什么不放它过去让执行器自己看着办：那等于让执行器**自行改变任务目标**，
     // 而目标属宪法层，执行层无权动。装配层因此也明写了
@@ -445,9 +457,9 @@ async function orchestrateTask(db, {
     //
     // `context` 类不在此列：补充上下文不改变要做什么，进收件箱段给执行器读就行。
     //
-    // 流水线第 3 步（在途工作处理）在串行模型里**是空的**：这里排在挑节点
-    // 之前，所以流水线跑起来时不可能有节点在途。如实记着，不假装实现了 ——
-    // 一旦有并发执行器它就必须真的做。
+    // 在途工作处理：紧急修正（say --urgent）会在步骤跑到一半时打断它（轮级闸门返回 STEER），
+    // 回到这里重规划。那一步没提交的改动已由执行器收起（workspace.parkInflight）：重规划作废它 → 放一边（revision.mjs），
+    // 改它的规格或不动它 → 它下次开跑时放回、并被告知原委（assemble 的"这一步上一次没做完"）。不紧急的修正照旧等这一步做完。
     const pendingRev = pendingRevision(db, taskId);
     if (pendingRev) {
       onEvent({ type: 'revision_pending', revision: pendingRev });
@@ -499,8 +511,13 @@ async function orchestrateTask(db, {
       }
       // 门没触发 → 直接生效并把 diff 推给人（"不默默换计划"）。
       const applied = applyRevision(db, { taskId, revisionId: prop.revisionId, by: 'auto' });
+      {
+        const CL = contentLang(db);
+        trySignal(db, 'plan.revised', { to: ['owner', msg.sender_id].filter(Boolean), taskId, ref: prop.revisionId, title: tl(CL, '[SuperIntern] 计划按修正改了（没到要你批的程度）'),
+          text: tl(CL, '改动不碰契约、要重来的已完成工作没过线，所以直接生效了。改了什么：任务页「计划变更」卡片。不同意就再发一条修正。') });
+      }
       onEvent({ type: 'revision_applied', taskId, ...applied, summary: prop.summary, rev: rp.args });
-      await reportOn('revision_applied', prop.revisionId);   // 汇报触发之一：重大状态变化
+      await reportOn('revision_applied', prop.revisionId);   // 汇报的触发之一：重大状态变化
       continue;                              // 重生点会重新读库，改完的计划从下一轮开始生效
     }
 
@@ -571,10 +588,15 @@ async function orchestrateTask(db, {
     // 用户自己加的服务商会被当成"不存在"（按角色绑定顺带修）。⚠️ 在下面的 try 里取：绑定配错抛 ConfigError，要走"退回 pending、不计重试"那条路
     let execEntry = null;
     onEvent({ type: 'node_start', cycle, node, tier });
+    // 仓库自带的项目规则：内容或有效决定清单变了，就对着已定的约定比一遍；冲突挂事项给负责人，不拦这一步
+    {
+      const rc = await checkRulesIfChanged(db, { taskId, workspace, makeClient: () => makeClient(CHECK_TIER) });
+      if (rc?.raised?.length) onEvent({ type: 'rules_conflict', node, questions: rc.raised.map((x) => x.questionId) });
+    }
 
     // 本节点的账，**每一轮工具调用后就落库**，不等节点结束。
-    // 进程若被 403 打死，此前每一轮工具调用烧掉的钱会一分没进账本 ——
-    // flushLedger 若只在 finally 里跑，进程活不到 finally。预算闸门看不见的钱
+    // 真跑里进程两次被 403 打死，各 11 轮工具调用烧掉的钱一分没进账本 ——
+    // flushLedger 原来只在 finally 里跑，进程没活到 finally。预算闸门看不见的钱
     // 就不是钱。每轮落一次，崩了最多丢最后一轮。
     let nodeMicro = 0, nodeRows = 0;
     const flushStep = () => {
@@ -588,11 +610,21 @@ async function orchestrateTask(db, {
     let infra = null;   // 基础设施错误（厂商 / 硬边界）：不是节点的错，另走一条路
     // 执行器实际用的模型的窗口。原来取的是档位绑定 —— 按角色绑定单独给执行器绑了模型时，窗口取错了模型
     const execWindow = () => { try { return client.catalog?.[(execEntry ?? client.entryFor(tier, 'executor')).key]?.contextWindow ?? null; } catch { return client.catalog?.[client.binding?.[tier]]?.contextWindow ?? null; } };
+    // 中止与急停不等这一轮的模型调用回来：每隔一会儿看一眼，看到就当场掐断那一次调用。
+    // 暂停与紧急修正不掐 —— 这一次已经在花钱，等它回来、在下一轮之前停，结果还用得上。
+    const cancel = new AbortController();
+    const watch = setInterval(() => {
+      try {
+        if (db.one(`SELECT status FROM tasks WHERE id=?`, taskId)?.status === 'aborted') cancel.abort(TASK_ABORTED);
+        else if (getSetting(db, 'deploy.paused')) cancel.abort(DEPLOY_PAUSED);
+      } catch { /* 库正忙：下一拍再看 */ }
+    }, CANCEL_POLL_MS);
+    watch.unref?.();
     try {
       execEntry = client.entryFor(tier, 'executor');
       // 开了 OTLP 导出时这一步是一个 span，里面每次模型调用是它的子 span（core/otel.mjs）
       r = await withSpan('execute_step', { attributes: { 'superintern.tier': tier, 'superintern.cycle': cycle } }, () => executeNode(db, {
-        client, taskId, nodeId: node.id, workspace, tier,
+        client, taskId, nodeId: node.id, workspace, tier, signal: cancel.signal,
         vendorId: execEntry.vendorId,
         narrativeDir: narrativeDir ?? join(workspace, '..', 'narratives'),
         maxIterations, exec,
@@ -634,17 +666,23 @@ async function orchestrateTask(db, {
         } : null,
         onStep: (i, resp) => { flushStep(); onEvent({ type: 'step', node, i, resp }); },
         // 轮级闸门。只查按轮增长的几维 —— 其余几维在一个节点内不会变，每轮重查是白费查询。
-        // 闸门必须在节点跑到一半时就能掐：单个节点的花费也可能超过预算，
+        // 闸门必须在节点跑到一半时就能掐：单个 heavy 节点能一口气烧掉好几美元，
         // 只在节点边界检查等于给每个节点发一张"最多再超一个节点"的免死金牌。
         abort: (i, info = {}) => {
+          // 人的打断排在最前、第一轮也查：暂停 / 中止 / 急停都是"别再花下一份钱"。原来这几样只在步骤之间读，
+          // 一个步骤可以在人按下暂停之后再跑几十轮。
+          const st = db.one(`SELECT status FROM tasks WHERE id=?`, taskId)?.status;
+          if (st === 'aborted') return TASK_ABORTED;
+          if (st === 'suspended') return TASK_PAUSED;
+          if (getSetting(db, 'deploy.paused')) return DEPLOY_PAUSED;
+          // 紧急修正：放行了（不在比对 / 等裁定）的就打断，回到循环开头重规划。不紧急的等这一步做完
+          if (i > 0 && pendingMessages(db, taskId).some((m) => (m.kind === 'correction' || m.kind === 'instruction') && m.urgency === 'urgent')) return STEER;
           // 预占：这一轮按最坏情况（上一轮的提示词体量 + 输出打满）预占，事务里连同项目 / 按人 / 部署闸门一起判 ——
           // 几个编排器并行时不会一起越过闸门；原来项目预算只在步骤边界查，一个步骤能越过去整整一步的钱
           const est = estimateCallMicro(execEntry.pricing, { inputTokens: Math.max(peakContextTokens, contextPeak(client)), maxTokens: 16000 });
           const rv = reserveCall(db, { taskId, holder: HOLDER, microUsd: est });
           if (i === 0) return null;   // 第一轮先让它跑起来，否则触顶后连叙事都没有（预占照记，别人看得见）
           if (!rv.ok) return tl(L, '{scope}预算（含别的任务已预占的 {est} 估算）：{actual} ≥ {limit}', { scope: tl(L, rv.breach.scope === 'project' ? '项目' : rv.breach.scope === 'person' ? '个人月度' : '部署月度'), est: `$${(est / 1e6).toFixed(4)}`, actual: `$${(rv.breach.actual / 1e6).toFixed(4)}`, limit: `$${(rv.breach.limit / 1e6).toFixed(4)}` });
-          // 部署级急停：步骤跑到一半也在下一轮停（节点回 pending、不计重试，见下方 aborted 分支）
-          if (getSetting(db, 'deploy.paused')) return DEPLOY_PAUSED;
           // 已落库 + 还在内存里的（onStep 每轮 flush，内存里通常只剩零头）
           const spent = taskSpendMicroUsd(db, taskId)
             + (client.ledger ?? []).reduce((s, e) => s + e.microUsd, 0);
@@ -667,6 +705,7 @@ async function orchestrateTask(db, {
       if (!isInfraError(e)) throw e;
       infra = e;
     } finally {
+      clearInterval(watch);
       flushStep();   // 无论成败都落账。失败的尝试同样烧了钱。
       releaseReservation(db, { taskId, holder: HOLDER });   // 落了账就不再需要预占
       onEvent({ type: 'billed', node, rows: nodeRows, microUsd: nodeMicro });
@@ -717,7 +756,8 @@ async function orchestrateTask(db, {
       // 消费本节点读过的补充上下文。**在节点 done 之后**，不在装配之后 ——
       // consumed_at 标的是"这条消息已经改变了系统状态"，而不是"被看过一眼"。
       // 节点失败退回重试时，这些消息必须还在，否则它们会在一次失败里静默蒸发。
-      const ctxMsgs = pendingMessages(db, taskId).filter((m) => m.kind === 'context');
+      const seenCtx = r.contextSeen ? new Set(r.contextSeen) : null;
+      const ctxMsgs = pendingMessages(db, taskId).filter((m) => m.kind === 'context' && (!seenCtx || seenCtx.has(m.id)));
       if (ctxMsgs.length) {
         db.tx(() => {
           consumeMessages(db, { taskId, ids: ctxMsgs.map((m) => m.id),
@@ -733,6 +773,17 @@ async function orchestrateTask(db, {
     }
     if (r.kind === 'aborted' && r.stopped === `aborted: ${DEPLOY_PAUSED}`) {
       return finish('deploy_paused', { cycles: cycle, completed, nodeId: node.id, why: tl(L, '管理员暂停了全部自动运行；恢复后自动接着跑') });
+    }
+    // 人的打断：节点已回 pending、不计重试，在途工作已收起
+    if (r.kind === 'aborted' && r.stopped === `aborted: ${TASK_PAUSED}`) {
+      return finish('paused', { cycles: cycle, completed, nodeId: node.id, why: tl(L, '任务被人暂停；恢复：cli 或看板 resume') });
+    }
+    if (r.kind === 'aborted' && r.stopped === `aborted: ${TASK_ABORTED}`) {
+      return finish('aborted_by_user', { cycles: cycle, completed, nodeId: node.id, why: tl(L, '任务被人中止') });
+    }
+    if (r.kind === 'aborted' && r.stopped === `aborted: ${STEER}`) {
+      onEvent({ type: 'steer_interrupt', node });
+      continue;   // 循环开头的 ⓪′ 处理那条修正
     }
     if (r.kind === 'aborted') {
       // 轮级闸门掐停。节点已回 pending 且**没有**计重试。这里必须走 breachOut：
@@ -826,6 +877,9 @@ async function orchestrateTask(db, {
         discardChanges(workspace, junk);
         audit(db, { actorKind: 'system', action: 'workspace_build_output_discarded', targetType: 'task', targetId: taskId,
           payload: { pid, when: 'before_verify', paths: junk } });
+        const CL = contentLang(db);
+        trySignal(db, 'fix.build_output_discarded', { to: ['owner'], taskId, title: tl(CL, '[SuperIntern] 验收前撤掉了 {n} 个构建产物', { n: junk.length }),
+          text: tl(CL, '验收前工作区里有上一轮留下的构建产物（{paths}），系统撤掉了它们再跑验收，免得把旧产物当成这一版。', { paths: junk.slice(0, 5).join(tl(CL, '、')) }) });
       }
       const rest = pre.filter((p) => !isBuildOutput(p));
       if (rest.length) {
@@ -885,6 +939,8 @@ async function orchestrateTask(db, {
           setParam(db, { taskId, key: CONTRACT_NODE_KEY, value: nid, by: { kind: 'agent', id: 'orchestrator' }, governance: 'execution' });
           audit(db, { actorKind: 'system', action: 'contract_node_added', targetType: 'task', targetId: taskId, payload: { pid, nodeId: nid, files: cov.files, gaps: cov.gaps } });
         });
+        trySignal(db, 'plan.step_added', { to: ['owner'], taskId, ref: nid, title: tl(L, '[SuperIntern] 系统给任务加了一步：{title}', { title: tlN(L, CONTRACT_NODE.title) }),
+          text: tl(L, '这一步是系统按规矩补的（不用你批）：{why}', { why: tlN(L, CONTRACT_NODE.why) }) });
         onEvent({ type: 'contract_node_added', nodeId: nid, gaps: cov.gaps.length });
         return AGAIN;
       }
@@ -911,6 +967,8 @@ async function orchestrateTask(db, {
         setParam(db, { taskId, key: PREVIEW_NODE_KEY, value: nid, by: { kind: 'agent', id: 'orchestrator' }, governance: 'execution' });
         audit(db, { actorKind: 'system', action: 'preview_node_added', targetType: 'task', targetId: taskId, payload: { pid, nodeId: nid } });
       });
+        trySignal(db, 'plan.step_added', { to: ['owner'], taskId, ref: nid, title: tl(L, '[SuperIntern] 系统给任务加了一步：{title}', { title: tlN(L, PREVIEW_NODE.title) }),
+          text: tl(L, '这一步是系统按规矩补的（不用你批）：{why}', { why: tlN(L, PREVIEW_NODE.why) }) });
       onEvent({ type: 'preview_node_added', nodeId: nid });
       return AGAIN;
     }
@@ -934,6 +992,8 @@ async function orchestrateTask(db, {
         setParam(db, { taskId, key: PREVIEW_SEED_NODE_KEY, value: nid, by: { kind: 'agent', id: 'orchestrator' }, governance: 'execution' });
         audit(db, { actorKind: 'system', action: 'preview_seed_node_added', targetType: 'task', targetId: taskId, payload: { pid, nodeId: nid, ...(missing.length ? { missing } : {}) } });
       });
+        trySignal(db, 'plan.step_added', { to: ['owner'], taskId, ref: nid, title: tl(L, '[SuperIntern] 系统给任务加了一步：{title}', { title: tlN(L, PREVIEW_SEED_NODE.title) }),
+          text: tl(L, '这一步是系统按规矩补的（不用你批）：{why}', { why: tlN(L, PREVIEW_SEED_NODE.why) }) });
       onEvent({ type: 'preview_node_added', nodeId: nid });
       return AGAIN;
     }
@@ -954,6 +1014,8 @@ async function orchestrateTask(db, {
       if (read && !touchesUi(workspace, mine)) {
         audit(db, { actorKind: 'system', action: 'preview_skipped', targetType: 'task', targetId: taskId,
           payload: { head: ws?.head ?? null, why: 'no_ui_change', files: (mine ?? []).length } });
+        trySignal(db, 'fix.preview_skipped', { to: ['owner'], taskId, title: tl(L, '[SuperIntern] 这一版没截页面图'),
+          text: tl(L, '这个任务没改界面（改了 {n} 个文件，都不是界面），签收页不挂截图。', { n: (mine ?? []).length }) });
       } else if (read) {
         const outDir = join(resolve(workspace, '..', '..'), 'previews', taskId, String(ws?.head ?? 'nohead').slice(0, 12));
         const r = read.error ? { ok: false, shots: [], why: read.error } : await capturePreview(exec, workspace, read.spec, { outDir, lang: L });

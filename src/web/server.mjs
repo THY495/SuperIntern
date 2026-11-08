@@ -16,6 +16,9 @@
 // "运行"按钮起的是 `node src/cli.mjs run <task>` 子进程（恢复 = 再跑一次 run），日志落
 // `.superintern/logs/`，页面能看尾巴。看板不 in-process 跑编排器：编排器该退出时就退出，看板不该拖着它。
 
+import { registerBoardBase } from '../core/links.mjs';
+import { prView, actOnComment, setPrAutofix } from '../core/pr-review.mjs';
+import { makePrWatcher } from '../core/pr-watch.mjs';
 import { createServer } from 'node:http';
 import { readFileSync, existsSync } from 'node:fs';
 import { join, dirname } from 'node:path';
@@ -27,8 +30,8 @@ import { updateUser } from '../db/users.mjs';
 import { runAs } from '../db/context.mjs';
 import { spendByPerson, setPersonBudget } from '../core/spend.mjs';
 import { createSession, endSession, issueToken, tokensOf, activeTokens, revokeTokenBy, revokeAllOf, createInvite, invitesList, inviteByCode, acceptInvite, revokeInviteBy } from '../core/sessions.mjs';
-import { openQuestions, pendingMessages, recordAnswer, sayWithClassifier, heldSteering, markConsumed } from '../core/inbox.mjs';
-import { answersOf, voteRulesOf, sideOnlyOf } from '../core/answers.mjs';
+import { openQuestions, pendingMessages, recordAnswer, recordMessage, sayWithClassifier, heldSteering, markConsumed } from '../core/inbox.mjs';
+import { answersOf, voteRulesOf, sideOnlyOf, waitingOn } from '../core/answers.mjs';
 import { DECISION_TYPES, loadTemplates, rulesOf, profileOf, knobsOf, setKnobs, applyTemplate, saveRules, diffFromTemplate, previewRouting,
   dutyCalendarOf, dutyView, setDutyCalendar, dutyStartAt, setDutyOverrides, transferQuestion, leadOf, leadOfKey, routingKeyOf, validateRules, authorize, rerouteOpen } from '../core/routing.mjs';
 import { addUser, listUsers, usersView, setUserChannel, setGitIdentity, removeUserChannel, setUserTags, setUserRole, renameUser, reissueToken } from '../core/users.mjs';
@@ -53,6 +56,7 @@ import { listMembers, setMember, removeMember, setVisibility, canAddTasks, invol
 import { previewHandover, executeHandover, requestHandover, listHandoverRequests, decideHandoverRequest, canDecideHandover, disableUser, enableUser } from '../core/handover.mjs';
 import { buildDigest, renderDigest, sendHandoverNotice, renderHandover } from '../core/digest.mjs';
 import { pendingRevision, nodesForReplan, gateOf, renderDiff, applyRevision, rejectRevision } from '../core/revision.mjs';
+import { rewindPlan, rewindTask, lastRewind } from '../core/rewind.mjs';
 import { ackRecheck } from '../core/invariants.mjs';
 import { LIMITS, limitOf, setLimit, setProjectLimit, projectLimits, LAYER_NAMES, limitChain, compactThresholdOf } from '../core/limits.mjs';
 import { roundsOf, diagnose, sameDefect, STALL_ROUNDS, OSC_RETURNS } from '../core/diagnose.mjs';
@@ -61,17 +65,29 @@ import { recordViews, approvalHabits, HABIT } from '../core/approval-habits.mjs'
 import { readPreviewSpec } from '../core/preview.mjs';
 import { testsAllowedFor, latestTestChanges, allowTestChanges } from '../core/test-guard.mjs';
 import { listReports, markReportsRead } from '../agent/reporter.mjs';
-import { signOff, signoffOf, deliverTask } from '../core/deliver.mjs';
+import { signOff, signoffOf } from '../core/deliver.mjs';
+import { offThread } from '../core/offthread.mjs';
 import { listCredentials, addCredential, revokeCredential, checkAccess, setAppOAuth } from '../core/credentials.mjs';
 import { PUSH_PREFIXES } from '../core/push.mjs';
 import { safePositional } from '../core/git.mjs';
 import { timeoutFor } from '../core/timeouts.mjs';
 import { makeLauncher } from '../core/launcher.mjs';
-import { projectTasks, chainGraph, advanceProject, deliverProject, acceptDeferredSignoffs, deliveryEvidence } from '../core/project.mjs';
+import { projectTasks, chainGraph, acceptDeferredSignoffs, deliveryEvidence } from '../core/project.mjs';
 import { getParam } from '../core/params.mjs';
 import { LlmClient } from '../llm/client.mjs';
 import { afterInput } from '../core/decision-check.mjs';
+import '../core/scope-ask.mjs';   // 越界申请的答复钩子（批了就放宽范围）：答复从这里进来，钩子得在这个进程里注册
 import { activeDecisions, SOURCE_NAMES, sourceNamesOf, overruledContractRules } from '../core/decisions.mjs';
+import { listProjectRules, writeProjectRule, RULES_MAX_BYTES } from '../core/project-rules.mjs';
+import { listSkills, setProjectSkill } from '../core/skills.mjs';
+import { hookOverview } from '../core/hooks.mjs';
+import { mcpOverview, checkProject, approveServers, setToolMode, setServerOff } from '../core/mcp.mjs';
+import { inboundView, setIssueInbound, makeIssueWatcher, setSchedule, removeSchedule } from '../core/inbound.mjs';
+import { describeCron } from '../core/cron.mjs';
+import { oversightView, setOversightMode, prefsView, setSignalPref, signalsFor, markSignalsRead, signalPrefsOf, mailReady } from '../core/signals.mjs';
+import { pushView, setPushPrefs } from '../core/push-queue.mjs';
+import { buildStatusReport, renderStatusReport, reportView, noteSeen, dismissAway, awaySummary, monthSpan, DETAILS as REPORT_DETAILS } from '../core/report.mjs';
+import { gatesOf, setGates, GATE_SUGGESTIONS, gateTest, gateRouteOf } from '../core/approval-gates.mjs';
 import { budgetState, setProjectBudget, projectVerifyCommand, setProjectVerify, gearOf, setGear, gearPrereqStatus, GEARS, deferredSignoffs, maxOpenOf, setMaxOpen, MAX_OPEN_CEILING, parallelOf, setParallel, setupCommandsOf, setSetupCommands, detectSetupCommands } from '../core/project-settings.mjs';
 import { sharedPathsOf } from '../core/parallel.mjs';
 import { TIERS, EFFORTS, makerOf } from '../llm/canonical.mjs';
@@ -178,6 +194,13 @@ export function projectList(db, lang = 'zh') {   // lang：上限数值按看的
     // 排着队的需求：这一轮结束后按先后单独起草
     const uname = (id) => db.one(`SELECT display_name FROM users WHERE id=?`, id)?.display_name ?? id;
     const appendQueue = (ap?.queue ?? []).map((q) => ({ by: uname(q.userId), brief: q.brief, at: q.at }));
+    // 在等谁签：做完了、还没合并的任务，签收事项还差谁、从什么时候等起 —— 签收占着开工名额，负责人要看得见 AI 在等谁
+    for (const t of tasks) {
+      if (t.status !== 'done' || t.merged_at) continue;
+      const sq = db.one(`SELECT * FROM questions WHERE task_id=? AND decision_type='signoff' AND status IN ('open','escalated') ORDER BY asked_at DESC LIMIT 1`, t.id);
+      const w = sq ? waitingOn(db, sq) : null;
+      if (w) t.signWait = { left: w.left.map(uname), need: w.need, since: w.since };
+    }
     for (const t of tasks) { const rb = getParam(db, t.id, 'task.requested_by'); if (rb) t.requestedBy = (Array.isArray(rb) ? rb : [rb]).map(uname).join(tl(contentLang(db), '、')); }
     const budget = budgetState(db, p.id);
     const lastDel = db.one(`SELECT ts, payload FROM audit_log WHERE action='project_delivered' AND target_id=? ORDER BY id DESC LIMIT 1`, p.id);
@@ -187,8 +210,8 @@ export function projectList(db, lang = 'zh') {   // lang：上限数值按看的
     // 交付过之后又合并了新任务（持续维护迭代）：还要再交付 —— 与收件箱「等你交付」同一个口径
     const deliverDue = projectsToDeliver(db, { ownerId: p.owner_id }).some((x) => x.projectId === p.id);
     // 交付前的一手证据。只在**能交付**的项目上算 —— 它要读一次 git，不该每次轮询给每个项目都跑一遍。
-    const evidence = (p.status === 'done' || p.status === 'aborted') ? deliveryEvidence(db, { projectId: p.id }) : null;
-    return { ...p, tasks, carrier, superseded, spendMicro, planningMicro, append, appendQueue, delivered, deliverDue, lastDelivery, evidence, members: listMembers(db, p.id),
+    const evidence = (p.status === 'done' || p.status === 'aborted') ? deliveryEvidence(db, { projectId: p.id, cachedOnly: true }) : null;
+    return { ...p, tasks, carrier, superseded, spendMicro, planningMicro, append, appendQueue, delivered, deliverDue, lastDelivery, evidence, pr: prView(db, { projectId: p.id }), members: listMembers(db, p.id),
       gear: gearOf(db, p.id), gears: GEARS, gearPrereqs: gearPrereqStatus(db, p.id),
       budget: { gate: budget.gate, spent: budget.spent, remaining: budget.remaining, over: budget.over },
       verifyCommand: projectVerifyCommand(db, p.id), limits: projectLimits(db, p.id, lang), layerNames: LAYER_NAMES,
@@ -201,6 +224,8 @@ export function projectList(db, lang = 'zh') {   // lang：上限数值按看的
       current: tasks.find((t) => !t.merged_at && t.status !== 'aborted' && startedIds.has(t.id))?.id ?? null,
       openIds: tasks.filter((t) => !t.merged_at && t.status !== 'aborted' && startedIds.has(t.id)).map((t) => t.id),
       maxOpen: maxOpenOf(db, p.id),
+      // 监督模式（每类信号怎么处理）与审批门禁
+      oversight: oversightView(db, p.id), gates: gatesOf(db, p.id).commands, gateSuggestions: GATE_SUGGESTIONS, gateRoute: gateRouteOf(db, p.id),
       parallel: parallelOf(db, p.id),
       sharedPaths: parallelOf(db, p.id) ? sharedPathsOf(db, p.id) : [],
       egress: projectEgressOf(db, p.id),
@@ -226,7 +251,7 @@ export function taskList(db) {
 export function taskDetail(db, taskId, { userId = null } = {}) {
   const task = db.one(`SELECT * FROM tasks WHERE id=?`, taskId);
   if (!task) return null;
-  const can = userId ? Object.fromEntries(['budget', 'egress', 'signoff', 'delivery'].map((k) => [k, authorize(db, { taskId, decisionType: k, userId }).ok])) : null;
+  const can = userId ? { ...Object.fromEntries(['budget', 'egress', 'signoff', 'delivery'].map((k) => [k, authorize(db, { taskId, decisionType: k, userId }).ok])), ...taskControls(db, taskId, userId) } : null;
   const c = db.one(`SELECT * FROM constitutions WHERE task_id=? AND superseded_at IS NULL ORDER BY version DESC LIMIT 1`, taskId);
   const rawNodes = db.all(`SELECT id,title,status,priority,risk_tier,model_tier,retry_count,started_at,finished_at,tier_escalated_at,spec,acceptance,ui_checks,created_at
                         FROM nodes WHERE task_id=? ORDER BY created_at, rowid`, taskId);
@@ -334,6 +359,8 @@ export function taskDetail(db, taskId, { userId = null } = {}) {
       // 第几次验收、什么时候、结论（块头写后果：打回在改 / 放行了但有没验的）
       if (p) n.uiRun = { round: runs.length, at: last.ts, verdict };
     } }
+    // 这一步是被「从这里重来」退回的、还没重做完 —— 详情里说清（不然只看见「待执行」，不知道为什么回来了）
+    { const rw = lastRewind(db, n.id); if (rw) n.rewound = { self: rw.self, cause: rw.cause, note: rw.note, target: rw.target?.title ?? null }; }
     const rounds = roundsOf(db, n.id);
     if (!rounds.some((r) => r.kind !== 'pass')) continue;
     const d = diagnose(rounds);
@@ -362,7 +389,7 @@ export function taskDetail(db, taskId, { userId = null } = {}) {
       }) };
   }
   return { task, draft, constitution: c ? { ...c, constraints: safeJson(c.constraints), overruled } : null, nodes, edges, questions, messages, decisions, assumptions,
-    audits, reports, revision, limits, measured, params, spend, signoff: signoffOf(db, taskId),
+    audits, reports, revision, limits, measured, params, spend, signoff: signoffOf(db, taskId), pr: prView(db, { taskId }),
     // 项目预算闸：任务页原来只写任务自己的上限，项目设了 $7 / $3 的人看到"上限 $5"不知道是哪层
     projectBudget: (() => { if (!task.project_id) return null; const b = budgetState(db, task.project_id); return b.gate === null ? null : { gate: b.gate, spent: b.spent, remaining: b.remaining, over: b.over }; })(), workspace: existsSync(wsDir) ? wsDir : null, preview: previewOf(db, taskId),
     signoffExceptions: questions.some((q) => q.decision_type === 'signoff' && ['open', 'escalated'].includes(q.status)) ? exceptionsView(db, taskId, wsDir) : null,
@@ -454,7 +481,7 @@ export function llmView(db, { env = process.env, lang = 'zh' } = {}) {
 }
 
 // ── 控制杆（写只经已有入口）────────────────────────────────────────────────
-export function makeControls(db, { home, tokenPlain, launcher = makeLauncher(db, { home }), makeClassifierClient = null, env = process.env }) {
+export function makeControls(db, { home, tokenPlain, launcher = makeLauncher(db, { home }), makeClassifierClient = null, env = process.env, fetchFn = globalThis.fetch }) {
   // 身份按请求：带了自己的令牌就是自己，没带就是起看板那个人。
   const auth = (o = {}) => {
     const tok = o._token || tokenPlain;
@@ -470,6 +497,10 @@ export function makeControls(db, { home, tokenPlain, launcher = makeLauncher(db,
     return [...new Set(answersOf(db, qid).filter((a) => a.stance === 'answer' && side.has(a.user_id) && readVerdict(a.body, th.labels) === 'feedback')
       .map((a) => db.one('SELECT display_name FROM users WHERE id=?', a.user_id)?.display_name ?? a.user_id))]; };
   const requireLead = (o, taskId) => { const { userId } = auth(o); if (userId !== leadOf(db, taskId)) throw new Error('只有该任务的负责人能执行此操作'); return userId; };
+  // 暂停 / 继续（用户 2026-10-15 定）：暂停对参与者开放 —— 被问到过这个任务的事项、或答过它的事项的人，看到它跑偏能先叫停；
+  // 继续归负责人或按下暂停的那个人；中止仍只归负责人，部署级急停仍只归管理员。
+  const requireCanPause = (o, taskId) => { const { userId } = auth(o); if (!taskControls(db, taskId, userId).pause) throw new I18nError('只有该任务的负责人或参与者（被问到或答过它的事项的人）能暂停它'); return userId; };
+  const requireCanResume = (o, taskId) => { const { userId } = auth(o); if (!taskControls(db, taskId, userId).resume) throw new I18nError('只有该任务的负责人或按下暂停的人能让它继续'); return userId; };
 
   // 分类器 client：测试可注入 fake（makeClassifierClient）；默认按库里的生效注册表建 live client（每次现读）。
   const newClassifierClient = makeClassifierClient
@@ -494,7 +525,10 @@ export function makeControls(db, { home, tokenPlain, launcher = makeLauncher(db,
       holdForCheck: true,   // 下面要比对，比对完之前别让守护进程拉走
       ...(hasKind ? {} : { llmClient: newClassifierClient() }),
     });
-    if (merged && ['correction', 'instruction'].includes(out.kind)) {
+    // 消息落库之后再看一次合没合：分类要几秒，期间合并可能刚好落地。合并那头在认领的事务里看有没有没处理的修正 ——
+    // 先落库的修正挡住合并；合并先认领的，这里读到已合并，转成添加任务。原来只用开头读的那一次，夹在中间的修正落在已合并的任务上，没人接。
+    const mergedNow = merged || !!(tk?.project_id && tk.project_order > 0 && db.one(`SELECT merged_at FROM tasks WHERE id=?`, taskId)?.merged_at);
+    if (mergedNow && ['correction', 'instruction'].includes(out.kind)) {
       markConsumed(db, { taskId, ids: [out.messageId], why: tl(contentLang(db), '任务已合并：这句话转成了项目的「添加任务」') });
       try { return { ...out, appended: true, append: requestAppend(db, { projectId: tk.project_id, userId: auth(o).userId, brief: body }) }; }
       catch (e) { return { ...out, appended: false, appendError: tl(o._lang, '这个任务已经合并，改不了了；这句话读着像新需求，但没能转成「添加任务」：{msg}', { msg: translateError(e, o._lang) }) }; }
@@ -513,25 +547,39 @@ export function makeControls(db, { home, tokenPlain, launcher = makeLauncher(db,
     answer: async (o) => {
       const { userId, plaintextToken } = auth(o);
       const q = db.one(`SELECT task_id FROM questions WHERE id=?`, o.questionId);
+      const isAnswer = (o.stance ?? 'answer') === 'answer';
+      const tk = q?.task_id ? db.one(`SELECT project_id, project_order, merged_at FROM tasks WHERE id=?`, q.task_id) : null;
+      const mergedTask = !!(tk?.project_id && tk.project_order > 0 && tk.merged_at);
+      let allowedTests = [], inline = null;
       const r = recordAnswer(db, { questionId: o.questionId, body: o.body, stance: o.stance ?? 'answer',
-        agreesWith: o.agreesWith ?? null, plaintextToken });
+        agreesWith: o.agreesWith ?? null, plaintextToken,
+        // "做不到"出口放行测试改动（路径由系统比对给出，不收客户端传的）与"同时作为修正"跟答复同一个事务落地。
+        // 修正先暂扣（待比对），比对在下面做；已合并任务的修正要转成添加任务，仍走 say 那条路
+        inTx: (res) => {
+          if (o.allowTests && isAnswer) allowedTests = allowTestChanges(db, { questionId: o.questionId, userId, answerId: res?.answerId ?? null });
+          if (o.alsoCorrection && isAnswer && q?.task_id && !mergedTask) {
+            inline = recordMessage(db, { taskId: q.task_id, body: o.body, kind: 'correction', urgency: 'normal', urgencySource: 'explicit', kindSource: 'explicit',
+              aboutQuestionId: o.questionId, plaintextToken, holdForCheck: true });
+          }
+        } });
       // 答复同时作为计划变更提交：结构矛盾的出路常常就是改契约，而答复本身改不了契约 —— 原来要人答完再去任务页
       // 发一条内容一样的修正，两次动作之间执行器已经按答复复工、去改范围外的文件，被越界校验拒回又来问。
       // 这里同一次请求里紧接着记下修正（先暂扣，比对完才放行；编排器见到暂扣的修正就先停下等它），
       // 于是复工的那一轮先重规划、再按新契约做。比对只做一次（修正那一路做），同一段话不比两遍。
       let correction = null;
-      if (o.alsoCorrection && (o.stance ?? 'answer') === 'answer' && q?.task_id) {
+      if (inline) {
+        await afterInput(db, { taskId: q.task_id, text: o.body, entry: 'revision', by: userId, makeClient: newClassifierClient, sourceId: inline.messageId });
+        correction = inline;
+      } else if (o.alsoCorrection && isAnswer && q?.task_id) {
         correction = await say({ ...o, taskId: q.task_id, kind: 'correction', about: o.questionId, urgent: false });
       } else if ((o.stance ?? 'answer') === 'answer' && q?.task_id) {
         await afterInput(db, { taskId: q.task_id, text: o.body, entry: 'answer', by: userId, makeClient: newClassifierClient, sourceId: r?.messageId ?? null });
       }
       // 方案批准的答复：回显系统怎么读这句话。判读本身仍由状态机做，这里用的是同一个函数。
       const th = (o.stance ?? 'answer') === 'answer' ? approvalThreadOf(db, o.questionId) : null;
-      // 答复时一并放行这一步对原有测试的改动（路径由系统比对给出，不收客户端传的）
-      const allowedTests = o.allowTests && (o.stance ?? 'answer') === 'answer' ? allowTestChanges(db, { questionId: o.questionId, userId, answerId: r?.answerId ?? null }) : [];
       let out = correction ? { ...r, correction: { messageId: correction.messageId ?? null, appended: !!correction.appended } } : r;
       if (allowedTests.length) out = { ...out, allowedTests };
-      return th ? { ...out, reading: describeReading({ body: o.body, labels: th.labels, reached: th.reached, kind: th.kind, tense: 'did', lang: contentLang(db), side: isSide(o.questionId, userId) }) } : out;
+      return th ? { ...out, reading: describeReading({ body: o.body, labels: th.labels, reached: th.reached, kind: th.kind, tense: 'did', lang: contentLang(db), side: isSide(o.questionId, userId), scopeNow: th.scopeNow ?? null }) } : out;
     },
     // 答之前的实时预览：只读，不落库。看不见这个任务的人拿不到（与任务详情同一道可见性）。
     // 顺带收到的人按他们自己的处境写后果
@@ -540,7 +588,7 @@ export function makeControls(db, { home, tokenPlain, launcher = makeLauncher(db,
       if (!canSeeTask(db, o.taskId, userId)) throw new Error('任务不存在');
       const th = approvalThreadOf(db, o.questionId);
       if (!th || th.taskId !== o.taskId) return { reading: null };
-      return { reading: describeReading({ body: String(o.body ?? ''), labels: th.labels, reached: th.reached, kind: th.kind, tense: 'will', lang: contentLang(db), side: isSide(o.questionId, userId), sideAsks: sideAsksOf(o.questionId, th) }) };
+      return { reading: describeReading({ body: String(o.body ?? ''), labels: th.labels, reached: th.reached, kind: th.kind, tense: 'will', lang: contentLang(db), side: isSide(o.questionId, userId), sideAsks: sideAsksOf(o.questionId, th), scopeNow: th.scopeNow ?? null }) };
     },
     // 看板上第一次看到写给自己的事项（监测走过场的"打开到答复"）。只记第一次、只记还开着的、写给这个人的
     seen: (o) => {
@@ -550,7 +598,7 @@ export function makeControls(db, { home, tokenPlain, launcher = makeLauncher(db,
       const ids = [].concat(o.questionIds ?? []).map(String).filter((id) => db.one(`SELECT task_id FROM questions WHERE id=?`, id)?.task_id === o.taskId);
       return { recorded: recordViews(db, { userId, questionIds: ids }) };
     },
-    transfer: (o) => transferQuestion(db, { questionId: o.questionId, to: [].concat(o.to ?? []), reason: o.reason ?? null, byUserId: auth(o).userId }),
+    transfer: (o) => transferQuestion(db, { questionId: o.questionId, to: [].concat(o.to ?? []), reason: o.reason ?? null, expectTo: o.expectTo ?? null, byUserId: auth(o).userId }),
     say,
     revision: (o) => {
       const { taskId, approve, why, reservation } = o;
@@ -572,7 +620,7 @@ export function makeControls(db, { home, tokenPlain, launcher = makeLauncher(db,
       const redo = String(why ?? '').trim();
       return rejectRevision(db, { taskId, revisionId: rv.id, userId, why: redo || tl(contentLang(db), '不要这份变更'), redo: redo ? { text: redo, tokenId: auth(o).tokenId ?? null } : null });
     },
-    limit: (o) => setLimit(db, { taskId: o.taskId, key: o.key, value: Number(o.value), userId: auth(o).userId }),
+    limit: (o) => setLimit(db, { taskId: o.taskId, key: o.key, value: Number(o.value), userId: auth(o).userId, expect: o.expect ?? null }),
     priority: (o) => {
       const { taskId, nodeId, priority } = o;
       const userId = requireLead(o, taskId);
@@ -585,12 +633,24 @@ export function makeControls(db, { home, tokenPlain, launcher = makeLauncher(db,
       audit(db, { actorKind: 'user', actorId: userId, action: 'node_priority_set', targetType: 'node', targetId: nodeId, payload: { from: n.priority, to: p } });
       return { nodeId, priority: p };
     },
+    // 从这里重来：先看预览（不能回的说清为什么，不当报错），确认时带上预览时的头（期间代码变了就拒）
+    rewindPlan: (o) => {
+      requireLead(o, o.taskId);
+      const p = rewindPlan(db, { taskId: o.taskId, nodeId: String(o.nodeId ?? ''), workspace: join(home, 'workspaces', o.taskId) });
+      return p.ok ? p : { ok: false, reason: tl(o._lang ?? contentLang(db), p.why, p.params) };
+    },
+    rewind: (o) => {
+      const { userId, plaintextToken } = auth(o);
+      const r = rewindTask(db, { taskId: o.taskId, nodeId: String(o.nodeId ?? ''), workspace: join(home, 'workspaces', o.taskId), userId,
+        note: typeof o.note === 'string' ? o.note : null, expectHead: typeof o.expectHead === 'string' ? o.expectHead : null, plaintextToken });
+      return { rewindId: r.rewindId, ref: r.ref, taskStatus: r.taskStatus, nodes: r.plan.nodes.length };
+    },
     // 暂停 / 恢复 / 中止：任务状态直改，编排器每轮开头读状态，suspended 就退出、aborted 就退出。
     // 都记审计 —— 这三个是人对任务最重的三个动作。
-    pause: (o) => setTaskStatus(db, o.taskId, 'suspended', ['running', 'waiting'], requireLead(o, o.taskId), 'task_paused'),
+    pause: (o) => setTaskStatus(db, o.taskId, 'suspended', ['running', 'waiting'], requireCanPause(o, o.taskId), 'task_paused'),
     resume: (o) => {
       const stillOpen = db.one(`SELECT count(*) n FROM questions WHERE task_id=? AND status IN ('open','escalated')`, o.taskId).n;
-      return setTaskStatus(db, o.taskId, stillOpen ? 'waiting' : 'running', ['suspended'], requireLead(o, o.taskId), 'task_resumed');
+      return setTaskStatus(db, o.taskId, stillOpen ? 'waiting' : 'running', ['suspended'], requireCanResume(o, o.taskId), 'task_resumed');
     },
     abort: (o) => setTaskStatus(db, o.taskId, 'aborted', ['planning', 'running', 'waiting', 'suspended'], requireLead(o, o.taskId), 'task_aborted', { why: o.why }),
     // 中止可反悔；改标题 / 归档只碰元数据。权限在 lifecycle.mjs 里判（任务负责人）。
@@ -599,12 +659,16 @@ export function makeControls(db, { home, tokenPlain, launcher = makeLauncher(db,
     archive: (o) => setTaskArchived(db, { taskId: o.taskId, archived: o.archived !== false, userId: auth(o).userId }),
     signoff: (o) => signOff(db, { taskId: o.taskId, accept: !!o.accept, reason: o.reason, ...auth(o) }),
     deliver: (o) => {
-      const { taskId, remote, pr, base } = o;
-      const { userId } = auth(o);
+      const { taskId, remote, pr, base, hookAck, autofix } = o;
+      const { userId, tokenId } = auth(o);
       const ws = join(home, 'workspaces', taskId);
       if (!existsSync(ws)) throw new Error('任务工作区不存在，无法交付');
-      return deliverTask(db, { taskId, workspace: ws, remote: remote || null, pr: !!pr, base: base || null, userId, env });
+      return offThread(db, 'deliverTask', { taskId, workspace: ws, remote: remote || null, pr: !!pr, base: base || null, userId, tokenId, autofix: autofix !== false, env: { ...env }, home, hookAck: [].concat(hookAck ?? []) });
     },
+    // 交付后回路：PR 上的意见转成修正 / 不用管；马上看一次 PR（不等守护进程的节奏）
+    prComment: (o) => { const { userId, tokenId } = auth(o); return actOnComment(db, { taskId: o.taskId, commentId: String(o.commentId ?? ''), op: o.op, userId, tokenId }); },
+    prAutofix: (o) => { const { userId, tokenId } = auth(o); return setPrAutofix(db, { taskId: o.taskId, on: o.on === true, userId, tokenId }); },
+    prRefresh: async (o) => { auth(o); await makePrWatcher(db, { fetchFn, env }).pollNow({ taskId: o.taskId }); return prView(db, { taskId: o.taskId }); },
     reportsRead: (o) => { auth(o); markReportsRead(db, [].concat(o.ids ?? []), { taskId: o.taskId }); return { ok: true }; },   // 只认这个任务的报告（原来任意 id 都标）
     // 起编排器子进程（经共用的启动器：守护进程起的和人按的在同一张表里，不会撞车）。
     // 手动"运行"按任务所处阶段拉对应的步骤：从想法起的任务先澄清（draft）、有契约没步骤的先规划（plan）、否则执行（run）。
@@ -625,6 +689,20 @@ export function makeControls(db, { home, tokenPlain, launcher = makeLauncher(db,
   };
 }
 
+/**
+ * 这个人对任务的暂停 / 继续 / 中止权。页面据此显示按钮，写入口据此放行 —— 同一个判断，不会页面能点、服务端拒。
+ * 参与者 = 这个任务的事项发给过他（addressed_to）、或他答过这个任务的事项；旁观者不算（只能留言）。
+ */
+export function taskControls(db, taskId, userId) {
+  const lead = userId === leadOf(db, taskId);
+  const observer = db.one(`SELECT role FROM users WHERE id=?`, userId)?.role === 'observer';
+  const participant = lead || (!observer && (
+    db.all(`SELECT addressed_to FROM questions WHERE task_id=?`, taskId).some((q) => { try { return JSON.parse(q.addressed_to || '[]').includes(userId); } catch { return false; } })
+    || !!db.one(`SELECT 1 FROM messages WHERE task_id=? AND kind='answer' AND sender_id=? LIMIT 1`, taskId, userId)));
+  const pausedBy = db.one(`SELECT actor_id FROM audit_log WHERE action='task_paused' AND target_id=? ORDER BY id DESC LIMIT 1`, taskId)?.actor_id ?? null;
+  return { pause: participant, resume: lead || (participant && pausedBy === userId), abort: lead };
+}
+
 function setTaskStatus(db, taskId, to, from, userId, action, extra = {}) {
   const task = db.one(`SELECT status FROM tasks WHERE id=?`, taskId);
   if (!task) throw new I18nError('任务不存在：{taskId}', { taskId });
@@ -633,7 +711,7 @@ function setTaskStatus(db, taskId, to, from, userId, action, extra = {}) {
   const cannot = { task_paused: () => new I18nError('任务状态为 {status}，无法暂停', { status }), task_resumed: () => new I18nError('任务状态为 {status}，无法恢复', { status }),
     task_aborted: () => new I18nError('任务状态为 {status}，无法中止', { status }) }[action] ?? (() => new Error(`任务状态为 ${status}，无法${verb}`));
   if (!from.includes(task.status)) throw cannot();
-  transition(db, 'tasks', taskId, to, { from, audit: { action, actorKind: 'user', actorId: userId, payload: extra } });
+  transition(db, 'tasks', taskId, to, { from, release: action === 'task_resumed', audit: { action, actorKind: 'user', actorId: userId, payload: extra } });
   return { from: task.status, to };
 }
 
@@ -687,7 +765,7 @@ export function startWeb(db, { home, port = 7357, host = '127.0.0.1', tokenPlain
   const TOKEN_COOKIE = `si_token${portTag}`, STATE_COOKIE = `si_gh_state${portTag}`;
   // 请求身份的兜底：本机模式 = 起看板的人；团队模式 = 没有
   const fallbackToken = team ? null : tokenPlain;
-  const controls = makeControls(db, { home, tokenPlain: fallbackToken, makeClassifierClient, env, ...(launcher ? { launcher } : {}) });
+  const controls = makeControls(db, { home, tokenPlain: fallbackToken, makeClassifierClient, env, fetchFn, ...(launcher ? { launcher } : {}) });
   // 登录失败限速（按来源地址）：令牌是高熵随机串，爆破本来就不现实；这道闸主要是别让人把认证当压测打
   const loginFails = new Map();
   const LOGIN_WINDOW_MS = 10 * 60_000, LOGIN_MAX_FAILS = 20;
@@ -802,7 +880,9 @@ export function startWeb(db, { home, port = 7357, host = '127.0.0.1', tokenPlain
   //    原来两个人同时改决策路由，后保存的一方整表覆盖前一个人的改动，谁也不知道。不带版本（命令行、老页面）照旧不查。
   const verOf = (...parts) => sha256(JSON.stringify(parts)).slice(0, 16);
   const routingVersion = (key) => verOf(rulesOf(db, key), profileOf(db, key), dutyCalendarOf(db, key));
-  const llmVersion = () => verOf(db.all(`SELECT * FROM llm_endpoints ORDER BY id`), db.all(`SELECT * FROM llm_models ORDER BY key`), db.all(`SELECT * FROM llm_bindings ORDER BY tier`), db.all(`SELECT * FROM llm_role_bindings ORDER BY role`));
+  // 验收员策略（两条部署设置）也在这一页上改，一并算进版本
+  const llmVersion = () => verOf(db.all(`SELECT * FROM llm_endpoints ORDER BY id`), db.all(`SELECT * FROM llm_models ORDER BY key`), db.all(`SELECT * FROM llm_bindings ORDER BY tier`), db.all(`SELECT * FROM llm_role_bindings ORDER BY role`),
+    getSetting(db, 'deploy.verifier_vendor'), getSetting(db, 'deploy.verifier_cosign'));
   const egressVersion = () => verOf(db.all(`SELECT * FROM egress_sources ORDER BY id`));
   const requireVersion = (sent, current, what, lastSql, ...lastArgs) => {
     if (sent == null || sent === '' || sent === current) return;
@@ -816,7 +896,7 @@ export function startWeb(db, { home, port = 7357, host = '127.0.0.1', tokenPlain
   // 失败回首页带原因与 GitHub 账号（让人知道是哪个号被拒；只带合法形状的账号名）
   const redirectLoginError = (res, code, login = null) => { res.writeHead(302, { location: `/?login_error=${encodeURIComponent(LOGIN_ERRORS.includes(code) ? code : 'github')}${login && GH_LOGIN_RE.test(login) ? `&gh=${encodeURIComponent(login)}` : ''}`, 'set-cookie': ghStateCookie('', 0), 'cache-control': 'no-store' }); return res.end(); };
   // ── 成员。读：所有人（没有令牌明文与通道地址）；写：负责人，本人可以管自己的通道与令牌。 ──
-  const usersPayload = (me, lang) => ({ users: usersView(db).map((u) => (me.role === 'lead' || u.id === me.userId ? u : { ...u, commitEmail: null })), settings: settingsView(db), githubLogin: { enabled: team && githubLoginConfig(db).enabled }, local: authenticate(db, tokenPlain)?.user_id ?? null,
+  const usersPayload = (me, lang) => ({ users: usersView(db).map((u) => (me.role === 'lead' || u.id === me.userId ? u : { ...u, commitEmail: null })), settings: settingsView(db), githubLogin: { enabled: team && githubLoginConfig(db).enabled }, mailReady: mailReady(), local: authenticate(db, tokenPlain)?.user_id ?? null,
     // 签收例外批准习惯：只给管理员（看别人的批准节奏是负责人的事）
     habits: me.role === 'lead' ? { rows: approvalHabits(db), rule: HABIT } : null,
     requests: listHandoverRequests(db, { status: 'open' }).map((r) => ({ ...r, canDecide: canDecideHandover(db, { byUserId: me.userId, scope: r.scope }) })).filter((r) => r.canDecide || r.fromUserId === me.userId).map((r) => {
@@ -1052,7 +1132,8 @@ export function startWeb(db, { home, port = 7357, host = '127.0.0.1', tokenPlain
       // 项目的表：该项目的负责人；默认表（不属于项目的任务共用）：任何一个负责人 —— 按项目交接后负责人不止一个。
       if (key ? me.userId !== leadOfKey(db, key) : me.role !== 'lead') return json(res, 403, { error: key ? '只有该项目的负责人能修改其决策路由' : '只有管理员能修改默认决策路由' });
       let result;
-      if (['template', 'rows', 'owner', 'remove', 'duty', 'dutyOverrides'].includes(body.action)) requireVersion(body.version, routingVersion(key), '决策路由', `l.action IN ('routing_saved','duty_calendar_set','duty_overrides_set') AND l.target_id IN (?, ?)`, key || '(default)', key);
+      if (['template', 'rows', 'owner', 'remove', 'duty', 'dutyOverrides'].includes(body.action)) requireVersion(body.version, routingVersion(key), '决策路由', `(l.action IN ('routing_saved','duty_calendar_set','duty_overrides_set') AND l.target_id IN (?, ?))
+          OR (l.action='handover_executed' AND EXISTS (SELECT 1 FROM json_each(l.payload, '$.routing') j WHERE json_extract(j.value, '$.key')=?))`, key || '(default)', key, key);   // 交接也会原地改收件人（说得出是谁）
       if (body.action === 'template') result = applyTemplate(db, { key, name: body.name, bindings: body.bindings ?? {}, userId: me.userId, lang: res.__lang });
       else if (body.action === 'rows') result = saveRules(db, { key, rules: body.rows, template: body.template ?? profileOf(db, key).template, bindings: body.bindings ?? safeJson(profileOf(db, key).bindings) ?? {}, userId: me.userId, lang: res.__lang });
       else if (body.action === 'validate') result = { errors: validateRules(db, key, body.rows, { lang: res.__lang }) };
@@ -1144,8 +1225,8 @@ export function startWeb(db, { home, port = 7357, host = '127.0.0.1', tokenPlain
       const body = await readBody(req);
       const userId = identity(req).userId;
       let result;
-      if (['endpoint_save', 'endpoint_enable', 'endpoint_remove', 'model_save', 'model_remove', 'bind_set', 'role_bind_set'].includes(body.action)) {
-        requireVersion(body.version, llmVersion(), '服务商、模型与模型分配', `l.target_type IN ('endpoint','model','binding')`);
+      if (['endpoint_save', 'endpoint_enable', 'endpoint_remove', 'model_save', 'model_remove', 'bind_set', 'role_bind_set', 'fallback_set', 'verifier_policy'].includes(body.action)) {
+        requireVersion(body.version, llmVersion(), '服务商、模型与模型分配', `l.target_type IN ('endpoint','model','binding') OR (l.action='setting_set' AND l.target_id IN ('deploy.verifier_vendor','deploy.verifier_cosign'))`);
       }
       if (body.action === 'endpoint_save') result = saveEndpoint(db, { ...pickEndpointFields(body), userId });
       else if (body.action === 'endpoint_enable') result = setEndpointEnabled(db, { id: body.id, enabled: !!body.enabled, userId });
@@ -1187,6 +1268,36 @@ export function startWeb(db, { home, port = 7357, host = '127.0.0.1', tokenPlain
       return json(res, 200, { ok: true, result, view: { ...llmView(db, { env, lang: res.__lang }), version: llmVersion() } });
     } },
     // ── 我的会话与令牌：每人管自己的；管理员另能看、能吊销所有人的 ──
+    // 发给我的通知（通知 + 备案）、标已读；我对各类信号的偏好
+    { method: 'GET', path: '/api/me/signals', auth: 'session', handler: (req, res, { url }) => { const me = identity(req);
+      const items = signalsFor(db, me.userId, { limit: Math.min(200, Number(url.searchParams.get('limit')) || 50), before: Number(url.searchParams.get('before')) || null });
+      const unread = db.one(`SELECT count(*) n FROM signal_recipients WHERE user_id=? AND read_at IS NULL AND tier='notify'`, me.userId).n;
+      return json(res, 200, { items, unread, prefs: signalPrefsOf(db, me.userId) }); } },
+    { method: 'POST', path: '/api/me/signals/read', auth: 'session', handler: async (req, res) => { const me = identity(req); const body = await readBody(req);
+      const ids = body.all ? db.all(`SELECT signal_id FROM signal_recipients WHERE user_id=? AND read_at IS NULL`, me.userId).map((r) => r.signal_id) : (Array.isArray(body.ids) ? body.ids.map(String) : []);
+      return json(res, 200, { ok: true, marked: markSignalsRead(db, me.userId, ids) }); } },
+    { method: 'GET', path: '/api/me/signal-prefs', auth: 'session', handler: (req, res) => json(res, 200, { ...prefsView(db, identity(req).userId), push: { ...pushView(db, identity(req).userId), report: reportView(db, identity(req).userId) } }) },
+    // 状态报告：看板随时看（时段、范围、详略可选；全部项目只给管理员）
+    { method: 'GET', path: '/api/report', auth: 'session', handler: (req, res, { url }) => {
+      const me = identity(req); const q = (k) => url.searchParams.get(k);
+      const month = q('span') === 'lastmonth' ? monthSpan(db, me.userId) : null;   // 上个自然月：按这个人的时区
+      const until = month?.until ?? (Number(q('until')) || Date.now());
+      const since = month?.since ?? (Number(q('since')) || until - 7 * 86_400_000);
+      if (!(since < until)) return json(res, 400, { error: new I18nError('时段不对：开始要早于结束') });
+      const detail = REPORT_DETAILS.includes(q('detail')) ? q('detail') : 'summary';
+      const r = buildStatusReport(db, { userId: me.userId, since, until, scope: q('scope') === 'all' ? 'all' : 'mine', detail });
+      return json(res, 200, { report: r, text: renderStatusReport(r) });
+    } },
+    // 5.4「你不在时」：页面可见、有过操作时看板报一次「人在看」；隔了 8 小时以上就回这段离开的摘要
+    { method: 'POST', path: '/api/me/seen', auth: 'session', handler: (req, res) => { const me = identity(req); return json(res, 200, { away: awaySummary(db, me.userId, noteSeen(db, me.userId)) }); } },
+    { method: 'POST', path: '/api/me/away/dismiss', auth: 'session', handler: (req, res) => { dismissAway(db, identity(req).userId); return json(res, 200, { ok: true }); } },
+    // 自己的工作时间、汇总间隔、推送限额（值为 null = 跟部署默认）
+    { method: 'POST', path: '/api/me/push-prefs', auth: 'session', handler: async (req, res) => { const me = identity(req); const body = await readBody(req);
+      try { setPushPrefs(db, { userId: me.userId, prefs: body.prefs ?? {} }); return json(res, 200, { ok: true, push: { ...pushView(db, me.userId), report: reportView(db, me.userId) } }); }
+      catch (e) { return json(res, 400, { error: e }); } } },
+    { method: 'POST', path: '/api/me/signal-prefs', auth: 'session', handler: async (req, res) => { const me = identity(req); const body = await readBody(req);
+      try { setSignalPref(db, { userId: me.userId, cls: String(body.cls ?? ''), tier: body.tier ?? null }); return json(res, 200, { ok: true, ...prefsView(db, me.userId) }); }
+      catch (e) { return json(res, 400, { error: e }); } } },
     { method: 'GET', path: '/api/me/tokens', auth: 'session', handler: (req, res, { url }) => { const me = identity(req); return json(res, 200, { tokens: tokensOf(db, me.userId, { current: me.tokenId, all: url.searchParams.get('all') === '1' }), current: me.tokenId, cliDays: Number(getSetting(db, 'deploy.cli_token_days')) }); } },
     { method: 'POST', path: '/api/me/tokens', auth: 'session', handler: async (req, res) => {
       const me = identity(req); const body = await readBody(req);
@@ -1285,9 +1396,52 @@ export function startWeb(db, { home, port = 7357, host = '127.0.0.1', tokenPlain
       return json(res, 200, { ok: true, result, ...usersPayload(me, res.__lang) });
     } },
     // 转交事项：事项所在的任务要看得见（controls.transfer 再判是不是能转）
+    // 事项链接：#q/<事项> 先问它在哪个任务里（看不见这个任务的人拿到 404，跟任务页同一道可见性）
+    { method: 'GET', re: /^\/api\/questions\/([^/]+)\/where$/, auth: 'task', taskFrom: ({ params }) => db.one(`SELECT task_id FROM questions WHERE id=?`, params[0])?.task_id ?? null,
+      handler: (req, res, { params }) => json(res, 200, { taskId: db.one(`SELECT task_id FROM questions WHERE id=?`, params[0]).task_id }) },
     { method: 'POST', re: /^\/api\/questions\/([^/]+)\/transfer$/, auth: 'task', taskFrom: ({ params }) => db.one(`SELECT task_id FROM questions WHERE id=?`, params[0])?.task_id ?? null,
-      handler: async (req, res, { params }) => { const body = await readBody(req); return json(res, 200, { ok: true, result: controls.transfer({ questionId: params[0], to: body.to, reason: body.reason, _token: tokenOf(req) }) }); } },
+      handler: async (req, res, { params }) => { const body = await readBody(req); return json(res, 200, { ok: true, result: controls.transfer({ questionId: params[0], to: body.to, reason: body.reason, expectTo: Array.isArray(body.expectTo) ? body.expectTo.map(String) : null, _token: tokenOf(req) }) }); } },
     // 决定登记：按需拉，不塞进项目列表 —— 列表每次刷新都要走，清单长了不该跟着走一遍。
+    // 项目规则文件：看得见项目的人都能看；改走下面那条 POST（只有负责人）
+    // skill：三层全列（含停用的、被同名顶掉的、用不了的 —— 看得见为什么不给 AI）；开关走下面那条 POST（只有负责人）
+    // 策略钩子：只读。宿主钩子的命令行只给负责人与管理员（命令里可能带着令牌之类）；改钩子在服务器上 / 仓库里改
+    { method: 'GET', re: /^\/api\/projects\/([^/]+)\/hooks$/, auth: 'project', handler: (req, res, { params }) => {
+      const who = whoOf(req);
+      const owner = db.one(`SELECT owner_id FROM projects WHERE id=?`, params[0])?.owner_id;
+      const admin = !!who && db.one(`SELECT role FROM users WHERE id=?`, who)?.role === 'lead';
+      try { return json(res, 200, hookOverview(db, { projectId: params[0], showCommands: admin || who === owner })); } catch (e) { return json(res, 400, { error: e }); }
+    } },
+    // MCP：看得见项目的人都能看清单与状态；检查 / 批准 / 改用法走下面那条 POST（只有负责人）。宿主配置的命令行只给负责人与管理员
+    { method: 'GET', re: /^\/api\/projects\/([^/]+)\/mcp$/, auth: 'project', handler: (req, res, { params }) => {
+      const who = whoOf(req);
+      const owner = db.one(`SELECT owner_id FROM projects WHERE id=?`, params[0])?.owner_id;
+      const admin = !!who && db.one(`SELECT role FROM users WHERE id=?`, who)?.role === 'lead';
+      try { return json(res, 200, { ...mcpOverview(db, { projectId: params[0], showCommands: admin || who === owner }), canEdit: who === owner }); } catch (e) { return json(res, 400, { error: e }); }
+    } },
+    // 入站：看得见项目的人都能看 issue 入口与定时任务；改走下面那条 POST（只有负责人）
+    { method: 'GET', re: /^\/api\/projects\/([^/]+)\/inbound$/, auth: 'project', handler: (req, res, { params }) => {
+      const who = whoOf(req);
+      const owner = db.one(`SELECT owner_id FROM projects WHERE id=?`, params[0])?.owner_id;
+      if (!owner) return json(res, 404, { error: new I18nError('项目不存在：{id}', { id: params[0] }) });
+      const v = inboundView(db, params[0]), lang = pageLang(req);
+      return json(res, 200, { ...v, schedules: v.schedules.map((s) => ({ ...s, when: describeCron(s.cron, lang) })), gear: gearOf(db, params[0]), canEdit: who === owner });
+    } },
+    { method: 'GET', re: /^\/api\/projects\/([^/]+)\/skills$/, auth: 'project', handler: (req, res, { params }) => {
+      const pid = params[0];
+      const owner = db.one(`SELECT owner_id FROM projects WHERE id=?`, pid)?.owner_id;
+      try {
+        const skills = listSkills(db, { projectId: pid }).map((s) => ({ id: s.id, layer: s.layer, name: s.name, description: s.description, body: s.body,
+          files: s.files.length, enabled: s.enabled, offBy: s.offBy, shadowedBy: s.shadowedBy, invocable: s.invocable, warnings: s.warnings, error: s.error,
+          where: s.layer === 'repo' ? s.where : null }));
+        return json(res, 200, { skills, canEdit: whoOf(req) === owner });
+      } catch (e) { return json(res, 400, { error: e }); }
+    } },
+    { method: 'GET', re: /^\/api\/projects\/([^/]+)\/rules$/, auth: 'project', handler: (req, res, { params }) => {
+      const pid = params[0];
+      const owner = db.one(`SELECT owner_id FROM projects WHERE id=?`, pid)?.owner_id;
+      try { return json(res, 200, { files: listProjectRules(db, { projectId: pid }), canEdit: whoOf(req) === owner, maxBytes: RULES_MAX_BYTES }); }
+      catch (e) { return json(res, 400, { error: e }); }
+    } },
     { method: 'GET', re: /^\/api\/projects\/([^/]+)\/decisions$/, auth: 'project', handler: (req, res, { params }) => {
       const pid = params[0];
       const active = activeDecisions(db, { projectId: pid });
@@ -1323,12 +1477,12 @@ export function startWeb(db, { home, port = 7357, host = '127.0.0.1', tokenPlain
       const r = startProject(db, { userId: me.userId, goal: body.goal, doneDefinition: body.doneDefinition, plan: body.plan ?? null,
         source: empty ? null : body.source, empty, base: body.base || null, title: body.title || null, home });
       if (body.parallel) setParallel(db, { projectId: r.projectId, on: true, userId: me.userId });
-      // 建的时候就定可见性（原来建好再改，这之间全员看得到标题与目标、收得到它的动态）。
+      // 建的时候就定可见性（多会话测试查出：原来建好再改，这之间全员看得到标题与目标、收得到它的动态）。
       // 与建项目在同一段同步代码里，推送的轮询插不进来
       if (body.visibility === 'members') setVisibility(db, { projectId: r.projectId, visibility: 'members', by: me.userId });
       return json(res, 200, { ok: true, result: r });
     } },
-    { method: 'POST', re: /^\/api\/projects\/([^/]+)\/(advance|deliver|abort|redo|rename|archive|append|review|member|visibility|goal|budget|verify|gear|limit|signoff_all|max_open|parallel|egress|setup)$/, auth: 'project', handler: async (req, res, { params }) => {
+    { method: 'POST', re: /^\/api\/projects\/([^/]+)\/(advance|deliver|abort|redo|rename|archive|append|review|member|visibility|goal|budget|verify|gear|limit|signoff_all|max_open|parallel|egress|setup|rules|skills|mcp|pr|inbound|oversight|gates)$/, auth: 'project', handler: async (req, res, { params }) => {
       const [projectId, action] = params;
       const body = await readBody(req);
       if (!localTokenOk()) return json(res, 400, { error: LOCAL_TOKEN_BAD });
@@ -1343,14 +1497,63 @@ export function startWeb(db, { home, port = 7357, host = '127.0.0.1', tokenPlain
         try { return json(res, 200, { ok: true, result: setSetupCommands(db, { projectId, commands: body.commands ?? '', userId: me.userId }) }); }
         catch (e) { return json(res, 400, { error: e }); }
       }
+      // 监督模式（null = 跟部署默认）、审批门禁（整份换；expect = 打开页面时看到的清单，对不上 409）
+      if (action === 'oversight') {
+        try { return json(res, 200, { ok: true, result: setOversightMode(db, { projectId, mode: body.mode ?? null, userId: me.userId }) }); }
+        catch (e) { return json(res, 400, { error: e }); }
+      }
+      if (action === 'gates') {
+        // 试一条命令：拿页面上（可能还没保存的）清单比，不保存、不跑
+        if (typeof body.test === 'string') return json(res, 200, { ok: true, ...gateTest(Array.isArray(body.commands) ? body.commands.map(String) : gatesOf(db, projectId).commands, body.test) });
+        try { return json(res, 200, { ok: true, result: setGates(db, { projectId, commands: Array.isArray(body.commands) ? body.commands : [], userId: me.userId, expect: Array.isArray(body.expect) ? body.expect : undefined }) }); }
+        catch (e) { return json(res, e.status ?? 400, { error: e, conflict: !!e.conflict }); }
+      }
       if (action === 'parallel') {
         // 只许关：开不开要在规划前定（建项目时），批准之后再打开，已经切好的任务不是按并行的形状切的。
         if (body.on) return json(res, 400, { error: new I18nError('并行开发只能在新建项目时开启（规划器的切法取决于它）') });
         try { return json(res, 200, { ok: true, result: setParallel(db, { projectId, on: false, userId: me.userId }) }); }
         catch (e) { return json(res, 400, { error: e }); }
       }
+      if (action === 'pr') {
+        // 项目整体交付的 PR：马上看一次 / 某条意见不用管（转修正要到项目页加任务）
+        try {
+          if (body.op === 'refresh') { await makePrWatcher(db, { fetchFn, env }).pollNow({ projectId }); return json(res, 200, { ok: true, result: prView(db, { projectId }) }); }
+          return json(res, 200, { ok: true, result: actOnComment(db, { projectId, commentId: String(body.commentId ?? ''), op: body.op, userId: me.userId, tokenId: me.tokenId ?? null }) });
+        } catch (e) { return json(res, 400, { error: e }); }
+      }
+      if (action === 'inbound') {
+        try {
+          if (body.op === 'issues') {
+            const r = setIssueInbound(db, { projectId, userId: me.userId, repo: body.repo, label: body.label, on: body.on !== false });
+            // 刚打开：马上看一次，人在页面上就知道连不连得上（连不上的原因写在状态里）
+            if (r.on) await makeIssueWatcher(db, { fetchFn, env }).pollNow(projectId).catch(() => {});
+            return json(res, 200, { ok: true, result: r });
+          }
+          if (body.op === 'poll') return json(res, 200, { ok: true, result: await makeIssueWatcher(db, { fetchFn, env }).pollNow(projectId) });
+          if (body.op === 'schedule') return json(res, 200, { ok: true, result: setSchedule(db, { projectId, userId: me.userId, id: body.id || null, name: body.name, cron: body.cron, brief: body.brief, on: typeof body.on === 'boolean' ? body.on : undefined }) });
+          if (body.op === 'schedule_remove') return json(res, 200, { ok: true, result: removeSchedule(db, { projectId, userId: me.userId, id: String(body.id ?? '') }) });
+          return json(res, 400, { error: '不认识的操作' });
+        } catch (e) { return json(res, 400, { error: e }); }
+      }
+      if (action === 'mcp') {
+        try {
+          if (body.op === 'check') { await checkProject(db, { projectId, home, userId: me.userId }); return json(res, 200, { ok: true }); }
+          if (body.op === 'approve') return json(res, 200, { ok: true, result: approveServers(db, { projectId, ids: [String(body.id ?? '')], userId: me.userId, seen: body.seen ? String(body.seen) : null }) });
+          if (body.op === 'off' || body.op === 'on') { setServerOff(db, { projectId, id: String(body.id ?? ''), off: body.op === 'off', userId: me.userId }); return json(res, 200, { ok: true }); }
+          if (body.op === 'mode') { setToolMode(db, { projectId, tool: String(body.tool ?? ''), mode: String(body.mode ?? ''), userId: me.userId }); return json(res, 200, { ok: true }); }
+          return json(res, 400, { error: '不认识的操作' });
+        } catch (e) { return json(res, 400, { error: e }); }
+      }
+      if (action === 'skills') {
+        try { return json(res, 200, { ok: true, result: setProjectSkill(db, { projectId, id: body.id, enabled: body.enabled === true, userId: me.userId }) }); }
+        catch (e) { return json(res, 400, { error: e }); }
+      }
+      if (action === 'rules') {
+        try { return json(res, 200, { ok: true, result: writeProjectRule(db, { projectId, path: body.path, text: body.delete ? null : String(body.text ?? ''), base: body.base ?? null, userId: me.userId }) }); }
+        catch (e) { return json(res, 400, { error: e }); }
+      }
       if (action === 'egress') {
-        try { return json(res, 200, { ok: true, result: setProjectEgress(db, { projectId, sources: Array.isArray(body.sources) ? body.sources : [], userId: me.userId }) }); }
+        try { return json(res, 200, { ok: true, result: setProjectEgress(db, { projectId, sources: Array.isArray(body.sources) ? body.sources : [], base: Array.isArray(body.base) ? body.base.map(String) : null, userId: me.userId }) }); }
         catch (e) { return json(res, 400, { error: e }); }
       }
       if (['budget', 'verify', 'gear', 'limit', 'signoff_all', 'max_open'].includes(action)) {
@@ -1361,7 +1564,7 @@ export function startWeb(db, { home, port = 7357, host = '127.0.0.1', tokenPlain
               : action === 'gear' ? setGear(db, { projectId, gear: body.gear, userId: me.userId })
                 : action === 'limit' ? setProjectLimit(db, { projectId, key: body.key, value: body.value === null || body.value === '' ? null : Number(body.value), userId: me.userId })
                   : action === 'max_open' ? setMaxOpen(db, { projectId, n: Number(body.n), userId: me.userId })
-                    : acceptDeferredSignoffs(db, { projectId, userId: me.userId });
+                    : acceptDeferredSignoffs(db, { projectId, userId: me.userId, seen: Array.isArray(body.tasks) ? body.tasks.map(String) : null });
           return json(res, 200, { ok: true, result: r3 });
         } catch (e) { return json(res, 400, { error: e }); }
       }
@@ -1382,8 +1585,9 @@ export function startWeb(db, { home, port = 7357, host = '127.0.0.1', tokenPlain
         }
         return json(res, 200, { ok: true, result: r2 });
       }
-      const r = action === 'advance' ? await advanceProject(db, { projectId, home, userId: me.userId })
-        : await deliverProject(db, { projectId, remote: body.remote || null, pr: !!body.pr, base: body.base || null, userId: me.userId, env, fetchFn });
+      // 推进与交付放到 worker 线程（offthread.mjs）：几十条同步 git 加上推送，在这里跑会把看板对所有人卡住
+      const r = action === 'advance' ? await offThread(db, 'advanceProject', { projectId, home, userId: me.userId })
+        : await offThread(db, 'deliverProject', { projectId, remote: body.remote || null, pr: !!body.pr, base: body.base || null, userId: me.userId, tokenId: me.tokenId ?? null, env: { ...env }, fetchFn, home, hookAck: [].concat(body.hookAck ?? []) });
       return json(res, 200, { ok: true, result: r });
     } },
     // 交付页的按任务改动：项目仓库里这个任务合并进来的那一段。
@@ -1463,7 +1667,7 @@ export function startWeb(db, { home, port = 7357, host = '127.0.0.1', tokenPlain
       const [taskId, action] = params;
       if (!controls[action] || ['running', 'logTail', 'me'].includes(action)) { req.resume(); return json(res, 404, { error: '接口不存在' }); }
       const body = await readBody(req);
-      // 请求体里点名的事项必须属于地址里的这个任务：粗粒度那一层只按地址里的任务判可见性，
+      // 请求体里点名的事项必须属于地址里的这个任务（多会话测试查出）：粗粒度那一层只按地址里的任务判可见性，
       // 原来拿自己看得见的任务地址、带别的任务的事项 id，就能在看不见的项目的事项下留言（say 的 about）、
       // 答复不设接收人的事项，报错还会说出事项在不在、该谁答。对不上一律当"没有这个事项"
       for (const k of ['questionId', 'about']) {
@@ -1559,7 +1763,7 @@ export function startWeb(db, { home, port = 7357, host = '127.0.0.1', tokenPlain
       return ctx.onBehalfOf ?await runAs({ onBehalfOf: ctx.onBehalfOf }, () => route.handler(req, res, ctx)) : await route.handler(req, res, ctx);
     } catch (e) {
       const c = classifyError(e);
-      if (c.expose) return json(res, c.status, { error: e, ...(e?.conflict ? { conflict: true } : {}) });
+      if (c.expose) return json(res, c.status, { error: e, ...(e?.conflict ? { conflict: true } : {}), ...(e?.hookAsk ? { hookAsk: e.hookAsk } : {}) });
       try { audit(db, { actorKind: 'system', action: 'http_error', targetType: 'route', targetId: `${req.method} ${p}`, payload: { error: String(e?.message).slice(0, 500), code: e?.code ?? null, stack: String(e?.stack ?? '').split('\n').slice(1, 6).map((l) => l.trim()) } }); } catch { /* 库本身出错：至少别把细节回给浏览器 */ }
       return json(res, 500, { error: '服务器内部错误（已记录）' });
     }
@@ -1568,10 +1772,13 @@ export function startWeb(db, { home, port = 7357, host = '127.0.0.1', tokenPlain
   server.requestTimeout = 120_000;
   server.headersTimeout = 30_000;
   server.maxConnections = 512;
-  return new Promise((ok) => server.listen(port, host, () => ok({
+  return new Promise((ok) => server.listen(port, host, () => {
+    // 事项链接的基址：推送在同一个进程里（web --daemon）就带得上链接
+    registerBoardBase(pub ? pub.origin : `http://${host === '0.0.0.0' || host === '::' ? '127.0.0.1' : host}:${server.address().port}`);
+    ok({
     server, port: server.address().port, host,
     // 授权矩阵测试按这张表逐条生成用例
     routes: ROUTES.map((r) => ({ method: r.method, path: r.path ?? null, re: r.re ?? null, auth: r.auth })),
     close: () => { clearInterval(ticker); clearInterval(ghRecheck); for (const c of clients) c.end(); server.close(); },
-  })));
+  }); }));
 }

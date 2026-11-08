@@ -80,8 +80,9 @@ function renderUserPanel() {
       <div class="row" style="margin-top:12px"><button id="ueSave" class="primary" ${off ? 'disabled' : ''}>${T('保存')}</button> <button id="ueCancel">${T('取消')}</button></div>
       <hr style="border:0;border-top:1px solid var(--line);margin:12px 0">` : ''}
     <div class="form"><label>${T('通知通道')} ${hint(T('待决事项路由到此成员时，向这些地址发送通知。地址可能含密钥，保存后仅显示类型与主机名；每种类型仅保留一条，再次添加即替换'))}</label>
-      <div>${u.channels.map((c) => `<span class="row small" style="margin-bottom:4px">${esc(Object.fromEntries(CH_KINDS)[c.kind] ?? c.kind)} <span class="mute">${esc(c.host ?? '')}</span> <button class="small" data-chrm="${esc(c.kind)}" ${off ? 'disabled' : ''}>${T('删除')}</button></span>`).join('') || `<span class="mute small">${T('未配置')}</span>`}</div>
-      <label>${T('添加 / 替换')}</label><div class="row"><select id="ueChKind" style="width:150px">${CH_KINDS.map(([k, n]) => `<option value="${esc(k)}">${esc(n)}</option>`).join('')}</select><input id="ueChTarget" type="password" autocomplete="off" placeholder="${T('ntfy topic 地址或群机器人 webhook 地址')}" style="flex:1"> <button id="ueChAdd" ${off ? 'disabled' : ''}>${T('保存')}</button></div></div>
+      <div>${u.channels.map((c) => `<span class="row small" style="margin-bottom:4px">${esc(Object.fromEntries(CH_KINDS)[c.kind] ?? c.kind)} <span class="mute">${esc(c.host ?? '')}</span>${chIdle(c)} <button class="small" data-chrm="${esc(c.kind)}" ${off ? 'disabled' : ''}>${T('删除')}</button></span>`).join('') || `<span class="mute small">${T('未配置')}</span>`}</div>
+      <label>${T('添加 / 替换')}</label><div class="row"><select id="ueChKind" style="width:150px">${CH_KINDS.map(([k, n]) => `<option value="${esc(k)}">${esc(n)}</option>`).join('')}</select><input id="ueChTarget" type="password" autocomplete="off" placeholder="${T('ntfy topic 地址或群机器人 webhook 地址')}" style="flex:1"> <button id="ueChAdd" ${off ? 'disabled' : ''}>${T('保存')}</button></div>
+      <div id="ueChMail" class="small mute" style="display:none">${usersData.mailReady ? T('推送发到这个邮箱，每封信末尾带事项链接，点开就是那一件。') : T('这个部署还没配发信服务器（.env 的 SMTP_URL 与 MAIL_FROM），邮箱可以先登记，配好之前推不出去。')}</div></div>
     ${lead || u.id === me.id ? `<hr style="border:0;border-top:1px solid var(--line);margin:12px 0">
     <div class="form"><label>${T('GitHub 账号')} ${hint(T('两个用处：写进提交末尾的出处行和 PR 溯源表（名字后面跟 @账号）；开了「用 GitHub 登录」时，用来认人。本人或管理员可以改。管理员填的直接算数；本人自己填的，要点「用 GitHub 验证并绑定」验证过才写进提交、才能用来登录（防止有人把别人的账号填在自己名下）'))}</label><input id="ueGithub" value="${esc(u.github ?? '')}" placeholder="octocat" autocomplete="off" ${off ? 'disabled' : ''}>${u.githubBound ? `<div class="small mute">${T('已绑定：按 GitHub 内部编号认人，这个账号在 GitHub 上改了名也不影响（下次用 GitHub 登录时，这里和提交里的 @账号跟着更新）。这里换成别的账号会解除绑定，之后要重新验证')}</div>`
         : usersData.githubLogin?.enabled && u.id === me.id ? `<div class="row" style="margin-top:4px"><button id="ueGhLink" class="small" ${off ? 'disabled' : ''}>${T('用 GitHub 验证并绑定')}</button> <span class="small mute">${T('跳到 GitHub 授权一次，回来就绑好了，以后可以用 GitHub 登录')}</span></div>`
@@ -110,6 +111,12 @@ function renderUserPanel() {
     } catch (e) { toast(e.message, true); renderUsers(true); }
   };
   document.querySelectorAll('button[data-chrm]').forEach((b) => b.onclick = async () => { try { await usersAct({ action: 'channel_remove', userId: u.id, kind: b.dataset.chrm }, T('已删除')); renderUsers(false); } catch (e) { toast(e.message, true); } });
+  // 邮件：地址不是密钥，明文显示；其余是 webhook 地址（含密钥），照旧遮住
+  $('#ueChKind').onchange = () => {
+    const mail = $('#ueChKind').value === 'email', inp = $('#ueChTarget');
+    inp.type = mail ? 'email' : 'password'; inp.placeholder = mail ? T('邮箱地址，例 lin@example.com') : T('ntfy topic 地址或群机器人 webhook 地址');
+    $('#ueChMail').style.display = mail ? '' : 'none';
+  };
   $('#ueChAdd').onclick = async () => {
     const target = $('#ueChTarget').value.trim(); if (!target) return toast(T('地址不能为空'), true);
     try { await usersAct({ action: 'channel_set', userId: u.id, kind: $('#ueChKind').value, target }, T('通知通道已保存')); renderUsers(false); } catch (e) { toast(e.message, true); }

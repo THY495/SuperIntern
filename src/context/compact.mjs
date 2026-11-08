@@ -82,7 +82,8 @@ function placeholder(r, call, { workspace, L }) {
   const name = r.name ?? call?.name;
   if (r.compacted) return null;
   if (estimateTokens(text) + (r.images?.length ?? 0) * 1500 < MIN_CLEAR) return null;
-  if (!['run_command', 'read_file', 'grep', 'list_dir', 'read_page', 'open_page', 'screenshot', 'click', 'type_text', 'select_option'].includes(name)) return null;
+  const mcp = /^mcp__/.test(String(name ?? ''));
+  if (!mcp && !['run_command', 'read_file', 'grep', 'list_dir', 'read_page', 'open_page', 'screenshot', 'click', 'type_text', 'select_option'].includes(name)) return null;
   const head = tl(L, '[系统] 为了给上下文腾地方，这条工具结果已从对话里清掉。');
   if (name === 'run_command') {
     let saved = null;
@@ -96,6 +97,19 @@ function placeholder(r, call, { workspace, L }) {
     const first = text.split('\n')[0].slice(0, 200);
     return `${head}${tl(L, '命令：{cmd}；{first}。最后 20 行：', { cmd: argvText(call?.args) || '?', first })}\n${lastLines(text, 20)}\n`
       + (saved ? tl(L, '全文存在 {path}，需要时用 read_file 重读（可以用 offset / limit 分段读）。', { path: saved }) : tl(L, '原文没能存下来；需要时重跑这条命令。'));
+  }
+  if (mcp) {
+    // MCP 调用不一定能重放（可能改了外面的东西）：原文落盘，同 run_command
+    let saved = null;
+    if (workspace) {
+      try {
+        mkdirSync(join(workspace, OUTPUTS_DIR), { recursive: true });
+        saved = `${OUTPUTS_DIR}/${safeName(r.callId)}.txt`;
+        writeFileSync(join(workspace, saved), text);
+      } catch { saved = null; }
+    }
+    return `${head}${tl(L, 'MCP 工具 {name} 的结果，开头：', { name })}\n${text.slice(0, 300)}\n`
+      + (saved ? tl(L, '全文存在 {path}，需要时用 read_file 重读（可以用 offset / limit 分段读）。', { path: saved }) : tl(L, '原文没能存下来。'));
   }
   if (name === 'read_file') {
     const lines = text.split('\n').length;

@@ -336,6 +336,31 @@ section('模型服务商暂停调用 / 换用备用 / 恢复 → 守护进程按
   db5.close();
 }
 
+section('邮件答复：守护进程每分钟收一轮；收不到信（IMAP 配错）从好到坏 / 从坏到好各告诉管理员一次');
+{
+  const db6 = openDb(':memory:');
+  ensureOwner(db6);
+  const launcher = makeLauncher(db6, { home: HOME, spawnFn: () => ({ pid: 1, exitCode: null, on() {} }) });
+  const sent = [];
+  let polls = 0, broken = true, t = Date.parse('2026-11-11T10:00:00Z');
+  const notifyOpts = {
+    env: { NTFY_URL: 'https://ntfy.example/si', SMTP_URL: 'smtp://127.0.0.1:2525', MAIL_FROM: 'si@x.com', IMAP_URL: 'imap://u:p@127.0.0.1:1143' },
+    fetchFn: async (url, init) => { sent.push({ title: decodeURIComponent(init.headers.title), body: init.body }); return { ok: true, status: 200 }; },
+    mailFetchFn: async () => { polls++; if (broken) throw new Error('登录（AUTHENTICATE PLAIN）：IMAP NO'); return { fetched: 0, errors: [] }; },
+  };
+  const d = startDaemon(db6, { home: HOME, launcher, intervalMs: 3600_000, alive: dead, runtime: null, notifyOpts, clock: () => t });
+  await d.tick();
+  await d.tick(); await d.tick();   // 同一分钟里再拍：不重收、不重报
+  t += 61_000; await d.tick();       // 一分钟后还是坏的：收了，但不重报
+  const failMsgs = () => sent.filter((s) => /收不到信/.test(s.title));
+  eq(JSON.stringify([polls, failMsgs().length]), '[2,1]', '每分钟最多收一轮；连不上只报一次（当拍就推）');
+  assert(/IMAP_URL/.test(failMsgs()[0]?.body ?? '') && /到看板上答/.test(failMsgs()[0]?.body ?? ''), '告诉管理员：哪项配置、修好之前让大家到看板上答');
+  broken = false; t += 61_000; await d.tick();
+  assert(sent.some((s) => /恢复了/.test(s.title)), '修好了：说一声');
+  d.stop?.();
+  db6.close();
+}
+
 section('一拍出错：不抛出去（不变成未处理的 rejection 带走进程），记审计、报事件，下一拍照常');
 {
   const db3 = openDb(':memory:');

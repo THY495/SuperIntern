@@ -115,10 +115,12 @@ function realOfNearestExisting(abs) {
  *
  * @returns {Promise<{code, stdout, stderr, truncated, timedOut, durationMs}>}
  */
-export function spawnCapped(file, args, { cwd, env, timeoutMs, maxOutputBytes, killAfterMs = null }) {
+export function spawnCapped(file, args, { cwd, env, timeoutMs, maxOutputBytes, killAfterMs = null, input = null }) {
   const elapsed = stopwatch();   // 时长用单调时钟
   return new Promise((done) => {
     const child = spawn(file, args, { cwd, env, shell: false });
+    // 有 input 才写 stdin 并关上（策略钩子按 Claude Code / Codex 的线上格式从 stdin 收 JSON）；没有就照旧不碰
+    if (input != null) { child.stdin.on('error', () => { /* 子进程没读就退了：EPIPE 不算错 */ }); child.stdin.end(String(input)); }
 
     let out = '', err = '', truncated = false, timedOut = false;
     // ⚠️ 截断标记要看**这一块有没有被切**，不能只看"已经满了没有"：
@@ -203,6 +205,17 @@ export class HostFileOps {
 export class LocalExecutor extends HostFileOps {
   constructor(opts = {}) { super(); this.defaults = { ...DEFAULT_LIMITS, ...opts }; }
 
+  /**
+   * 长连接的子进程（MCP stdio server）：三条管道接好交给调用方，调用方负责关。
+   * 环境同 execute 的白名单，再加调用方给的（MCP 配置里的，已滤掉像凭据的）。不经 shell。
+   */
+  spawnStream(cmd, workspace, { env = {} } = {}) {
+    const { file, args = [] } = cmd;
+    if (!file) throw new Error('spawnStream: cmd.file 必填');
+    return spawn(file, args, { cwd: resolve(workspace), shell: false, windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'],
+      env: { PATH: process.env.PATH, SYSTEMROOT: process.env.SYSTEMROOT, TEMP: process.env.TEMP, ...env } });
+  }
+
   /** @returns {Promise<{code, stdout, stderr, truncated, timedOut, durationMs}>} */
   execute(cmd, workspace, limits = {}) {
     maybeFault('exec', { file: cmd.file, args: cmd.args });   // 故障注入点
@@ -215,7 +228,7 @@ export class LocalExecutor extends HostFileOps {
       // 不在本地执行器里；
       // 这里做的是"至少别主动递给它"，不等于隔离。
       env: { PATH: process.env.PATH, SYSTEMROOT: process.env.SYSTEMROOT, TEMP: process.env.TEMP },
-      timeoutMs: lim.timeoutMs, maxOutputBytes: lim.maxOutputBytes,
+      timeoutMs: lim.timeoutMs, maxOutputBytes: lim.maxOutputBytes, input: lim.input ?? null,
     });
   }
 }

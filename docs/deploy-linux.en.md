@@ -22,7 +22,7 @@ For Windows, see [Deployment](deploy.en.md). This guide covers installation on L
 ```bash
 # 1. Put the code on the Linux filesystem.
 #    On WSL2, avoid /mnt/c and /mnt/d: drvfs ownership, permissions and performance differ.
-tar xzf superintern-v0.4.0-linux.tar.gz && cd superintern-v0.4.0
+tar xzf superintern-v0.5.0-linux.tar.gz && cd superintern-v0.5.0
 #    Alternatively: git clone <repository-url> ~/superintern && cd ~/superintern
 
 # 2. Check prerequisites, create .env (mode 600), build sandbox images.

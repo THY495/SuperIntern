@@ -429,6 +429,16 @@ const isSelector = (F, t) => !t.parent && /(?:\$\$?|querySelector(?:All)?|closes
 
 // ── 登记：确实安全、但扫描看不出来的插值。键："文件|表达式"（表达式去掉首尾空白）。理由写在值里 ──
 const ALLOW = new Map(Object.entries({
+  // 05 项目设置 → Skill：每组的「怎么装」是 T(…) 拼的 HTML 片段（<code> 包命令 / 路径，项目 id 已 esc）
+  '05-settings-network.js|how': '每组的安装说明由 GROUPS 里拼好（<code> 片段，插值已转义）',
+  // 05 项目设置 → 钩子：每个时机的「要人确认 / 出错」两行与来源名是 WHEN / SRC 里 T(…) 拼好的（<code> 片段经 code() 转义）
+  '05-settings-network.js|ask': '钩子页 WHEN 里拼好的说明（code() 已转义）',
+  '05-settings-network.js|failed': '钩子页 WHEN 里拼好的说明（code() 已转义）',
+  '05-settings-network.js|name': '钩子页 SRC 里拼好的来源名（code() 已转义）',
+  // 05 项目设置 → MCP：状态行（statusLine 里插的 server id、报错、变更原文都已 esc）与来源两行（SRC 里 T(…) + code() 拼好）
+  '05-settings-network.js|statusLine(s)': 'MCP 页的状态行在 statusLine 里拼好（插值已转义）',
+  '05-settings-network.js|SRC[x.kind][0]': 'MCP 页 SRC 里拼好的来源名（code() 已转义）',
+  '05-settings-network.js|SRC[x.kind][1]': 'MCP 页 SRC 里拼好的来源说明（纯文案）',
   // 竖向分层图的节点：line1 / line2 约定是调用方拼好的 HTML 片段（03-project.js 的 esc(state) 与 T('依赖 {deps}', …#数字)、
   // 09-graph.js 步骤图的 T('步骤 {n}') · esc(stName(…)) 与 T('风险 {level}', …esc)），title 才是原文、这里 esc
   '09-graph.js|x.line1': '节点的 line1 由调用方拼好（已转义）',

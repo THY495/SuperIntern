@@ -1,8 +1,11 @@
 // ── 成员：列表 / 编辑面板 / 交接 ─────────────────────────────────────────
 // 负责人管所有人；成员只能动自己那一行（通知通道、令牌、申请交接）。与其他设置分区一样不跟 SSE 重画。
 let usersData = null, userEdit = null, userAdd = false, hoState = null, tokenBox = null, userPerm = null;
-const usersFrom = (r) => ({ users: r.users, local: r.local, requests: r.requests, settings: r.settings ?? {} });
-const CH_KINDS = [['ntfy', 'ntfy'], ['feishu', T('飞书机器人')], ['dingtalk', T('钉钉机器人')], ['wecom', T('企业微信机器人')]];
+// 动作的返回带着整份成员视图（另有 ok / result）：整份接住，别漏掉 githubLogin、mailReady 这类附带字段
+const usersFrom = ({ ok, result, ...r }) => ({ ...r, settings: r.settings ?? {} });
+const CH_KINDS = [['ntfy', 'ntfy'], ['feishu', T('飞书机器人')], ['dingtalk', T('钉钉机器人')], ['wecom', T('企业微信机器人')], ['email', T('邮件')]];
+// 邮件通道要部署配了发信服务器才推得出去：没配时在登记的邮箱后面标出来
+const chIdle = (c) => (c.kind === 'email' && usersData && !usersData.mailReady ? ` <span class="warn small">${T('（发信没配，还推不出去）')}</span>` : '');
 async function usersAct(body, okMsg) {
   const r = await api('/api/users', body);
   // 重发的是自己正在用的令牌：浏览器里存的那枚跟着换，否则下一个请求就认证不过
@@ -48,7 +51,7 @@ async function renderUsers(reload = true) {
   if (!me || me.role === 'observer') return;
   if (reload || !usersData) { try { usersData = await api('/api/users'); } catch (e) { $('#users').innerHTML = `<span class="mute">${esc(e.message)}</span>`; return; } }
   const lead = me.role === 'lead', U = usersData.users;
-  const chText = (u) => u.channels.map((c) => `${esc(Object.fromEntries(CH_KINDS)[c.kind] ?? c.kind)}${c.host ? ` <span class="mute">${esc(c.host)}</span>` : ''}`).join(T('、')) || `<span class="mute">${T('无')}</span>`;
+  const chText = (u) => u.channels.map((c) => `${esc(Object.fromEntries(CH_KINDS)[c.kind] ?? c.kind)}${c.host ? ` <span class="mute">${esc(c.host)}</span>` : ''}${chIdle(c)}`).join(T('、')) || `<span class="mute">${T('无')}</span>`;
   const reqs = usersData.requests ?? [], adminOnly = !!usersData.settings?.['deploy.create_admin_only'];
   const contentLang = usersData.settings?.['deploy.content_lang'] ?? 'zh';
   const LANG_NAMES = { zh: I18N.lang === 'zh' ? '中文' : 'Chinese (中文)', en: 'English' };   // 语言名在英文界面带上英文

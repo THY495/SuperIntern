@@ -24,6 +24,8 @@ import { LLM_ROLES, bindRoleOf } from '../llm/canonical.mjs';
 export const TOOL_EFFECTS = {
   list_dir: 'read', read_file: 'read', grep: 'read',
   write_file: 'workspace', run_command: 'exec',
+  // 取用 skill —— 读部署 / 项目层装好的 skill（宿主上，操作人装的）或仓库里的，参考文件复制进工作区的 .si-skills/
+  activate_skill: 'workspace',
   submit_handoff: 'record', raise_question: 'ask', request_egress: 'ask',
   submit_verdict: 'record', open_page: 'app', read_page: 'app', click: 'app', type_text: 'app', select_option: 'app', screenshot: 'app',
   submit_plan: 'record', ask_user: 'ask', propose_constitution: 'record',
@@ -36,8 +38,9 @@ export const TOOL_EFFECTS = {
  * sensitive / external：'none'，或 'sandbox'（取决于沙箱装配，见 sandboxCaps），或 'human'（经人点了才发生，例如交付）。
  */
 export const SESSIONS = {
-  executor: { tools: ['list_dir', 'read_file', 'grep', 'write_file', 'run_command', 'submit_handoff', 'raise_question', 'request_egress'],
-    untrusted: ['仓库内容', '命令输出', '出网读到的网页与包', '上游步骤的交接'], sensitive: 'sandbox', external: 'sandbox' },
+  // mcp：可以拿 MCP 工具（名字 mcp__<server>__<工具>）。server 跑在这个沙箱里，碰得到的网络与凭据就是沙箱的 —— 效果同 exec
+  executor: { tools: ['list_dir', 'read_file', 'grep', 'write_file', 'run_command', 'submit_handoff', 'raise_question', 'request_egress', 'activate_skill'], mcp: true,
+    untrusted: ['仓库内容', '命令输出', '出网读到的网页与包', '上游步骤的交接', '仓库里的 skill', 'MCP 工具的说明与输出'], sensitive: 'sandbox', external: 'sandbox' },
   verifier: { tools: ['list_dir', 'read_file', 'grep', 'submit_verdict', 'open_page', 'read_page', 'click', 'type_text', 'select_option', 'screenshot'],
     untrusted: ['仓库内容', '执行器写的交接', '运行中的应用页面'], sensitive: 'sandbox', external: 'sandbox' },
   planner: { tools: ['submit_plan', 'raise_question'], untrusted: [], sensitive: 'none', external: 'none' },
@@ -51,6 +54,9 @@ export const SESSIONS = {
   compactor: { tools: [], untrusted: ['执行器的工作记录（仓库内容、命令输出）'], sensitive: 'none', external: 'none' },
   'decision-check': { tools: [], untrusted: [], sensitive: 'none', external: 'none' },
 };
+
+/** MCP 工具：名字是动态的，效果按 exec 算（server 在沙箱里跑）。只有登记了 mcp: true 的会话能拿 */
+export const isMcpTool = (name) => /^mcp__[A-Za-z0-9_-]+$/.test(String(name));
 
 export class CapabilityError extends I18nError {
   constructor(tpl, params) { super(tpl, params); this.name = 'CapabilityError'; this.capability = true; }
@@ -69,7 +75,7 @@ export function assertSessionTools(role, tools = []) {
   const key = bindRoleOf(role);
   const s = SESSIONS[key];
   if (!s) throw new CapabilityError('会话角色 {role} 没在能力表里登记（core/capabilities.mjs）：先写清它读什么输入、能不能碰凭据、能不能对外改东西', { role });
-  const extra = names.filter((n) => !s.tools.includes(n));
+  const extra = names.filter((n) => !s.tools.includes(n) && !(s.mcp && isMcpTool(n)));
   if (extra.length) throw new CapabilityError('角色 {role} 拿到了没登记的工具：{tools}。先在 core/capabilities.mjs 的 SESSIONS 与 TOOL_EFFECTS 里登记它的效果', { role, tools: extra.join(', ') });
 }
 
@@ -118,6 +124,7 @@ export function staticProblems() {
   for (const [k, s] of Object.entries(SESSIONS)) {
     for (const t of s.tools) if (!TOOL_EFFECTS[t]) out.push(`${k} 的工具 ${t} 没登记效果`);
     if (s.sensitive === 'sandbox' || s.external === 'sandbox') continue;
+    if (s.mcp) out.push(`${k} 不经沙箱却能拿 MCP 工具`);   // MCP server 只在沙箱里起
     if (s.untrusted.length && s.sensitive !== 'none' && s.external !== 'none' && s.external !== 'human') out.push(`${k} 三样齐了`);
     // 不经沙箱的会话不许有能碰外面的工具
     for (const t of s.tools) if (['exec', 'app'].includes(TOOL_EFFECTS[t])) out.push(`${k} 不经沙箱却有 ${t}`);

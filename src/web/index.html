@@ -86,6 +86,12 @@
      进设置时它让位给设置的分区导航，不并排两栏。 */
   .shell { display:grid; grid-template-columns: 250px minmax(0,1fr); align-items:start; }
   .shell.noside { grid-template-columns: minmax(0,1fr); } .shell.noside #side { display:none; }
+  /* 快速答复：只留那一件，手机上读得下 */
+  body.quick .shell { grid-template-columns: minmax(0,1fr); } body.quick #side, body.quick #btnSide { display:none !important; }
+  body.quick #viewTask > section:not(#qSection), body.quick #qSection > h2, body.quick #revision { display:none !important; }
+  body.quick #viewTask { max-width:760px; margin:0 auto; }
+  body.quick #btnPauseAll, body.quick header #spend, body.quick #daemon, body.quick #btnToken { display:none !important; }   /* 全局急停：手机上一不小心就点到，快速答复里用不着 */
+  #quickBar { padding:10px 12px; margin:8px 0; border:1px solid var(--line); border-radius:8px; background:var(--card); }
   #side { position:sticky; top:45px; height:calc(100vh - 45px); overflow:auto; border-right:1px solid var(--line); background:var(--card); padding:10px 8px 16px; }
   #side .col { display:flex; flex-direction:column; gap:1px; min-height:100%; }
   .srow { display:flex; align-items:center; gap:7px; padding:5px 8px; border-radius:6px; color:var(--ink2); text-decoration:none; cursor:pointer; font-size:13px; min-width:0; border:0; background:transparent; width:100%; text-align:left; }
@@ -239,6 +245,7 @@
     <button data-pane="sessions">登录与令牌</button>
     <button data-pane="spend">花费</button>
     <button data-pane="time">时间与日历</button>
+    <button data-pane="notify">我的通知</button>
     <button data-pane="conn">连接</button>
     <div class="grp lead-only">部署</div>
     <button data-pane="health" class="lead-only">运行状况<span id="healthDot" class="dot"></span></button>
@@ -250,8 +257,14 @@
   <div class="snav" id="psnav">
     <div class="grp">项目设置</div>
     <button data-ps="general" class="on">常规</button>
+    <button data-ps="rules">项目规则</button>
+    <button data-ps="skills">Skill</button>
+    <button data-ps="hooks">钩子</button>
+    <button data-ps="mcp">MCP</button>
+    <button data-ps="inbound">Issue 与定时任务</button>
     <button data-ps="members">成员与权限</button>
     <button data-ps="routing" class="ps-lead">决策路由</button>
+    <button data-ps="oversight">监督与审批</button>
     <button data-ps="budget" class="ps-lead">预算与上限</button>
     <button data-ps="auto" class="ps-lead">自动化</button>
     <button data-ps="net" class="ps-lead">联网</button>
@@ -303,11 +316,25 @@
 </div>
 
 <main id="viewInbox" class="hide" style="grid-template-columns:minmax(0,1fr);max-width:1000px;margin:0">
+  <section class="card hide" id="awayBar" role="status"></section>
   <section class="card not-observer" id="digestCard">
     <h2 style="font-size:16px">收件箱 <span id="digestTag" class="tag"></span></h2>
     <div id="digest" class="small"></div>
   </section>
+  <section class="card" id="signalCard">
+    <h2 style="font-size:16px">通知 <span id="signalTag" class="tag"></span></h2>
+    <div id="signalFeed" class="small"></div>
+  </section>
   <section class="card hide" id="inboxObserver"><span class="mute">旁观者没有待办事项。请在左侧选择任务查看。</span></section>
+</main>
+
+<main id="viewReport" class="hide" style="grid-template-columns:minmax(0,1fr);max-width:1000px;margin:0">
+  <section class="card">
+    <h2 style="font-size:16px">状态报告</h2>
+    <div class="small mute">这段时间发生了什么：出事了没有、没等你拍板就定下的、进展、花费。收件箱管还等你动手的，这里管已经发生的。</div>
+    <div id="reportCtl" style="margin-top:8px"></div>
+    <div id="reportOut" style="margin-top:4px"></div>
+  </section>
 </main>
 
 <main id="viewProject" class="hide" style="grid-template-columns:minmax(0,1fr);max-width:1100px;margin:0">
@@ -327,6 +354,26 @@
       <h2>常规</h2>
       <div id="psGeneral"></div>
     </section>
+    <section class="card pane hide" data-ps="rules">
+      <h2>项目规则</h2>
+      <div id="psRules"></div>
+    </section>
+    <section class="card pane hide" data-ps="skills">
+      <h2>Skill</h2>
+      <div id="psSkills"></div>
+    </section>
+    <section class="card pane hide" data-ps="hooks">
+      <h2>钩子</h2>
+      <div id="psHooks"></div>
+    </section>
+    <section class="card pane hide" data-ps="mcp">
+      <h2>MCP</h2>
+      <div id="psMcp"></div>
+    </section>
+    <section class="card pane hide" data-ps="inbound">
+      <h2>Issue 与定时任务</h2>
+      <div id="psInbound"></div>
+    </section>
     <section class="card pane hide" data-ps="members">
       <h2>成员与权限</h2>
       <div id="projMembers"></div>
@@ -335,6 +382,10 @@
       <h2>决策路由 <span id="projRoutingTag" class="tag"></span></h2>
       <div class="small mute" style="margin-bottom:8px">本项目的待决事项按下表发给谁；未设置的类别沿用「设置 → 默认决策路由」。</div>
       <div id="projRouting"></div>
+    </section>
+    <section class="card pane hide" data-ps="oversight">
+      <h2>监督与审批</h2>
+      <div id="psOversight"></div>
     </section>
     <section class="card pane hide" data-ps="budget">
       <h2>预算与上限</h2>
@@ -356,16 +407,17 @@
 </main>
 
 <main id="viewTask">
+  <div id="quickBar" class="hide"></div>
 
 
   <section class="card full" id="controls">
     <div class="row">
-      <span class="row task-lead-only">
-        <button id="btnRun" class="primary">运行</button>
-        <button id="btnPause">暂停</button>
-        <button id="btnResume">继续</button>
-        <button id="btnAbort" class="danger" title="停止执行。可恢复：工作区、步骤与待决事项都保留；中止期间其待决事项不出现在任何人的收件箱">中止</button>
-        <button id="btnReopen" class="hide" title="回到中止前的状态，接着已有的进度继续。如需修改方案，恢复后在下方发送消息提出变更">恢复</button>
+      <span class="row">
+        <button id="btnRun" class="primary task-lead-only">运行</button>
+        <button id="btnPause" title="临时停一下：AI 手上这一下（一次回复或一条命令）做完就停，不等这一步做完。没写完的改动先存起来，点「继续」后放回接着做">暂停</button>
+        <button id="btnResume" title="接着做；暂停时存起来的改动会放回">继续</button>
+        <button id="btnAbort" class="danger task-lead-only" title="不再做这个任务：立即停下，AI 正在写的回复直接作废（正在跑的命令跑完为止）。工作区、步骤与待决事项都保留，以后可以恢复；中止期间其待决事项不出现在任何人的收件箱">中止</button>
+        <button id="btnReopen" class="hide task-lead-only" title="回到中止前的状态，接着已有的进度继续。如需修改方案，恢复后在下方发送消息提出变更">恢复</button>
       </span>
       <span id="runState" class="small mute"></span>
       <span id="nextStep" class="small"></span>
@@ -383,7 +435,7 @@
       <textarea id="sayBody" rows="2" aria-label="向任务发送消息" placeholder="向任务发送消息：修正、新指令或补充信息" style="flex:1 1 100%"></textarea>
       <select id="sayKind" class="not-observer" title="自动：由轻量模型按内容分类，结果显示在「消息」中"><option value="">类别：自动</option><option value="correction">修正</option><option value="instruction">新指令</option><option value="context">补充信息</option></select>
       <select id="sayAbout" aria-label="关联到哪个事项"><option value="">不关联事项</option></select>
-      <label class="small not-observer" title="仅作标记：在模型上下文和活动中标为紧急，不中断正在执行的步骤"><input type="checkbox" id="sayUrgent"> 紧急</label>
+      <label class="small not-observer" title="修正或新指令：勾上就打断正在执行的步骤、马上按它改计划；不勾就等这一步做完。补充信息勾不勾，AI 都会在下一次回复前看到"><input type="checkbox" id="sayUrgent"> 紧急</label>
       <span class="grow"></span>
       <button id="btnSay">发送</button>
     </div>
@@ -391,7 +443,12 @@
     <pre id="log" hidden></pre>
   </section>
 
-  <section class="card">
+  <section class="card hide" id="prCard">
+    <h2>交付的 PR</h2>
+    <div id="taskPr"></div>
+  </section>
+
+  <section class="card" id="qSection">
     <h2>待决事项 <span id="qCount" class="tag"></span></h2>
     <div id="questions" class="list"></div>
     <h2 class="sub">待批准的计划变更</h2>
@@ -483,6 +540,13 @@
       <h2>花费</h2>
       <div id="spend"></div>
     </section>
+    <section class="card pane hide" data-pane="notify">
+      <h2>我的通知</h2>
+      <h3>什么时候推</h3>
+      <div id="pushPrefs"></div>
+      <h3 style="margin-top:18px">推哪几类</h3>
+      <div id="sigPrefs"></div>
+    </section>
     <section class="card pane hide" data-pane="time">
       <h2>时间与日历</h2>
       <div id="timeCard"></div>
@@ -522,5 +586,9 @@
 <script src="/app/20-login.js" defer></script>
 <script src="/app/21-health.js" defer></script>
 <script src="/app/22-time.js" defer></script>
+<script src="/app/23-pr.js" defer></script>
+<script src="/app/24-inbound.js" defer></script>
+<script src="/app/25-oversight.js" defer></script>
+<script src="/app/26-report.js" defer></script>
 </body>
 </html>

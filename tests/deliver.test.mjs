@@ -129,6 +129,13 @@ section('3. 开 PR 的请求形状（假 GitHub）');
   eq(JSON.parse(f.db.one(`SELECT value FROM params WHERE task_id=? AND key='delivery.pr_url' AND superseded_at IS NULL`, f.taskId).value),
     'https://github.com/o/r/pull/7', '参数 delivery.pr_url');
   eq(git(f.bare, 'rev-parse', `refs/heads/v0/${f.taskId}`), f.head, '分支真的推到了远端');
+  const pr = JSON.parse(f.db.one(`SELECT value FROM params WHERE task_id=? AND key='delivery.pr' AND superseded_at IS NULL`, f.taskId).value);
+  eq(JSON.stringify([pr.owner, pr.repo, pr.number, pr.branch, pr.head, pr.by]), JSON.stringify(['o', 'r', 7, `v0/${f.taskId}`, f.head, f.owner.userId]), '记下交付的 PR（PR 轮询按它看）：仓库、编号、分支、头、谁交付的');
+  // 同一个分支再交付（修 CI 之后）：推送就更新了 PR，不再开一个（GitHub 会回 422）
+  const calls1 = [];
+  const r1 = await deliverTask(f.db, { taskId: f.taskId, workspace: f.ws, remote: 'https://github.com/o/r.git', pr: true, token: 'tok', userId: f.owner.userId, fetchFn: fakeGithub(calls1) });
+  assert(r1.pr?.updated && r1.pr.number === 7 && !calls1.some((c) => c.url.endsWith('/pulls')), '已经开着 PR：再交付只推送、不另开', JSON.stringify(r1.pr));
+  f.db.run(`UPDATE params SET superseded_at=1 WHERE task_id=? AND key='delivery.pr'`, f.taskId);
   // 没 token：push 照做、PR 跳过并说明
   const calls2 = [];
   const r2 = await deliverTask(f.db, { taskId: f.taskId, workspace: f.ws, remote: 'https://github.com/o/r.git', pr: true, token: '',

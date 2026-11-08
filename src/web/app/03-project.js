@@ -4,6 +4,11 @@
 let projView = (() => { try { return localStorage.getItem('si.projView') === 'graph' ? 'graph' : 'list'; } catch { return 'list'; } })();
 const projViewBar = (p) => (p.tasks.length > 1 ? `<div class="row small" style="margin-bottom:8px;gap:4px">
     <button class="small${projView === 'list' ? ' primary' : ''}" data-pv="list">${T('清单')}</button><button class="small${projView === 'graph' ? ' primary' : ''}" data-pv="graph">${T('依赖图')}</button></div>` : '');
+/** 还在等的依赖：做完了、在等签收合并的标出来（签收占着名额，人要看得见后面的任务在等谁签） */
+function depsText(p, t) {
+  const byOrder = new Map(p.tasks.map((x) => [x.project_order, x]));
+  return (t.waitsFor ?? []).map((n) => `#${esc(n)}${byOrder.get(n)?.status === 'done' ? T('（待签收）') : ''}`).join(' ');
+}
 function projGraphHtml(p, so) {
   const byOrder = new Map(p.tasks.map((t) => [t.project_order, t]));
   const open = p.openIds ?? [p.current];
@@ -12,7 +17,7 @@ function projGraphHtml(p, so) {
     const color = t.merged_at ? 'var(--ok)' : t.status === 'aborted' ? 'var(--bad)' : t.status === 'done' ? 'var(--wait)'
       : open.includes(t.id) ? 'var(--run)' : 'var(--mute)';
     const state = t.merged_at ? T('已合并') : t.status === 'done' ? T('已完成 · {signoff}', { signoff: so[t.signoff] ?? T('待签收') })
-      : open.includes(t.id) ? (t.status === 'running' ? T('执行中') : T('执行中 · {status}', { status: ST_NAME[t.status] ?? t.status })) : waiting ? T('等待 {deps}', { deps: t.waitsFor.map((n) => `#${esc(n)}`).join(' ') })
+      : open.includes(t.id) ? (t.status === 'running' ? T('执行中') : T('执行中 · {status}', { status: ST_NAME[t.status] ?? t.status })) : waiting ? T('等待 {deps}', { deps: depsText(p, t) })
       : !t.started && !ended(t.status) ? T('排队中') : (ST_NAME[t.status] ?? t.status);
     return { id: t.id, href: `#${t.id}`, title: `#${t.project_order} ${t.title}`, color, line1: esc(state),
       line2: (t.dependsOn ?? []).length ? T('依赖 {deps}', { deps: t.dependsOn.map((n) => `#${esc(n)}`).join(' ') }) : '',
@@ -44,6 +49,7 @@ function renderProject() {
       <div class="row" style="margin-top:8px"><button id="btnProjReview" title="${T('AI 对照目标与完成定义重新判断一次：已经达成就请你确认达成，还差东西就提出新任务 —— 结果照常进你的收件箱')}">${T('重新复盘')}</button>
       <span class="small mute">${T('也可以在下面「添加任务…」写还要做什么，或在 {link}里中止项目', { link: `<a href="#p/${esc(p.id)}/settings">${T('项目设置 → 危险区（中止等不可撤销的操作）')}</a>` })}</span></div>` : T('等待项目负责人处理。')}</div>` : ''}
     ${lead && p.evidence && (!p.delivered || p.deliverDue) ? deliverEvidenceHtml(p) : ''}
+    ${p.pr ? prCardHtml(p.pr, { project: true, canAct: lead }) : ''}
     <div class="kv" style="margin-top:10px"><span class="mute">${T('项目负责人')}</span><span>${esc(ownerName)}</span><span class="mute">${T('仓库')}</span><span class="mono">${esc(p.repo)}</span><span class="mute">${T('分支')}</span><span class="mono">${esc(p.branch)} <span class="mute">← ${esc(p.base_ref)}</span></span>${p.source ? `<span class="mute">${T('来源')}</span><span class="mono">${esc(p.source)}</span>` : ''}<span class="mute">${T('累计花费')}</span><span>${usd(p.spendMicro ?? 0)} <span class="mute small">${T('本项目所有花费的总和')}${p.planningMicro ? T('，其中 {usd} 花在起草方案上（项目规划、添加任务、复盘）', { usd: usd(p.planningMicro) }) : ''}</span>${p.budget?.gate === null ? `${lead ? ` · <a href="#p/${esc(p.id)}/settings" title="${T('设一个整个项目的花费上限；撞到后不再开新任务')}">${T('设预算上限')}</a>` : ''}` : ` · ${T('上限 {usd}', { usd: usd(p.budget.gate) })}${p.budget.over ? ` <span class="bad">${T('已撞闸，不再开新任务')}</span>` : ` <span class="mute small">${T('还剩 {usd}', { usd: usd(p.budget.remaining) })}</span>`}${lead ? ` · <a href="#p/${esc(p.id)}/settings">${T('修改')}</a>` : ''}`}</span>
       <span class="mute">${T('自动化')}</span><span>${esc((p.gears ?? {})[p.gear]?.label ? T(p.gears[p.gear].label) : p.gear ?? T('提议'))}<span class="mute small">${T(' —— ')}${p.gear === 'auto' ? T('复盘给出的下一批任务会直接开工，事后通知你；交付仍要你点') : T('所有新任务都要你先批一次')}</span>${lead ? ` · <a href="#p/${esc(p.id)}/settings">${T('修改')}</a>` : ''}</span></div>`;
   const carrier = p.carrier && byId[p.carrier] && !p.tasks.some((t) => t.id === p.carrier) ? byId[p.carrier] : null;
@@ -52,7 +58,7 @@ function renderProject() {
     ${carrier ? `<tr><td class="mute">—</td><td><a href="#${esc(carrier.id)}">${T('项目方案')}</a></td><td></td><td><span class="pill ${esc(carrier.status)}">${esc(ST_NAME[carrier.status] ?? carrier.status)}</span></td><td></td><td></td></tr>` : ''}
     ${p.tasks.map((t) => `<tr${t.id === p.current ? '' : ended(t.status) ? ' class="off"' : ''}><td class="num">${esc(t.project_order)}</td><td><a href="#${esc(t.id)}"${(p.openIds ?? [p.current]).includes(t.id) ? ' style="font-weight:600"' : ''}>${esc(t.title)}</a>${t.requestedBy ? ` <span class="small mute" title="${T('谁用「添加任务」提的这个任务。决策路由里的「需求提出人」就是这个人；任务合并后，收件箱会告诉这个人。没有这个标注的任务（项目开头规划的、复盘给出的）没有需求提出人：路由里的这一项对它自动空缺，只剩同一行的其他人')}">${T('· {name}提的', { name: esc(t.requestedBy) })}</span>` : ''}${(p.openIds ?? [p.current]).includes(t.id) ? ` <span class="pill running" title="${T('这个任务已经开工（有工作区、还没合并）。同时最多开 {n} 个：只有开着的任务全都在等人时，系统才会让路再开一个。是否正在运行，见本行「状态」列', { n: esc(p.maxOpen ?? 1) })}">${T('执行中')}</span>` : ''}</td>
       <td class="small mute">${(t.dependsOn ?? []).length ? t.dependsOn.map((n) => `#${esc(n)}`).join(' ') : '—'}</td>
-      <td>${!t.started && !ended(t.status) && ((t.waitsFor ?? []).length || (p.current && p.current !== t.id)) ? `<span class="pill" title="${(t.waitsFor ?? []).length ? T('依赖的任务还没有全部合并') : T('依赖已满足；等当前执行的任务合并后开工（同一时间只执行一个）')}">${(t.waitsFor ?? []).length ? T('等待 {deps}', { deps: t.waitsFor.map((n) => `#${esc(n)}`).join(' ') }) : T('排队中')}</span>` : `<span class="pill ${esc(t.status)}">${esc(ST_NAME[t.status] ?? t.status)}</span>`}</td><td class="small">${t.status === 'done' ? (so[t.signoff] ?? T('待签收')) : ''}</td><td class="small mute">${t.merged_at ? T('{t}前', { t: ago(t.merged_at) }) : ''}</td></tr>`).join('') || (carrier ? '' : `<tr><td colspan="6" class="mute">${T('暂无任务')}</td></tr>`)}</table>`}
+      <td>${!t.started && !ended(t.status) && ((t.waitsFor ?? []).length || (p.current && p.current !== t.id)) ? `<span class="pill" title="${(t.waitsFor ?? []).length ? T('依赖的任务还没有全部合并') : T('依赖已满足；等当前执行的任务合并后开工（同一时间只执行一个）')}">${(t.waitsFor ?? []).length ? T('等待 {deps}', { deps: depsText(p, t) }) : T('排队中')}</span>` : `<span class="pill ${esc(t.status)}">${esc(ST_NAME[t.status] ?? t.status)}</span>`}</td><td class="small">${t.status === 'done' ? (so[t.signoff] ?? T('待签收')) : ''}${t.signWait && waitWho(t.signWait.left, t.signWait.need) ? `<div class="mute">${waitWho(t.signWait.left, t.signWait.need)} · ${T('等了 {t}', { t: ago(t.signWait.since) })}</div>` : ''}</td><td class="small mute">${t.merged_at ? T('{t}前', { t: ago(t.merged_at) }) : ''}</td></tr>`).join('') || (carrier ? '' : `<tr><td colspan="6" class="mute">${T('暂无任务')}</td></tr>`)}</table>`}
     <div class="small mute" style="margin-top:6px">${T('任务按依赖关系执行：一个任务要等它「依赖」的任务都签收并合并后才开工；多个都可以开工时先做编号小的。')}<br>${p.parallel ? T('同时最多开着 {n} 个：并行开发已开启 —— 依赖满足的任务同时开工，模块任务各自只改自己的目录。', { n: esc(p.maxOpen ?? 2) }) : T('同时最多开着 {n} 个{how}。', { n: esc(p.maxOpen ?? 1), how: (p.maxOpen ?? 1) > 1 ? T('：平时一次只做一个，只有开着的任务<b>全都在等人</b>（等你答题、等你签收）时，系统才会让独立的下一个先跑起来 —— 那段时间本来是白等的') : T('（串行，一次只做一个）') })}${lead ? `${T('改：')}<a href="#p/${esc(p.id)}/settings">${T('项目设置 → 预算与上限')}</a>` : ''}</div>
     ${p.append ? (p.append.kind === 'review'
       ? `<div class="item flag" style="margin-top:10px">${T('<b>正在复盘</b>：本项目的任务都已完成并合并，系统正在对照项目目标与完成定义判断还差什么。')}${p.append.stage === 'proposed' ? T('结论 v{v} 待你确认 —— {link}（要么确认项目达成，要么说还差什么）', { v: esc(p.append.version), link: `<a href="#${esc(p.carrier)}">${T('前往查看')}</a>` }) : (daemonOn ? T('通常几分钟内给出结论。') : T('自动运行未开启：请运行 {cmd}', { cmd: `node src/cli.mjs project plan ${esc(p.id)}` }))}</div>`
@@ -63,6 +69,7 @@ function renderProject() {
       <div class="row" style="margin-top:6px"><textarea id="projAppendText" rows="4" aria-label="${T('还要做什么？')}" placeholder="${T('还要做什么？')}" style="flex:1"></textarea></div>
       <div class="row" style="margin-top:6px"><span class="grow"></span><button id="btnProjAppend" class="primary">${T('提交')}</button></div></details>` : ''}
     ${(p.superseded ?? []).length ? `<div class="small mute" style="margin-top:8px">${T('已被重做取代的任务（保留记录，不参与执行）：')}${p.superseded.map((t) => `<a href="#${esc(t.id)}">${esc(t.title)}</a>`).join(T('、'))}</div>` : ''}`;
+  bindPrCard($('#projHead'), { projectId: p.id });
   // 交付前的按任务改动：点开才读，开着的刷新后保持开着（与收件箱签收同一套）
   $('#projHead').querySelectorAll('details[data-dvopen]').forEach((dt) => {
     if (dt.open) dvHydrate(dt);
@@ -111,7 +118,7 @@ function renderProject() {
     // 而"验收压根没跑过"和"验收跑的是另一份代码"这两句，恰恰是一旦推出去就没法挽回的那种。
     const e = p.evidence;
     if (e) {
-      const lines = [e.stat ? T('要推：{range}，{n} 个提交，头 {head}', { range: e.stat.range, n: e.stat.commits, head: String(e.stat.head).slice(0, 8) }) : T('⚠ 读不到项目仓库，说不出这次要推什么')];
+      const lines = [e.stat ? T('要推：{range}，{n} 个提交，头 {head}', { range: e.stat.range, n: e.stat.commits, head: String(e.stat.head).slice(0, 8) }) : e.pending ? T('⚠ 还没读完这次要推出去的改动：先取消，等页面上「要推出去的是……」出来再点') : T('⚠ 读不到项目仓库，说不出这次要推什么')];
       if (!e.command) lines.push(T('⚠ 没有填项目级验收命令 —— "达成"完全是人宣布的，一条机械核实都没有'));
       else if (!e.verify) lines.push(T('⚠ 验收命令 {cmd} 一次都没跑过', { cmd: e.command.join(' ') }));
       else {
@@ -129,6 +136,6 @@ function renderProject() {
     const gh = /github\.com[/:]/i.test(remote);
     const base = gh ? (prompt(T('PR 目标分支（留空 = 仓库默认分支）')) ?? '') : '';
     const pr = gh ? confirm(T('同时创建 PR？')) : false;
-    try { const r = await api(`/api/projects/${p.id}/deliver`, { remote, pr, base }); toast(r.result.pr ? T('PR：{url}', { url: r.result.pr.url }) : `${T('已推送 {branch}', { branch: r.result.branch })}${r.result.prSkipped ? `${T('；')}${r.result.prSkipped}` : ''}`); } catch (e) { toast(e.message, true); }
+    try { const r = await withHookAck((hookAck) => api(`/api/projects/${p.id}/deliver`, { remote, pr, base, hookAck })); toast(r.result.pr ? T('PR：{url}', { url: r.result.pr.url }) : `${T('已推送 {branch}', { branch: r.result.branch })}${r.result.prSkipped ? `${T('；')}${r.result.prSkipped}` : ''}`); } catch (e) { toast(e.message, true); }
   };
 }

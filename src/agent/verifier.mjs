@@ -22,6 +22,7 @@ import { VERIFIER_CATEGORIES } from '../core/diagnose.mjs';
 import { describeTestChanges } from '../core/test-guard.mjs';
 import { uiChecksOf } from '../db/nodes.mjs';
 import { liveTools, liveHandlers } from './live-tools.mjs';
+import { loadRules, renderRules, ruleDirsFor } from '../core/project-rules.mjs';
 
 const READ_ONLY = new Set(['list_dir', 'read_file', 'grep']);
 
@@ -133,7 +134,13 @@ ${JSON.parse(c?.constraints || '[]').map((x) => `- ${x}`).join('\n') || '（无�
 ## 人的裁定（经认证通道，具指令效力）
 ${rulings.length ? rulings.map((r) => `- 问：${String(r.text).replace(/\s+/g, ' ').slice(0, 400)}\n  答：${String(r.body).replace(/\s+/g, ' ').slice(0, 600)}`).join('\n') : '（无）'}
 ${rulings.length ? '人明确放行的事项不再按约束字面判违规；裁定没覆盖的部分约束照旧。' : ''}
-
+${(() => {
+    // 仓库自带的项目规则：与执行器看到的同一批（根 + 范围目录的祖先链），当判据参考
+    try {
+      const r = renderRules(loadRules(workspace, ruleDirsFor(db, taskId)), { role: 'verifier' });
+      return r ? `\n${r}\n` : '';
+    } catch { return ''; }
+  })()}
 # 节点
 **${node.title}**
 规格：${node.spec}

@@ -219,18 +219,57 @@ function bindDiagFix() {
     if (r) { box.open = false; box.querySelector('[data-diagsend]').disabled = true; }
   };
 }
+// 「从这一步重来」：点开才算预览（会退回哪些步骤、代码回到哪、撤回什么、花掉的钱），确认时带上预览时的头
+const RW_WHY = () => ({ target: T('这一步本身'), depends: T('用到了它的结果'), commit: T('在它之后做的，改动跟着代码一起回退') });
+async function loadRewind(nodeId) {
+  const body = $('#nodeRewindBody'); if (!body) return;
+  let p;
+  try { p = (await api(`/api/tasks/${cur}/rewindPlan`, { nodeId })).result; } catch (e) { body.innerHTML = `<span class="bad">${esc(e.message)}</span>`; return; }
+  if (!p.ok) { body.innerHTML = `<span class="mute">${esc(p.reason)}</span>`; return; }
+  const merges = p.commits.filter((c) => c.merge).length;
+  const added = new Set(p.added ?? []);
+  const fileList = p.files.length ? `<details><summary>${T('看是哪些文件')}</summary><ul>${p.files.slice(0, 60).map((f) => `<li class="mono">${esc(f)}${added.has(f) ? ` <span class="mute">${T('（这几步新建的，回退后没有了）')}</span>` : ''}</li>`).join('')}${p.files.length > 60 ? `<li class="mute">${T('……另有 {n} 个', { n: p.files.length - 60 })}</li>` : ''}</ul></details>` : '';
+  const after = p.taskStatus === 'suspended' ? T('任务现在暂停着：确认后点上方「继续」，AI 才会接着做。')
+    : daemonOn ? T('确认后 AI 自动从这一步接着做，不用再点什么。') : T('自动运行没开：确认后点上方「运行」，AI 才会接着做。');
+  const facts = [
+    p.moves ? T('代码：工作区回到这一步开始之前，{files} 个文件回到旧样子。', { files: p.files.length }) + (merges ? ` ${T('中间把项目分支合进来过，合并时会再合一次。')}` : '') : T('代码不动：这一步没有改过文件。'),
+    p.moves ? T('回退前的代码不删，存在 git 上，「活动」里那几条「决定」写着存在哪；确认后不能一键撤销。') : null,
+    p.dirty.length ? T('工作区里还没提交的改动（{n} 个文件）一起存到 git 上，不留在工作区。', { n: p.dirty.length }) : null,
+    p.questions.length ? T('这几步提的 {n} 条事项还开着，一起撤回。', { n: p.questions.length }) : null,
+    p.signoff ? (p.signoff.accepted ? T('你已经签收过，签收作废：重做完要重新签收。') : T('等你签收的那条撤回：重做完重新请你签收。')) : null,
+    T('这几步已经花了 {usd}，不退；重做还要再花。', { usd: usd(p.spentMicro) }),
+  ].filter(Boolean);
+  body.innerHTML = `<p class="small">${T('需求没变、只是这一步做得不对，想让 AI 把它从头重做时用：代码退回这一步之前，AI 按原来的步骤说明再做一遍。')}${p.signoff?.id ? T('想让 AI 照你的意见改（需求或做法变了），用签收卡片上的「打回…」，或在页面最上方的输入框选「修正」发送。') : T('想让 AI 照你的意见改（需求或做法变了），在页面最上方的输入框选「修正」发送。')}</p>
+    <b>${T('退回重做的步骤（{n} 个）', { n: p.nodes.length })}</b>
+    <ul>${p.nodes.map((x) => `<li>${esc(x.title)} <span class="small mute">${esc(RW_WHY()[x.why] ?? x.why)}</span></li>`).join('')}</ul>
+    <p class="small mute">${T('其余步骤不动。')}</p>
+    <ul class="small">${facts.map((f) => `<li>${esc(f)}</li>`).join('')}</ul>${fileList}
+    <p class="small"><b>${esc(after)}</b></p>
+    <label class="small" for="rwNote">${T('这次要注意什么（可选；原样给重做这几步的 AI，记在「活动」里）')}</label>
+    <textarea id="rwNote" rows="3" style="width:100%"></textarea>
+    <button type="button" id="rwGo">${T('确认从这一步重来')}</button>`;
+  $('#rwGo').onclick = async () => {
+    $('#rwGo').disabled = true;
+    const r = await act('rewind', { nodeId, note: $('#rwNote').value, expectHead: p.head }, (x) => `${T('已退回 {n} 个步骤。', { n: x.result.nodes })}${x.result.taskStatus === 'suspended' ? T('任务还在暂停：点上方「继续」后才会接着做。') : daemonOn ? T('AI 会从这一步接着做。') : T('自动运行没开：点上方「运行」它才会接着做。')}`);
+    if (!r) { if ($('#rwGo')) $('#rwGo').disabled = false; return; }
+    showNode(nodeId);   // 这一步已经退回待执行：重画详情（没有重来入口了，改动那一栏也跟着变）
+  };
+}
 const stName = (s) => ({ done: T('已完成'), running: T('进行中'), blocked: T('待答复'), ready: T('就绪'), pending: T('待执行'), void: T('已作废'), failed: T('失败'), review: T('验收中') }[s] ?? s);
 function showNode(id) {
   const n = detail.nodes.find((x) => x.id === id); if (!n) return;
   $('#nodeDetail').innerHTML = `<div class="item"><div class="row"><b>${esc(n.title)}</b> <span class="pill ${esc(n.status)}">${esc(nodeStName(n))}</span>
     <span style="flex:1"></span> ${isLead() ? `<span class="small mute" title="${T('数值越小越先执行')}">${T('优先级')}</span> <input id="prio" type="number" value="${esc(n.priority)}" style="width:70px"> <button id="prioBtn" class="small">${T('保存')}</button>` : ''}</div>
-    ${uiChecksHtml(n)}${testChangesHtml(n)}${diagHtml(n)}<details><summary>${T('步骤说明')}</summary><div class="body">${esc(n.spec)}</div></details><details><summary>${T('验收标准')}</summary><div class="body">${esc(n.acceptance)}</div></details>
+    ${n.rewound ? `<div class="small" style="margin:6px 0">${esc(n.rewound.self ? T('负责人让这一步从头重做，等 AI 重新做。') : T('因为「{title}」从头重做，这一步也退回来等重新做。', { title: n.rewound.target ?? '?' }))}${n.rewound.note ? `<br>${T('写给 AI 的话：')}${esc(n.rewound.note)}` : ''}</div>` : ''}${uiChecksHtml(n)}${testChangesHtml(n)}${diagHtml(n)}<details><summary>${T('步骤说明')}</summary><div class="body">${esc(n.spec)}</div></details><details><summary>${T('验收标准')}</summary><div class="body">${esc(n.acceptance)}</div></details>
     <details id="nodeProv"><summary>${T('这一步的出处')}</summary><div class="body" id="nodeProvBody"><span class="mute">${T('读取中…')}</span></div></details>
+    ${n.status === 'done' && isLead() ? `<details id="nodeRewind" class="not-observer"><summary>${T('从这一步重来…')}</summary><div class="body" id="nodeRewindBody"><span class="mute">${T('读取中…')}</span></div></details>` : ''}
     ${n.status === 'done' ? `<details id="nodeDiff"${DV_DETAILS_OPEN.has(`node:${esc(n.id)}`) ? ' open' : ''}><summary>${T('这一步的改动（逐行取自代码）')}</summary>${dvSlot(`node:${esc(n.id)}:${esc(n.finished_at ?? '')}`, `/api/tasks/${encodeURIComponent(cur)}/diff?scope=node&node=${encodeURIComponent(n.id)}`, `/api/tasks/${encodeURIComponent(cur)}/diff_lines?scope=node&node=${encodeURIComponent(n.id)}`, { baseLabel: T('这一步开始前'), headLabel: T('这一步做完') })}</details>` : ''}</div>`;
   // 按步骤看改动（第二层）：点开才读；开着的在换步骤 / 刷新后按步骤记住
   const nd = $('#nodeDiff');
   if (nd) { if (nd.open) dvHydrate(nd); nd.ontoggle = () => { if (nd.open) { DV_DETAILS_OPEN.add(`node:${n.id}`); dvHydrate(nd); } else DV_DETAILS_OPEN.delete(`node:${n.id}`); }; }
   bindDiagFix();
+  const rw = $('#nodeRewind');
+  if (rw) rw.ontoggle = () => { if (rw.open) loadRewind(id); };
   const b = $('#prioBtn'); if (b) b.onclick = () => act('priority', { nodeId: id, priority: Number($('#prio').value) }, T('优先级已保存'));
   const np = $('#nodeProv');
   const loadProv = async () => { try { $('#nodeProvBody').innerHTML = provHtml(await api(`/api/tasks/${cur}/provenance?node=${encodeURIComponent(id)}`)); } catch (e) { $('#nodeProvBody').innerHTML = `<span class="bad">${esc(e.message)}</span>`; } };

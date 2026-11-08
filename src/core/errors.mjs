@@ -63,4 +63,14 @@ export class SandboxError extends InfraError {
   summary() { return { cmd: this.cmd ?? null, message: String(this.message).slice(0, 400) }; }
 }
 
+/**
+ * 调用方（人中止任务、管理员急停）取消了进行中的模型调用。**不是**基础设施错误：不报厂商健康、不换备用、不重试 ——
+ * 那家好好的，是我们自己不要这次结果了。工具循环接住它、按"被掐停"收尾（节点回 pending、不计重试）。
+ * reason 是掐停的原因（与轮级闸门同一套字符串）。
+ */
+export class CancelledError extends Error {
+  constructor(reason) { super(`cancelled: ${reason}`); this.name = 'CancelledError'; this.reason = String(reason); this.cancelled = true; }
+}
+export const isCancelled = (e) => e?.cancelled === true;
+
 export const isInfraError = (e) => e?.infra === true;

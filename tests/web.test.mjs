@@ -209,8 +209,8 @@ section('3c. 角色与路由：按请求识别身份；旁观者只读；路由�
   db.run(`INSERT INTO constitutions (id,task_id,version,goal,scope,definition_of_done,constraints,valid_from,recorded_at) VALUES (?,?,1,'g','.','d','[]',?,?)`, newId('c'), t2, t0, t0);
   db.run(`INSERT INTO nodes (id,task_id,title,spec,acceptance,status,priority,created_at) VALUES (?,?,'步','s','a','blocked',5,?)`, n3, t2, t0);
   r = await postAs(alice.plaintext, `/api/tasks/${t2}/pause`);
-  eq(r.status, 400, '介入者不能暂停');
-  assert(/负责人能执行此操作/.test(r.error), '拒绝理由');
+  eq(r.status, 400, '介入者（还没被问到过这个任务的事项）不能暂停');
+  assert(/负责人或参与者/.test(r.error), '拒绝理由');
   r = await postAs(alice.plaintext, `/api/tasks/${t2}/limit`, { key: 'limit.llm_calls', value: 5 });
   eq(r.status, 400, '介入者不在预算行：改不了上限');
   r = await postAs(alice.plaintext, '/api/routing', { action: 'template', name: 'solo' });
@@ -233,7 +233,20 @@ section('3c. 角色与路由：按请求识别身份；旁观者只读；路由�
   const qq = d2.questions.find((x) => x.id === q2);
   eq(JSON.stringify([qq.addressed_to, qq.decisionLabel, qq.answers.length]), JSON.stringify([[alice.userId], '规格取舍', 0]), '事项带收件人、类型名、答复列表');
   eq(d2.lead, owner.userId, '详情带负责人');
-  eq(JSON.stringify(d2.can), JSON.stringify({ budget: true, egress: true, signoff: true, delivery: true }), '负责人：can 四类全真');
+  eq(JSON.stringify(d2.can), JSON.stringify({ budget: true, egress: true, signoff: true, delivery: true, pause: true, resume: true, abort: true }), '负责人：can 四类全真，暂停 / 继续 / 中止都能');
+  // 事项发给了 alice → 她是这个任务的参与者：能暂停、能让自己按的暂停继续，不能中止
+  const ca = (await getAs(alice.plaintext, `/api/tasks/${t2}`)).can;
+  eq(JSON.stringify([ca.pause, ca.resume, ca.abort]), JSON.stringify([true, false, false]), '参与者 alice：能暂停、（还没人暂停时）不能继续、不能中止');
+  r = await postAs(alice.plaintext, `/api/tasks/${t2}/pause`);
+  eq(r.status, 200, '参与者能暂停');
+  eq((await getAs(alice.plaintext, `/api/tasks/${t2}`)).can.resume, true, '按下暂停的人能让它继续');
+  const { taskControls } = await import('../src/web/server.mjs');
+  eq(taskControls(db, t2, carol.userId).pause, false, '旁观者不能暂停');
+  r = await postAs(alice.plaintext, `/api/tasks/${t2}/abort`);
+  eq(r.status, 400, '参与者不能中止');
+  r = await postAs(alice.plaintext, `/api/tasks/${t2}/resume`);
+  eq(r.status, 200, '按下暂停的人让它继续');
+  eq(db.one(`SELECT status FROM tasks WHERE id=?`, t2).status, 'waiting', '继续后回到 waiting（还有待答的事项）');
   eq((await getAs(alice.plaintext, `/api/tasks/${t2}`)).can.budget, false, 'alice 不在预算行：can.budget 假（看板据此禁用上限输入）');
   await post('/api/routing', { action: 'owner', type: 'budget', recipients: ['group:reviewer'] });
   eq((await getAs(alice.plaintext, `/api/tasks/${t2}`)).can.budget, true, '预算归属改到 reviewer 组后：alice 的 can.budget 真');

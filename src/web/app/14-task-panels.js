@@ -77,7 +77,7 @@ function renderLimits() {
     const k = b.dataset.limset; const L = LIM[k] ?? {}; const raw = $(`input[data-lim="${k}"]`).value;
     const value = L.to ? L.to(raw) : Number(raw);
     if (!Number.isFinite(value) || value < 0) return toast(T('请输入非负数'), true);
-    SAVED.set(`lim:${k}`, Date.now()); act('limit', { key: k, value }, L.field ? T('已保存') : T('上限已保存')).then((r) => { if (!r) { SAVED.delete(`lim:${k}`); renderLimits(); } });
+    SAVED.set(`lim:${k}`, Date.now()); act('limit', { key: k, value, expect: detail.limits[k]?.value ?? null }, L.field ? T('已保存') : T('上限已保存')).then((r) => { if (!r) { SAVED.delete(`lim:${k}`); renderLimits(); } });
   });
 }
 

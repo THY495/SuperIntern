@@ -33,6 +33,9 @@ const BASELINE = {
   handoffs: ['src/agent/executor.mjs'],
   handover_requests: ['src/core/handover.mjs'],
   llm_bindings: ['src/llm/registry.mjs'],
+  mail_inbound: ['src/core/mail-reply.mjs'],
+  mail_reply_tokens: ['src/core/mail-reply.mjs'],
+  status_reports: ['src/core/report.mjs'],
   llm_role_bindings: ['src/llm/registry.mjs'],
   llm_endpoints: ['src/llm/registry.mjs'],
   llm_models: ['src/llm/registry.mjs'],
@@ -41,7 +44,9 @@ const BASELINE = {
   question_views: ['src/core/approval-habits.mjs'],   // 第一次在任务页看到某条事项（v42）
   llm_health: ['src/llm/health.mjs'],   // 服务商熔断 / 共享退避（v43）
   invariant_state: ['src/core/invariants.mjs'],   // 运行期不变量最近一次查的结果（v44）
-  egress_credentials: ['src/core/egress-creds.mjs'],   // 联网源的凭据，只进出口代理（v45）
+  egress_credentials: ['src/core/egress-creds.mjs'],
+  signals: ['src/core/signals.mjs'], signal_recipients: ['src/core/signals.mjs'],   // 不阻塞信号的发件箱（v49）   // 联网源的凭据，只进出口代理（v45）
+  push_queue: ['src/core/push-queue.mjs'],   // 按人的推送队列（v51）
   questions: ['src/core/questions.mjs'],
   reports: ['src/agent/reporter.mjs'],
   revisions: ['src/core/revision.mjs'],

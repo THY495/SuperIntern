@@ -398,7 +398,19 @@ export async function planProject(db, { client, projectId, tier = LLM_ROLES.proj
 }
 
 /** 草案落库：旧契约任务作废并脱钩，新一批建好（无工作区），Ⅲ 级批准问题挂载体任务。 */
-function recordProposal(db, { project, carrier, spec, notes, prevSpec = null }) {
+function recordProposal(db, opts) {
+  // 整份草案一个事务，先核项目还是开始规划时读到的那一版：另一个规划进程（守护进程拉的 + 有人手动 project plan）
+  // 可能先出了一版。原来照落 —— 后一份把前一份的任务作废、另挂一条批准事项，前一条批准事项成了孤儿，人答它等于白答。
+  return db.tx(() => {
+    const cur = db.one(`SELECT draft_version, draft_question FROM projects WHERE id=?`, opts.project.id);
+    if (cur.draft_version !== opts.project.draft_version || (cur.draft_question ?? null) !== (opts.project.draft_question ?? null)) {
+      throw Object.assign(new I18nError('规划期间项目已经出了新一版草案（v{version}）：这一份不落', { version: cur.draft_version }), { planRace: 'draft_moved' });
+    }
+    return recordProposalTx(db, opts);
+  });
+}
+
+function recordProposalTx(db, { project, carrier, spec, notes, prevSpec = null }) {
   const t = now();
   const version = project.draft_version + 1;
   const qid = newId('q');

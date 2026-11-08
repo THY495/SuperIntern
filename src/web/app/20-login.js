@@ -6,7 +6,7 @@ function showLogin() {
   $('#loginView').classList.remove('hide');
   $('#loginToken').focus();
 }
-$('#btnGhLogin').onclick = () => { location.href = '/api/auth/github'; };
+$('#btnGhLogin').onclick = () => { try { if (location.hash) sessionStorage.setItem('si.afterLogin', location.hash); } catch { /* 记不住就回首页 */ } location.href = '/api/auth/github'; };
 $('#btnLogin').onclick = async () => {
   const token = $('#loginToken').value.trim();
   if (!token) { $('#loginErr').textContent = T('先贴上令牌'); return; }
@@ -66,6 +66,7 @@ async function showInvite(code) {
     if (s.limits) $('#loginLimits').textContent = T('登录后这台浏览器会保持登录：闲置 {h} 小时、或登录满 {d} 天，要重新登录。在别人的电脑上用完，记得点右上角「退出登录」。', { h: s.limits.idleHours, d: s.limits.maxDays });
     return showLogin();
   }
+  try { const back = sessionStorage.getItem('si.afterLogin'); if (back) { sessionStorage.removeItem('si.afterLogin'); if (!location.hash) history.replaceState(null, '', location.pathname + back); } } catch { /* 无痕窗口 */ }
   await loadMe(); await loadTasks(); await route();
   // 「用 GitHub 验证并绑定」回来：成了就说一声，没成说原因
   if (s.github?.linked) toast(T('已绑定 GitHub 账号 @{login}：以后可以用 GitHub 登录', { login: s.github.linked }));

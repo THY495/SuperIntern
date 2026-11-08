@@ -10,7 +10,7 @@ import { execFileSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { openDb, ensureOwner, now, audit } from '../src/db/db.mjs';
-import { createProject, advanceProject, deliverProject, projectTasks, validateProjectSpec, createProjectTasks, chainGraph, scheduleOf, raiseIntegrateBlocked, blockedAtHead, signoffCoversDone, conflictSide, deliveryEvidence, runProjectVerify, PROJECT_TASK_RUNTIME_MS } from '../src/core/project.mjs';
+import { createProject, advanceProject, deliverProject, projectTasks, validateProjectSpec, createProjectTasks, chainGraph, scheduleOf, raiseIntegrateBlocked, blockedAtHead, signoffCoversDone, conflictSide, deliveryEvidence, runProjectVerify, clearGitMemo, warmDeliveryEvidence, evidenceReady, PROJECT_TASK_RUNTIME_MS } from '../src/core/project.mjs';
 import { limitOf } from '../src/core/limits.mjs';
 import { getParam, setParam } from '../src/core/params.mjs';
 import { signOff, pushEnv, raiseSignoffQuestion } from '../src/core/deliver.mjs';
@@ -865,6 +865,17 @@ section('11h. 逐任务重跑：项目级验收之外，每个已合并任务自
   e = deliveryEvidence(db, { projectId: P.projectId });
   eq(e.verify.perTask.find((x) => x.order === 2).ok, null, '没有验收命令 → ok 是 null');
   eq(e.verify.perTask.find((x) => x.order === 2).why, 'no_command', '而且说得出为什么没跑');
+
+  // 看板列表（cachedOnly）：缓存不齐时不在请求里同步跑一串 git（30 个任务约 2 秒、全看板卡住），先说"正在读"、后台一段段算
+  clearGitMemo();
+  e = deliveryEvidence(db, { projectId: P.projectId, cachedOnly: true });
+  eq(JSON.stringify([e.pending, e.stat, e.verify?.ok]), JSON.stringify([true, null, true]), '刚重启：看板拿到 pending，验收结果照给（只读库），不同步算 git');
+  const pr = db.one(`SELECT * FROM projects WHERE id=?`, P.projectId);
+  const head = execFileSync('git', ['-C', pr.repo, 'rev-parse', pr.branch], { encoding: 'utf8' }).trim();
+  await warmDeliveryEvidence(db, pr, head);
+  eq(evidenceReady(db, pr, head), true, '后台算完：齐了');
+  e = deliveryEvidence(db, { projectId: P.projectId, cachedOnly: true });
+  assert(!e.pending && e.stat?.commits > 0 && e.byTask?.tasks?.length === 2, '下一次刷新拿到完整证据（范围 + 按任务分）', JSON.stringify(e.stat));
 }
 
 

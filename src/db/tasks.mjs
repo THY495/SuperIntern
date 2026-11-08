@@ -21,6 +21,8 @@ export const setTaskArchived = (db, taskId, at) => db.run(`UPDATE tasks SET arch
 
 /** 合进项目分支的时刻。 */
 export const markTaskMerged = (db, taskId, at = now()) => db.run(`UPDATE tasks SET merged_at=? WHERE id=?`, at, taskId);
+/** 撤掉合并认领：认领之后快进没成（项目分支没动），回到没合并。 */
+export const unmarkTaskMerged = (db, taskId) => db.run(`UPDATE tasks SET merged_at=NULL WHERE id=?`, taskId);
 
 /** 调度位置（null = 暂时移出调度，重做时用）。 */
 export const setTaskOrder = (db, taskId, order) => db.run(`UPDATE tasks SET project_order=? WHERE id=?`, order, taskId);

@@ -28,7 +28,8 @@ async function loadDecisions(projectId) {
 
 /** 项目层的写操作都走这里：一次请求 + 刷新侧栏、收件箱与当前页。 */
 async function projAct(projectId, action, body, msg) {
-  try { await api(`/api/projects/${projectId}/${action}`, body); toast(msg); await loadTasks(); await renderDigest(); refresh(); if (view === 'projset') renderProjSet(); return true; }
+  // msg 可以是函数：按服务端的回报写（例如合并时保留了别人的改动）
+  try { const r = await api(`/api/projects/${projectId}/${action}`, body); toast(typeof msg === 'function' ? msg(r) : msg); await loadTasks(); await renderDigest(); refresh(); if (view === 'projset') renderProjSet(); return true; }
   catch (e) { toast(e.message, true); return false; }
 }
 

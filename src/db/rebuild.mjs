@@ -16,7 +16,8 @@ const HEAD = /^\s*CREATE\s+TABLE\s+(?:"([^"]+)"|(\w+))\s*\(/i;
 
 /**
  * @param {import('node:sqlite').DatabaseSync} raw  迁移执行器给的原始句柄（事务已开、外键已关）
- * @param {Array<{table: string, checks?: Array<{name: string, expr: string}>, strict?: boolean}>} plan
+ * @param {Array<{table: string, checks?: Array<{name: string, expr: string}>, strict?: boolean, rewrite?: (body: string) => string}>} plan
+ *   rewrite：改已有的列定义 / 约束（例：枚举多一个值）。拿到括号里的整段，返回新的一段；没改动就抛（防着改了个寂寞）
  * @param {{suffix: string}} opts  临时表后缀，形如 '_v29'（tests/schema.test.mjs 认得这个形状）
  * @returns {{rebuilt: string[]}}
  */
@@ -26,7 +27,7 @@ export function rebuildTables(raw, plan, { suffix }) {
   for (const t of saved.filter((o) => o.type === 'trigger')) raw.exec(`DROP TRIGGER "${t.name}"`);
   const hasSeq = !!raw.prepare(`SELECT 1 FROM sqlite_master WHERE name='sqlite_sequence'`).get();
   const rebuilt = [];
-  for (const { table, checks = [], strict = true } of plan) {
+  for (const { table, checks = [], strict = true, rewrite = null } of plan) {
     const row = raw.prepare(`SELECT sql FROM sqlite_master WHERE type='table' AND name=?`).get(table);
     if (!row) throw new Error(`重建：没有表 ${table}`);
     const sql = row.sql;
@@ -41,7 +42,8 @@ export function rebuildTables(raw, plan, { suffix }) {
       if (badRows.length) throw new Error(`重建 ${table}：已有数据不满足新约束 ${c.name}（${c.expr}），如 rowid ${badRows.map((x) => x.r).join('、')} —— 迁移已回滚，库没动`);
     }
     const tmp = `${table}${suffix}`;
-    const body = sql.slice(m[0].length, close);
+    let body = sql.slice(m[0].length, close);
+    if (rewrite) { const nb = rewrite(body); if (nb === body) throw new Error(`重建 ${table}：rewrite 没有改动任何东西`); body = nb; }
     const extra = checks.map((c) => `\n  , CONSTRAINT ${c.name} CHECK (${c.expr})`).join('');
     // 新约束另起一行接在后面：原语句最后一列后面可能跟着 -- 注释，接在同一行会被注释吞掉
     raw.exec(`CREATE TABLE "${tmp}" (${body}${extra}\n)${strict || /^STRICT$/i.test(tail) ? ' STRICT' : ''}`);

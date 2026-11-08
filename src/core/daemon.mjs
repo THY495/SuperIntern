@@ -22,16 +22,17 @@ import { audit, now } from '../db/db.mjs';
 import { pidAlive } from './proc.mjs';
 import { sweepTimeouts } from './timeouts.mjs';
 import { notifyPendingQuestions, notifyPendingDeliveries } from './users.mjs';
-import { handoverDigests, scheduledDigests } from './digest.mjs';
+import { handoverDigests } from './digest.mjs';
 import { checkCatalog, renderCatalogCheck, recordCatalogCheck, catalogCheckDue } from '../llm/catalog-check.mjs';
 import { checkableCatalog } from '../llm/registry.mjs';
-import { firstAdmin } from './routing.mjs';
 import { readyNodes } from '../context/assemble.mjs';
 import { heldSteering, hasSteering } from './inbox.mjs';
-import { channelsForUsers } from './users.mjs';
-import { notify, channelsFromEnv, llmHealthNotice, invariantNotice } from './notify.mjs';
+import { llmHealthNotice, invariantNotice } from './notify.mjs';
+import { emitSignal, pushSignal, deliverSignals } from './signals.mjs';
+import { pollMailReplies } from './mail-reply.mjs';
+import { queueDueReports } from './report.mjs';
 import { getParam } from './params.mjs';
-import { advanceProject } from './project.mjs';
+import { offThread } from './offthread.mjs';
 import { appendStateOf, appendPending } from '../agent/project-append.mjs';
 import { sweepLiveness, UNKNOWN_GRACE_MS, REPEAT_THRESHOLD } from './liveness.mjs';
 import { sweepInvariants } from './invariants.mjs';
@@ -46,6 +47,11 @@ import { dbMaintenance } from './db-maintenance.mjs';
 import { newTrace } from './log.mjs';
 import { housekeeping } from './housekeeping.mjs';
 import { fairOrder } from './spend.mjs';
+import { makePrWatcher } from './pr-watch.mjs';
+import { makeIssueWatcher, fireSchedules } from './inbound.mjs';
+import { onCiChange, redeliverFixes, redeliverSignoffOk } from './pr-fix.mjs';
+import { onReviewChange } from './pr-review.mjs';
+import { doneHeadOf } from './deliver.mjs';
 
 /** 上次退出之后出现其中任一审计动作 → 任务可以接着跑。question_* 挂在问题上，其余挂在任务上。 */
 export const RESUME_ACTIONS = ['question_answered', 'question_defaulted', 'message_received', 'message_released', 'limit_set',
@@ -232,13 +238,18 @@ export function assessTask(db, task, { at = now(), isLive = () => null, hasWorks
   // 被挡着的修正（待比对 / 等裁定）**不算**能跑的活，而且挡着的时候整个任务都不拉 ——
   // 编排器那边同一条口径（⓪″）：修正多半要改计划，这时接着跑旧计划是白干。
   // 两种挡法各带一个可解引用的接收者：待比对是一个钟点（readyAt），等裁定是那条冲突事项。
-  if (['running', 'waiting'].includes(task.status)) {
+  // done 也一样：done 的任务在等签收 / 等合并时人发来修正，编排器那头会重开它（orchestrator ⓪′），
+  // 但守护进程原来只看 planning / running / waiting —— 修正落了库就悬着，签收、合并照常走，人要的改动悄悄丢了。
+  // 已合并的不拉：发给它的修正在看板入口就转成了「添加任务」。
+  const doneWork = task.status === 'done' && !task.merged_at;
+  if (['running', 'waiting'].includes(task.status) || doneWork) {
     const held = heldSteering(db, taskId, { at });
     const verdict = held.filter((h) => h.why === 'verdict');
     if (verdict.length) return { due: false, verb: 'run', reason: 'held:verdict', questionIds: [...new Set(verdict.flatMap((h) => h.questionIds))] };
     if (held.length) return { due: false, verb: 'run', reason: 'backoff:held_check', readyAt: Math.max(...held.map((h) => h.until ?? at)) };
   }
-  const waitingWork = task.status === 'waiting' && (hasSteering(db, taskId, { at }) || readyNodes(db, taskId).length > 0);
+  const waitingWork = (task.status === 'waiting' && (hasSteering(db, taskId, { at }) || readyNodes(db, taskId).length > 0))
+    || (doneWork && hasSteering(db, taskId, { at }));
   if (task.status !== 'running' && !waitingWork) return { due: false, verb: 'run', reason: `status:${task.status}` };
   if (!hasWorkspace(taskId)) return { due: false, verb: 'run', reason: 'no_workspace' };
   return assessPhase(db, taskId, 'run', { at, alive, retryKinds: ['provider_error', 'sandbox_error', 'crashed'],
@@ -253,7 +264,10 @@ export function assessTask(db, task, { at = now(), isLive = () => null, hasWorks
 export function dueTasks(db, opts = {}) {
   const out = [];
   // waiting 也要过一遍 assessTask：它可能有一条未消费的计划变更在等着被处理。
-  for (const t of db.all(`SELECT id, status FROM tasks WHERE status IN ('planning','running','waiting') ORDER BY created_at`)) {
+  // done 且没合并、有没消费的修正 / 新指令的也过一遍（见 assessTask 里 doneWork）
+  for (const t of db.all(`SELECT id, status, merged_at FROM tasks WHERE status IN ('planning','running','waiting')
+      OR (status='done' AND merged_at IS NULL AND EXISTS (SELECT 1 FROM messages m WHERE m.task_id=tasks.id AND m.consumed_at IS NULL AND m.kind IN ('correction','instruction')))
+      ORDER BY created_at`)) {
     out.push({ taskId: t.id, ...assessTask(db, t, opts) });
   }
   return out;
@@ -280,23 +294,37 @@ export function daemonStatus(home, { at = Date.now() } = {}) {
 /**
  * 轮询循环：每 intervalMs 扫一次超时链，再把该拉的拉起来。返回 { tick, stop }。
  * 通知与打印都交给 onEvent，守护进程本身不知道通道。
+ * makeExec：项目推进里变基验收 / 项目级验收用的执行器工厂；不给 = 按项目配置起沙箱（离线场景集给宿主执行器）。
  */
-export function startDaemon(db, { home, launcher, intervalMs = 15_000, iterations = null, onEvent = () => {}, alive = pidAlive, clock = now, notifyOpts = null, liveness = null, runtime = makeRuntimeHealth({ lang: () => contentLang(db) }), dbPath = null, invariants = true }) {
+export function startDaemon(db, { home, launcher, intervalMs = 15_000, iterations = null, onEvent = () => {}, alive = pidAlive, clock = now, notifyOpts = null, liveness = null, runtime = makeRuntimeHealth({ lang: () => contentLang(db) }), dbPath = null, invariants = true,
+  prWatcher = undefined, issueWatcher = undefined, makeExec = null }) {
+  const ghGate = { holdUntil: 0 };   // GitHub 额度不够就整体等：PR 与 issue 两个轮询器共用
+  // 交付后回路：盯已交付的 PR。只读（部署级连接），所以放在急停判断之前；它触发的修复自己看急停
+  const prw = prWatcher === undefined ? makePrWatcher(db, { fetchFn: notifyOpts?.fetchFn ?? globalThis.fetch, env: notifyOpts?.env ?? process.env, onChange: async (item, prev, next, ctx) => {
+      onEvent({ type: 'pr_changed', ref: item.taskId ?? item.projectId, state: next.state, ci: next.ci?.state ?? null });
+      const r = await onCiChange(db, item, prev, next, ctx);
+      if (r?.started || r?.asked) onEvent({ type: r.started ? 'ci_fix_started' : 'ci_failed_asked', ref: item.taskId ?? item.projectId, why: r.why ?? null });
+      const rv = onReviewChange(db, item, prev, next, ctx);
+      if (rv.auto.length || rv.blocked.length) onEvent({ type: 'pr_review', ref: item.taskId, auto: rv.auto, blocked: rv.blocked.map((x) => x.id) });
+    }, gate: ghGate }) : prWatcher;
+  // 入站：带标签的 GitHub issue → 添加任务的草稿。只读；起草本身（花模型钱）在急停之后的 assessProjectPlan 里
+  const isw = issueWatcher === undefined ? makeIssueWatcher(db, { fetchFn: notifyOpts?.fetchFn ?? globalThis.fetch, env: notifyOpts?.env ?? process.env, gate: ghGate }) : issueWatcher;
+  // 修好了的推回 PR：推送是对外动作，放在急停判断之后；推的人是授权修这一轮的那个人
+  const redeliver = (at) => redeliverFixes(db, { at, doneHeadOf,
+    workspaceOf: (id) => join(home, 'workspaces', id),
+    signoffOk: redeliverSignoffOk,
+    deliver: (o) => offThread(db, 'deliverTask', { ...o, home, env: { ...(notifyOpts?.env ?? process.env) }, fetchFn: notifyOpts?.fetchFn ?? globalThis.fetch }) });
   // 容器运行时的状态：不在的时候不拉要用沙箱的那几步（run、项目推进里的变基验收 / 项目级验收），
   // 不烧退避表的重试次数；起草、规划照常。状态变化各记一条审计，看板与活动流据此说话。
   let runtimeWasOk = true;
   let pausedWas = false;
+  let mailPolledAt = -Infinity;   // 邮件答复：上次收信的时刻（每分钟最多收一轮）
+  let mailFailing = false;        // 收信连不上：回信会一直躺在邮箱里没人处理，从好到坏 / 从坏到好各告诉管理员一次
   // 熔断 / 换用备用 / 恢复审计的水位，启动时取当前最大 id —— 守护进程重启不把旧事再报一遍
   const HEALTH_ACTIONS = ['llm_breaker_opened', 'llm_breaker_closed', 'llm_fallback_used'];
   const healthSql = `action IN (${HEALTH_ACTIONS.map(() => '?').join(',')})`;
-  // 部署级的事告诉管理员：个人通道，没有就退到部署级（.env 里的）。不抛
-  const notifyLead = async ({ kind, title, text, ref }) => {
-    const { env = process.env, extraCmd = null, fetchFn = globalThis.fetch } = notifyOpts;
-    const lead = firstAdmin(db);
-    let channels = lead ? channelsForUsers(db, [lead]) : [];
-    if (!channels.length) channels = channelsFromEnv(env, extraCmd);
-    if (channels.length) await notify(db, { taskId: null, kind, title, text, ref, channels, fetchFn }).catch(() => {});
-  };
+  // 部署级的事告诉全体管理员（原来只告诉最早的那一位）：进发件箱，这一拍末尾统一推（个人通道，没有就退到部署级 .env）。
+  const notifyAdmins = (name, { title, text, ref }) => { try { emitSignal(db, name, { to: ['admins'], title, text, ref }); } catch (e) { onEvent({ type: 'notify_failed', error: e.message }); } };
   let healthSeen = db.one(`SELECT COALESCE(MAX(id), 0) AS m FROM audit_log WHERE ${healthSql}`, ...HEALTH_ACTIONS).m;
   const hasWorkspace = (taskId) => existsSync(join(home, 'workspaces', taskId));
   audit(db, { actorKind: 'system', action: 'daemon_started', targetType: 'daemon', targetId: String(process.pid),
@@ -345,7 +373,8 @@ export function startDaemon(db, { home, launcher, intervalMs = 15_000, iteration
       try {
         // onEvent 透传：变基与"变基之后重跑"都发生在这条路上，而它们会起容器、花时间 ——
         // 守护进程的事件流里看不见它们，人就只能从审计轨里事后考古。
-        const r = await advanceProject(db, { projectId: p.id, home, userId: p.owner_id, onEvent: (e) => onEvent({ projectId: p.id, ...e }) });
+        // 放到 worker 线程（offthread.mjs）：推进要跑几十条同步 git，与看板同进程时会把看板卡住几秒
+        const r = await offThread(db, 'advanceProject', { projectId: p.id, home, userId: p.owner_id, makeExec, onEvent: (e) => onEvent({ projectId: p.id, ...e }) });
         projectFails.delete(p.id);
         if (r.advanced) { out.push({ projectId: p.id, ...r }); onEvent({ type: 'project', projectId: p.id, ...r }); }
       } catch (e) {
@@ -378,11 +407,9 @@ export function startDaemon(db, { home, launcher, intervalMs = 15_000, iteration
       const notified = notifyOpts ? await notifyPendingQuestions(db, notifyOpts).catch((e) => { onEvent({ type: 'notify_failed', error: e.message }); return []; }) : [];
       for (const n of notified) onEvent({ type: 'notified', ...n });
       if (notifyOpts) for (const n of await notifyPendingDeliveries(db, notifyOpts).catch((e) => { onEvent({ type: 'notify_failed', error: e.message }); return []; })) onEvent({ type: 'notified', ...n });
-      // 打包摘要：换班交接每轮都看（值班者变了就给接班人推一份）；定时摘要按 digestEvery 间隔。
+      // 换班交接每轮都看（值班者变了就给接班人推一份）。定时的全量待办摘要已由推送队列的汇总推送取代。
       if (notifyOpts) {
-        const { digestEvery, ...nopts } = notifyOpts;
-        for (const h of await handoverDigests(db, { at, ...nopts }).catch((e) => { onEvent({ type: 'notify_failed', error: e.message }); return []; })) onEvent({ type: 'handover', ...h });
-        if (digestEvery) for (const d of await scheduledDigests(db, { every: digestEvery, at, ...nopts }).catch((e) => { onEvent({ type: 'notify_failed', error: e.message }); return []; })) onEvent({ type: 'digest', ...d });
+        for (const h of await handoverDigests(db, { at, ...notifyOpts }).catch((e) => { onEvent({ type: 'notify_failed', error: e.message }); return []; })) onEvent({ type: 'handover', ...h });
       }
       // 模型目录漂移检查：按间隔，或绑定里出现没查过的键。只报告不改目录；有问题就通知管理员（个人通道，退到部署级）。
       if (notifyOpts?.catalogCheckEvery) {
@@ -396,13 +423,8 @@ export function startDaemon(db, { home, launcher, intervalMs = 15_000, iteration
             recordCatalogCheck(db, r, { by: 'daemon', lang: contentLang(db) });
             let sent = 0;
             if (r.warnings > 0) {
-              const lead = firstAdmin(db);
-              let channels = lead ? channelsForUsers(db, [lead]) : [];
-              if (!channels.length) channels = channelsFromEnv(env, extraCmd);
-              if (channels.length) {
-                const receipts = await notify(db, { taskId: null, kind: 'catalog', title: `[SuperIntern] ${tl(contentLang(db), '模型目录有 {n} 项要看一眼', { n: r.warnings })}`, text: renderCatalogCheck(r, { onlyProblems: true, lang: contentLang(db) }), ref: 'catalog', channels, fetchFn });
-                sent = receipts.filter((x) => x.ok).length;
-              }
+              const s = await pushSignal(db, 'deploy.catalog', { to: ['admins'], title: `[SuperIntern] ${tl(contentLang(db), '模型目录有 {n} 项要看一眼', { n: r.warnings })}`, text: renderCatalogCheck(r, { onlyProblems: true, lang: contentLang(db) }), ref: 'catalog' }, { env, extraCmd, fetchFn });
+              sent = s.receipts.filter((x) => x.ok).length;
             }
             onEvent({ type: 'catalog', why: due.why, warnings: r.warnings, fetchErrors: r.fetchErrors.length, sent });
           } catch (e) { onEvent({ type: 'notify_failed', error: tl(contentLang(db), '目录检查：{msg}', { msg: e.message }) }); }
@@ -415,15 +437,11 @@ export function startDaemon(db, { home, launcher, intervalMs = 15_000, iteration
         onEvent({ type: rt.ok ? 'runtime_up' : 'runtime_down', why: rt.why ?? null });
         // 掉了就告诉管理员（个人通道，退到部署级；与模型目录检查同一套）。恢复不另发 —— 看板那一条自己会消失
         if (!rt.ok && notifyOpts) {
-          const { env = process.env, extraCmd = null, fetchFn = globalThis.fetch } = notifyOpts;
-          const lead = firstAdmin(db);
-          let channels = lead ? channelsForUsers(db, [lead]) : [];
-          if (!channels.length) channels = channelsFromEnv(env, extraCmd);
           const L = contentLang(db);
-          if (channels.length) await notify(db, { taskId: null, kind: 'runtime', title: `[SuperIntern] ${tl(L, '沙箱用不了：{cli} 没在运行', { cli: rt.cli ?? 'Docker' })}`,
+          notifyAdmins('deploy.runtime_down', { title: `[SuperIntern] ${tl(L, '沙箱用不了：{cli} 没在运行', { cli: rt.cli ?? 'Docker' })}`,
             text: `${tl(L, '要改代码、跑测试的步骤已暂停（不算失败、不耗重试次数）。在服务器上把 {cli} 启动起来，系统会自己接着跑。', { cli: rt.cli ?? 'Docker' })}
 
-${rt.why ?? ''}`, ref: 'runtime', channels, fetchFn }).catch(() => {});
+${rt.why ?? ''}`, ref: 'runtime' });
         }
       }
       // 模型服务商熔断：编排器子进程写的审计，守护进程按水位捡起来告诉管理员（个人通道，退到部署级）
@@ -434,7 +452,7 @@ ${rt.why ?? ''}`, ref: 'runtime', channels, fetchFn }).catch(() => {});
           const L = contentLang(db);
           const n = llmHealthNotice(rows.map((r) => ({ action: r.action, targetId: r.target_id, payload: (() => { try { return JSON.parse(r.payload); } catch { return {}; } })() })), L);
           onEvent({ type: 'llm_health', events: rows.length, lines: n?.lines ?? [] });
-          if (n && notifyOpts) await notifyLead({ kind: 'llm_health', ...n });
+          if (n && notifyOpts) notifyAdmins('deploy.llm_health', n);
         }
       }
       // 运行期不变量：各条按自己的周期查，结果进 invariant_state（健康卡读）；从对到错 / 从错到对告诉管理员。
@@ -448,15 +466,53 @@ ${rt.why ?? ''}`, ref: 'runtime', channels, fetchFn }).catch(() => {});
           if (tr.length) {
             const n = invariantNotice(tr, contentLang(db));
             onEvent({ type: 'invariants', transitions: tr, lines: n?.lines ?? [] });
-            if (n && notifyOpts) await notifyLead({ kind: 'invariants', ...n });
+            if (n && notifyOpts) notifyAdmins('deploy.invariants', n);
           }
         } catch (e) { onEvent({ type: 'notify_failed', error: tl(contentLang(db), '运行期自检：{msg}', { msg: e.message }) }); }
       }
+      // 邮件答复：配了 IMAP_URL 就收一轮回信（每分钟最多一次）。急停时照收：答复是人给的，不花模型钱。
+      // 放在发件箱之前：收信连不上 / 恢复的告警当拍就推出去
+      if (notifyOpts && at - mailPolledAt >= 60_000) {
+        mailPolledAt = at;
+        const { env, mailFetchFn, sendMailFn } = notifyOpts;
+        try {
+          const mr = await pollMailReplies(db, { env, ...(mailFetchFn ? { fetchFn: mailFetchFn } : {}), ...(sendMailFn ? { sendMailFn } : {}) });
+          if (mr && (mr.results.length || mr.errors.length)) onEvent({ type: 'mail_replies', outcomes: mr.results.map((r) => r.outcome), errors: mr.errors });
+          if (mr && mailFailing) { mailFailing = false; const L = contentLang(db); notifyAdmins('deploy.mail_inbound', { title: tl(L, '[SuperIntern] 邮件答复恢复了'), text: tl(L, '守护进程又能收到回信了；之前积着的回信这一轮已经处理。'), ref: 'mail_inbound' }); }
+        } catch (e) {
+          onEvent({ type: 'notify_failed', error: tl(contentLang(db), '收邮件答复：{msg}', { msg: e.message }) });
+          if (!mailFailing) {
+            mailFailing = true;
+            const L = contentLang(db);
+            notifyAdmins('deploy.mail_inbound', { title: tl(L, '[SuperIntern] 邮件答复收不到信'), ref: 'mail_inbound',
+              text: tl(L, '守护进程连不上收信服务器（.env 的 IMAP_URL）：{msg}\n修好之前，大家回的邮件会一直躺在邮箱里、不算答复，请提醒他们到看板上答。修好后积着的回信会补处理。', { msg: String(e.message).slice(0, 200) }) });
+          }
+        }
+      }
+      // 状态报告：到点的人各排一份进推送队列（一个时刻点只排一次），下面的发件箱按工作时间与限额推
+      try { const due = queueDueReports(db, { at }); if (due.length) onEvent({ type: 'reports_queued', reports: due }); }
+      catch (e) { onEvent({ type: 'notify_failed', error: tl(contentLang(db), '状态报告：{msg}', { msg: e.message }) }); }
+      // 发件箱：这一拍以及别的进程（编排器、看板）记下的不阻塞信号，统一在这里推；认领在事务里，至多推一次
+      if (notifyOpts) {
+        const { env, extraCmd, fetchFn, spawn } = notifyOpts;
+        for (const n of await deliverSignals(db, { env, extraCmd, fetchFn, spawn }).catch((e) => { onEvent({ type: 'notify_failed', error: e.message }); return []; })) onEvent({ type: 'signal_sent', ...n });
+      }
+      if (prw) {
+        try { await prw.tick(at); } catch (e) { onEvent({ type: 'notify_failed', error: tl(contentLang(db), '盯 PR：{msg}', { msg: e.message }) }); }
+      }
+      if (isw) {
+        try { await isw.tick(at); } catch (e) { onEvent({ type: 'notify_failed', error: tl(contentLang(db), '看 GitHub issue：{msg}', { msg: e.message }) }); }
+      }
+      // 定时任务：到点起草一轮添加任务（只写库；起草本身在急停之后）
+      try { const fired = fireSchedules(db, { at }); if (fired.length) onEvent({ type: 'schedules_fired', fired }); }
+      catch (e) { onEvent({ type: 'notify_failed', error: tl(contentLang(db), '定时任务：{msg}', { msg: e.message }) }); }
       // 部署级急停：不推进项目、不拉起任何进程；停等账本也不扫 —— 那时所有任务都"静止"，
       // 扫了会把管理员的暂停误判成停摆、给负责人挂报警事项。超时、通知、摘要照常（那些是给人的，不花模型钱）。
       const paused = !!getSetting(db, 'deploy.paused');
       if (paused !== pausedWas) { pausedWas = paused; onEvent({ type: paused ? 'deploy_paused' : 'deploy_resumed' }); }
       if (paused) return { swept, projects: [], launched: [], skipped: [], liveness: null, paused: true };
+      try { const pushed = await redeliver(at); if (pushed.length) { onEvent({ type: 'ci_fix_redelivered', tasks: pushed }); for (const id of pushed) await prw?.pollNow({ taskId: id }, at).catch(() => {}); } }
+      catch (e) { onEvent({ type: 'notify_failed', error: tl(contentLang(db), '把修好的推回 PR：{msg}', { msg: e.message }) }); }
       const sandboxOk = !rt || rt.ok !== false;
       const projects = sandboxOk ? await advanceProjects(at) : [];
       // 项目规划器：proposed 的项目按 assessProjectPlan 拉 `project plan <id>`；起不来走同一张退避表。

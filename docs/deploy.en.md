@@ -27,8 +27,10 @@ For people logging in from their own computers (team mode), see [Team deployment
   - **Model keys:** provide a key for at least one vendor.
   - **`GITHUB_TOKEN`:** the older way to configure delivery; it still works. For new deployments, set up delivery credentials under Settings → Connections instead; see [Connections](#connections-delivery-credentials) below.
   - **`NTFY_URL` and similar variables:** deployment-wide notification channels. Individual channels are configured under Settings → Members.
+  - **Email (optional):** `SMTP_URL`, `MAIL_FROM` (sending), `MAIL_TO` (deployment-wide address), `IMAP_URL`, `MAIL_REPLY_TO` (reply by email); see [Email channel and reply by email](#email-channel-and-reply-by-email) below.
 
-  Check whether a key is set without printing its value: `grep -c '^DEEPSEEK_API_KEY=.' .env`.
+  Check whether a key is set without printing its value: `grep -c '^DEEPSEEK_API_KEY=.' .env`. To read a different environment file, set `SUPERINTERN_ENV_FILE=<path>`; set it to `none` to read no `.env` at all.
+- Optional: when Universal Ctags is installed on the host, the repository map (see "Models and review" below) uses it to extract symbols; without it, per-language patterns are used.
 - Initialize the database: `node src/cli.mjs init --name <administrator name>`. It:
   - issues a CLI token and writes it to `.superintern/cli-token`. This is the token's only plaintext copy; the database stores only a hash.
   - chooses light / standard / heavy models based on the keys present in `.env`. Override a binding with `--bind heavy=<provider/model>`.
@@ -55,7 +57,10 @@ powershell -ExecutionPolicy Bypass -File scripts\daemon.ps1 status   # also star
 - Local mode listens only on `127.0.0.1:7357`. For remote access, use an SSH tunnel: `ssh -L 7357:127.0.0.1:7357 <host>`, then open http://127.0.0.1:7357/ locally.
 - In local mode, requests without a token act as the administrator who started the web UI. Other members log in with their own tokens. Adding a person under Settings → Members generates a token that is shown once.
 - For direct access from multiple computers, use team mode: [Team deployment](deploy-team.en.md).
-- **"Pause all" (emergency stop):** an administrator clicks "Pause all" in the web UI's top bar. The system starts no new steps, and a step in progress stops after its current operation. This does not count as a failure or a retry, and tasks are not cancelled; after "Resume automatic runs", work continues automatically. The paused state is stored in the database and survives restarts. CLI: `node src/cli.mjs user setting deploy.paused true` (`false` resumes).
+- **"Pause all" (emergency stop):** an administrator clicks "Pause all" in the web UI's top bar. The system starts no new steps, and a step in progress stops right away: a model call in flight is cancelled, a running command is allowed to finish, and the step's half-done changes are set aside and put back when work resumes. This does not count as a failure or a retry, and tasks are not cancelled; after "Resume automatic runs", work continues automatically. The paused state is stored in the database and survives restarts. CLI: `node src/cli.mjs user setting deploy.paused true` (`false` resumes).
+- **Pausing or aborting a task:** takes effect at the AI's next turn, without waiting for the step and its review to finish. Abort cancels a model call in flight. Half-done changes of the interrupted step are saved to `refs/superintern/parked/<step>` and put back when the step runs again; if they cannot be put back, the step says where they are and how to retrieve them. Who can do what: Pause = the owner and people who took part in the task (an item was sent to them, or they answered one); Resume = the owner or whoever paused it; Abort = the owner only. Corrections and new instructions sent with `say --urgent` also interrupt the current step and replan right away; extra information needs no `--urgent` and reaches the AI in the middle of a step.
+- **Redo from this step:** the task owner clicks "Redo from this step…" in the step details (finished steps only). That step, the steps that used its results and the steps committed after it all go back to be redone, and the code returns to before that step. A preview comes first: which steps go back, which files revert or are deleted, which items are withdrawn and which sign-offs are voided. The code from before (including uncommitted changes) is kept at `refs/superintern/rewound/<id>`. A running task must be paused first; tasks that are delivered, merged into the project branch, aborted or archived cannot be sent back this way (add a task instead). CLI: `rewind <task> <step> [--note "what to watch out for"] [--yes]`; without `--yes` it only shows the preview.
+- **The AI asking to widen its writable paths:** when a handoff is rejected only because it changed files outside the writable paths, the AI can ask to add those paths. The system sends one plan-approval item with the paths, the AI's reason, the writable paths now and after approval, any overlap with other tasks in the project, and the out-of-scope diff. Choosing "Approve" writes the paths into the contract; the step's changes are kept and it does not have to be redone. Any other answer counts as not approved. Shared paths, rules files and hook files cannot be requested this way.
 
 ## Models and review
 
@@ -67,6 +72,7 @@ Every model call belongs to a **role**: planning, execution, review, writing rep
 - **Fallback models:** each tier can have a fallback model (the "Backup" column in Model assignment, or `bind fallback <tier>=<provider/model>`; `none` removes it). When a provider keeps returning errors, the system stops calling it for a while (all processes share this decision; the cool-down doubles each time, up to 15 minutes). During that time, tiers with a fallback switch to it, and switch back once the provider recovers. Steps without a fallback wait; the "Model providers" entry in System status says which provider they are waiting for.
 - **Weakened pre-existing tests:** at each handoff, the system compares what the step did to tests that existed before the task started: deleted test files, added skips, fewer cases or assertions, changed expected values. By default this is only flagged, for the reviewer and the person signing off. To have such handoffs sent back directly, run `node src/cli.mjs user setting deploy.test_guard reject` (there is no page switch yet). When a change really is needed, tick "Allow this step to change these tests that existed before the task" when answering that item, or use `answer <item> "…" --allow-tests` on the CLI. JavaScript, Python and Go test styles are recognized for now.
 - **Context compaction:** when a request's context passes the "Automatic compaction line", the system compacts it and then continues. First it replaces the oldest large tool outputs with a one-line placeholder (the full command output is saved under `.si-outputs/` in the workspace and is not committed). If that is not enough, the model writes a brief and the context is rebuilt from it. If one step still does not fit after two compactions, an item suggests splitting the step. Change the line on the task page or under "Budget & limits" in project settings; the default is 120k tokens, 0 = off. The effective value never exceeds 80% of the context limit.
+- **Repository map:** at the start of each step the executor gets a map of files and the symbols they define, ranked by the step's scope and cut to `deploy.repo_map_tokens` (2048 tokens by default, 0 = off). The map shows the repository as it was when the step started and is not refreshed when files change mid-step. Universal Ctags is used if it is installed on the host; otherwise symbols are found with per-language patterns (JS/TS, Python, Go, Rust, the Java family, Ruby, PHP, C/C++).
 
 ### The reviewer checks the running app
 
@@ -103,7 +109,7 @@ Delivery pushes a branch to a remote repository and can also open a PR. The cred
 1. Create an App under the organization's Settings → Developer settings → GitHub Apps → New GitHub App:
    - Homepage URL: the organization's home page, for example `https://github.com/<organization>`;
    - Webhook: clear Active;
-   - Repository permissions: set Contents and Pull requests to Read and write, and keep Metadata at Read-only. To allow the AI to change files under `.github/workflows/`, also set Workflows to Read and write;
+   - Repository permissions: set Contents and Pull requests to Read and write, and keep Metadata at Read-only. To allow the AI to change files under `.github/workflows/`, also set Workflows to Read and write. To let the system watch delivered PRs (see "GitHub loop" below), also set Checks, Commit statuses and Actions to Read-only; for GitHub issue intake, also set Issues to Read-only. After adding permissions to an App that is already installed, accept the new permissions on the organization's GitHub Apps installation page;
    - Where can this GitHub App be installed: choose Only on this account.
 2. After it is created, note the App ID, click Generate a private key and download the `.pem` private key file.
 3. Click Install App on the left of the App page, install it on the organization, and choose all repositories or selected ones.
@@ -127,6 +133,27 @@ Whichever connection is used, the system only pushes its own branches (`superint
 
 Merging is always done by a person on GitHub. Private repositories in free GitHub organizations cannot use branch protection, so the system enforces this guardrail itself. If you later move to a paid plan, you can add branch protection and required reviews on GitHub as a second line of defense.
 
+## GitHub loop
+
+After a delivery opens a PR, the daemon keeps watching it; labeled GitHub issues and schedules can also become new tasks. All of this uses only deployment-level connections (GitHub App first, then a deployment token), never members' own connections; the App permissions needed are listed above.
+
+- **Watching delivered PRs:** the "Delivered PR" card on task and project pages shows the PR's status, CI and review comments. The daemon adjusts its pace: every minute while CI is running, every 5 minutes once it has finished, every 30 minutes for a closed PR (and not at all after 3 days), and it stops once the PR is merged; on errors it backs off step by step. Requests are conditional, so unchanged data does not use up GitHub's rate limit; when fewer than 50 requests remain, it waits for the reset. If the App lacks the CI read permissions, PR status and comments are still watched and the CI column says which permission is missing.
+- **AI follow-up:** when a delivery opens a PR, you are asked separately whether to authorize AI follow-up for it (the CLI authorizes it by default; add `--autofix off` to leave it off). Once authorized:
+  - When CI fails, the AI works from the failed checks and the tail of the Actions logs, and pushes the fix back to the same PR, at most 2 rounds. Logs are external text, never instructions.
+  - "Request changes" on GitHub from a member who may deliver the task becomes a correction directly, together with that review's inline comments; the result is pushed back the same way.
+  - Before pushing back, the same checks as delivery apply: tasks that were signed off at delivery, or are high-risk, need the new version signed off too; the pre-delivery hooks and push guardrails apply as usual.
+  - It asks a person with an item instead of fixing when: 2 rounds have already been used, the budget gate would be hit, someone else has pushed to the PR branch, or the person who authorized it has been disabled or their token revoked. Answering "no fix needed" leaves the failure on that commit alone; any other answer becomes a correction.
+  - The card shows who authorized it; anyone who may deliver can "Withdraw authorization" or "Authorize AI follow-up yourself". Withdrawing affects only what comes next; a round already handed to the AI is finished (pause the task to stop it right away).
+  - Merging is always done by a person on GitHub.
+- **Review comments:** each comment on the card can be handled with "Have the AI act on this" (in the name of whoever clicks) or "Ignore" (recorded on the board only, nothing goes back to GitHub); "Ignore" can be undone. Comments from non-members are listed separately and never trigger paid work; bots are not listed.
+- **Whole-project PRs:** when CI fails, a fix task is drafted under the authorization of the person who delivered (at most 2 rounds, following the project's automation mode); after the fix task merges, someone has to deliver the project again for the PR to update.
+- **GitHub issue intake:** the project lead sets a repository and a label under Project settings → Issues & schedules (CLI: `project issues <project> --repo <owner/repo> --label <label>`, `--off` to turn it off). The daemon looks every 5 minutes, and each issue with that label becomes a draft "Add task" request:
+  - It always needs a person's approval, even in auto mode. The approval item starts with the source, the author and a link; the issue text is external text and is passed to the AI marked as not being instructions.
+  - If the author matches someone in the project, the request is recorded under their name (and they sign it off); otherwise under the person who set up the intake.
+  - At most 3 are in progress at once (being drafted, awaiting approval or queued); abandoned ones are not drafted again; closing an issue or removing its label takes it out of the queue.
+  - GitHub is only read: no comments and no label changes. The label is the gate that authorizes intake, so do not put it into issue templates.
+- **Schedules:** added on the same page, by choosing daily / weekly / monthly or writing a cron expression (five fields, deployment time zone; forms such as `@daily` work too); CLI: `project schedule <project> add --name <name> --cron "0 9 * * 1" --brief "<what to do>"` (`on` / `off` / `rm <id>`). When due, it drafts an "Add task" request that follows the automation mode like a request typed by a person. A missed run is made up only once; if the previous draft has not been approved yet, the run is skipped.
+
 ## Credentials for network sources
 
 When a private npm / PyPI source or an internal mirror requires authentication, the credentials are set on the **source**, and the egress proxy adds them to the tool's requests. Code in the sandbox cannot see them.
@@ -139,6 +166,49 @@ node src/cli.mjs sources cred add <source id> --key-file <file> --basic    # the
 - Find the source id under Settings → Network catalog. Credentials are stored encrypted in the database (with the same master key as connections); once entered, nobody can view the original.
 - **Read-only by default:** a source with credentials gets them only on read requests (GET, git clone). In addition, for a project that allows such a source, every source it allows becomes read-only (POST, PUT and the like are blocked), so code in a task cannot use the credentials to send things out. For a source that really needs writes, add `--allow-write`.
 - Revoke: `sources cred revoke <credential id>`.
+
+## Project rules, skills, hooks and MCP
+
+**Project rules**
+
+- From the repository root down to the directories this step changes, at most one file is taken per level: `AGENTS.override.md`, otherwise `AGENTS.md`, otherwise `CLAUDE.md`. The root comes first and deeper files take precedence, up to 32 KiB in total; when that is exceeded, the deepest level is kept first and the skipped files are named. The committed version is read. When the executor reads or writes in another directory, that level's rules are attached to the tool result.
+- Rules are given to the executor and the reviewer, marked as coming from the repository: they cannot override the contract, widen the scope or relax acceptance criteria.
+- Rules files are maintained by people: if the executor changes one, the handoff is sent back, unless the contract's writable paths name that file.
+- Before each step, if the rules or the decided conventions have changed, the rules are compared against the decided conventions; a conflict becomes an item for the project lead.
+- Project settings → Project rules: anyone who can see the project can view them; the lead can create, edit and delete them, and saving commits once to the project branch with the editor as author. Tasks already started do not see the change; it applies from tasks started afterwards.
+
+**Skills**
+
+- A directory with a `SKILL.md` (name, description, body), optionally with reference files.
+- Three levels: deployment `.superintern/skills/` (administrators install with `skill add <directory>`), project `.superintern/projects/<project id>/skills/` (`skill add <directory> --project <id>`), and the repository's `.agents/skills/` (or `.claude/skills/` if that is absent). For the same name, deployment > project > repository.
+- At each step the AI first sees only names and descriptions (8000 characters in total; beyond that, ranked by relevance to the step); skills named in the task or step are always included; skills with `disable-model-invocation` are included only when named. The AI fetches the full text when it needs it; deployment and project skills are copied with their reference files into `.si-skills/` in the workspace, which is not committed, and their scripts run only in the sandbox.
+- Turning off: the lead switches them one by one under Project settings → Skills (this project only), or `skill off <level>:<name> --project <id>`; administrators omit `--project` to turn one off for all projects. Turning one off also turns off same-named ones it was hiding.
+
+**Policy hooks**
+
+- Four points: before a tool call (`PreToolUse`), before handoff (`PreHandoff`), before merge (`PreMerge`) and before delivery (`PreDeliver`).
+- The format is the same as Claude Code hooks, so existing hooks work as they are:
+
+  ```json
+  {"hooks": {"PreToolUse": [{"matcher": "Bash", "hooks": [{"type": "command", "command": "./.superintern/hooks/check.sh", "timeout": 30}]}]}}
+  ```
+
+  The hook gets JSON on stdin (event name, tool name, tool input and so on). Exit 2 = block, with the reason taken from stderr; on exit 0, `hookSpecificOutput.permissionDecision` in stdout is read (`allow` / `deny` / `ask`). When several hooks match, all of them run and the results combine as deny > ask > allow. `matcher` accepts the system's tool names as well as Claude Code's names (`Bash`, `Read`, `Write` and so on); write `mcp__.*` for MCP tools. `timeout` defaults to 30 seconds, at most 600.
+- Where they live and how they are trusted:
+  - Deployment `.superintern/hooks.json` and project `.superintern/projects/<project id>/hooks.json`: only people with access to the server can change them, and they run on the host. They are approved by content: `hook list` shows them, `hook trust` approves them; when the command or a script it refers to changes, it must be approved again, and unapproved hooks do not run.
+  - The repository's `.superintern/hooks.json` and `.claude/settings.json` (only `PreToolUse` is read from the latter): read from the commit the task started from, and run read-only in the sandbox only. If a task changes a hook file or hook script, repository hooks do not run, this counts as blocking, and the handoff is sent back.
+- When a hook itself fails: before a tool call and before handoff, the default is to allow (a hook with `"onFailure": "block"` blocks instead); before merge and before delivery, failure always counts as blocking.
+- When a hook blocks: before a tool call, the reason goes back to the AI; before handoff, it joins the handoff rejection, and the same block three times in a row becomes a question to a person; before merge, an item is raised and the answer becomes a correction; before delivery, delivery fails and nothing is pushed.
+- When a hook asks for confirmation: a "Security approval" item is sent, and answering "agree" allows that one action. When a pre-delivery hook asks, the error carries a confirmation code: confirm in the dialog on the board, or deliver again with `--hook-ack <code>` on the CLI; the code becomes invalid if what the hook says changes.
+- Project settings → Hooks (read-only) lists, for each of the four points, what happens when a hook blocks, asks for confirmation or fails, together with the built-in checks and the status of each configured hook.
+
+**MCP**
+
+- Configuration: deployment `.superintern/mcp.json`, project `.superintern/projects/<project id>/mcp.json` and the repository's `.mcp.json`, in the Claude Code format: `{"mcpServers": {"<name>": {"command": "…", "args": […], "env": {…}}}}`; a remote server is `{"type": "http", "url": "https://…"}`. For the same name, the earlier one wins.
+- Local servers start inside the task's sandbox, with that sandbox's network and credentials. Remote servers go through a bridge inside the sandbox and the egress proxy, so the server's domain must be allowed under the project's network settings. Do not put tokens for remote servers into the configuration: add a source for the server's address under Settings → Network catalog and set the credential with `sources cred add <source id> … --allow-write` (MCP requests are all POST). Environment variables and headers that look like credentials are never used; any that were committed to a repository should be treated as leaked and replaced.
+- Approval: the project lead or an administrator starts the server and reads the original tool descriptions under Project settings → MCP, or with `mcp check --project <id>`, then approves with `mcp approve --project <id>`. When the server's command, arguments, environment, address or tool list changes, the AI loses access until it is approved again; the page shows the approved and current descriptions side by side. `mcp off --server <id> --project <id>` turns a server off (`on` turns it back on).
+- Per-tool mode: `ask` (default: every call sends a Security approval item, and answering "agree" allows that one call) / `auto` (always allowed) / `off` (not given to the AI). Change it in the dropdown on the page or with `mcp tool <mcp__…> auto|ask|off --project <id>`. Read-only / write annotations from the tools themselves are not trusted.
+- Sandbox only: tasks without a sandbox get no MCP tools. Results over 40,000 characters give the AI only the beginning; the full text is saved under `.si-outputs/` in the workspace.
 
 ## Change provenance: what each change is based on
 
@@ -192,6 +262,7 @@ There are four budget levels. When any level is reached, the running step stops 
 | Whole deployment per month | `deploy.budget_usd_month` | Not set |
 
 - **Reservation:** before each model call, the system reserves the worst-case cost in one transaction and checks it against all the gates together. When several tasks run at once, they cannot pass a gate together.
+- **Cancelled calls:** a model call cancelled when a task is aborted or everything is paused has no usage report, so it is charged as an estimate (input estimated, output at its maximum) and marked as an estimate.
 - **Months:** split by the deployment time zone (see "Time and calendar" below; UTC if not set).
 - **Fair scheduling:** `deploy.max_running_per_person` limits how many tasks each person can have running at once; 0 means no limit. The daemon takes turns between people when starting tasks, so one person submitting many tasks at once does not push other people's tasks to the back.
 - **Viewing spending:** Settings → Spend shows each person's spending for this month and last month, and the trend over the last 14 days. Members see only their own row. CLI: `node src/cli.mjs user spend`.
@@ -210,8 +281,63 @@ Under Settings → Time and calendar, an administrator sets the **deployment tim
 
 - The "1bd" (one business day) timeout in the routing table, the duty roster's hand-over time and the day monthly budgets roll over all follow the deployment time zone. If it is not set, UTC is used, which is 8 hours off for a deployment in China; System status warns about this.
 - Holidays, one per line: `2026-10-01..2026-10-07 国庆`; make-up workdays are written `2026-10-11 班`. When the listed days are about to run out, System status reminds you to add the next year.
-- Each person can set their own time zone on the same page; it affects only the times they see.
+- Each person can set their own time zone on the same page: times on the board are shown in it, and it also sets their working hours and the time of their status reports (see below). If not set, the deployment time zone is used.
 - Duty swaps (someone covers whole days) are added below the duty roster in decision routing, or with `routing swap`.
+
+## Oversight modes and approval gates
+
+Every kind of signal the system sends to people has one of three levels of human involvement: **Decide** (a person must decide; it becomes an item), **Notify** (pushed to people without blocking work) and **Record** (only recorded, visible on the board).
+
+- **Oversight mode:** each project picks one under Project settings → Oversight & approvals; projects that have not chosen use the deployment default `deploy.oversight_mode` (`full` / `spot` / `exception`, default `spot`).
+  - **Full oversight:** choices the AI makes on its own and plan changes it makes need your approval, and nothing is merged before that; every step's progress is pushed to you.
+  - **Spot check** (default): what needs your call waits for you; choices the AI makes and plan changes are sent to you without blocking it; per-step reports are only recorded, while task-level progress is still pushed.
+  - **Management by exception:** you are only disturbed when something departs from the norm: level Ⅰ spec choices go ahead with the AI's proposed default and you are told afterwards; day-to-day progress is only recorded.
+- **Floors:** contract and plan approvals, sign-offs, disagreements, spending gates, security approvals and failures handed back to people always need a person in every mode. Decisions made for people by the system (timeouts, going ahead with a default), external actions in your name, security boundaries changed by the system and deployment failures are always notified in every mode and cannot be muted.
+- **Approval gates:** on the same page, the lead lists commands that need a person's approval before they run, one per line; `*` matches any text and `?` one character, matching the whole command, case-insensitive (for example `git push*`, `*migrate*`, `kubectl apply*`, `psql*`). Each part of a command wrapped in `sh -c "…"` or joined with `&&`, `||`, `;` or `|` is checked, and leading variable assignments and tool paths are stripped first (`PGPASSWORD=x psql` and `/usr/bin/psql` are both recognized). The AI stops before a matching command and sends a "Security approval" item; answering "agree" allows that one command, and the identical command is not asked about again. The list is empty by default, and a lone `*` is not accepted. The page can "try a command" against the unsaved list.
+- **Security approval:** approval gate hits, policy hooks asking for confirmation and MCP tools needing approval all send this kind of item. It has no default answer and is never decided by timeout; if nobody answers, work stays stopped. Routing tables without a row for it send it to whoever handles "system stuck"; to route it elsewhere, add a row under Project settings → Decision routing (the built-in templates already have one).
+- **Kinds the system never decides for people:** structural conflicts, plan approvals, sign-offs, limit increases, network approvals, disagreements, security approvals and system-stuck items have no default answer; when they time out they are escalated, and if still unanswered they wait while the original recipients and the task owner are told.
+
+## Notifications and pushes
+
+- **Channels:** each person adds their own channels under Settings → Members (ntfy, Feishu, DingTalk, WeCom, email). Deployment-wide channels in `.env` (`NTFY_URL`, `MAIL_TO` and so on) are used only for administrators without a personal channel, and as a fallback when none of an item's recipients can be reached. Without any channel, items are still in the Inbox on the board.
+- **"My notifications"** (in Settings): choose per kind of signal between "Push" and "Record only"; kinds with a floor say "always pushed" and cannot be changed. In the notifications card of the Inbox, each entry shows its kind and can stop pushes of that kind with one click (for all projects).
+- **Urgency:** urgent items are pushed right away: level Ⅲ items (except sign-offs), security approvals, items already escalated or less than 2 hours from their deadline, external actions in your name, security boundaries changed by the system, and deployment failures. Everything else is not urgent, including sign-offs and items you are only informed about.
+- **Working hours:** non-urgent items are pushed only during your working hours, weekdays 9–18 by default, in your own time zone and following the deployment's holidays; shifts across midnight are supported.
+- **Digest:** non-urgent items are held and combined into one push at an interval (60 minutes by default), grouped by kind with items from the same project next to each other; if only one item is waiting, it is pushed as is.
+- **Rate limit:** the number of times you are interrupted in an hour (a single push and a digest each count once) is 4 by default; after that, further items go to the front of the next digest. Level Ⅲ items (except sign-offs) and deployment failures are exempt.
+- Each person changes these under "My notifications → When to push", which also shows how often they were interrupted in the last 7 days. Administrators change the deployment defaults in the same place; they correspond to `deploy.work_start_hour`, `deploy.work_end_hour` (24 = until midnight), `deploy.work_days_only`, `deploy.digest_every_min` (0 = no holding) and `deploy.push_cap_per_hour` (0 = no limit).
+- **Item links and Quick reply:** every push ends with a link. A single item's link opens just that item, readable and answerable on a phone (spec choices, structural conflicts, system-stuck items and disagreements); sign-offs, security approvals, plan approvals, limit increases, network approvals and delivery link to the full task page. Digests link to the Inbox. Links use the dashboard address under Settings → Connections (`deploy.board_url`), or else the address the board was started with (`--public-url` in team mode, `127.0.0.1` in local mode); if the daemon runs on its own and no address is set, pushes carry no link. Links contain no credentials, so opening one requires the usual login.
+- The daemon's `--digest-every` (periodic full to-do digests) is no longer used; for the full list, see the Inbox or the `digest` command.
+
+## Email channel and reply by email
+
+**Sending:** set `SMTP_URL` and `MAIL_FROM` in `.env` to enable the email channel; members register their own address under Settings → Members (CLI: `user channel <id> --email <address>`), and `MAIL_TO` is the deployment-wide address. Without these two variables, registered addresses are marked as not reachable yet.
+
+- `SMTP_URL` forms: `smtps://user:password@smtp.example.com:465` (direct TLS); `smtp://user:password@smtp.example.com:587` (STARTTLS after connecting; if the server does not support it, nothing is sent, with no downgrade); `smtp://127.0.0.1:25` (local relay; plain text is allowed only for local addresses, and no password is sent over plain text). Write `@ : /` in user names and passwords as `%40 %3A %2F`.
+- Certificates are verified as usual; the audit log records only the recipient's domain.
+
+**Reply by email:** also set `IMAP_URL` to let people answer by replying to push emails.
+
+- `IMAP_URL` forms: `imaps://user:password@imap.example.com:993`; the folder is INBOX by default, and another folder goes in the path (`imaps://…/Replies`); `imap://…:143` uses STARTTLS and does not fetch if the server lacks it. The daemon fetches unread mail once a minute, marks it read after processing and never deletes it.
+- Replies go to `MAIL_REPLY_TO` (or `MAIL_FROM` if empty), and mail to that address must arrive in the `IMAP_URL` mailbox. If your provider supports plus addressing (Gmail, Outlook, Fastmail, your own Postfix and so on), write `reply+{token}@example.com`; replies from clients that drop In-Reply-To are then recognized too.
+- Only spec choices, structural conflicts and system-stuck items can be answered by email, and only by the people who are asked; emails for other items, for people only informed, and digests say up front that replying has no effect.
+- Write one line at the top of the reply (for example "B"); there is no need to delete the quoted text. Only the first reply counts, within 72 hours of the push; to change the answer later, do it on the board.
+- The reply must come from the registered address; replies the receiving server marks as a DMARC / SPF failure do not count. Replies that do not count (expired, already answered, item not recognized and so on) get an explanation with a link; explanations go only to registered addresses, at most 10 per address per hour. Auto-replies, bounces and bulk mail are ignored.
+- When mail cannot be fetched (`IMAP_URL` wrong, server unreachable), administrators are told once, and again once it recovers.
+
+## Status reports
+
+What happened over a period, computed per person without calling a model:
+
+1. **Did anything go wrong:** deployment failures, security boundaries changed by the system, hard failures, stopped projects, timeouts nobody picked up, spending or call limits reached; "nothing went wrong" appears only when all of these are zero.
+2. **Decided without waiting for you:** defaults taken on timeout, others changing your items, choices the AI made, plan changes it made, tasks the AI added, automatic model upgrades, external actions in your name, minor system fixes; kinds set to "Record only" are included too, marked as never pushed.
+3. **Progress:** which tasks were merged.
+4. **Spending**, and how many items are still waiting for you.
+
+- Scope: members see what was sent to them and the projects they take part in; all projects is for administrators only (and their default). Detail: Exceptions only / Summary (at most 5 entries per section) / Full.
+- See them any time on the "Status report" page in the sidebar: last 24 hours / 7 days / 30 days / last month, with entries linking to the item, task or project. CLI: `node src/cli.mjs report [--since 24h|7d|<date>] [--detail exceptions|summary|full] [--all] [--user <id|name>]` (`--all` and other people's reports are for administrators only).
+- **Scheduled pushes:** each person sets the frequency (off / daily / weekly on a chosen day), time and detail under "My notifications"; otherwise the deployment defaults apply: `deploy.report_every` (`auto` / `off` / `day` / `week`), `deploy.report_day` (1 = Monday … 7 = Sunday), `deploy.report_hour` and `deploy.report_detail` (`auto` / `exceptions` / `summary` / `full`). `auto` follows the default oversight mode: a daily summary under Full oversight, a weekly summary under Spot check, and a weekly exceptions-only report under Management by exception; the default is Monday at 9:00. Times follow each person's time zone, and a day that is not a workday moves to the next workday at the same hour. Each report starts where the previous one ended, so nothing is missed or repeated. Reports are pushed on their own (not in a digest), only during working hours, and count toward the rate limit; long ones are cut, with the full report on the board.
+- **"While you were away":** when you come back to the board after 8 hours or more (the page counts as being looked at only while it is visible and you are using it), the top of the Inbox shows how much happened and links to the report for that period.
 
 ## Logs and tracing
 
@@ -253,13 +379,31 @@ Under Settings → Time and calendar, an administrator sets the **deployment tim
 - **Tokens:** newly issued CLI tokens expire after 90 days by default (`deploy.cli_token_days`, 0 = never); tokens issued before the upgrade are not affected. In team mode, the browser cookie now holds a session instead of the token itself.
 - On machines with `HTTPS_PROXY` set, model calls also go through that proxy (`SUPERINTERN_IGNORE_ENV_PROXY=1` turns this off).
 
+**Upgrading from 0.4.x to 0.5.0:**
+
+- **The database is upgraded automatically after a backup:** the first command you run migrates the database step by step from the 0.4.x version, after backing it up to `.superintern/backups/` (the file name contains `pre-v47`). A few tables (items, routing rules, tokens, the push queue) are rebuilt, so a large database takes a little longer. After the upgrade, 0.4.x code refuses to open the database; to go back, put the old code back and run `node src/cli.mjs db restore <that backup>`. Sandbox images have not changed, so there is no need to rerun `setup`.
+- **These repository files now take effect:** `AGENTS.md` (and `AGENTS.override.md`, with `CLAUDE.md` as a fallback) is given in full to the executor and the reviewer; skills in `.agents/skills/` and `.claude/skills/` are offered to the AI; PreToolUse hooks in `.superintern/hooks.json` and `.claude/settings.json` run in the sandbox and may block what the AI does, and hooks before merge and before delivery count as blocking when they fail; servers in `.mcp.json` are only listed and are not given to the AI until the project lead approves them. Before upgrading, check whether your project repositories contain these files and whether their content is what you want the AI to follow. Also, changes the AI makes to rules files and hook files are sent back unless the contract's writable paths name them. See "Project rules, skills, hooks and MCP" above.
+- **Fewer and later pushes:** pushes are now queued per person. By default, non-urgent items are pushed only during working hours (weekdays 9–18), combined into one digest every 60 minutes, and nobody is interrupted more than 4 times an hour; urgent items are still pushed right away. Working hours use each person's own time zone, otherwise the deployment time zone, otherwise UTC. Deployments outside UTC should set the deployment time zone under Settings → Time and calendar first, or working hours will be off. A person's own time zone now also sets their working hours and status report time, not only how times are shown. To push everything as soon as it happens, as before: set `deploy.digest_every_min` and `deploy.push_cap_per_hour` to 0, `deploy.work_start_hour` to 0, `deploy.work_end_hour` to 24 and `deploy.work_days_only` to `false`.
+- **Deployment-wide notification channels no longer receive every item:** `NTFY_URL` and the others in `.env` are now used only for administrators without a personal channel, and as a fallback when none of the recipients can be reached. Members who relied on a shared deployment channel should add their own channel under Settings → Members.
+- **Per-step reports are no longer pushed:** the default oversight mode is Spot check, where per-step reports are only recorded (they are still visible on the board); finished tasks, work waiting for a person and work waiting for delivery are still pushed. To keep getting every step, set the project's oversight mode to Full oversight (Project settings → Oversight & approvals).
+- **Weekly status reports start arriving:** `deploy.report_every` defaults to `auto`, which under Spot check means a summary every Monday at 9:00 (in each person's time zone, pushed within working hours). To stop them, each person can turn them off under "My notifications", or an administrator can run `node src/cli.mjs user setting deploy.report_every off`.
+- **The daemon's `--digest-every` is ignored:** if your scheduled task or systemd unit still passes it, the daemon prints a note at startup and runs normally; you can remove it from the arguments.
+- **Some items no longer close by default:** structural conflicts, plan approvals, sign-offs, limit increases, network approvals, disagreements, security approvals and system-stuck items never have a default answer; when they time out they are escalated and then wait for a person. This also applies to such items still open at upgrade: the migration removes their stored default answer and raises level Ⅰ to level Ⅱ. On the other hand, questions asked during planning now have time limits (they used to wait indefinitely) and are escalated or settled by default according to their level once the limit passes.
+- **New decision type "Security approval":** it is used when a hook asks for confirmation, an MCP tool needs approval or an approval gate is hit. Existing routing tables without a row for it send it to whoever handles "system stuck" (or else structural conflicts). To route it elsewhere, add a row under Project settings → Decision routing; the built-in templates already have one.
+- **The executor's input gains a repository map:** up to 2048 tokens at the start of each step, so spending rises slightly. To turn it off: `node src/cli.mjs user setting deploy.repo_map_tokens 0`.
+- **The GitHub App needs a few more read permissions:** watching PR CI needs read access to Checks, Commit statuses and Actions; GitHub issue intake needs read access to Issues. Add them in the App settings, then accept the new permissions on the organization's installation page. Without them, PR status and comments are still watched and the CI column says which permission is missing. PRs opened before the upgrade are not watched; only PRs opened afterwards are.
+- **Delivering from the CLI authorizes AI follow-up by default:** for PRs opened with `deliver … --pr`, the AI fixes failed CI and pushes back to the same PR (at most 2 rounds). Add `--autofix off` if you do not want this; the board asks separately when you deliver.
+- **Who can pause a task has changed:** people who took part in a task (an item was sent to them, or they answered one) can also pause it; the owner or whoever paused it can resume; only the owner can abort.
+- **Pushes carry item links:** when started with the `start` scripts or `web --daemon`, links use the board's own address (in local mode this is `127.0.0.1`, reachable only through an SSH tunnel). If the daemon runs on its own, or links should use a different address, set the dashboard address under Settings → Connections (`deploy.board_url`); note that this address is also written into provenance links in commits and PRs.
+- **New optional configuration:** the email channel and reply by email (`SMTP_URL`, `MAIL_FROM`, `MAIL_TO`, `IMAP_URL`, `MAIL_REPLY_TO` in `.env`; see `.env.example`); deployment-level skills, hooks and MCP configuration (`.superintern/skills/`, `.superintern/hooks.json`, `.superintern/mcp.json`); and the new deployment settings described in the sections above. Everything works without them.
+
 ## Everyday commands
 
 ```bash
 node src/cli.mjs digest                 # my to-dos: who answers, who is pending, deadlines
 node src/cli.mjs questions              # open questions
 node src/cli.mjs answer <qid> "..."     # answer a question
-node src/cli.mjs say <task> "..."       # correction / new instruction / extra information
+node src/cli.mjs say <task> "..."       # correction / new instruction / extra information; --urgent interrupts the running step
 node src/cli.mjs signoff <task> --accept | --reject "reason"
 node src/cli.mjs replay <task>          # reconstruct from the audit log and state database only
 node src/cli.mjs sandbox --reap         # clean up leftover containers and derived images
@@ -270,4 +414,9 @@ node src/cli.mjs invariants             # runtime self-check results
 node src/cli.mjs db check               # state database integrity check; db stats shows size and slow statements
 node src/cli.mjs endpoint               # providers and key status; endpoint test <id> checks connectivity
 node src/cli.mjs catalog check          # catalog drift check; the daemon runs it every 7 days by default
+node src/cli.mjs report --since 7d      # status report: what went wrong, what was decided without you, progress, spending
+node src/cli.mjs rewind <task> <step>   # redo from a finished step: shows a preview; add --yes to apply
+node src/cli.mjs skill list             # skills; hook list / hook trust manage hooks on the host
+node src/cli.mjs mcp list --project <id>   # MCP server status; mcp check / mcp approve check and approve them
+node src/cli.mjs project issues <id>    # GitHub issue intake; project schedule <id> manages schedules
 ```

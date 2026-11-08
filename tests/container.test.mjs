@@ -17,12 +17,16 @@
 //   C5 资源限额      内存/PID/能力集实测生效
 //   C6 接口可替换    同一段调用代码换掉执行器就跑在沙箱里，签名零改动
 
-import { mkdtempSync, rmSync, writeFileSync, mkdirSync, readFileSync, symlinkSync, statSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync, mkdirSync, readFileSync, symlinkSync, statSync, readdirSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { LocalExecutor, containedPath, classifyCommand, READ_ONLY_FILES } from '../src/core/executor.mjs';
 import { ContainerExecutor, detectRuntime, listSandboxes, SANDBOX_IMAGE, hostUserArgs } from '../src/core/container.mjs';
+import { McpConnection, renderResult, parseMcpConfig, startServer } from '../src/core/mcp.mjs';
+import { I18nError } from '../src/i18n/index.mjs';
+import { fileURLToPath } from 'node:url';
+const HERE_DIR = join(fileURLToPath(import.meta.url), '..');
 
 let pass = 0, fail = 0;
 const section = (t) => console.log(`\n${'─'.repeat(72)}\n${t}\n${'─'.repeat(72)}`);
@@ -208,6 +212,33 @@ section('5. C2 写边界 —— 由内核拒，不由提示词拒');
     'try{require("node:fs").writeFileSync("./ro-probe.txt","x");console.log("WROTE")}'
     + 'catch(e){console.log("DENIED:"+e.code)}'] }, wsA, { mode: 'read-only' });
   has(roWrite.stdout, 'DENIED', '被判为只读的命令写工作区时由内核拒（EROFS）—— 分类不再是装饰');
+
+  // 策略钩子从 stdin 收 JSON（docker exec -i）。只读视图上跑，读得到 stdin、写不了工作区
+  const hook = await ctr.execute({ file: 'node', args: ['-e', 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{const j=JSON.parse(s);process.stderr.write("拦 "+j.tool_name);process.exit(2)})'] }, wsA, { mode: 'read-only', input: JSON.stringify({ tool_name: 'run_command' }) });
+  eq(hook.code, 2, '容器里的命令收得到 stdin（钩子的线上格式）：exit 2 原样回来');
+  eq(hook.stderr.trim(), '拦 run_command', '读到的是给的 JSON，stderr 原样回来');
+  const noIn = await ctr.execute({ file: 'node', args: ['-e', 'console.log(process.stdin.isTTY ? "tty" : "pipe")'] }, wsA, {});
+  eq(noIn.code, 0, '不给 input 时照旧（不加 -i）');
+
+  // MCP stdio server 在容器里起（docker exec -i 长连接），新协议走一遍；环境只给配置的
+  writeFileSync(join(wsA, 'fake-mcp.mjs'), readFileSync(join(HERE_DIR, 'fixtures', 'fake-mcp.mjs')));
+  const proc = await ctr.spawnStream({ file: 'node', args: ['fake-mcp.mjs', 'new'] }, wsA, { env: { FOO: 'in-box' } });
+  const mc = new McpConnection(proc, { name: 'box' });
+  eq((await mc.connect()).protocol, '2026-07-28', '容器里的 MCP server：连上（新协议）');
+  eq((await mc.listTools()).length, 6, '列出工具');
+  eq(JSON.parse(renderResult(await mc.callTool('env', {})).text).FOO, 'in-box', '环境变量给到了容器里的进程');
+  await mc.close();
+  eq(mc.closed, true, '关掉');
+
+  // 远程 server 的桥在容器里起（node -e 传源码，工作区不落文件）；断网的容器里连不上，报错说清两种可能、带模板回来
+  const remote = (url) => parseMcpConfig(JSON.stringify({ mcpServers: { r: { type: 'http', url } } }), { source: 'project', file: 'mcp.json' }).servers[0];
+  let be = null;
+  try { await startServer(remote('http://mcp.example.invalid/mcp'), { exec: ctr, workspace: wsA }); } catch (e) { be = e; }
+  assert(be instanceof I18nError && /地址写错了，或者没在「联网」里放行/.test(be.tpl) && be.params.host === 'mcp.example.invalid', '容器里的桥：断网时连不上，说清是没放行还是地址错', be?.message);
+  let bl = null;
+  try { await startServer(remote('http://127.0.0.1:9/mcp'), { exec: ctr, workspace: wsA }); } catch (e) { bl = e; }
+  assert(bl instanceof I18nError && /沙箱自己/.test(bl.tpl), '容器里的桥：127.0.0.1 是沙箱自己', bl?.message);
+  eq(readdirSync(wsA).filter((f) => /bridge/.test(f)).length, 0, '桥没往工作区落文件');
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

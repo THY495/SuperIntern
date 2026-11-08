@@ -7,7 +7,7 @@ import { readFileSync, appendFileSync, existsSync } from 'node:fs';
 import { PROVIDERS } from './providers.mjs';
 import { costMicroUsd, EMPTY_USAGE, addUsage, tierEntry, modelEntry, bindRoleOf, clampEffort, makerOf, TIER_BINDING, MODEL_CATALOG, VENDORS } from './canonical.mjs';
 import { headersFor } from './registry.mjs';
-import { ProviderError, ConfigError, isInfraError } from '../core/errors.mjs';
+import { ProviderError, ConfigError, isInfraError, CancelledError, isCancelled } from '../core/errors.mjs';
 import { I18nError } from '../i18n/index.mjs';
 import { withTimeout, llmTimeoutMs } from '../core/http.mjs';
 import { maybeFault } from '../core/faults.mjs';
@@ -30,10 +30,12 @@ export const isRetryableStatus = (s) => s === 429 || s === 408 || (s >= 500 && s
 const sleep = (ms) => (ms > 0 ? new Promise((r) => setTimeout(r, ms)) : Promise.resolve());
 const TIMEOUT_RETRIES = 1;
 
-async function postWithRetry({ url, headers, body, vendor, model, tier, key, hkey }, delays, health = null, rnd = Math.random, info = {}) {
+async function postWithRetry({ url, headers, body, vendor, model, tier, key, hkey, signal = null }, delays, health = null, rnd = Math.random, info = {}) {
   const fail = (msg, o) => new ProviderError(msg, { vendor, model, tier, ...o });
+  const cancelled = () => new CancelledError(signal?.reason?.message ?? signal?.reason ?? 'cancelled');
   let timeouts = 0;
   for (let attempt = 0; ; attempt++) {
+    if (signal?.aborted) throw cancelled();
     // 共享状态：熔断开着 / 有人在试探 → 不打；共享退避没到点 → 短的等，长的放手
     for (let g = health?.gate(hkey); g && !g.ok;) {
       if (g.reason === 'backoff' && g.wait <= BACKOFF.maxWaitMs) { await sleep(g.wait); g = health.gate(hkey); continue; }
@@ -42,9 +44,13 @@ async function postWithRetry({ url, headers, body, vendor, model, tier, key, hke
     }
     let res, wire;
     try {
-      res = await fetch(url, withTimeout({ method: 'POST', headers, body }, llmTimeoutMs()));
+      // 调用方的取消与单次时限合在一起：哪个先到算哪个（人中止 / 急停时当场掐断这一次）
+      const init = withTimeout({ method: 'POST', headers, body }, llmTimeoutMs());
+      if (signal) init.signal = AbortSignal.any([init.signal, signal]);
+      res = await fetch(url, init);
       wire = await res.json().catch(() => null);
     } catch (e) {
+      if (signal?.aborted) throw cancelled();   // 我们自己不要了：不算这家失败
       const timedOut = e?.name === 'TimeoutError' || e?.name === 'AbortError';
       health?.report(hkey, { ok: false, status: null, error: e.message });
       if (timedOut) timeouts++;
@@ -224,6 +230,23 @@ export class LlmClient {
       const resp = this.fake.respond ? this.fake.respond(canon) : this.fake.nextScripted();
       // 脚本里放一个 Error 就抛它 —— 离线测"厂商挂了"这条路的唯一办法。
       if (resp instanceof Error) throw resp;
+      // 假模型也可以慢慢回（回一个 promise）：离线测"调用进行中被取消"
+      if (resp && typeof resp.then === 'function') {
+        const sig = canon.signal;
+        if (sig?.aborted) throw new CancelledError(sig.reason?.message ?? sig.reason);
+        const fr = { role: canon.role, key: 'fake/fake', vendorId: 'fake', pricing: canon.fakePricing ?? this.fakePricing ?? { input: 0, output: 0 } };
+        let r;
+        try {
+          r = await (sig ? Promise.race([resp, new Promise((_, rej) => sig.addEventListener('abort', () => rej(new CancelledError(sig.reason?.message ?? sig.reason)), { once: true }))]) : resp);
+        } catch (e) {
+          // 与真调用同一口径：被取消的那一次按估算记账（_live 的 .catch）
+          if (isCancelled(e)) this._accountCancelled(canon, fr, { startedAt, durationMs: Math.round(performance.now() - t0) });
+          throw e;
+        }
+        if (r instanceof Error) throw r;
+        this._account(r, canon.tier, { ...fr, timing: { startedAt, durationMs: Math.round(performance.now() - t0), attempts: 1 } });
+        return r;
+      }
       this._account(resp, canon.tier, { role: canon.role, key: 'fake/fake', vendorId: 'fake',
         pricing: canon.fakePricing ?? this.fakePricing ?? { input: 0, output: 0 },
         timing: { startedAt, durationMs: Math.round(performance.now() - t0), attempts: 1 } });
@@ -242,7 +265,7 @@ export class LlmClient {
     }
     // live / record。主模型熔断 / 重试用尽（可重试的失败）且这一档配了备用：换备用打一次
     try { return await this._live(canon, primary); } catch (e) {
-      const fb = e instanceof ProviderError && e.retryable ? this._fallbackFor(canon, primary) : null;
+      const fb = e instanceof ProviderError && e.retryable && !canon.signal?.aborted ? this._fallbackFor(canon, primary) : null;
       if (!fb) throw e;
       this.health?.noteFallback(healthKey(primary), { from: primary.key, to: fb.key, tier: canon.tier, reason: e.blocked ?? (e.status != null ? `HTTP ${e.status}` : 'network') });
       try { return await this._live(canon, fb); } catch (e2) {
@@ -275,8 +298,13 @@ export class LlmClient {
     const info = {}, startedAt = Date.now(), t0 = performance.now();
     const wire = await postWithRetry({
       url, headers: headersFor(r.adapter, r.endpoint, r.apiKey), body: JSON.stringify(wireReq),
-      vendor: r.vendorId, model: r.model, tier: canon.tier, key: r.key, hkey: healthKey(r),
-    }, this.retryDelays, this.health, Math.random, info);
+      vendor: r.vendorId, model: r.model, tier: canon.tier, key: r.key, hkey: healthKey(r), signal: canon0.signal ?? null,
+    }, this.retryDelays, this.health, Math.random, info).catch((e) => {
+      // 被取消的那一次：厂商多半已经在算、照样计费，而我们拿不到用量 —— 按"输入照估、输出打满"的最坏情况记一笔估算，
+      // 闸门宁可多算不可少算（预占同一口径）。账本上标 estimated=1（迁移 v48），复盘与看板认得出这是估的。
+      if (isCancelled(e)) this._accountCancelled(canon, r, { startedAt, durationMs: Math.round(performance.now() - t0) });
+      throw e;
+    });
     const timing = { startedAt, durationMs: Math.round(performance.now() - t0), attempts: info.attempts ?? null };
     if (this.mode === 'record' && this.cassette) {
       appendFileSync(this.cassette, JSON.stringify(redactDeep({ key, provider: r.vendorId, adapter: r.adapter.id, model: r.model, request: wireReq, response: wire })) + '\n');   // 录制文件会被拷来拷去
@@ -338,6 +366,19 @@ export class LlmClient {
       at: Date.now(),
       ...(r.timing ? { startedAt: r.timing.startedAt, durationMs: r.timing.durationMs, attempts: r.timing.attempts } : {}),
     });
+  }
+
+  /**
+   * 被取消的那一次调用：按"输入照估（字符数 / 3.5）、输出打满（max_tokens）"记账，estimated=1。
+   * 与预占同一口径：闸门宁可多算。没有单价（网关只认回报计费、目录没兜底价）就不记 —— 那种情况下 _account 本来也拒绝按 0 入账。
+   */
+  _accountCancelled(canon, r, timing) {
+    if (!r.pricing) return;
+    const chars = JSON.stringify(canon.messages ?? []).length + JSON.stringify(canon.system ?? '').length;
+    const usage = { ...EMPTY_USAGE, inputTokens: Math.ceil(chars / 3.5), outputTokens: canon.maxTokens ?? 16000 };
+    this.ledger.push({ model: r.key, vendor: r.vendorId, tier: canon.tier, ...(r.role === 'compactor' ? { role: 'compactor' } : {}),
+      ...usage, microUsd: costMicroUsd(usage, r.pricing), billing: 'computed', estimated: true, at: Date.now(),
+      startedAt: timing.startedAt, durationMs: timing.durationMs, attempts: null });
   }
 
   /** 一次工具调用做完（runToolLoop 调）：进 toolLog，flushLedger 落 tool_calls。 */
@@ -427,7 +468,12 @@ export async function runToolLoop(client, canon, handlers, opts = {}) {
     let nextTokens = null;
     if (opts.compactor) {
       const b = await opts.compactor.beforeRequest(messages, i);
-      if (b?.messages) messages.splice(0, messages.length, ...b.messages);
+      if (b?.messages) {
+        messages.splice(0, messages.length, ...b.messages);
+        // 整理会清掉旧的工具结果（第 1 级）、或只留最近几轮（第 2 级）：中途附在工具结果上的补充信息跟着没了。
+        // 由调用方把它们收拢进首条消息（缓存这时本来就断了，改首条消息不额外花钱）
+        opts.inbox?.afterCompaction?.(messages);
+      }
       nextTokens = b?.nextTokens ?? null;
       if (b?.stop) return { resp: null, messages, trace, stopped: 'terminal_tool' };
     }
@@ -447,7 +493,12 @@ export async function runToolLoop(client, canon, handlers, opts = {}) {
     // 只看编排器看不见这一条——编排器重生，历史从不累积。
     // 执行器恰恰相反：它一次性活到底，历史就是它的全部体量。
     if (opts.rollingCache !== false) markRollingCache(messages);
-    const resp = await client.complete({ ...canon, messages });
+    let resp;
+    try { resp = await client.complete({ ...canon, messages }); } catch (e) {
+      // 人中止 / 急停把进行中的这一次掐了：与轮级闸门掐停同一种收尾
+      if (isCancelled(e)) return { resp: null, messages, trace, stopped: `aborted: ${e.reason}` };
+      throw e;
+    }
     trace.push({ iteration: i, stopReason: resp.stopReason, content: resp.content });
     opts.compactor?.observe(resp);
     opts.onStep?.(i, resp);
@@ -512,13 +563,18 @@ export async function runToolLoop(client, canon, handlers, opts = {}) {
     // 紧跟一条 user 文本消息在 Anthropic 上是可疑形状，而工具结果的正文四家都照收。
     const note = opts.iterationNote?.(i, maxIterations);
     if (note && results.length) results[results.length - 1].content += `\n\n${note}`;
-
-    messages.push({ role: 'tool_results', results });
-
     // 终结性工具（提交交接记录、提问挂起…）：调到它就该收工。没有这个钩子，
     // 上层只能靠"回一句'别再调工具了'然后祈祷模型听话"，多烧的是整轮上下文的钱，
     // 而且模型完全可能继续调下去直到 maxIterations。
-    if (opts.shouldStop?.(results)) return { resp, messages, trace, stopped: 'terminal_tool' };
+    const stop = !!opts.shouldStop?.(results);
+    // 执行中途人发来的补充信息：同样挂在最后一条工具结果末尾，下一轮请求就看得到 ——
+    // 原来要等这一步做完、下一步装配时才读，而那时它多半已经用不上了。
+    // ⚠️ 只在**还有下一轮**时取：这一轮就收工（终结性工具 / 轮次用完）时取走了，模型看不到，却会被当成读过、做完就消费掉
+    const extra = !stop && i < maxIterations - 1 ? opts.inbox?.pull?.(i) : null;
+    if (extra && results.length) results[results.length - 1].content += `\n\n${extra}`;
+
+    messages.push({ role: 'tool_results', results });
+    if (stop) return { resp, messages, trace, stopped: 'terminal_tool' };
   }
 
   return { resp: null, messages, trace, stopped: 'max_iterations' };

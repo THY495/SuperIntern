@@ -71,7 +71,7 @@ export function reopenTask(db, { taskId, userId, at = now() }) {
     let from = null; try { from = JSON.parse(last?.payload || '{}').from ?? null; } catch { /* 旧数据 */ }
     const stillOpen = db.one(`SELECT count(*) n FROM questions WHERE task_id=? AND status IN ('open','escalated')`, taskId).n > 0;
     const to = ['planning', 'suspended'].includes(from) ? from : stillOpen ? 'waiting' : 'running';
-    transition(db, 'tasks', taskId, to, { from: ['aborted'], audit: { action: 'task_reopened', actorKind: 'user', actorId: userId } });
+    transition(db, 'tasks', taskId, to, { from: ['aborted'], release: true, audit: { action: 'task_reopened', actorKind: 'user', actorId: userId } });
     // 恢复后事项重新进待办：让守护进程再通知一次。
     resetNotified(db, { taskId });
     let projectResumed = false;

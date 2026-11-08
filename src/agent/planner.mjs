@@ -24,6 +24,7 @@ import { getParam } from '../core/params.mjs';
 import { parallelText } from '../core/parallel.mjs';
 import { transition } from '../db/state.mjs';
 import { insertQuestion } from '../core/questions.mjs';
+import { timeoutFor } from '../core/timeouts.mjs';
 import { stopwatch } from '../core/clock.mjs';
 
 const RISK_TIERS = ['low', 'normal', 'high'];
@@ -409,7 +410,9 @@ function recordQuestion(db, { taskId, args, tier, attempt }) {
   // Ⅲ 级无默认动作是库层硬规则；模型给了也不传，让它以"提了个不合法的问题"暴露
   const def = args.level === 3 ? null : (args.default_action ?? null);
   db.tx(() => {
-    insertQuestion(db, { id, taskId, level: args.level, levelSource: 'classifier', text: args.text, defaultAction: def, askedAt: t });
+    // 与执行器一致：Ⅰ/Ⅱ 级从提出那一刻计时 —— 原来规划器的问题不写时限，Ⅰ 级也永远等下去
+    const ttl = timeoutFor(db, taskId, args.level);
+    insertQuestion(db, { id, taskId, level: args.level, levelSource: 'classifier', text: args.text, defaultAction: def, askedAt: t, timeoutAt: ttl ? t + ttl : null });
     routeQuestion(db, { questionId: id, ...decisionTypeOfQuestion({ kind: args.kind, text: args.text }), at: t });
     transition(db, 'tasks', taskId, 'waiting');
     audit(db, {
@@ -476,10 +479,19 @@ ${(JSON.parse(c.constraints || '[]')).map((x) => `- ${tag('constraint', x)}`).jo
  * 出处边若晚于主记录落库，中间那一刻的数据是无出处的，
  * 而下游装配随时可能读走它 —— 事后巡检不是闸门。
  */
-export function persistPlan(db, { taskId, constitutionId, nodes, rationale }) {
+export function persistPlan(db, { taskId, constitutionId, nodes, rationale, expectNodes = 0 }) {
   const t = now();
   const idOf = new Map();
   return db.tx(() => {
+    // 规划要几十秒到几分钟：期间另一个规划进程（看板守护进程拉的 + 有人手动跑了 plan）可能先落了库，
+    // 契约也可能被人改了。原来照落：两套节点并排、或者照着旧契约干活。落库前在同一个事务里核一次，不对就不落。
+    // expectNodes：开始规划时已有几个节点（plan --force 在已有方案上再规划时不为 0）
+    if (db.one(`SELECT count(*) AS n FROM nodes WHERE task_id=?`, taskId).n !== expectNodes) {
+      throw Object.assign(new I18nError('任务 {taskId} 已经有方案了（另一个规划进程先落了库）：这一份不落', { taskId }), { planRace: 'nodes_exist' });
+    }
+    if (db.one(`SELECT superseded_at FROM constitutions WHERE id=?`, constitutionId)?.superseded_at != null) {
+      throw Object.assign(new I18nError('规划期间契约改过了（{id} 已被新版本取代）：这一份方案照的是旧契约，不落；重新规划', { id: constitutionId }), { planRace: 'constitution_superseded' });
+    }
     for (const n of nodes) idOf.set(n.key, newId('n'));
 
     for (const n of nodes) {

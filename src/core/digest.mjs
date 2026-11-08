@@ -9,10 +9,11 @@
 // 有意不做（要真实积压才知道形状）：按人统计打断次数并提示、同类问题合并、模型写的摘要。
 
 import { newId, now, audit } from '../db/db.mjs';
-import { DECISION_TYPES, leadOf, dutyCalendarOf, onDutyAt, dueAfter, isValidAfter } from './routing.mjs';
+import { DECISION_TYPES, leadOf, dutyCalendarOf, onDutyAt } from './routing.mjs';
 import { channelsForUsers } from './users.mjs';
-import { notify, channelsFromEnv } from './notify.mjs';
-import { answersOf } from './answers.mjs';
+import { channelsFromEnv } from './notify.mjs';
+import { pushDirect } from './signals.mjs';
+import { answersOf, waitingOn } from './answers.mjs';
 import { signoffExceptions, stripExceptions } from './signoff-exceptions.mjs';
 import { approvalHabits, HABIT } from './approval-habits.mjs';
 import { lastCatalogCheck } from '../llm/catalog-check.mjs';
@@ -21,6 +22,7 @@ import { projectsToDeliver } from './delivery-due.mjs';
 import { expiringCredentials } from './credentials.mjs';
 import { tl, userLang, I18nError, CATALOGS } from '../i18n/index.mjs';
 import { viewerTz } from './calendar.mjs';
+import { pushStats } from './push-queue.mjs';
 import { fmtAt } from './tz.mjs';
 
 // 摘要是按人发的（0.2.0）：用这个人的界面语言 userLang(db, userId)。buildDigest 把语言放进结果（d.lang），渲染照它写。
@@ -69,7 +71,9 @@ export function buildDigest(db, { userId, at = now(), since = null, projectId = 
       answers: answersOf(db, q.id).filter((a) => ['answer', 'agree'].includes(a.stance))
         .map((a) => ({ name: nm(a.user_id), stance: a.stance, text: oneLine(a.body).slice(0, 120) })),
       // 签收事项带上各条例外的档（收件箱只露各档条数，细节在任务页的签收卡上）
-      ...(q.decision_type === 'signoff' && q.task_id ? { exceptions: signoffExceptions(db, q.task_id).map((e) => (e.appDown ? 'app_down' : e.tier)) } : {}) };
+      ...(q.decision_type === 'signoff' && q.task_id ? { exceptions: signoffExceptions(db, q.task_id).map((e) => (e.appDown ? 'app_down' : e.tier)) } : {}),
+      // 签收上写出还差谁（几个人签、谁还没签）
+      ...(q.decision_type === 'signoff' ? (() => { const w = waitingOn(db, q); return w ? { wait: { left: w.left.map(nm), need: w.need } } : {}; })() : {}) };
   };
   const waitingOnMe = [], inConflict = [], waitingOnOthers = [], informed = [], unaddressed = [];
   const leadCache = new Map();
@@ -88,7 +92,7 @@ export function buildDigest(db, { userId, at = now(), since = null, projectId = 
       continue;
     }
     if (to.includes(userId)) {
-      if (answered(userId)) waitingOnOthers.push({ ...item(q), missing: to.filter((uid) => !answered(uid)).map(nm) });
+      if (answered(userId)) { const w = waitingOn(db, q); waitingOnOthers.push({ ...item(q), missing: (w ? w.left : to.filter((uid) => !answered(uid))).map(nm), need: w?.need ?? null }); }
       else waitingOnMe.push(item(q));
     } else if (inf.includes(userId)) informed.push(item(q));
     else if (isLead && !to.length) unaddressed.push(item(q));
@@ -147,16 +151,17 @@ export function buildDigest(db, { userId, at = now(), since = null, projectId = 
   const daemonOffItem = daemonOff?.unfinished ? daemonOff : null;
   // 可能在走过场的人（管理员的总摘要才有；只是提醒，不拦任何操作。细节在设置 → 成员的「批准习惯」）
   const rubberStamps = u.role === 'lead' && projectId === null
-    ? approvalHabits(db, { at }).filter((h) => h.flagged).map((h) => ({ userId: h.userId, name: h.name, streak: h.streak, medianOpenMs: h.medianOpenMs, fastWithExceptions: h.fastWithExceptions }))
+    ? approvalHabits(db, { at }).filter((h) => h.flagged).map((h) => ({ userId: h.userId, name: h.name, streak: h.streak, medianOpenMs: h.medianOpenMs, fastWithExceptions: h.fastWithExceptions,
+      pushes7d: pushStats(db, h.userId, { since: at - 7 * 24 * 3_600_000 }).pushes }))
     : [];
-  // 停滞的项目（剩下的任务都被已中止的任务卡住；取编号最小的那个已中止任务）：等负责人三选一 —— 恢复 / 重做 / 中止项目。不是事项（没有自由文本要解析），但要进待办。
+  // 停滞的项目（剩下的任务都被已中止的任务卡住；5b 起取编号最小的那个已中止任务）：等负责人三选一 —— 恢复 / 重做 / 中止项目。不是事项（没有自由文本要解析），但要进待办。
   const stalledProjects = projectId !== null ? [] : db.all(`SELECT id, title FROM projects WHERE status='stalled' AND owner_id=? AND archived_at IS NULL ORDER BY created_at`, userId)
     .map((p) => { const cur = db.one(`SELECT id, title FROM tasks WHERE project_id=? AND project_order>0 AND merged_at IS NULL AND status='aborted' ORDER BY project_order LIMIT 1`, p.id);
       const why = (() => { try { return JSON.parse(db.one(`SELECT payload FROM audit_log WHERE action='task_aborted' AND target_id=? ORDER BY id DESC LIMIT 1`, cur?.id ?? '')?.payload || '{}').why ?? null; } catch { return null; } })();
-      // 停滞有两种：剩下的任务在等已中止的任务；或全部已合并、复盘时选了「先放着」（后一种不能套"任务「」已中止"的说法）
+      // 停滞有两种：剩下的任务在等已中止的任务；或全部已合并、复盘时选了「先放着」（后一种原来也套了"任务「」已中止"）
       return { projectId: p.id, title: p.title, kind: cur ? 'aborted_task' : 'review_shelved', taskId: cur?.id ?? null, taskTitle: cur?.title ?? null, why }; });
   // 已达成、还没交付的项目：交付是这套系统里唯一必须负责人亲自点的一步，也不是事项（没有自由文本要解析，推送不可逆、只能在页面上点）。
-  // 否则会签确认达成后负责人收件箱里什么都没有，他那一轮就结束了 —— "达成了、等你交付"必须进待办，交付了才消失。
+  // 否则三人会签确认达成后负责人收件箱里什么都没有，他那一轮就结束了 —— "达成了、等你交付"必须进待办，交付了才消失。
   const toDeliver = projectId !== null ? [] : projectsToDeliver(db, { ownerId: userId });
   // 自动挡替你开工的那几批：草案里那句"事后通知"落在这里。摘要是这个系统唯一会**主动推给人**
   // 的东西，所以"AI 自己加了任务并且已经在做"必须出现在这里，而不是只躺在审计轨里等人去翻。
@@ -271,7 +276,7 @@ export async function sendDigest(db, { userId, kind = 'manual', projectId = '', 
   if (shouldSend) {
     const lang = digest.lang ?? 'zh';
     const title = `[SuperIntern] ${kind === 'handover' ? tl(lang, '接班：') : ''}${tl(lang, '{name} 的待办 {n} 件等你', { name: digest.name, n: digest.actionable })}${digest.total > digest.actionable ? tl(lang, '，另 {n} 项', { n: digest.total - digest.actionable }) : ''}`;
-    receipts = await notify(db, { taskId: null, kind: 'digest', title, text, ref: `digest:${kind}:${userId}`, channels, fetchFn, ...(spawn ? { spawn } : {}) });
+    receipts = await pushDirect(db, 'digest.todo', { title, text, ref: `digest:${kind}:${userId}`, channels, fetchFn, spawn });
   }
   if (record) {
     db.run(`INSERT INTO digests (id,user_id,kind,project_id,items,sent,sent_at,receipts) VALUES (?,?,?,?,?,?,?,?)`,
@@ -280,27 +285,6 @@ export async function sendDigest(db, { userId, kind = 'manual', projectId = '', 
       payload: { kind, projectId, items: digest.total, actionable: digest.actionable, sent: !!shouldSend, channels: channels.map((c) => c.kind), delivered: receipts.filter((r) => r.ok).length } });
   }
   return { digest, text, sent: !!shouldSend, receipts };
-}
-
-/**
- * 定时摘要：每个负责人 / 成员，距上一次 scheduled 摘要超过 `every`（30m / 8h / 1d / 1bd）且有东西可发才发。
- * 没东西不记（下一轮再看，查询便宜）。返回发出的列表。
- */
-export async function scheduledDigests(db, { every, at = now(), ...opts } = {}) {
-  if (!isValidAfter(every)) throw new I18nError('摘要间隔写法不对：{every}（可用 30m / 8h / 1d / 1bd）', { every: `${every}` });
-  const out = [];
-  for (const u of db.all(`SELECT id FROM users WHERE role IN ('lead','member') AND disabled_at IS NULL ORDER BY created_at`)) {
-    const last = lastDigest(db, { userId: u.id, kind: 'scheduled' });
-    if (last && at < dueAfter(last.sent_at, every)) continue;
-    const r = await sendDigest(db, { userId: u.id, kind: 'scheduled', at, since: last?.sent_at ?? null, record: false, ...opts });
-    if (!r.sent) continue;
-    db.run(`INSERT INTO digests (id,user_id,kind,project_id,items,sent,sent_at,receipts) VALUES (?,?,?,?,?,?,?,?)`,
-      newId('dg'), u.id, 'scheduled', '', r.digest.total, 1, at, JSON.stringify(r.receipts));
-    audit(db, { actorKind: 'system', action: 'digest_sent', targetType: 'user', targetId: u.id,
-      payload: { kind: 'scheduled', items: r.digest.total, actionable: r.digest.actionable, sent: true, delivered: r.receipts.filter((x) => x.ok).length } });
-    out.push({ userId: u.id, items: r.digest.total, receipts: r.receipts });
-  }
-  return out;
 }
 
 /**
@@ -361,6 +345,6 @@ export async function sendHandoverNotice(db, { changes, at = now(), env = proces
   if (!channels.length) return { sent: false, receipts: [] };
   const lang = userLang(db, changes.to.id);
   const text = `${renderHandover(changes, lang)}\n\n${renderDigest(buildDigest(db, { userId: changes.to.id, at }), { at })}`;
-  const receipts = await notify(db, { taskId: null, kind: 'digest', title: `[SuperIntern] ${tl(lang, '{from} 把{scope}范围内的责任交给了你', { from: changes.from.name, scope: changes.scopeText })}`, text, ref: `handover:${changes.from.id}:${changes.to.id}`, channels, fetchFn, ...(spawn ? { spawn } : {}) });
+  const receipts = await pushDirect(db, 'handover.digest', { title: `[SuperIntern] ${tl(lang, '{from} 把{scope}范围内的责任交给了你', { from: changes.from.name, scope: changes.scopeText })}`, text, ref: `handover:${changes.from.id}:${changes.to.id}`, channels, fetchFn, spawn });
   return { sent: true, receipts };
 }

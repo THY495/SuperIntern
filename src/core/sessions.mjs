@@ -94,7 +94,7 @@ const status = (t, at) => (t.revoked_at ? 'revoked' : t.expires_at != null && t.
 export function tokensOf(db, userId, { at = now(), current = null, all = false } = {}) {
   // current：发这个请求用的那一枚（会话或长期令牌）；viaCurrent：当前会话是用它登录换来的
   const via = current ? db.one(`SELECT parent_id p FROM tokens WHERE id=?`, current)?.p ?? null : null;
-  return db.all(`SELECT id, name, kind, scope, issued_at, issued_by, expires_at, idle_ms, last_used_at, last_ip, parent_id, revoked_at FROM tokens WHERE user_id=? ORDER BY issued_at DESC`, userId)
+  return db.all(`SELECT id, name, kind, scope, issued_at, issued_by, expires_at, idle_ms, last_used_at, last_ip, parent_id, revoked_at FROM tokens WHERE user_id=? AND kind<>'mail' ORDER BY issued_at DESC`, userId)
     .map((t) => ({ ...t, status: status(t, at), current: t.id === current, viaCurrent: t.id === via }))
     .filter((t) => all || t.status === 'active');
 }
@@ -102,7 +102,7 @@ export function tokensOf(db, userId, { at = now(), current = null, all = false }
 /** 管理员看全员：所有还有效的令牌与会话，带成员名。 */
 export function activeTokens(db, { at = now() } = {}) {
   return db.all(`SELECT k.id, k.user_id, u.display_name, u.kind AS user_kind, k.name, k.kind, k.scope, k.issued_at, k.expires_at, k.idle_ms, k.last_used_at, k.last_ip, k.parent_id, k.revoked_at
-                 FROM tokens k JOIN users u ON u.id=k.user_id WHERE k.revoked_at IS NULL AND u.disabled_at IS NULL ORDER BY u.display_name, k.issued_at DESC`)
+                 FROM tokens k JOIN users u ON u.id=k.user_id WHERE k.revoked_at IS NULL AND u.disabled_at IS NULL AND k.kind<>'mail' ORDER BY u.display_name, k.issued_at DESC`)
     .map((t) => ({ ...t, status: status(t, at) })).filter((t) => t.status === 'active');
 }
 

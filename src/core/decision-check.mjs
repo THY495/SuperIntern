@@ -31,7 +31,7 @@ export const MAX_HITS = 3;
 /** 输出上限。推理 token 算在里面：原来的 800 在 Kimi 上会被推理吃光、正文为空；按量计费，上限放宽不多花钱 */
 export const MAX_TOKENS = 2000;
 
-export const ENTRY_NAMES = { task: '新任务描述', revision: '变更消息', answer: '对问题的答复' };
+export const ENTRY_NAMES = { task: '新任务描述', revision: '变更消息', answer: '对问题的答复', rules: '仓库里的项目规则文件（不是人说的话，是能往仓库提交的人写下、执行器会照着做的约定）' };
 
 const head = (s, n) => { const t = String(s ?? '').replace(/\s+/g, ' ').trim(); return t.length > n ? `${t.slice(0, n - 1)}…` : t; };
 const day = (ts) => new Date(Number(ts) || 0).toISOString().slice(0, 10);
@@ -129,7 +129,7 @@ export function routeOf(db, { decision, by }) {
 
 const nameOf = (db, id) => (id ? db.one(`SELECT display_name FROM users WHERE id=?`, id)?.display_name ?? id : tl(contentLang(db), '（系统）'));
 /** 事项正文里的入口名（按内容语言）；ENTRY_NAMES 本身给模型的提示词用，保持中文。 */
-const entryNameOf = (L, entry) => (entry === 'task' ? tl(L, '新任务描述') : entry === 'revision' ? tl(L, '变更消息') : entry === 'answer' ? tl(L, '对问题的答复') : entry);
+const entryNameOf = (L, entry) => (entry === 'task' ? tl(L, '新任务描述') : entry === 'revision' ? tl(L, '变更消息') : entry === 'answer' ? tl(L, '对问题的答复') : entry === 'rules' ? tl(L, '仓库里的项目规则文件') : entry);
 
 /**
  * 一次输入命中**一组**决定时的走法：
@@ -138,7 +138,9 @@ const entryNameOf = (L, entry) => (entry === 'task' ? tl(L, '新任务描述') :
  * 一句话推翻的条数越多。按每条一事项，一句话会变成三四条待办，每条都要人单独选一次"以新为准"。
  * 所以按**输入**归并：一句话 = 一条事项，正文里把被推翻的都列出来，一次选定、一起作废。
  */
-const groupRoute = (db, group, by) => {
+const groupRoute = (db, group, by, entry = null) => {
+  // 仓库里的规则文件没有"说话的人"可以去商量：一律交负责人 —— 改规则文件还是作废约定，都是他拍板
+  if (entry === 'rules') { const l = leadOf(db, group[0]?.decision?.task_id ?? null); return { mode: 'lead', parties: l ? [l] : [] }; }
   const modes = group.map((g) => routeOf(db, { decision: g.decision, by }));
   // 只要有一条是契约条款（或作者已停用），整组就归负责人 —— 取最严的那一档，不让一组里混两种走法。
   // mode='lead' 时也要把负责人**当成当事一方**填进 parties：`conflict` 类型的路由表第一行就是
@@ -184,12 +186,14 @@ const bodyOf = (db, { group, entry, by, mode, held = false }) => {
     ? (one ? tl(L, '你这次说的，会推翻你自己先前定下的一条决定。') : tl(L, '你这次说的，会推翻你自己先前定下的{n} 条决定。', { n }))
     : (one ? tl(L, '这次的{entry}，和一条仍然有效的旧决定对不上。', { entry: entryName }) : tl(L, '这次的{entry}，和 {n} 条仍然有效的旧决定对不上。', { entry: entryName, n }))}
 
-${tl(L, '这次说的（{who}）：{quote}', { who: `${nameOf(db, by)}${roleHint(db, by)}`, quote: quote ? `“${quote}”` : tl(L, '（见本任务的最新消息）') })}
+${entry === 'rules'
+    ? tl(L, '规则文件里写的：{quote}', { quote: quote ? `“${quote}”` : tl(L, '（见仓库里的规则文件）') })
+    : tl(L, '这次说的（{who}）：{quote}', { who: `${nameOf(db, by)}${roleHint(db, by)}`, quote: quote ? `“${quote}”` : tl(L, '（见本任务的最新消息）') })}
 
 ${one ? tl(L, '旧决定：') : tl(L, '被推翻的 {n} 条旧决定：', { n })}
 ${listed}
 
-${mode === 'self' ? '' : lead
+${entry === 'rules' ? `${tl(L, '规则文件是仓库提供的：执行器在你选定之前以旧决定为准。选 (A) 就作废旧决定、照规则文件做；选 (B) 就保留旧决定 —— 规则文件里那句还在仓库里，可以在看板「项目设置 → 项目规则」里把它改掉（改了之后不会再为这一句来问你）。')}\n` : mode === 'self' ? '' : lead
     ? `${group.some((g) => g.decision.source_kind === 'contract')
       ? tl(L, '其中有契约里的条款 —— 契约是你批准过的，改它只能由你来定。')
       : tl(L, '定下这些决定的人已经停用，所以这条交给你。')}\n`
@@ -261,7 +265,7 @@ export function raiseDecisionConflict(db, { taskId, group, entry, by, messageIds
     return { questionId: [...reusedIds][0] ?? null, mode: null, reused: true, decisionIds: [] };
   }
   for (const qid of reusedIds) linkMessages(qid);
-  const { mode, parties } = groupRoute(db, fresh, by);
+  const { mode, parties } = groupRoute(db, fresh, by, entry);
   const id = newId('q');
   insertQuestion(db, { id: id, taskId: taskId, level: 3, text: bodyOf(db, { group: fresh, entry, by, mode, held: messageIds.length > 0 }), askedAt: at });
   // 出处边指向每一条旧决定 —— 结论钩子靠它们认出"这是一条决定冲突"，并知道该作废哪几条。

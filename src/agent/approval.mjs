@@ -17,7 +17,7 @@ import { hasMark, markOf } from '../i18n/marks.mjs';
 import { tl, contentLang } from '../i18n/index.mjs';
 import { newId, now, audit } from '../db/db.mjs';
 import { getParam } from '../core/params.mjs';
-import { routeQuestion } from '../core/routing.mjs';
+import { routeQuestion, scopePathsOf, prefixesOf, scopeFilesOf } from '../core/routing.mjs';
 import { transition } from '../db/state.mjs';
 import { insertQuestion } from '../core/questions.mjs';
 
@@ -110,7 +110,21 @@ export function approvalThreadOf(db, questionId) {
   // 计划变更（修正提案）的批准：A 批准 / B 要改（重出一版）/ C 不改了 —— 与上面三台状态机同一套判读、同一份回显与会签归并
   // （原来只分批 / 驳两态，B 写了新方向也被当作"作罢"，人的话全丢）
   if (db.one(`SELECT 1 FROM revisions WHERE question_id=? AND status='proposed'`, questionId)) return { taskId, kind: 'revision', reached: false, labels: {} };
+  // 越界申请（core/scope-ask.mjs）：A 批准放进范围 / 别的都算不批（写的话交给 AI）。直接查审计，不 import 那个模块（它 import 本模块）
+  if (db.one(`SELECT 1 FROM audit_log WHERE action='scope_ask_raised' AND target_type='question' AND target_id=?`, questionId)) {
+    const paths = scopePathsOf(db, taskId);
+    const scopeNow = paths.length ? paths : [...prefixesOf(db, taskId).map((p) => (p === '*' ? p : `${p}/`)), ...scopeFilesOf(db, taskId)];
+    return { taskId, kind: 'scope', reached: false, labels: {}, scopeNow };
+  }
   return null;
+}
+
+/** 答复里像路径的词（带 / 且有扩展名或以 / 结尾）里，不在给定范围内的。 */
+function outsideScope(body, scope) {
+  if (scope.includes('*')) return [];
+  const words = [...new Set(String(body ?? '').match(/[A-Za-z0-9_.-]+(?:\/[A-Za-z0-9_.-]+)+\/?/g) ?? [])].filter((w) => /\.[A-Za-z0-9]+$|\/$/.test(w));
+  const covered = (p) => scope.some((s) => (s.endsWith('/') ? p.startsWith(s) || `${p}/` === s : p === s));
+  return words.filter((w) => !covered(w)).slice(0, 5);
 }
 
 const clip = (s, n = 40) => { const t = String(s ?? '').replace(/\s+/g, ' ').trim(); return t.length > n ? `${t.slice(0, n)}…` : t; };
@@ -120,7 +134,7 @@ const clip = (s, n = 40) => { const t = String(s ?? '').replace(/\s+/g, ' ').tri
  * 返回 { verdict, label, text }：label 是短标签（历史状态用），text 是整段说明。
  * `lang`：判读说明随事项走，按内容语言写（调用方传 contentLang(db)；默认中文）。
  */
-export function describeReading({ body, labels = {}, reached = false, tense = 'did', lang = 'zh', kind = null, side = false, sideAsks = [] }) {
+export function describeReading({ body, labels = {}, reached = false, tense = 'did', lang = 'zh', kind = null, side = false, sideAsks = [], scopeNow = null }) {
   const L = lang;
   const verdict = readVerdict(body, labels);
   const resv = reservationOf(body);
@@ -135,8 +149,17 @@ export function describeReading({ body, labels = {}, reached = false, tense = 'd
   } else if (verdict === 'approve') {
     label = reached ? tl(L, '确认达成') : tl(L, '批准');
     text = reached ? tl(L, '{head}：确认达成（A）。填了项目级验收命令的，系统先跑一遍，过了才算达成；之后可以交付。', { head })
-      : kind === 'revision' ? tl(L, '{head}：批准（A）。够数后这份计划变更生效，任务接着跑。', { head }) : tl(L, '{head}：批准（A）。这一版方案照原样生效。', { head });
+      : kind === 'revision' ? tl(L, '{head}：批准（A）。够数后这份计划变更生效，任务接着跑。', { head })
+        : kind === 'scope' ? tl(L, '{head}：批准（A）。这些路径放进任务的范围，这一步的改动不再因为越界被拒。', { head }) : tl(L, '{head}：批准（A）。这一版方案照原样生效。', { head });
     if (resv) text += '\n' + tl(L, '「{resv}」记成保留意见：不挡任何东西，只留在项目的约定清单上。', { resv: clip(resv) });
+  } else if (kind === 'scope') {
+    // 越界申请只有批 / 不批：放弃与"要改"都是不批，写了的话原样交给 AI 当做法
+    label = tl(L, '不批');
+    text = tl(L, '{head}：不批。AI 会撤掉范围外的改动，在现有范围里做{extra}；做不到会再来问。', { head, extra: verdict === 'feedback' ? tl(L, '，你写的这段话原样交给它') : '' });
+    // 写的做法里点名了范围外的文件：照做还得再申请一次（走查：人以为"另建一个测试文件"就绕开了）
+    const outside = scopeNow ? outsideScope(body, scopeNow) : [];
+    if (outside.length) text += '\n' + tl(L, '你写到的 {paths} 也不在现在的可动路径里：AI 要动它还得再申请一次。想让它直接动，就回 A；或者写清只用哪些已经在范围里的文件。', { paths: outside.join(tl(L, '、')) });
+    if (lead && verdict === 'feedback') text += '\n' + tl(L, '你以「{lead}」开头，但后面还接着写了话，系统分不清是批准还是别的，按"不批"算。只想批准：只回「A」；批准但想留一句话：先回 A，另起一行写「保留：…」。', { lead });
   } else if (verdict === 'abandon') {
     const shelve = reached || !!labels.reached;   // 达成确认 / 复盘提的任务方案：放弃 = 复盘先放着，项目停滞
     label = shelve ? tl(L, '先放着') : kind === 'revision' ? tl(L, '不要这份变更') : tl(L, '放弃');

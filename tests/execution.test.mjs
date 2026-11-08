@@ -239,7 +239,7 @@ section('6. 交接记录校验：形状之外还核实物');
     const out = validateHandoff(handoffArgs(), { ...ctx, changed: new Set(['src/llm/a.mjs', 'README.md', 'src/core/x.mjs']), scopePrefixes: ['src/llm'] });
     const hit = out.find((e) => /越界改动/.test(e));
     assert(hit && hit.includes('`README.md`') && hit.includes('`src/core/x.mjs`') && !hit.includes('src/llm/a.mjs'), `越界改动被打回并逐个点名\n         └ ${hit}`);
-    assert(/raise_question/.test(hit), '打回文案指向 raise_question（人来改 scope，agent 无权自己扩）');
+    assert(/scope_request/.test(hit) && /无权自己扩/.test(hit), '打回文案指向 scope_request（申请由人批，agent 无权自己扩）');
     eq(validateHandoff(handoffArgs(), { ...ctx, changed: new Set(['anything.txt']), scopePrefixes: [] }).some((e) => /越界改动/.test(e)), false, '抽不出前缀 = 不执法');
     eq(validateHandoff(handoffArgs(), { ...ctx, changed: new Set(['src/llmx/a.mjs']), scopePrefixes: ['src/llm'] }).some((e) => /越界改动/.test(e)), true, '前缀按目录边界匹配，src/llmx 不算 src/llm');
 
@@ -264,9 +264,7 @@ section('6. 交接记录校验：形状之外还核实物');
   bad2({ artifacts: [] }, '没有产物');
   bad2({ artifacts: [{ path: 'ghost/never-written.mjs' }] }, '声称产出了工作区里并不存在的文件');
 
-  // ↓ 这两条来自实际运行：曾有一份通过了的交接记录，第二条产物是执行器
-  //   越界建出来的空目录（下游节点的活），当时的校验
-  //   只问"存在吗"，于是它过了。
+  // 已存在的目录或未改过的文件，都不能算本步骤产物。
   mkdirSync(join(WS, 'somedir'), { recursive: true });
   bad2({ artifacts: [{ path: 'somedir', kind: 'directory' }] }, '把一个目录当产物交上来');
   bad2({ artifacts: [{ path: 'untouched.txt' }] }, '把工作区里现成的、本节点根本没动过的文件算作自己的产物');

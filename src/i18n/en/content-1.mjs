@@ -174,7 +174,6 @@ export default {
   "接班：": "Taking over: ",
   "{name} 的待办 {n} 件等你": "{n} to-do item(s) waiting for {name}",
   "，另 {n} 项": ", plus {n} more",
-  "摘要间隔写法不对：{every}（可用 30m / 8h / 1d / 1bd）": "Invalid digest interval: {every} (use 30m / 8h / 1d / 1bd)",
   "知会 {who}": "inform {who}",
   "范围：{scope}": "scope: {scope}",
   "负责人变更 · 项目 {n} 个：{list}": "Owner change · projects ({n}): {list}",

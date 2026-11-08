@@ -38,6 +38,7 @@ import { insertUserMessage } from '../db/messages.mjs';
 import { routeQuestion, advanceRoute, leadOf, requesterOf } from './routing.mjs';
 import { recordFromQuestion } from './decisions.mjs';
 import { CHOICES_MARK, choicesSide } from './choices.mjs';
+import { emitSignal } from './signals.mjs';
 // 方案会签按判读的方向归并，判读只有一份（agent/approval.mjs 只依赖 core，不成环）
 import { approvalThreadOf, readVerdict, reservationOf } from '../agent/approval.mjs';
 import { transition } from '../db/state.mjs';
@@ -59,6 +60,12 @@ export const ANSWER_GUARDS = {};
 const norm = (s) => String(s ?? '').trim().replace(/\s+/g, ' ').toLowerCase();
 const isWithdraw = (s) => /^(撤回|撤销|withdraw)/i.test(String(s ?? '').trim());
 const nameOf = (db, userId) => db.one(`SELECT display_name FROM users WHERE id=?`, userId)?.display_name ?? userId;
+const headOf = (q) => String(q.text).split('\n')[0].slice(0, 60);
+/** 别人动了你的事 —— 原来只在审计里写了 notify 名单、没有代码读它（回给答复人的话却说"已通知"）。现在真的进发件箱。 */
+function tellOthers(db, name, q, { to, title, text }) {
+  const who = [...new Set(to.filter(Boolean))];
+  if (who.length) emitSignal(db, name, { to: who, taskId: q.task_id, ref: q.id, title: `[SuperIntern] ${title}`, text: `${text}\n\n${String(q.text).slice(0, 300)}` });
+}
 
 /** 三个动作。answer / agree 计入法定人数；abstain 是"把我从收件人里去掉"，不计入。 */
 export const STANCES = { answer: '答复', agree: '附议', abstain: '弃权' };
@@ -74,12 +81,27 @@ export const writtenOf = (db, questionId) => answersOf(db, questionId).filter((a
  * @returns {{ messageId, questionId, nodeId, userId, stillOpen, resolved: boolean, pending?: {need, have}, conflictId?: string, finalBody?: string }}
  * @throws 令牌无效 / 问题不存在 / 问题已关闭 / 无权
  */
-export function recordAnswer(db, { questionId, body, stance = 'answer', agreesWith = null, plaintextToken, at = now() }) {
+export function recordAnswer(db, opts) {
+  // 整个答复在一个事务里（先拿写锁）：读事项状态与写答复之间不能让别的进程插进来。原来状态在事务外看，
+  // 另一个进程（CLI、编排器子进程里的超时扫描、worker 里的推进）恰好在中间把它了结，这边照样按"还开着"写，
+  // 已决事项再走一遍了结：答复边、审计、类型钩子（批准扩范围会把契约升两版）都来第二次。
+  // inTx(r)：跟这条答复一起落地的东西（看板勾的"同时作为修正""放行测试改动"），在同一个事务里写 ——
+  // 答复一提交任务就可能被放回 running、守护进程马上拉起执行器；原来这两样在答复之后另写，执行器先跑起来，
+  // 看不到修正（照旧计划干活）、测试改动照旧被拒回再来问。迟到的答复（只记作意见）不带这些。
+  return db.tx(() => {
+    const r = recordAnswerTx(db, opts);
+    if (opts.inTx && !r?.late) opts.inTx(r);
+    return r;
+  });
+}
+
+function recordAnswerTx(db, { questionId, body, stance = 'answer', agreesWith = null, plaintextToken, mailToken = false, at = now() }) {
   if (!STANCES[stance]) throw new I18nError('立场无效：{stance}（只能是 {list}）', { stance, list: Object.keys(STANCES).join(' / ') });
   if (stance === 'answer' && !body?.trim()) throw new I18nError('答复内容不能为空');
 
   // ① 认证。**先认证再看问题**：认证失败不该泄露"这个问题存不存在"。
-  const auth = authenticate(db, plaintextToken);
+  // mailToken：邮件答复用的答复令牌，只在那条路上认（mail-reply.mjs）
+  const auth = authenticate(db, plaintextToken, { mail: !!mailToken });
   if (!auth) {
     throw new I18nError('令牌无效或已吊销');
   }
@@ -164,6 +186,9 @@ export function recordAnswer(db, { questionId, body, stance = 'answer', agreesWi
       markResolved(db, q.id, at);
       audit(db, { actorKind: 'user', actorId: auth.user_id, action: 'answer_superseded', targetType: 'question', targetId: q.id,
         payload: { messageId: mid, previous: prev.map((a) => ({ answerId: a.id, userId: a.user_id, body: a.body.slice(0, 300) })), notify: [lead, ...prev.map((a) => a.user_id)].filter(Boolean) } });
+      tellOthers(db, 'answer.superseded', q, { to: [lead, ...prev.map((a) => a.user_id)].filter((u) => u !== auth.user_id),
+        title: tl(L, '{who} 的新答复取代了之前的：{head}', { who: nameOf(db, auth.user_id), head: headOf(q) }),
+        text: tl(L, '这条事项按"后答生效"结算，现在以 {who} 的答复为准：{body}', { who: nameOf(db, auth.user_id), body: body.slice(0, 300) }) });
       return { ...base, resolved: true, superseded: prev.length, finalBody: body, stillOpen: openCount(db, q.task_id) };
     }
 
@@ -187,6 +212,9 @@ export function recordAnswer(db, { questionId, body, stance = 'answer', agreesWi
       if (overridden.length) {
         audit(db, { actorKind: 'user', actorId: auth.user_id, action: 'answer_overridden', targetType: 'question', targetId: q.id,
           payload: { leadMessageId: mid, leadBody: body.slice(0, 300), dissent: overridden.map((a) => ({ answerId: a.id, userId: a.user_id, body: a.body.slice(0, 300) })), notify: overridden.map((a) => a.user_id) } });
+        tellOthers(db, 'answer.overridden', q, { to: overridden.map((a) => a.user_id),
+          title: tl(L, '负责人 {who} 定了结论，和你的答复不同：{head}', { who: nameOf(db, auth.user_id), head: headOf(q) }),
+          text: tl(L, '结论以负责人的答复为准：{body}\n你的答复已记为不同意见，留在事项里。', { body: body.slice(0, 300) }) });
       }
       return resolve(db, { q, messageId: win.message_id, finalBody: win.body, by: win.user_id, at, base,
         how: target ? 'lead_agreed' : overridden.length ? 'lead_override' : 'lead' });
@@ -350,18 +378,14 @@ function cosign(db, { q, written, at }) {
 }
 
 /**
- * block 策略下的结算：数人头 → 够数就看**有几个不同的立场**。
- * 从 recordAnswer 与 recordAbstain 两处调用 —— 弃权会让法定人数按剩余人数重算，
- * 重算之后很可能当场就够数了（quorum 2、一人已答、另一人弃权）。
- * 忘了在弃权路径上结算，事项就会停在"等一个永远不会来的人"上，守护模式下无人接手、无报错、无待办。
+ * 还差几票、差谁（结算与看板"在等谁签"共用，免得两处口径不一）。
+ * pending 每段：scope / need / have，left = 这一段里还没表态的人（法定人数是 N 时，其中任 need-have 个就够）。
  */
-function settleBlock(db, { q, at, base, answerId = null }) {
-  const fresh = db.one(`SELECT * FROM questions WHERE id=?`, q.id);
+export function quorumPending(db, fresh, all = answersOf(db, fresh.id)) {
   const route = fresh.route ? JSON.parse(fresh.route) : null;
   const addressed = JSON.parse(fresh.addressed_to || '[]');
   // 没有路由信息的旧事项按 quorum 1。
   const rows = route?.rows?.length ? route.rows : [{ recipients: addressed, quorum: '1' }];
-  const all = answersOf(db, q.id);
   let counted = all.filter((a) => COUNTED.includes(a.stance));
   // 计划变更（宪法层）的提出人不能独自批准自己的改动：名单里还有别人时，提出人那一票不计入人数（仍可答、仍留痕）。
   // 否则：成员发的修正要改完成定义，审批法定人数 1、提出人本人在名单里 → 一个人就能批了自己的宪法改动。
@@ -374,17 +398,42 @@ function settleBlock(db, { q, at, base, answerId = null }) {
     if (!r.recipients.length && row.recipients.length) continue;   // 这一段只有提出人自己 → 这一段不设门槛，由别的段把关
     const need = r.quorum === 'all' ? r.recipients.length : Math.min(Number(r.quorum), r.recipients.length || Number(r.quorum));
     const have = new Set(counted.filter((a) => r.recipients.includes(a.user_id) || !r.recipients.length).map((a) => a.user_id)).size;
-    if (have < need) pending.push({ scope: r.scope ?? '*', need, have });
+    if (have < need) pending.push({ scope: r.scope ?? '*', need, have, left: r.recipients.filter((u) => !counted.some((a) => a.user_id === u)) });
   }
   // 兜底：各段都只剩提出人时上面全跳过了 —— 至少要有一个别人批。
-  if (selfExcluded && !pending.length && !counted.length) pending.push({ scope: '提出人以外', need: 1, have: 0 });
+  if (selfExcluded && !pending.length && !counted.length) pending.push({ scope: '提出人以外', need: 1, have: 0, left: [] });
   // 谁提的需求谁签收：提出人在签收人里时，必须有提出人那一票 —— 负责人可以一起签，但替不了。
   // 否则：签收配成"负责人 + 提需求的人"、法定人数 1，负责人先签，就把别人提的需求替提出人签掉了。
   // 提出人自己点了"不归我"（弃权）就不在收件人里了，这条不再拦。
-  for (const u of mustSign) if (!counted.some((a) => a.user_id === u)) pending.push({ scope: '需求提出人', need: 1, have: 0, requester: u });
+  for (const u of mustSign) if (!counted.some((a) => a.user_id === u)) pending.push({ scope: '需求提出人', need: 1, have: 0, requester: u, left: [u] });
+  return { pending, counted };
+}
+
+/**
+ * 一条开着的事项还在等谁（看板"在等谁签"、收件箱"还差"）：left = 还没表态、表了态就能往前走的人；
+ * need = 还差几票；need 小于 left 人数时是"其中任几位"。since = 提出的时刻。
+ */
+export function waitingOn(db, q) {
+  const fresh = typeof q === 'string' ? db.one(`SELECT * FROM questions WHERE id=?`, q) : q;
+  if (!fresh) return null;
+  const { pending } = quorumPending(db, fresh);
+  return { left: [...new Set(pending.flatMap((p) => p.left))], need: pending.reduce((n, p) => n + Math.max(0, p.need - p.have), 0), since: fresh.asked_at };
+}
+
+/**
+ * block 策略下的结算：数人头 → 够数就看**有几个不同的立场**。
+ * 从 recordAnswer 与 recordAbstain 两处调用 —— 弃权会让法定人数按剩余人数重算，
+ * 重算之后很可能当场就够数了（quorum 2、一人已答、另一人弃权）。
+ * 忘了在弃权路径上结算，事项就会停在"等一个永远不会来的人"上，守护模式下无人接手、无报错、无待办。
+ */
+function settleBlock(db, { q, at, base, answerId = null }) {
+  const fresh = db.one(`SELECT * FROM questions WHERE id=?`, q.id);
+  const route = fresh.route ? JSON.parse(fresh.route) : null;
+  const all = answersOf(db, q.id);
+  const { pending } = quorumPending(db, fresh, all);
   if (pending.length) {
-    audit(db, { actorKind: 'system', action: 'answer_pending_quorum', targetType: 'question', targetId: q.id, payload: { pending, answerId } });
-    return { ...base, resolved: false, pending, stillOpen: openCount(db, q.task_id) };
+    audit(db, { actorKind: 'system', action: 'answer_pending_quorum', targetType: 'question', targetId: q.id, payload: { pending: pending.map(({ left, ...p }) => p), answerId } });
+    return { ...base, resolved: false, pending: pending.map(({ left, ...p }) => p), stillOpen: openCount(db, q.task_id) };
   }
   // 够数。冲突事项里"撤回"是放弃自己的立场（历史上是一句文字，现在也可以用弃权动作，见 recordAbstain）。
   const side = sideOnlyOf(route);
@@ -463,6 +512,9 @@ function recordAbstain(db, { q, auth, body, at, lead, addressed }) {
     setRecipients(db, q.id, { addressedTo: left, route: route ?? q.route });
     audit(db, { actorKind: 'user', actorId: auth.user_id, action: 'answer_abstained', targetType: 'question', targetId: q.id,
       payload: { note, left, droppedChains: dropped, notify: [lead].filter((u) => u && u !== auth.user_id) } });
+    tellOthers(db, 'answer.abstained', q, { to: [lead].filter((u) => u && u !== auth.user_id),
+      title: tl(L, '{who} 说这条不归自己答：{head}', { who: nameOf(db, auth.user_id), head: headOf(q) }),
+      text: note ? tl(L, '理由：{note}', { note: String(note).slice(0, 300) }) : tl(L, '没写理由。') });
 
     // 一个收件人都不剩：转下一行 → 挂给负责人 → 都不行就挂着（进摘要）。
     if (!left.length || (route && !route.rows.length)) {
@@ -503,6 +555,12 @@ function recordLateAnswer(db, { q, auth, body, stance: action = 'answer', at, le
     const notify = [...new Set([lead, effective?.sender_id].filter((u) => u && u !== auth.user_id))];
     audit(db, { actorKind: 'user', actorId: auth.user_id, action: differs ? 'late_dissent_noted' : 'late_agreement_noted', targetType: 'question', targetId: q.id,
       payload: { answerId: aid, messageId: mid, decisionType: q.decision_type, effective: effective?.body?.slice(0, 300) ?? null, body: body.slice(0, 300), notify } });
+    if (differs) {
+      const L = contentLang(db);
+      tellOthers(db, 'answer.late_dissent', q, { to: notify,
+        title: tl(L, '{who} 对已有结论有不同意见：{head}', { who: nameOf(db, auth.user_id), head: headOf(q) }),
+        text: tl(L, '结论没有变。{who} 的意见：{body}\n要改结论，由负责人在任务页发「修正」消息。', { who: nameOf(db, auth.user_id), body: body.slice(0, 300) }) });
+    }
     // 回给答复人本人看的一句话：用他的界面语言
     const UL = userLang(db, auth.user_id);
     const note = differs ? tl(UL, '该事项已有结论。你的不同意见已记录，并已通知负责人与答复人；如需更改结论，请由负责人走修正流程') : tl(UL, '该事项已有结论，且与你的答复一致，已记为附议');

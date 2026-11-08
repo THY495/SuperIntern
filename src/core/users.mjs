@@ -3,10 +3,13 @@
 // 令牌明文只在签发那一刻返回一次，库里只有哈希（与 ensureOwner 同一规矩）。CLI 把它写进文件不打印；看板把它显示一次。
 // 通知按人：user_channels。旁观者不收通知 —— 解析器根本不把旁观者放进收件人。
 
+import { itemLink } from './links.mjs';
 import { newId, now, audit, sha256 } from '../db/db.mjs';
 import { insertUser, updateUser, revokeTokens } from '../db/users.mjs';
 import { issueToken } from './sessions.mjs';
-import { notify, channelsFromEnv } from './notify.mjs';
+import { channelsFromEnv } from './notify.mjs';
+import { emitSignal, deliverSignals, pushDirect, channelsFor, informedTier } from './signals.mjs';
+import { enqueuePush, deliverPushes, questionUrgency, reachable } from './push-queue.mjs';
 import { responsibilitiesOf, responsibilitiesText } from './handover.mjs';
 import { DECISION_TYPES } from './routing.mjs';
 import { questionsToNotify, markNotified } from './questions.mjs';
@@ -14,9 +17,7 @@ import { projectsToDeliver } from './delivery-due.mjs';
 import { tl, contentLang, I18nError, CATALOGS, N_ } from '../i18n/index.mjs';
 
 export const ROLES = ['lead', 'member', 'observer'];
-/** user_channels.channel 的 CHECK 值 → notify.mjs 的通道种类。 */
-const CHANNEL_KIND = { ntfy: 'ntfy', lark: 'feishu', dingtalk: 'dingtalk', wecom: 'wecom' };
-const KIND_CHANNEL = { ntfy: 'ntfy', feishu: 'lark', lark: 'lark', dingtalk: 'dingtalk', wecom: 'wecom' };
+const KIND_CHANNEL = { ntfy: 'ntfy', feishu: 'lark', lark: 'lark', dingtalk: 'dingtalk', wecom: 'wecom', email: 'email' };
 
 export function addUser(db, { name, role, tags = [], byUserId }) {
   const display = String(name ?? '').trim();
@@ -36,16 +37,18 @@ export function addUser(db, { name, role, tags = [], byUserId }) {
 export function listUsers(db) {
   return db.all(`SELECT u.id, u.display_name, u.role, u.domain_tags, u.created_at, u.disabled_at,
                         (SELECT count(*) FROM user_channels c WHERE c.user_id=u.id AND c.enabled=1) AS channels,
-                        (SELECT count(*) FROM tokens t WHERE t.user_id=u.id AND t.revoked_at IS NULL) AS tokens
+                        (SELECT count(*) FROM tokens t WHERE t.user_id=u.id AND t.revoked_at IS NULL AND t.kind<>'mail') AS tokens
                  FROM users u ORDER BY (u.disabled_at IS NOT NULL), CASE u.role WHEN 'lead' THEN 0 WHEN 'member' THEN 1 ELSE 2 END, u.created_at`)
     .map((u) => ({ ...u, domain_tags: JSON.parse(u.domain_tags || '[]') }));
 }
 
 /** 通道地址可能带密钥（webhook URL）：对外只给种类与主机名，与审计同一规矩。 */
 export function channelHost(target) {
+  // 邮箱地址是个人信息：同样只给域名
+  const m = String(target ?? '').trim().match(/^[^s@<>]+@([^s@<>]+)$/); if (m) return m[1].toLowerCase();
   try { return new URL(String(target)).host || null; } catch { return null; }
 }
-const KIND_LABEL = { ntfy: 'ntfy', lark: 'feishu', dingtalk: 'dingtalk', wecom: 'wecom' };
+const KIND_LABEL = { ntfy: 'ntfy', lark: 'feishu', dingtalk: 'dingtalk', wecom: 'wecom', email: 'email' };
 
 /**
  * 成员设置页 / `user list` 用的完整视图：每人的通道（种类 + 主机名）、令牌状态、名下还没了结的责任。
@@ -54,7 +57,7 @@ const KIND_LABEL = { ntfy: 'ntfy', lark: 'feishu', dingtalk: 'dingtalk', wecom: 
 export function usersView(db) {
   return listUsers(db).map((u) => {
     const resp = responsibilitiesOf(db, u.id, { all: true });
-    const tk = db.one(`SELECT max(issued_at) AS issued_at FROM tokens WHERE user_id=? AND revoked_at IS NULL`, u.id);
+    const tk = db.one(`SELECT max(issued_at) AS issued_at FROM tokens WHERE user_id=? AND revoked_at IS NULL AND kind<>'mail'`, u.id);
     const gi = db.one(`SELECT github_login, commit_email, github_id FROM users WHERE id=?`, u.id);
     return { id: u.id, name: u.display_name, role: u.role, tags: u.domain_tags, createdAt: u.created_at, disabledAt: u.disabled_at ?? null,
       github: gi?.github_login ?? null, commitEmail: gi?.commit_email ?? null, githubBound: gi?.github_id != null,
@@ -124,7 +127,7 @@ export function reissueToken(db, { userId, byUserId }) {
 
 export function removeUserChannel(db, { userId, kind, byUserId }) {
   const ch = KIND_CHANNEL[kind];
-  if (!ch) throw new I18nError('通知通道无效：{kind}（应为 ntfy / feishu / dingtalk / wecom）', { kind });
+  if (!ch) throw new I18nError('通知通道无效：{kind}（应为 ntfy / feishu / dingtalk / wecom / email）', { kind });
   mustUser(db, userId);
   return db.tx(() => {
     const n = Number(db.run(`DELETE FROM user_channels WHERE user_id=? AND channel=?`, userId, ch).changes);
@@ -166,9 +169,10 @@ export function setGitIdentity(db, { userId, github = undefined, email = undefin
 /** 挂一条通道。同种通道覆盖（一人一种一条）。URL 里可能带密钥：审计只记种类。 */
 export function setUserChannel(db, { userId, kind, target, byUserId }) {
   const ch = KIND_CHANNEL[kind];
-  if (!ch) throw new I18nError('通知通道无效：{kind}（应为 ntfy / feishu / dingtalk / wecom）', { kind });
+  if (!ch) throw new I18nError('通知通道无效：{kind}（应为 ntfy / feishu / dingtalk / wecom / email）', { kind });
   if (!db.one(`SELECT id FROM users WHERE id=?`, userId)) throw new I18nError('成员不存在：{id}', { id: userId });
   if (!String(target ?? '').trim()) throw new I18nError('通道地址不能为空');
+  if (ch === 'email' && !/^[^s@<>]+@[^s@<>]+.[^s@<>]+$/.test(String(target).trim())) throw new I18nError('邮箱地址写法不对：{target}', { target: String(target) });
   db.tx(() => {
     db.run(`DELETE FROM user_channels WHERE user_id=? AND channel=?`, userId, ch);
     db.run(`INSERT INTO user_channels (id,user_id,channel,target,priority,enabled) VALUES (?,?,?,?,100,1)`, newId('ch'), userId, ch, String(target).trim());
@@ -176,66 +180,86 @@ export function setUserChannel(db, { userId, kind, target, byUserId }) {
   });
 }
 
-/** 若干用户的通道（notify.mjs 形状），去重。 */
-export function channelsForUsers(db, userIds) {
-  const out = []; const seen = new Set();
-  for (const uid of userIds) {
-    // 已停用的人不收通知（他可能还留在某条已答过的开放事项的收件人里）
-    for (const c of db.all(`SELECT c.channel, c.target FROM user_channels c JOIN users u ON u.id=c.user_id WHERE c.user_id=? AND c.enabled=1 AND u.disabled_at IS NULL ORDER BY c.priority`, uid)) {
-      const kind = CHANNEL_KIND[c.channel]; if (!kind) continue;
-      const k = `${kind}:${c.target}`; if (seen.has(k)) continue; seen.add(k);
-      out.push({ kind, target: c.target, userId: uid });
-    }
-  }
-  return out;
-}
+/** 若干用户的通道（notify.mjs 形状），去重。已停用的人不收。实现在 signals.mjs（推送只出自那里）。 */
+export const channelsForUsers = channelsFor;
 
 /**
- * 给还没通知过的开放事项发通知：收件人与知会人各自的通道 + 部署级通道（.env）。发过就标 notified_at。
- * 守护进程每轮调一次；没通道也标（不然每轮都重发到 .env 通道）。**不抛**。
- */
-/**
- * 已达成、还没交付的项目：给负责人发一次通知（每个项目只发一次，审计 delivery_notified 去重）。
- * 交付不是事项（按钮动作），不走 notifyPendingQuestions；不单独通知的话，达成后负责人既没待办也没通知，交付就没人点。**不抛**。
+ * 已达成、还没交付的项目：给负责人发一次通知（每有一批新合并只发一次，审计 delivery_notified 去重）。
+ * 交付不是事项（按钮动作），不走 notifyPendingQuestions；否则达成后负责人既没待办也没通知，交付就没人点。
+ * 进发件箱（信号 project.awaiting_delivery，例外管理下也通知），记信号与去重审计在同一个事务里，再当场推。**不抛**。
  */
 export async function notifyPendingDeliveries(db, { env = process.env, extraCmd = null, fetchFn = globalThis.fetch, spawn } = {}) {
-  // 每有一批新合并只通知一次：这批合并之后已经通知过的不再发
-  const due = projectsToDeliver(db).filter((p) => !db.one(`SELECT 1 FROM audit_log WHERE action='delivery_notified' AND target_id=? AND ts >= ?`, p.projectId, p.mergedMax))
-    .map((p) => ({ id: p.projectId, title: p.title, owner_id: p.ownerId, again: p.again }));
-  const sent = [];
   const L = contentLang(db);
-  for (const p of due) {
-    const channels = [...channelsForUsers(db, [p.owner_id]), ...channelsFromEnv(env, extraCmd)];
-    let receipts = [];
-    if (channels.length) {
-      receipts = await notify(db, { taskId: null, kind: 'delivery', title: `[SuperIntern] ${tl(L, '项目已达成，等你交付：{title}', { title: String(p.title).slice(0, 40) })}`,
-        text: tl(L, '项目「{title}」已确认达成，所有任务都已合进项目分支（还只在这套系统里）。\n到看板的项目页点「交付项目」，才会推到你们的代码仓库 —— 只能你亲自点，推出去收不回。', { title: p.title }), ref: `deliver:${p.id}`, channels, fetchFn, ...(spawn ? { spawn } : {}) });
-      sent.push({ projectId: p.id, to: [p.owner_id], receipts });
-    }
-    audit(db, { actorKind: 'system', action: 'delivery_notified', targetType: 'project', targetId: p.id, payload: { to: p.owner_id, channels: channels.map((c) => c.kind) } });
+  const emitted = [];
+  for (const p of projectsToDeliver(db)) {
+    const r = db.tx(() => {
+      // 每有一批新合并只通知一次：这批合并之后已经通知过的不再发（事务里重读：两个进程同时扫只记一次）
+      if (db.one(`SELECT 1 FROM audit_log WHERE action='delivery_notified' AND target_id=? AND ts >= ?`, p.projectId, p.mergedMax)) return null;
+      const s = emitSignal(db, 'project.awaiting_delivery', { to: [p.ownerId], projectId: p.projectId, ref: `deliver:${p.projectId}`,
+        title: `[SuperIntern] ${tl(L, '项目已达成，等你交付：{title}', { title: String(p.title).slice(0, 40) })}`,
+        text: tl(L, '项目「{title}」已确认达成，所有任务都已合进项目分支（还只在这套系统里）。\n到看板的项目页点「交付项目」，才会推到你们的代码仓库 —— 只能你亲自点，推出去收不回。', { title: p.title }) });
+      audit(db, { actorKind: 'system', action: 'delivery_notified', targetType: 'project', targetId: p.projectId, payload: { to: p.ownerId, signalId: s.id } });
+      return { projectId: p.projectId, signalId: s.id, queued: s.queued };
+    });
+    if (r) emitted.push(r);
   }
-  return sent;
+  if (!emitted.length) return [];
+  // 推给负责人的进推送队列（不紧急：工作时间里随汇总推）；兜底的部署级通道当场推。排进队列就算通知了
+  const sent = await deliverSignals(db, { env, extraCmd, fetchFn, spawn, ids: emitted.map((e) => e.signalId) });
+  const pushed = await deliverPushes(db, { env, extraCmd, fetchFn, spawn, ids: emitted.flatMap((e) => e.queued) });
+  return emitted.map((e) => ({ projectId: e.projectId, queued: e.queued.length, receipts: [...(sent.find((s) => s.signalId === e.signalId)?.receipts ?? []), ...pushed.filter((p) => p.refs.includes(e.signalId)).flatMap((p) => p.receipts)] }))
+    .filter((e) => e.queued || e.receipts.length);
 }
 
+/**
+ * 给开放事项的收件人与知会人推送：只推还没推过的人。第一次推给全部收件人与知会人；之后换了人（转交、超时转下一行、
+ * 全员弃权转负责人、交接），只补推新加进来的。
+ * / 先在事务里认领（把这次要推的人记进 notified_to）再推 —— 守护进程与编排器同时扫也不重推；
+ * 收件人是"决策"（要答），标题说要答；知会人是"通知"（不用答），标题写"通知："，个人可把这一类调成备案（不推）。**不抛**。
+ */
 export async function notifyPendingQuestions(db, { env = process.env, extraCmd = null, fetchFn = globalThis.fetch, spawn } = {}) {
-  // 只推还没推过的人：第一次推给全部收件人与知会人；之后换了人（转交、超时转下一行、全员弃权转负责人、交接），只补推新加进来的
-  const due = questionsToNotify(db);
   const sent = [];
   const L = contentLang(db);
-  for (const q of due) {
-    const to = q.fresh;
-    const personal = channelsForUsers(db, to);
-    // 部署级通道（.env）：第一次推照旧带上；之后只在新加的人里有没配个人通道的时才带（不然那个人就谁也通知不到）
-    const fallback = q.first || to.some((u) => !channelsForUsers(db, [u]).length);
-    const channels = [...personal, ...(fallback ? channelsFromEnv(env, extraCmd) : [])];
+  for (const q0 of questionsToNotify(db)) {
+    const claim = db.tx(() => {
+      const q = questionsToNotify(db, { id: q0.id })[0];
+      if (!q) return null;
+      markNotified(db, q.id, { to: q.all, at: now() });
+      return q;
+    });
+    if (!claim) continue;
+    const q = claim;
+    const addressed = new Set(JSON.parse(q.addressed_to || '[]'));
+    const answerers = q.fresh.filter((u) => addressed.has(u));
+    const informed = q.fresh.filter((u) => !addressed.has(u) && informedTier(db, u, q.decision_type) === 'notify');
     const lvl = ['', 'Ⅰ', 'Ⅱ', 'Ⅲ'][q.level] ?? q.level;
-    const title = `[SuperIntern] ${tl(L, '{what}：{title}', { what: q.decision_type === 'conflict' ? tl(L, '冲突事项') : q.decision_type === 'signoff' ? tl(L, '等你签收') : tl(L, '{lvl} 级问题在等你', { lvl }), title: String(q.title).slice(0, 40) })}`;
+    const head = String(q.title).slice(0, 40);
     const text = `${String(q.text).slice(0, 400)}\n\n${tl(L, '回答：node src/cli.mjs answer {id} "..."（任务 {taskId}）', { id: q.id, taskId: q.task_id })}`;
-    if (channels.length) {
-      const receipts = await notify(db, { taskId: q.task_id, kind: 'question', title, text, ref: q.id, channels, fetchFn, ...(spawn ? { spawn } : {}) });
-      sent.push({ questionId: q.id, to, receipts });
+    const out = { questionId: q.id, to: [], queued: [], receipts: [] };
+    // 推给人的进推送队列（紧急的马上推，不紧急的攒进汇总；推之前再看一次事项还开着没有）
+    const projectId = db.one(`SELECT project_id FROM tasks WHERE id=?`, q.task_id)?.project_id ?? null;
+    const at = now();
+    if (answerers.length) {
+      const title = `[SuperIntern] ${tl(L, '{what}：{title}', { what: q.decision_type === 'conflict' ? tl(L, '冲突事项') : q.decision_type === 'signoff' ? tl(L, '等你签收') : tl(L, '{lvl} 级问题在等你', { lvl }), title: head })}`;
+      const { urgent, exempt } = questionUrgency(q, { at });
+      const group = q.decision_type === 'signoff' ? `sign:${projectId ?? ''}` : 'ask';
+      db.tx(() => { for (const u of answerers) out.queued.push(enqueuePush(db, { userId: u, kind: 'question.addressed', source: 'question', sourceId: q.id, urgent, exempt, group, projectId, taskId: q.task_id, title, text, at })); });
+      out.to.push(...answerers);
     }
-    markNotified(db, q.id, { to: q.all, at: now() });
+    // 部署级通道（.env）只兜"一个都推不到"的：没有收件人（第一次推），或收件人都没有通道（没有个人通道的管理员算推得到，走 .env）
+    if ((answerers.length || q.first) && !answerers.some((u) => reachable(db, u, { env, extraCmd }))) {
+      const title = `[SuperIntern] ${tl(L, '{what}：{title}', { what: answerers.length ? tl(L, '{lvl} 级问题在等人', { lvl }) : tl(L, '没人接的事项'), title: head })}`;
+      out.receipts.push(...await pushDirect(db, 'question.addressed', { channels: channelsFromEnv(env, extraCmd), taskId: q.task_id, title, text, ref: q.id, link: itemLink(db, { questionId: q.id }), fetchFn, spawn }));
+    }
+    if (informed.length) {
+      const title = `[SuperIntern] ${tl(L, '通知：{title}（不用你答）', { title: head })}`;
+      db.tx(() => { for (const u of informed) out.queued.push(enqueuePush(db, { userId: u, kind: 'question.informed', source: 'question', sourceId: q.id, urgent: false, group: 'cc', projectId, taskId: q.task_id, title, text, at })); });
+      out.to.push(...informed);
+    }
+    if (out.queued.length || out.receipts.length) sent.push(out);
   }
+  // 当场推一轮该推的（紧急的、到了汇总间隔的）；其余的守护进程下一拍再看
+  const pushed = await deliverPushes(db, { env, extraCmd, fetchFn, spawn });
+  for (const s of sent) s.receipts.push(...pushed.filter((p) => p.refs.includes(s.questionId)).flatMap((p) => p.receipts));
   return sent;
 }

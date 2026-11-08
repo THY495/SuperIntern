@@ -18,6 +18,7 @@ import { orchestrate } from '../src/core/orchestrator.mjs';
 import { isBuildOutput, discardChanges, writeDepExcludes, workspaceStatus } from '../src/core/workspace.mjs';
 import { getParam } from '../src/core/params.mjs';
 import { recordAnswer } from '../src/core/answers.mjs';
+import { markConsumed } from '../src/core/inbox.mjs';
 import { createProject, advanceProject } from '../src/core/project.mjs';
 import { signOff, raiseSignoffQuestion } from '../src/core/deliver.mjs';
 import { HANDBACK_KEY } from '../src/core/handback.mjs';
@@ -200,6 +201,8 @@ section('6. 合并前工作区有别的没提交的改动 → 一条【合并卡
   eq(db.one(`SELECT status FROM tasks WHERE id=?`, t1).status, 'running', 'done + 已签收的任务放回 running，守护进程才会拉它');
   // AI 照做：只撤掉那个文件，提交没变 → 再次 done 时不该重新要签收
   rmSync(join(ws, 'NOTES.md'));
+  // 编排器照做时会把这条修正标成已处理；没处理的修正挡着合并（人要改它就不合）
+  markConsumed(db, { taskId: t1, ids: [res.hook.messageId], why: '编排器已照做' });
   db.run(`UPDATE tasks SET status='done' WHERE id=?`, t1);
   const s = raiseSignoffQuestion(db, { taskId: t1, head: git(ws, 'rev-parse', 'HEAD'), dir: ws });
   eq(s.alreadySigned, true, '同一个提交已经签过收 → 不再弹签收（否则白添一条事项）');

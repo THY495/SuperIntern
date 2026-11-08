@@ -201,7 +201,7 @@ section('5b. 在达成确认里回"还差东西"并写了要什么的人 = 新�
   const r = await planProject(db, { client: client([call('project_goal_reached', { reason: '都有了', unverified: [] })]), projectId: S.projectId });
   recordAnswer(db, { questionId: r.questionId, body: 'B\n还差一个：每本书显示评分标签', plaintextToken: lin.plaintext });
   answer(r.questionId, 'B 同意阿青，加上标签');
-  // 负责人那句"同意阿青"也读成"还差东西" → 名单是阿青 + 负责人；规划器按反馈把 T3 标给阿青
+  // 负责人那句"同意阿青"也读成"还差东西" → 名单是阿青 + 负责人；规划器按反馈把 T3 标给阿青（有结构化日志之后要标）
   const r2 = await planProject(db, { client: client([propose([{ ...loose('T3 标签'), requested_by: ['阿青'] }])]), projectId: S.projectId });
   eq(appendStateOf(db, S.projectId).requestedBy, lin.userId, '这一轮记在阿青名下（不是会签合并那条的署名人）');
   recordAnswer(db, { questionId: r2.questionId, body: 'A', plaintextToken: lin.plaintext });

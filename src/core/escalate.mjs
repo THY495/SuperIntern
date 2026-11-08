@@ -18,6 +18,7 @@ import { escalateNodeTier } from '../db/nodes.mjs';
 import { limitOf, priorRuntimeMs } from './limits.mjs';
 import { taskSpendMicroUsd } from './ledger.mjs';
 import { tl, contentLang, N_ } from '../i18n/index.mjs';
+import { trySignal } from './signals.mjs';
 
 export const TIER_ORDER = ['light', 'standard', 'heavy'];
 export const ESCALATE_AFTER_RETRIES = 2;
@@ -79,4 +80,7 @@ export function recordEscalation(db, { taskId, node, esc }) {
   audit(db, { actorKind: 'system', action: 'node_escalated', targetType: 'node', targetId: node.id,
     payload: { taskId, from: esc.from, to: esc.tier, retryCount: node.retry_count,
       estimateMicro: esc.estimateMicro, remainingMicro: esc.remainingMicro, pid: process.pid } });
+  const L = contentLang(db);
+  trySignal(db, 'auto.escalated', { to: ['owner'], taskId, ref: node.id, at: t, title: tl(L, '[SuperIntern] 换了更贵的模型重试：{title}', { title: node.title }),
+    text: tl(L, '这一步已经失败 {n} 次，系统按规矩从 {from} 档换到 {to} 档再试，预计再花 {usd}（在预算和时长闸门之内）。', { n: node.retry_count, from: esc.from, to: esc.tier, usd: '$' + ((esc.estimateMicro ?? 0) / 1e6).toFixed(2) }) });
 }

@@ -22,7 +22,7 @@
 // Docker 的 HTTP API / dockerode —— 后者会把实现钉死在一家。未来换微 VM
 // （Firecracker/gVisor）或托管沙箱（E2B）时换的也应该只是这个类。
 
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawn } from 'node:child_process';
 import { statSync } from 'node:fs';
 import { resolve, join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -344,7 +344,7 @@ export class ContainerExecutor extends HostFileOps {
     // 杀客户端只断了 I/O 管道，容器里那个进程照跑不误，还会带着 CPU 和内存
     // 一路影响后面每一条命令。把上限放进笼子里才是真的上限。
     const secs = Math.max(1, Math.ceil(lim.timeoutMs / 1000));
-    const argv = ['exec', '-w', cwd, this.name,
+    const argv = ['exec', ...(lim.input != null ? ['-i'] : []), '-w', cwd, this.name,
       'timeout', '--signal=KILL', String(secs), file, ...args];
 
     const r = await spawnCapped(this.cli, argv, {
@@ -356,6 +356,7 @@ export class ContainerExecutor extends HostFileOps {
       // 宿主侧只做兜底：容器内的 timeout 该在 secs 秒后动手，多给 15 秒是留给
       // docker 客户端自己卡住的情况。两层都有，因为它们失效的原因不一样。
       killAfterMs: lim.timeoutMs + 15_000,
+      input: lim.input ?? null,
     });
 
     // 命令非零退出时，先确认是不是撞上了 OOM / pids 硬边界；是就记审计 + 硬失败。
@@ -366,6 +367,23 @@ export class ContainerExecutor extends HostFileOps {
     // 宿主兜底计时器触发时 spawnCapped 已经把 timedOut 置上了，两条路合并。
     const timedOut = r.timedOut || r.code === 137 || r.code === 124;
     return { ...r, timedOut, mode, cwd };
+  }
+
+  /**
+   * 长连接的子进程（MCP stdio server），在这个容器里起：docker exec -i，三条管道交给调用方。
+   * 网络与凭据就是这个沙箱的（出口代理 + 放行表）；环境变量只给调用方给的（已滤掉像凭据的），宿主的不透传。
+   * 容器里套一层 timeout 封顶寿命：杀宿主侧的 docker exec 客户端不会杀掉容器里的进程（见 execute 的注释）。
+   */
+  async spawnStream(cmd, workspace, { env = {}, lifetimeSec = 6 * 3600 } = {}) {
+    const { file, args = [] } = cmd;
+    if (!file) throw new Error('spawnStream: cmd.file 必填');
+    if (!this.started) await this.start(workspace);
+    if (resolve(workspace) !== this.started.workspace) {
+      throw new Error(`沙箱 ${this.name} 挂的是 ${this.started.workspace}，却被要求在 ${resolve(workspace)} 上起进程`);
+    }
+    const argv = ['exec', '-i', '-w', MOUNT_RW, ...Object.entries(env).flatMap(([k, v]) => ['-e', `${k}=${v}`]), this.name,
+      'timeout', '--signal=KILL', String(lifetimeSec), file, ...args];
+    return spawn(this.cli, argv, { env: { PATH: process.env.PATH, SYSTEMROOT: process.env.SYSTEMROOT }, stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true });
   }
 
   /** 停并删。任务收尾时调；不调也不会泄漏太久 —— `cli sandbox --reap` 按 label 清。 */

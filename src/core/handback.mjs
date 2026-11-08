@@ -21,6 +21,8 @@ import { tl, contentLang } from '../i18n/index.mjs';
 import { markOf } from '../i18n/marks.mjs';
 import { transition } from '../db/state.mjs';
 import { insertQuestion } from './questions.mjs';
+import { HOOK_APPROVE } from './hooks.mjs';
+import { noteAnsweredFix } from './pr-watch.mjs';
 
 export const HANDBACK_KEY = 'task.handback';
 
@@ -36,14 +38,14 @@ export function openHandback(db, taskId, kind = null) {
   return q && ['open', 'escalated'].includes(q.status) ? h : null;
 }
 
-function raise(db, { taskId, kind, text, detail, at, extra = {} }) {
+function raise(db, { taskId, kind, text, detail, at, extra = {}, decisionType = null }) {
   const cur = openHandback(db, taskId, kind);
   if (cur) return { questionId: cur.questionId, reused: true };
   const id = newId('q');
   return db.tx(() => {
     insertQuestion(db, { id: id, taskId: taskId, level: 3, text: text, askedAt: at });
     // 验收没过是代码的事 → 结构矛盾（必含负责人）；其余是系统卡住 → 运维（负责人可以只派给管代码的人）。都禁 default，不会到期自己消失。
-    const r = routeQuestion(db, { questionId: id, decisionType: kind === 'verify_failed' ? 'structural' : 'ops', typeSource: 'hard_rule', at });
+    const r = routeQuestion(db, { questionId: id, decisionType: decisionType ?? (CODE_KINDS.has(kind) ? 'structural' : 'ops'), typeSource: 'hard_rule', at });
     setParam(db, { taskId, key: HANDBACK_KEY, value: { kind, questionId: id, at, detail, ...extra }, by: BY, governance: 'execution' });
     audit(db, { actorKind: 'system', action: 'handback_raised', targetType: 'task', targetId: taskId,
       payload: { kind, questionId: id, addressedTo: r.answerers } });
@@ -52,6 +54,46 @@ function raise(db, { taskId, kind, text, detail, at, extra = {} }) {
 }
 
 const tailOf = (s, n = 20) => String(s ?? '').trim().split('\n').slice(-n).join('\n');
+// 代码的事（必含负责人）；其余是系统卡住（运维）
+const CODE_KINDS = new Set(['verify_failed', 'ci_failed', 'project_ci_failed']);
+const DECLINE_RE = /^(不用修|不修|不用管|忽略|算了|先不管|ignore|skip|leave it)/i;
+
+/** PR 的 CI 没过、没有自动修（pr-fix.mjs）：说清为什么没自动修，失败材料附上 */
+export function raiseCiFailed(db, { taskId, intro, why, logs, url, at = now() }) {
+  const L = contentLang(db);
+  const detail = `${intro}\n${url ?? ''}\n\n${logs}`;
+  const text = `${markOf(L, 'ciFailed')}${intro}\n${url ?? ''}\n\n${tl(L, '没有自动修：{why}。', { why })}\n\n${NO_AI(L)}\n\n`
+    + `${tl(L, '怎么答：')}\n`
+    + `· ${tl(L, '让 AI 修：写一句你的判断（比如"是新加的测试写错了"），只写"按日志修"也行。你的话连同 CI 的输出一起交给 AI；修好之后系统把新提交推到同一个 PR（推的人是你）。')}\n`
+    + `· ${tl(L, '不用修（比如 CI 自己的问题、已经有人在修）：回「不用修」。这个提交上的失败就不再管，下次推了新提交再看。')}\n`
+    + `· ${HOW_TO_ABORT(L)}\n\n${logs}`;
+  return raise(db, { taskId, kind: 'ci_failed', text, detail, at });
+}
+
+/** 项目的 PR（整体交付的）CI 没过：没有一个能接着修的任务，说清怎么加任务修 */
+export function raiseProjectCiFailed(db, { projectId, intro, logs, url, at = now() }) {
+  const L = contentLang(db);
+  const host = db.one(`SELECT id FROM tasks WHERE project_id=? AND project_order=0`, projectId)?.id
+    ?? db.one(`SELECT id FROM tasks WHERE project_id=? ORDER BY COALESCE(project_order,0) DESC LIMIT 1`, projectId)?.id;
+  if (!host) return null;
+  const text = `${markOf(L, 'ciFailed')}${intro}\n${url ?? ''}\n\n${NO_AI(L)}\n\n`
+    + `${tl(L, '这是项目整体交付的 PR，这一次系统没有替你起草修复（原因见上一行）。')}\n`
+    + `${tl(L, '要修：到项目页「添加任务」，把下面的输出贴进去；新任务合并之后，到项目页再交付一次 —— 推的还是这个分支，PR 跟着更新。')}\n`
+    + `${tl(L, '不用修：回「不用修」。')}\n\n${logs}`;
+  return raise(db, { taskId: host, kind: 'project_ci_failed', text, detail: `${intro}\n${url ?? ''}`, at, extra: { projectId } });
+}
+
+/** 修好了、往 PR 推的时候没推上去（或者修完没有新提交） */
+export function raiseRedeliverFailed(db, { taskId, why, url, at = now() }) {
+  const L = contentLang(db);
+  const text = `${markOf(L, 'ciRedeliverFailed')}${tl(L, '按 CI 失败修了一轮，但新的提交没有推到 PR：{why}', { why })}\n${url ?? ''}\n\n${NO_AI(L)}\n\n`
+    + `${tl(L, '怎么答：')}\n`
+    + `· ${tl(L, '自己推：到任务页点「交付」（同一个分支，PR 跟着更新）。推完回这条「推了」。')}\n`
+    + `· ${tl(L, '还要 AI 再改：写一句要它改什么，连同上面的原因交给 AI。')}\n`
+    + `· ${HOW_TO_ABORT(L)}`;
+  return raise(db, { taskId, kind: 'ci_redeliver_failed', text, detail: why, at });
+}
+
 
 /** 任务级验收没过。 */
 export function raiseVerifyFailed(db, { taskId, verification: v, at = now() }) {
@@ -109,6 +151,37 @@ export function raiseAdvanceFailed(db, { projectId, taskId = null, error, attemp
   return raise(db, { taskId: host, kind: 'advance_failed', text, detail, at });
 }
 
+/**
+ * 合并前的策略钩子拦下了，或要人确认。拦下：答复 = 修正交给 AI（同验收没过）；改完重新签收，合并前再查一遍。
+ * 要人确认（包括"这个任务改了钩子文件"）：回「同意」放行这一版；别的答复同样当修正交给 AI。
+ */
+export function raiseMergeHookBlocked(db, { taskId, decision, lines, tampered = [], key, at = now() }) {
+  const L = contentLang(db);
+  const task = db.one(`SELECT title FROM tasks WHERE id=?`, taskId);
+  const why = tampered.length
+    ? tl(L, '这个任务改了策略钩子文件：{files}。合进去之后，以后的步骤与合并都按改过的钩子来，所以要人确认。', { files: tampered.join(tl(L, '、')) })
+    : (lines.length ? lines.map((x) => `- ${x}`).join('\n') : tl(L, '- （钩子没写理由）'));
+  const detail = decision === 'ask' ? tl(L, '合并前的策略钩子要人确认：\n{why}', { why })
+    : decision === 'failed' ? tl(L, '合并前的策略钩子自己没跑成（脚本崩了、超时、输出看不懂，或者没核准），不是检查没过：\n{why}', { why })
+    : tl(L, '合并前的策略钩子拦下了：\n{why}', { why });
+  if (decision === 'failed') {
+    // 不给"让 AI 改"这条路：AI 改不了钩子，答复转成修正只会空转
+    const text = `${markOf(L, 'mergeBlocked')}${tl(L, '任务「{title}」已经签收，但合并进项目分支之前的策略钩子没能跑起来，所以先没合并。', { title: task?.title ?? taskId })}\n\n`
+      + `${detail}\n\n${NO_AI(L)}\n\n${tl(L, '怎么答：')}\n`
+      + `· ${tl(L, '先把钩子修好：宿主上的钩子找管理员（改过要重新核准）；仓库里的钩子要发一条变更、在任务范围里点名钩子文件。修好之后回任意一句（比如「重试」），系统下一拍重新检查。')}\n`
+      + `· ${HOW_TO_ABORT(L)}`;
+    return raise(db, { taskId, kind: 'merge_hook', text, detail, at, extra: { decision, key } });
+  }
+  const text = `${markOf(L, 'mergeBlocked')}${tl(L, '任务「{title}」已经签收，但合并进项目分支之前没过策略钩子，所以先没合并。', { title: task?.title ?? taskId })}\n\n`
+    + `${detail}\n\n${NO_AI(L)}\n\n${tl(L, '怎么答：')}\n`
+    + (decision === 'ask' ? `· ${tl(L, '看过没问题：回「同意」。系统放行这一版的合并（这一版只问这一次）。')}\n` : '')
+    + `· ${tl(L, '让 AI 按钩子说的改：直接写一句要求（只写"按钩子改"也行）。上面的钩子输出会一起交给 AI；改完要你重新签收，合并前会再查一遍。')}\n`
+    + `· ${tl(L, '觉得是钩子错了：宿主上的钩子找管理员改；仓库里的钩子（.superintern/hooks.json 等）要发一条变更、在任务范围里点名钩子文件，让 AI 去改。')}\n`
+    + `· ${HOW_TO_ABORT(L)}`;
+  // 要人确认（钩子说 ask，或任务改了钩子文件）是安全审批：派给管安全的人；拦下（deny）是代码的事，照旧
+  return raise(db, { taskId, kind: 'merge_hook', text, detail, at, extra: { decision, key }, decisionType: decision === 'ask' ? 'security' : null });
+}
+
 // 改计划没成时人回"算了"= 撤回那条修正、照原计划做（中英都认）
 const DROP_RE = /^(算了|不改了|不用了|never ?mind|forget it|drop it|leave it)/i;
 
@@ -150,6 +223,26 @@ export function handbackHook(db, { question, finalBody, by, messageId, at }) {
       payload: { questionId: question.id, kind: h.kind, why: tl(L, '答复要求中止，这一步不可逆，留给人在任务页做') } });
     return { handled: false, abort: true };
   }
+  if (h.kind === 'merge_hook' && h.decision === 'ask' && HOOK_APPROVE.test(body)) {
+    // 放行这一版：记下 key（任务 + 工作区的头），下一拍推进时合并闸门认它
+    setParam(db, { taskId, key: 'hooks.merge_approved', value: h.key, by: { kind: 'user', id: by }, governance: 'constitutional' });
+    audit(db, { actorKind: 'user', actorId: by, action: 'merge_hook_approved', targetType: 'task', targetId: taskId, payload: { questionId: question.id, key: h.key } });
+    return { handled: true, approved: true, kind: h.kind };
+  }
+  if (h.kind === 'merge_hook' && h.decision === 'failed') {
+    // 同 advance_failed：不是 AI 的活。事项一答，合并闸门下一拍重新跑
+    audit(db, { actorKind: 'user', actorId: by, action: 'merge_hook_retry_requested', targetType: 'task', targetId: taskId, payload: { questionId: question.id, body: body.slice(0, 300) } });
+    return { handled: true, retry: true, kind: h.kind };
+  }
+  if ((h.kind === 'ci_failed' || h.kind === 'project_ci_failed') && DECLINE_RE.test(body)) {
+    audit(db, { actorKind: 'user', actorId: by, action: 'ci_fix_declined', targetType: 'task', targetId: taskId, payload: { questionId: question.id, kind: h.kind } });
+    return { handled: true, declined: true, kind: h.kind };
+  }
+  if (h.kind === 'project_ci_failed' || (h.kind === 'ci_redeliver_failed' && /^(推了|已推|pushed|done)/i.test(body))) {
+    // 项目那条只能人去加任务；推了那条人已经自己推了：都不转修正
+    audit(db, { actorKind: 'user', actorId: by, action: 'handback_acknowledged', targetType: 'task', targetId: taskId, payload: { questionId: question.id, kind: h.kind, body: body.slice(0, 300) } });
+    return { handled: true, acknowledged: true, kind: h.kind };
+  }
   if (h.kind === 'advance_failed') {
     // 不转修正：这不是 AI 的活。守护进程看到这条事项答了就清掉退避、立刻再试（daemon.advanceProjects）。
     audit(db, { actorKind: 'user', actorId: by, action: 'advance_retry_requested', targetType: 'task', targetId: taskId,
@@ -168,12 +261,14 @@ export function handbackHook(db, { question, finalBody, by, messageId, at }) {
       return { handled: true, dropped: true, kind: h.kind };
     }
   }
-  const mark = markOf(L, { dirty_workspace: 'mergeBlocked', replan_failed: 'replanFailed' }[h.kind] ?? 'verifyFailed');
+  const mark = markOf(L, { dirty_workspace: 'mergeBlocked', merge_hook: 'mergeBlocked', replan_failed: 'replanFailed', ci_failed: 'ciFailed', ci_redeliver_failed: 'ciRedeliverFailed' }[h.kind] ?? 'verifyFailed');
   const tok = messageId ? db.one(`SELECT token_id FROM messages WHERE id=?`, messageId)?.token_id ?? null : null;
   const mid = newId('m');
   const reason = `${mark}${body || tl(L, '（没有补充）')}\n\n${tl(L, '—— 系统附（不由模型生成）——')}\n${h.detail ?? ''}`;
   insertUserMessage(db, { id: mid, taskId, senderId: by, tokenId: tok, body: reason, kind: 'correction', urgency: 'urgent', receivedAt: at });
   if (messageId) insertEdge(db, mid, messageId, 'derived_from', at);
+  // CI 没过那两条：这一轮由答复人授权，修好之后系统照样把新提交推回 PR（推的人是他）
+  if (h.kind === 'ci_failed' || h.kind === 'ci_redeliver_failed') noteAnsweredFix(db, { taskId, by, tokenId: tok, messageId: mid, at });
   // 合并卡住的那一档任务是 done + 已签收：放回 running，否则守护进程不拉它，这条修正就没人处理。
   if (db.one(`SELECT status FROM tasks WHERE id=?`, taskId)?.status === 'done') {
     transition(db, 'tasks', taskId, 'running');

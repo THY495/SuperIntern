@@ -180,7 +180,7 @@ section('⑤ 截图说明接了后端却没写 seed → 补一步放样例数据
   const rej = db.all(`SELECT a.payload FROM audit_log a JOIN nodes n ON n.id=a.target_id WHERE a.action='handoff_rejected' AND n.task_id=?`, e.tid);
   eq(rej.length, 3, '只拒了三次，没有重交到上限');
   const q = db.one(`SELECT level, text, default_action FROM questions WHERE task_id=?`, e.tid);
-  assert(q && /连续 3 次交了同样的改动/.test(q.text) && q.level === 2 && q.default_action, '问题是系统代填的：说清重交不会改判、给出默认动作');
+  assert(q && /连续 3 次交了同样的改动/.test(q.text) && q.level === 2 && q.default_action === null, '问题是系统代填的：说清重交不会改判；结构矛盾不带默认（不会到期替人撤销改动）');
   const narr = db.one(`SELECT 1 FROM audit_log a JOIN nodes n ON n.id=a.target_id WHERE a.action='question_raised' AND n.task_id=?`, e.tid);
   assert(narr, '照常记 question_raised（复工简报照留）');
 

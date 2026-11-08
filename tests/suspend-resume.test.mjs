@@ -436,7 +436,8 @@ section('8. 硬要求：进程**真的**退出，恢复发生在**新进程**里
   const home = join(TMP, 'home8');
   const dbPath = join(home, 'state.db');
   const ws = makeWorkspace('ws8');
-  const env = { ...process.env, SUPERINTERN_HOME: home };
+  // 不读仓库的 .env：子进程挂起时会按 .env 里的通知通道真发通知
+  const env = { ...process.env, SUPERINTERN_HOME: home, SUPERINTERN_ENV_FILE: 'none' };
   // ⚠️ `--no-sandbox` 在这里是**显式**的，不是默认捡来的。`run` 默认
   // 起容器沙箱；这一节验的是编排器重生（两个进程、两次寿命），不是沙箱，
   // 而且离线回归不该要求装了 Docker 才能跑。例外写在调用点上才看得见 ——

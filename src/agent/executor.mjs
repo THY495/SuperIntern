@@ -17,18 +17,28 @@ import { runToolLoop } from '../llm/client.mjs';
 import { textOf } from '../llm/canonical.mjs';
 import { newId, now, audit, insertEdge } from '../db/db.mjs';
 import { insertDecision } from '../db/constitutions.mjs';
-import { assembleExecutor } from '../context/assemble.mjs';
+import { assembleExecutor, midRunInbox } from '../context/assemble.mjs';
 import { makeCompactor, fixedEstimate, OUTPUTS_DIR } from '../context/compact.mjs';
 import { compactThresholdOf } from '../core/limits.mjs';
 import { LocalExecutor, classifyCommand } from '../core/executor.mjs';
 import { raiseEgressQuestion, sourceOf, hostProblem } from '../core/egress.mjs';
-import { changedSince, nodeBaseline, clearNodeBaseline, isBuildOutput } from '../core/workspace.mjs';
+import { changedSince, nodeBaseline, clearNodeBaseline, isBuildOutput, parkInflight, restoreInflight, parkedRef } from '../core/workspace.mjs';
+import { pendingMessages } from '../core/inbox.mjs';
+import { loadRules, rulesForPath, renderLateRules, isRuleFile, RULES_MAX_BYTES, ruleDirsFor } from '../core/project-rules.mjs';
+import { discoverSkills, renderCatalog, activateTool, activateSkill, PIN_TOTAL } from '../core/skills.mjs';
+import { buildRepoMap } from '../core/repomap.mjs';
+import { makeHookSession, HOOKED_TOOLS, toolInputFor, isHookPath, reasonLines, HOOK_APPROVE } from '../core/hooks.mjs';
+import { makeMcpSession, OUTPUT_INLINE_MAX } from '../core/mcp.mjs';
+import { createHash } from 'node:crypto';
+import { randomBytes } from 'node:crypto';
 import { isInfraError } from '../core/errors.mjs';
 import { timeoutFor } from '../core/timeouts.mjs';
 import { coveredBy, lockedPathsFor, grantedSharedFor } from '../core/parallel.mjs';
+import { checkScopeRequest, scopeAskText, SCOPE_ASK_RAISED } from '../core/scope-ask.mjs';
 import { grepFiles, RegexTimeoutError, GREP_TIMEOUT_MS } from '../core/safe-grep.mjs';
 import { transition } from '../db/state.mjs';
 import { insertQuestion } from '../core/questions.mjs';
+import { gatesOf, gateHit } from '../core/approval-gates.mjs';
 import { nodeDiagnosis, describeDiagnosis, listDefects, roundsOf } from '../core/diagnose.mjs';
 import { testChanges, describeTestChanges, describeFinding, testsAllowedFor } from '../core/test-guard.mjs';
 import { baseHeadOf } from '../core/workspace.mjs';
@@ -109,6 +119,14 @@ export const TOOLS = [
       known_issues: { type: 'array', items: { type: 'string' } },
       downstream_notes: { type: 'string' },
       acceptance_evidence: { type: 'string', description: '验收标准成立的机械证据：跑了什么命令、退出码多少、输出关键行' },
+      scope_request: { type: 'object',
+        description: '只在交接被判"越界改动"、而这些文件确实必须由这一步来改时填：申请把它们放进本任务的范围。'
+          + '系统把申请转成一条批准事项给负责人，这一步挂起；批准后范围放宽，你原样重交就过；不批就撤掉这些改动、按答复在现有范围里做。'
+          + '能在现有范围里做的就别申请。',
+        properties: {
+          paths: { type: 'array', items: { type: 'string' }, description: '要放进范围的路径：文件写全名，目录以 / 结尾。必须盖住每一处越界改动；只列确实要动的，别写 *' },
+          why: { type: 'string', description: '给批准的人看：为什么这一步必须动这些文件，不动会怎样，为什么不能在现有范围里做' } },
+        required: ['paths', 'why'] },
     }, required: ['artifacts', 'interface_contract', 'acceptance_evidence'] } },
   { name: 'raise_question',
     description: '节点做不下去时调用：规格自相矛盾、需要人拍板的取舍、缺少你无权决定的信息。'
@@ -120,8 +138,9 @@ export const TOOLS = [
       level: { type: 'integer', enum: [1, 2, 3],
         description: 'Ⅰ=有明确默认动作；Ⅱ=可回退的选择，需人拍板；Ⅲ=不可逆或对外承诺，无默认、无限期等待' },
       text: { type: 'string', description: '问题本身，要让没有上下文的人也能回答。'
-        + '**不要把"授权我改 scope / 改契约"写成一个答复就能落实的选项**：答复不是契约，scope 只能由人发一条计划变更来改；'
+        + '**不要把"授权我改 scope / 改契约"写成一个答复就能落实的选项**：答复不是契约；'
         + '照一句授权去动范围外的文件，交接时会被机械校验判越界并撤销，于是又回到这条问题上。'
+        + '只是要动范围外的文件：改好之后在 submit_handoff 里填 scope_request 申请，不要用这里问；行为规则、验收标准要改，才是人发计划变更的事。'
         + '要给的是：现有范围内可行的出路，以及（若确实只能改契约）说明要改哪一条、改成什么。' },
       default_action: { type: 'string', description: '仅 Ⅰ/Ⅱ 级填' },
       blocked_by: { type: 'string', description: '被规格/验收标准里的哪一条卡住，原文引用' },
@@ -305,9 +324,18 @@ export function validateHandoffDetailed(args, { exec, workspace, changed, scopeP
     const inScope = (p) => alwaysInScope(p) || (scopePrefixes ?? []).some((s) => p === s || p.startsWith(`${s}/`)) || scopeFiles.includes(p);   // 范围里点名的文件（package.json 之类）
     const out = [...changed].filter((p) => !inScope(p)).sort();
     if (out.length) {
-      add('scope', out, tl(L, '越界改动：{paths} 不在宪法块 scope 划定的范围（{scope}）里 —— 撤销这些改动；确实必须动它们的话用 raise_question 说明，由人改 scope，你无权自己扩',
+      add('scope', out, tl(L, '越界改动：{paths} 不在宪法块 scope 划定的范围（{scope}）里 —— 撤销这些改动；确实必须由这一步动它们的话，在 submit_handoff 里填 scope_request（要放进范围的路径 + 为什么），系统转给负责人批准。你无权自己扩',
         { paths: list(out), scope: [...(scopePrefixes ?? []).map((x) => `${x}/`), ...scopeFiles].join(tl(L, '、')) }));
     }
+  }
+  // 项目规则文件由人维护：执行器改了就打回 —— 除非契约的结构化范围点名了这个文件（"本任务就是改 AGENTS.md"）。
+  // 排在范围校验之外单列：规则文件常在根目录，范围是 "*" 或抽不出目录时上面那条不执法，这条照样管
+  if (changed) {
+    const hit = [...changed].filter((p) => isRuleFile(p) && !scopeFiles.includes(p)).sort();
+    if (hit.length) add('rules', hit, tl(L, '改了项目规则文件：{paths}。规则文件由人维护，执行器不能改 —— 撤销这些改动（git checkout -- <文件>；新建的直接删掉）。觉得哪条规则该改，写进交接记录的 known_issues', { paths: list(hit) }));
+    // 策略钩子的配置与脚本同理：执行器改了它们，就能改掉管自己的规矩
+    const hooks = [...changed].filter((p) => isHookPath(p) && !scopeFiles.includes(p)).sort();
+    if (hooks.length) add('rules', hooks, tl(L, '改了策略钩子文件：{paths}。钩子由人维护，执行器不能改 —— 撤销这些改动（git checkout -- <文件>；新建的直接删掉）。觉得哪个钩子拦错了，写进交接记录的 known_issues', { paths: list(hooks) }));
   }
   const arts = args?.artifacts;
   if (!Array.isArray(arts) || !arts.length) add('artifact', ['artifacts'], tl(L, 'artifacts 为空 —— 没有产物的节点不算完成'));
@@ -363,31 +391,8 @@ const hasCitation = (s = '') => s.length >= 10
 
 /**
  * 假设的认识论校验。
- *
- * 实测：5 次执行，提问 0 次、假设 21 条。人工标注后，21 条里只有 4 条
- * 真的是"我替人做了个决定"；**13 条本来就该去查证**（其中两条 agent 已经知道
- * 答案，却写成了假设）。假设表被当成备注栏用，而提问机制因为有这个免费出口
- * 从未被触发——不是模型偷懒，是激励设反了。
- *
- * 所以这里只做一件事：**把"查得了"和"查不了"分开**。
- * 后果分级（Ⅰ/Ⅱ/Ⅲ 该不该阻塞）是另一个轴，由超时链与计划变更的花费口径决定，
- * 不在本函数内——两个轴压成一个，就会判错。
- *
- * ⚠️ 曾经在这里犯过同一个错，只是换了个方向：它把 `verified_against='none'`
- * 硬拒并强制路由去 raise_question —— 那等于说"凡是查不了的都得问人"，不看后果，
- * 又一次把两个轴压成一个。实测下来的后果是：
- * 模型**没有照做**，而是给不可查证的选择换了个标签绕过去
- * （拿"测试没覆盖 + 全绿"当 `command` 凭据）。那条规则实际从未生效过，
- * 只制造了标签噪声，还让"交接被拒 0 次"被误读成合规。
- *
- * 现在的做法：`settled_by_me` 是一个**准确又不挨罚**的格子，绕行没有动机了。
- * 它不阻塞，靠 classifyAssumption 强制披露 —— 同一份实测还显示，披露通道
- * 接住了阻塞闸漏掉的每一条。**软信号走披露通道，硬规则才走阻塞通道**，
- * 而"这是个选择"是软信号。
- *
- * 这里**故意不加**"有 settled_by_me 就必须写 key_decisions"这类联动校验：
- * 那种规则填一条空话就能满足，属于同一类可被轻易满足的假护栏 —— 它带来的
- * 不是约束，是"已经拦过了"的错觉。
+ * 将可查证的事实和不可查证的选择分开。是否阻塞取决于后果，由其它规则判断。
+ * 自主选择由 classifyAssumption 要求披露，不因不可查证而一律阻塞。
  */
 export function validateAssumptions(list) {
   const errs = [];
@@ -555,8 +560,11 @@ function impossibleNote(args, L) {
 function recordQuestion(db, { taskId, nodeId, args, narrativeRef, contextTokens }) {
   const id = newId('q');
   const t = now();
-  const def = args.level === 3 ? null : (args.default_action ?? null);
-  const kind = decisionTypeOfQuestion({ kind: args.kind, text: args.text });
+  let def = args.level === 3 ? null : (args.default_action ?? null);
+  // 越界申请（kind=scope，只由系统写）：动的是契约，按方案批准类派人；路由按申请的路径挑行
+  // 安全审批（kind=security，只由系统写：审批门禁、钩子要确认、MCP 工具要批准）：派给管安全的人，不许带默认（routeQuestion 清掉）
+  const kind = args.kind === 'scope' ? { decisionType: 'contract_approval', typeSource: 'hard_rule' }
+    : args.kind === 'security' ? { decisionType: 'security', typeSource: 'hard_rule' } : decisionTypeOfQuestion({ kind: args.kind, text: args.text });
   if (args.kind === 'impossible') args = { ...args, text: `${args.text}${impossibleNote(args, contentLang(db))}` };
   if (kind.decisionType === 'structural') args = { ...args, text: `${args.text}${SCOPE_NOTE(contentLang(db))}` };
   // 超时链：Ⅰ/Ⅱ 级从提出那一刻起计时；Ⅲ 级 NULL（库层 CHECK 也不许它有）。
@@ -566,12 +574,13 @@ function recordQuestion(db, { taskId, nodeId, args, narrativeRef, contextTokens 
     insertQuestion(db, { id, taskId, nodeId, level: args.level, levelSource: 'classifier', text: args.text, defaultAction: def, askedAt: t, timeoutAt: ttl ? t + ttl : null });
     insertEdge(db, id, nodeId, 'about_node', t);
     // 路由：模型自报 kind 决定决策类型（structural 一律采信）；没报的按正文硬规则单向兜底，否则规格取舍。收件人在此刻解析并写回。
-    routeQuestion(db, { questionId: id, ...kind, at: t });
+    routeQuestion(db, { questionId: id, ...kind, ...(args.kind === 'scope' ? { prefixes: args.scopePaths } : {}), at: t });
 
     bid = recordBriefing(db, { taskId, nodeId, questionId: id, args, narrativeRef, contextTokens });
 
     transition(db, 'nodes', nodeId, 'blocked');
     transition(db, 'tasks', taskId, 'waiting');
+    def = db.one(`SELECT default_action FROM questions WHERE id=?`, id).default_action;   // 路由按类型可能清掉了默认
     audit(db, { actorKind: 'agent', actorId: 'executor', action: 'question_raised',
       targetType: 'node', targetId: nodeId,
       payload: { questionId: id, briefingId: bid, level: args.level,
@@ -612,14 +621,14 @@ function recordBriefing(db, { taskId, nodeId, questionId, args, narrativeRef, co
 export async function executeNode(db, {
   client, taskId, nodeId, workspace, tier, vendorId, narrativeDir,
   exec = new LocalExecutor(), maxIterations = 20, onStep, abort,
+  // 人中止 / 管理员急停时由编排器掐断，进行中的那一次模型调用当场取消（见 llm/client.mjs postWithRetry）
+  signal = null,
   // 独立验收员：({args, changed}) => {verdict, reasons}。null = 不验（离线测试默认；
   // CLI 默认开）。放在这里而不是在里面 new 一个 client，是为了让 executeNode 对
   // "验收员用哪家模型、账记在哪"一无所知 —— 那是编排器的事。
   verifier = null,
 }) {
   const node = db.one(`SELECT * FROM nodes WHERE id=?`, nodeId);
-  const asm = assembleExecutor(db, { taskId, nodeId, tier, vendorId, maxIterations });
-  transition(db, 'nodes', nodeId, 'running', { set: { started_at: now() } });
   // 本节点的产物基线：开跑这一刻的 HEAD。非 git 工作区（离线测试）时为 null，
   // 校验退化为只查"存在且不是目录"。
   // ⚠️ 基线**落库**（nodeBaseline）：复工/重试是新进程，但不是新的一段工作 ——
@@ -628,6 +637,56 @@ export async function executeNode(db, {
   // 是不是 git 工作区，看的是目录本身，不是"基线取没取到"：取不到基线正是要拒收的情形之一（见 submit_handoff）。
   const gitWorkspace = existsSync(join(workspace, '.git'));
   try { baseRef = nodeBaseline(db, { taskId, nodeId, workspace }).base; } catch (e) { baseErr = e; /* 非 git 工作区：正常 */ }
+  // 上一次被打断时收起的在途工作：基线取过之后放回 —— 放回的改动算这一段的产物。装配要说清放回了没有，所以排在装配之前
+  const inflight = gitWorkspace ? restoreInflight(db, { taskId, nodeId, workspace }) : null;
+  const inboxMark = randomBytes(4).toString('hex');
+  // 仓库自带的项目规则：根 + 这一步范围里每个目录的祖先链。范围是全仓库（*）或抽不出目录时只有根那一份
+  const rules = loadRules(workspace, ruleDirsFor(db, taskId));
+  // 可以取用的 skill：部署 / 项目 / 仓库三层，停用的与被同名顶掉的不给。清单按这一步的文字排相关度；名字出现在里面的算点名
+  const goal = db.one(`SELECT goal FROM constitutions WHERE task_id=? AND superseded_at IS NULL ORDER BY version DESC LIMIT 1`, taskId)?.goal ?? '';
+  const focusText = `${goal}\n${node?.title ?? ''}\n${node?.spec ?? ''}\n${node?.acceptance ?? ''}`;
+  let skillList = [], catalog = null;
+  try {
+    skillList = discoverSkills(db, { projectId: db.one(`SELECT project_id FROM tasks WHERE id=?`, taskId)?.project_id ?? null, workspace });
+    catalog = renderCatalog(skillList, { focus: focusText });
+  } catch (e) { audit(db, { actorKind: 'system', action: 'skills_unavailable', targetType: 'node', targetId: nodeId, payload: { error: String(e.message).slice(0, 300) } }); }
+  // 仓库地图：文件 → 定义的符号，按这一步的范围与文字排序，截到 deploy.repo_map_tokens（0 = 不给）。
+  // 只给 git 工作区（文件清单取自 git ls-files）；按 blob 缓存在工作区自己的 .git 里，删工作区就跟着没了。抽不出来只记审计，这一步照常做
+  let repoMap = null;
+  try {
+    const budget = getSetting(db, 'deploy.repo_map_tokens');
+    if (budget > 0 && gitWorkspace) {
+      const t0 = Date.now();
+      const m = buildRepoMap({ root: workspace, scopePaths: scopePathsOf(db, taskId).filter((p) => p !== '*'), mention: focusText, budgetTokens: budget,
+        cacheDir: existsSync(join(workspace, '.git', 'HEAD')) ? join(workspace, '.git', 'superintern', 'repomap') : null });
+      if (m.text) repoMap = { ...m, budget, ms: Date.now() - t0 };
+    }
+  } catch (e) { audit(db, { actorKind: 'system', action: 'repo_map_unavailable', targetType: 'node', targetId: nodeId, payload: { error: String(e.message).slice(0, 300) } }); }
+  let tools = catalog?.names?.length ? [...TOOLS, activateTool(catalog.names)] : TOOLS;
+  const asm = assembleExecutor(db, { taskId, nodeId, tier, vendorId, maxIterations, inflight, inboxMark, rules, skills: catalog?.text ? catalog : null, repoMap });
+  transition(db, 'nodes', nodeId, 'running', { set: { started_at: now() } });
+  // 这一步读进了哪几条补充信息：装配时的收件箱 + 执行中途附进来的。编排器在这一步做完后只消费这些 ——
+  // 原来消费的是"做完那一刻所有未读的补充"，装配之后才到的那几条执行器根本没见过，也被标成读过了
+  const seen = new Set(asm.meta.inboxIds ?? []);
+  const injected = [];
+  const inbox = {
+    pull: () => {
+      const fresh = pendingMessages(db, taskId).filter((m) => m.kind === 'context' && !seen.has(m.id));
+      if (!fresh.length) return null;
+      for (const m of fresh) { seen.add(m.id); injected.push(m); }
+      audit(db, { actorKind: 'system', action: 'context_injected', targetType: 'node', targetId: nodeId, payload: { ids: fresh.map((m) => m.id) } });
+      return midRunInbox(fresh, inboxMark);
+    },
+    afterCompaction: (messages) => {
+      if (!Array.isArray(messages[0]?.content)) return;
+      if (injected.length) {
+        messages[0] = { ...messages[0], content: [...messages[0].content.filter((b) => !b.inboxFold),
+          { type: 'text', text: midRunInbox(injected, inboxMark, { folded: true }), inboxFold: true }] };
+      }
+      const pin = pinnedText(messages);
+      messages[0] = { ...messages[0], content: [...messages[0].content.filter((b) => !b.pinFold), ...(pin ? [{ type: 'text', text: pin, pinFold: true }] : [])] };
+    },
+  };
   // scope 机械执法用的前缀：与路由表的"触及范围"同一份抽取（routing.prefixesOfScope）。
   const scopePrefixes = prefixesOf(db, taskId);
   const scopeFiles = scopeFilesOf(db, taskId);
@@ -638,11 +697,105 @@ export async function executeNode(db, {
 
   const trace = [];
   const handlers = makeHandlers(exec, workspace, trace);
+  // 范围之外的子目录有自己的规则文件：执行器读 / 写 / 列到那里时附在工具结果后面（照 Claude Code 的按需加载），每份只给一次
+  const seenRules = new Set([...rules.files, ...rules.skipped].map((f) => f.path));
+  const lateSpent = { bytes: 0 };
+  const lateRules = [];                      // 中途附上过的规则文本（整理后放回）
+  const activated = new Map();               // 取用过的 skill：名字 → 放回用的正文（插入顺序 = 取用顺序）
+  // 还留在对话里（没被清掉）的就不重复放；放回的按最近取用的优先、合计封顶
+  const pinnedText = (messages) => {
+    const live = messages.slice(1).flatMap((m) => (m.role === 'tool_results' ? m.results.filter((r) => !r.compacted).map((r) => String(r.content ?? '')) : [])).join('\n');
+    const parts = [];
+    let used = 0;
+    for (const t of lateRules) if (!live.includes(t) && used + t.length <= PIN_TOTAL) { parts.push(t); used += t.length; }
+    for (const [name, t] of [...activated].reverse()) {
+      if (live.includes(`<skill_content name="${name}"`)) continue;
+      if (used + t.length > PIN_TOTAL) continue;
+      parts.push(t); used += t.length;
+    }
+    return parts.length ? `[系统] 对话整理过，下面是之前给过你、整理后放回来的项目规则与 skill 正文（仍然有效）：\n\n${parts.join('\n\n')}` : null;
+  };
+  for (const name of ['read_file', 'write_file', 'list_dir']) {
+    const fn = handlers[name];
+    handlers[name] = async (a) => {
+      const out = await fn(a);
+      if (typeof out !== 'string' || !a?.path) return out;
+      let extra = '';
+      if (name === 'write_file' && isRuleFile(a.path)) {
+        extra += `\n\n[系统] \`${a.path}\` 是项目规则文件，由人维护，执行器不能改：交接时会被打回。撤销它（git checkout -- ${a.path}；新建的直接删掉），觉得该改就写进交接记录的 known_issues。`;
+      }
+      try { const late = renderLateRules(rulesForPath(workspace, a.path, seenRules, { maxBytes: RULES_MAX_BYTES, spent: lateSpent })); if (late) { extra += `\n\n${late}`; lateRules.push(late); } } catch { /* 读不了规则不影响这次工具调用 */ }
+      return extra ? out + extra : out;
+    };
+  }
   let outcome = null;
   const rejections = [];
   let lastMechanical = null, sameMechanical = 0;
   // 改过的测试文件与这一步开跑时比；"原有测试" = 任务工作区建立时就有的（别的任务写的 / 仓库原有的）
   const taskBase = baseHeadOf(db, taskId);
+  const hooks = makeHookSession(db, { taskId, nodeId, projectId: db.one(`SELECT project_id FROM tasks WHERE id=?`, taskId)?.project_id ?? null, workspace, exec, baseRef: taskBase });
+  const hookKey = (event, tool, a) => createHash('sha256').update(JSON.stringify([event, tool, a ?? null])).digest('hex').slice(0, 16);
+  // 钩子说"要人确认"：挂一条事项问人（现有的提问机制），答「同意」就放行这一条（之后一模一样的调用不再问），别的答复都算不同意
+  const approvedKeys = new Set(db.all(`SELECT payload FROM audit_log WHERE action='hook_ask_raised' AND target_type='node' AND target_id=?`, nodeId).flatMap((r) => {
+    try { const p = JSON.parse(r.payload); const a = db.one(`SELECT body FROM answers WHERE question_id=? ORDER BY created_at DESC LIMIT 1`, p.questionId); return a && HOOK_APPROVE.test(a.body ?? '') ? [p.key] : []; } catch { return []; }
+  }));
+  const hookApproved = (k) => approvedKeys.has(k);
+  const askHuman = (event, tool, a, m) => {
+    const L2 = contentLang(db);
+    const what = tool ? tl(L2, '工具 {tool}：{args}', { tool, args: JSON.stringify(toolInputFor(tool, a)).slice(0, 600) }) : tl(L2, '交接（产物 {n} 项）', { n: (a?.artifacts ?? []).length });
+    outcome = { kind: 'question', hookAsk: { key: hookKey(event, tool, a), event, tool }, args: {
+      level: 2, kind: 'security',
+      text: tl(L2, '策略钩子要人确认才能做这一步操作：\n{what}\n钩子说：\n{lines}\n\n回答「同意」就放行这一条（之后一模一样的操作不再问）；别的答复都当不同意，AI 会换别的做法。', { what, lines: reasonLines(m, (k, p) => tl(L2, k, p)).map((x) => `- ${x}`).join('\n') || tl(L2, '- （钩子没写理由）') }),
+      blocked_by: tl(L2, '策略钩子要人确认'),
+      work_done: tl(L2, '（系统代填）钩子拦在这一步操作之前；本步的改动还在工作区里、没有提交。'),
+      plan_after_answer: tl(L2, '同意就照原样做这一步；不同意就换别的做法。'),
+    } };
+    return tl(L2, '这一步操作要人确认，系统已挂事项问人，本节点挂起。不要再调用任何工具。');
+  };
+  // 越界申请：正文由系统写（core/scope-ask.mjs），按方案批准类派给能批契约的人；改动留在工作区里，批了原样重交
+  const askScope = ({ paths, out, why, args: h }) => {
+    const L2 = contentLang(db);
+    const arts = (h?.artifacts ?? []).map((a) => a?.path).filter(Boolean);
+    outcome = { kind: 'question', scopeAsk: { paths, out, why }, args: {
+      level: 3, kind: 'scope', scopePaths: paths,
+      text: scopeAskText(db, { taskId, nodeId, paths, out, why, workspace: gitWorkspace ? workspace : null, baseRef }),
+      blocked_by: tl(L2, '改了契约范围外的文件：{paths}；已申请放进范围，等人批准', { paths: out.join(tl(L2, '、')) }),
+      work_done: tl(L2, '（系统代填）这一步的改动都还在工作区里、没有提交；交接只因越界被拒。上次交接列的产物：{arts}', { arts: arts.join(tl(L2, '、')) || tl(L2, '（没列）') }),
+      plan_after_answer: tl(L2, '批准：范围已经放宽，检查一遍改动后照常交接（不用再填 scope_request）。不批：撤掉范围外的改动（git checkout {base} -- <文件>；新建的直接删掉），按答复在现有范围里做完再交。', { base: String(baseRef ?? 'HEAD').slice(0, 12) }),
+    } };
+    return tl(L2, '已申请把这些路径放进范围，系统已挂事项给负责人，本节点挂起。不要再调用任何工具。');
+  };
+  // MCP：项目里批准过的 server 在这个沙箱里起；工具按负责人定的用法给 —— auto 直接用、ask 每次问人（默认）、off 不给。
+  // 起不来 / 批准之后变了的 server 不给工具、记审计，不挡这一步
+  let mcp = null;
+  try {
+    mcp = await makeMcpSession(db, { taskId, nodeId, projectId: db.one(`SELECT project_id FROM tasks WHERE id=?`, taskId)?.project_id ?? null, workspace, exec, baseRef: taskBase,
+      spill: (name, text) => {
+        try {
+          mkdirSync(join(workspace, OUTPUTS_DIR), { recursive: true });
+          const p = `${OUTPUTS_DIR}/${name}-${randomBytes(3).toString('hex')}.txt`;
+          writeFileSync(join(workspace, p), text);
+          return `${text.slice(0, 4000)}\n\n${tl(contentLang(db), '[系统] 结果太长（{n} 字符），这里只放了开头；全文存在 {path}，需要时用 read_file 分段读。', { n: text.length, path: p })}`;
+        } catch { return text.slice(0, OUTPUT_INLINE_MAX); }
+      } });
+  } catch (e) { audit(db, { actorKind: 'system', action: 'mcp_unavailable', targetType: 'node', targetId: nodeId, payload: { error: String(e.message).slice(0, 300) } }); }
+  const askMcp = (tool, a) => {
+    const L2 = contentLang(db);
+    outcome = { kind: 'question', hookAsk: { key: hookKey('McpCall', tool, a), event: 'McpCall', tool }, args: {
+      level: 2, kind: 'security',
+      text: tl(L2, 'AI 要调用 MCP 工具 {tool}，这个工具设成了每次调用都要人批准。参数：\n{args}\n\n回答「同意」就放行这一次（之后一模一样的调用不再问）；别的答复都当不同意，AI 会换别的做法。想让这个工具以后直接用：负责人把它设成 auto（命令 mcp tool {tool} auto --project <项目>）。', { tool, args: JSON.stringify(a ?? {}).slice(0, 800) }),
+      blocked_by: tl(L2, 'MCP 工具要人批准'),
+      work_done: tl(L2, '（系统代填）停在这次 MCP 调用之前；本步的改动还在工作区里、没有提交。'),
+      plan_after_answer: tl(L2, '同意就照原样调用；不同意就换别的做法。'),
+    } };
+    return tl(L2, '这次调用要人批准，系统已挂事项问人，本节点挂起。不要再调用任何工具。');
+  };
+  if (mcp?.tools.length) {
+    tools = [...tools, ...mcp.tools];
+    for (const t of mcp.tools) {
+      handlers[t.name] = async (a) => (mcp.modeOf(t.name) === 'ask' && !hookApproved(hookKey('McpCall', t.name, a)) ? askMcp(t.name, a) : mcp.call(t.name, a));
+    }
+  }
   let lastTestSig = null;
   const testsChangedSince = (changed) => {
     if (!baseRef) return [];
@@ -658,6 +811,18 @@ export async function executeNode(db, {
 
   // 出口两个都挂在 handler 上：runToolLoop 只认"工具调用 → 结果"，
   // 所以出口也走工具，收尾由 stopReason 之外的这个 outcome 标记决定。
+  // 取用 skill：正文 + 参考文件清单；部署 / 项目层的复制进工作区 .si-skills/。同一份再取只说一句（整理后正文会被放回）
+  if (catalog?.names?.length) {
+    handlers.activate_skill = async (args) => {
+      const s = skillList.find((x) => x.enabled && x.name === args?.name && catalog.names.includes(x.name));
+      if (!s) return `没有这份 skill：${String(args?.name ?? '').slice(0, 64)}。能取用的：${catalog.names.join('、')}`;
+      if (activated.has(s.name)) return `${s.name} 前面已经取用过了，正文还在对话里（整理过的话在开头那条消息里）。`;
+      const r = activateSkill(s, { workspace });
+      activated.set(s.name, r.pin);
+      audit(db, { actorKind: 'agent', actorId: 'executor', action: 'skill_activated', targetType: 'node', targetId: nodeId, payload: { id: s.id, sha: s.sha.slice(0, 12), copied: r.copied } });
+      return r.text;
+    };
+  }
   handlers.submit_handoff = async (args) => {
     // 每次校验现取一次改动清单：执行器随时可能又写了文件，缓存住会判错。
     // 非 git 工作区（离线测试）时退化为只查存在性与"不是目录"。
@@ -697,6 +862,28 @@ export async function executeNode(db, {
         defects.push({ category: 'spec', summary: pv.error, locations: [PREVIEW_FILE] });
       }
     }
+    if (!errs.length && hooks.has('PreHandoff')) {
+      const m = await hooks.run('PreHandoff', { handoff: args, changed_files: changed ? [...changed].sort() : null });
+      if (m.tampered.length) {
+        errs.push(tl(L, '钩子文件被改过：{paths}。仓库的钩子没法照常检查这次交接。撤销这些改动（git checkout {base} -- <文件>；新建的直接删掉）再交', { paths: m.tampered.join('、'), base: taskBase ?? 'HEAD' }));
+        defects.push({ category: 'rules', summary: tl(L, '钩子文件被改过'), locations: m.tampered });
+      } else if (m.decision === 'ask' && !hookApproved(hookKey('PreHandoff', null, { artifacts: args?.artifacts }))) {
+        return askHuman('PreHandoff', null, { artifacts: args?.artifacts }, m);
+      } else if (m.decision === 'deny') {
+        for (const line of reasonLines(m, (k, p) => tl(L, k, p))) errs.push(tl(L, '[钩子] {line}', { line }));
+        if (!m.reasons.length) errs.push(tl(L, '[钩子] 交接被钩子拦下（钩子没写理由）'));
+        defects.push({ category: 'quality', summary: tl(L, '交接被策略钩子拦下'), locations: m.reasons.map((r) => r.hook) });
+      }
+    }
+    // 越界申请（core/scope-ask.mjs）：越界是唯一的拒收理由、执行器说明了要放进范围的路径与理由 → 挂一条批准事项，这一步挂起，不打回
+    const scopeOut = [...new Set(defects.filter((d) => d.category === 'scope').flatMap((d) => d.locations))].sort();
+    const scopeOnly = errs.length > 0 && scopeOut.length > 0 && defects.every((d) => d.category === 'scope');
+    if (scopeOnly && args?.scope_request) {
+      const req = checkScopeRequest(args.scope_request, { out: scopeOut, lang: L });
+      if (!req.errs.length) return askScope({ paths: req.paths, out: scopeOut, why: req.why, args });
+      errs.push(...req.errs);
+      defects.push(...req.errs.map((e) => ({ category: 'scope', summary: e, locations: ['scope_request'] })));
+    }
     if (errs.length) {
       rejections.push(errs);
       audit(db, { actorKind: 'agent', actorId: 'executor', action: 'handoff_rejected',
@@ -711,6 +898,8 @@ export async function executeNode(db, {
       lastMechanical = sig;
       if (sameMechanical >= MECHANICAL_REPEAT_STOP) {
         const L = contentLang(db);
+        // 卡住的只是越界：人要拍的就是"这几个文件让不让动"，替它提越界申请（没有理由，正文里说清）
+        if (scopeOnly) return askScope({ paths: scopeOut, out: scopeOut, why: null, args });
         outcome = { kind: 'question', args: {
           level: 2, kind: 'structural',
           text: tl(L, '这一步连续 {n} 次交了同样的改动，都被同一条机械校验拒回（见下面"卡在哪"）。重交不会改判：要么撤销被点名的改动，要么由人发一条计划变更把它们放进本任务的范围。', { n: sameMechanical }),
@@ -808,6 +997,43 @@ export async function executeNode(db, {
     return '放行请求已记录，本节点挂起等人拍板。不要再调用任何工具。';
   };
 
+  // 审批门禁：负责人列的命令模式，命中就停下挂"安全审批"事项；答「同意」放行这一条（一模一样的再跑不再问，与钩子同一套记账）
+  {
+    const gates = gatesOf(db, db.one(`SELECT project_id FROM tasks WHERE id=?`, taskId)?.project_id ?? null).commands;
+    const fn = handlers.run_command;
+    if (gates.length && fn) handlers.run_command = async (a) => {
+      const hit = gateHit(gates, a?.file, a?.args ?? []);
+      if (!hit || hookApproved(hookKey('ApprovalGate', 'run_command', { file: a?.file, args: a?.args ?? [] }))) return fn(a);
+      const L2 = contentLang(db);
+      const cmd = [a.file, ...(a.args ?? [])].join(' ').slice(0, 600);
+      outcome = { kind: 'question', hookAsk: { key: hookKey('ApprovalGate', 'run_command', { file: a?.file, args: a?.args ?? [] }), event: 'ApprovalGate', tool: 'run_command', pattern: hit }, args: {
+        level: 2, kind: 'security',
+        text: tl(L2, 'AI 要跑一条命中审批门禁的命令，要有人点头才能跑：\n{cmd}\n命中的门禁：{pattern}\n\n回答「同意」就放行这一条（之后一模一样的命令不再问）；别的答复都当不同意，AI 会换别的做法。门禁清单在项目设置的「审批门禁」里。', { cmd, pattern: hit }),
+        blocked_by: tl(L2, '命令命中审批门禁：{pattern}', { pattern: hit }),
+        work_done: tl(L2, '（系统代填）停在这条命令之前，命令没有跑；本步的改动还在工作区里、没有提交。'),
+        plan_after_answer: tl(L2, '同意就照原样跑这条命令；不同意就换别的做法。'),
+      } };
+      return tl(L2, '这条命令要人点头才能跑，系统已挂事项问人，本节点挂起。不要再调用任何工具。');
+    };
+  }
+  // 策略钩子 PreToolUse：读写列搜、跑命令、取 skill 之前问一遍钩子。拦下 / 要人确认的不执行，理由回给模型；
+  // 放行时钩子给的补充（additionalContext）附在结果后面。提问、交接、申请联网不过这一关（拦住"问人"没有意义）
+  if (hooks.has('PreToolUse')) {
+    for (const name of [...HOOKED_TOOLS, ...(mcp?.tools ?? []).map((t) => t.name)]) {
+      const fn = handlers[name];
+      if (!fn) continue;
+      handlers[name] = async (a) => {
+        const m = await hooks.run('PreToolUse', { tool_name: name, tool_input: toolInputFor(name, a) }, { tool: name });
+        if (m.tampered.length) return tl(L, '[系统] 钩子文件被改过（{paths}），仓库的钩子没法照常检查，这次调用没执行。先撤销这些改动（git checkout {base} -- <文件>；新建的直接删掉），再继续。', { paths: m.tampered.join('、'), base: taskBase ?? 'HEAD' });
+        const lines = reasonLines(m, (k, p) => tl(L, k, p)).map((x) => `- ${x}`).join('\n') || tl(L, '- （钩子没写理由）');
+        if (m.decision === 'deny') return tl(L, '[钩子] 这次调用被拦下，没执行：\n{lines}\n换一个不违反它的做法；确实绕不开就在交接记录的 known_issues 里写明。', { lines });
+        if (m.decision === 'ask' && !hookApproved(hookKey('PreToolUse', name, a))) return askHuman('PreToolUse', name, a, m);
+        const out = await fn(a);
+        return m.context && typeof out === 'string' ? `${out}\n\n${tl(L, '[钩子补充]')}\n${m.context}` : out;
+      };
+    }
+  }
+
   // ⚠️ 崩溃也要留下叙事。曾出现过厂商余额耗尽，异常从 runToolLoop 里穿出去，
   // 20 轮工具调用的记录**一条都没落盘** —— 而复盘要求只凭真相源。
   // 所以 loop 包在 try 里，叙事归档无论成败都写。
@@ -819,7 +1045,7 @@ export async function executeNode(db, {
   // 上一段工作留下的落盘输出不再有人引用（新的一段从装配重新开始）
   if (workspace) { try { rmSync(join(workspace, OUTPUTS_DIR), { recursive: true, force: true }); } catch { /* 尽力 */ } }
   const compactor = compactAt.at ? makeCompactor(db, { client, taskId, nodeId, tier, role: 'executor', workspace, baseRef, at: compactAt.at,
-    levels: [1, 2], fixed: fixedEstimate(asm.system, TOOLS), maxIterations,
+    levels: [1, 2], fixed: fixedEstimate(asm.system, tools), maxIterations,
     // 同一步骤用模型整理到顶了还不够：这一步多半太大。与 诊断层"打回不收敛"同一条路 —— 替执行器把问题提给人
     escalate: ({ n, at }) => {
       audit(db, { actorKind: 'system', action: 'compaction_escalated', targetType: 'node', targetId: nodeId, payload: { n, at } });
@@ -839,11 +1065,11 @@ export async function executeNode(db, {
   let loop;
   try {
     loop = await runToolLoop(client, {
-      role: 'executor', tier, system: asm.system, messages: asm.messages, tools: TOOLS,
+      role: 'executor', tier, system: asm.system, messages: asm.messages, tools,
       maxTokens: 16000, effort: 'high',
-      cacheSystem: asm.cacheStable, cacheKey: `node:${nodeId}`,
+      cacheSystem: asm.cacheStable, cacheKey: `node:${nodeId}`, ...(signal ? { signal } : {}),
     }, handlers, {
-      maxIterations, abort, shouldStop: () => outcome !== null, compactor,
+      maxIterations, abort, shouldStop: () => outcome !== null, compactor, inbox,
       onStep: (i, resp) => { const u = resp?.usage; if (u) lastRequestTokens = (u.inputTokens ?? 0) + (u.cacheReadTokens ?? 0) + (u.cacheWriteTokens ?? 0); onStep?.(i, resp); },
       // 剩 5 轮开始报数。不是催它快点做完 —— 是逼它在"做不完"和"假装做完了"
       // 之外看见第三条路：还有 raise_question。
@@ -860,6 +1086,7 @@ export async function executeNode(db, {
     crashed = e;
     loop = { trace: [], stopped: `crashed: ${e.message}` };
   }
+  if (mcp) await mcp.close();
 
   // 没收尾时工作区里留下的改动（相对这一步的基线；依赖目录不算）：下一次重开时告诉执行器这是它自己上一次留下的
   const leftover = () => {
@@ -893,7 +1120,7 @@ export async function executeNode(db, {
   if (outcome?.kind === 'done') {
     const { handoffId, conflicts } = persistHandoff(db, { taskId, nodeId, args: outcome.args, narrativeRef });
     clearNodeBaseline(db, { taskId, nodeId });   // 这一段工作结束；修正若让它重做，下一段重取
-    return { kind: 'done', handoffId, conflicts, trace, rejections, assemblyId: asm.assemblyId, narrativeRef, meta: asm.meta };
+    return { kind: 'done', handoffId, conflicts, trace, rejections, assemblyId: asm.assemblyId, narrativeRef, meta: asm.meta, contextSeen: [...seen] };
   }
   if (outcome?.kind === 'egress') {
     // 问题正文与定级由状态机写（`raiseEgressQuestion`），模型只提供"要哪个生态、为什么"。
@@ -924,6 +1151,8 @@ export async function executeNode(db, {
     const last = client.ledger?.at?.(-1);
     const contextTokens = lastRequestTokens ?? (last ? last.inputTokens + last.cacheReadTokens + last.cacheWriteTokens : null);
     const question = recordQuestion(db, { taskId, nodeId, args: outcome.args, narrativeRef, contextTokens });
+    if (outcome.hookAsk) audit(db, { actorKind: 'system', action: 'hook_ask_raised', targetType: 'node', targetId: nodeId, payload: { questionId: question.id, ...outcome.hookAsk } });
+    if (outcome.scopeAsk) audit(db, { actorKind: 'agent', actorId: 'executor', action: SCOPE_ASK_RAISED, targetType: 'question', targetId: question.id, payload: { taskId, nodeId, ...outcome.scopeAsk } });
     return { kind: 'question', question, trace, rejections, assemblyId: asm.assemblyId, narrativeRef, meta: asm.meta };
   }
 
@@ -932,10 +1161,19 @@ export async function executeNode(db, {
   // 记在它头上会让加额重跑的人凭空少一次机会，还会把 limit.node_retries 那一维污染成
   // "谁先撞上预算谁先被判死"。
   if (loop.stopped?.startsWith('aborted:')) {
+    const reason = loop.stopped.slice(9);
+    const left = leftover();
     transition(db, 'nodes', nodeId, 'pending');
+    // 在途工作收起来：下一个跑的未必是这一步（紧急修正会重规划），原地留着会被别的步骤算成自己的改动。
+    // 这一步下次开跑时放回；被修正作废就放一边、ref 留着。收不起来（git 报错）就照旧原地留着，原因进审计
+    let parked = null;
+    if (gitWorkspace) {
+      try { const p = parkInflight(db, { taskId, nodeId, workspace, reason }); parked = p && { ref: parkedRef(nodeId), n: p.files.length }; }
+      catch (e) { parked = { error: String(e.stderr ?? e.message).slice(0, 300) }; }
+    }
     audit(db, { actorKind: 'system', action: 'node_aborted', targetType: 'node', targetId: nodeId,
-      payload: { reason: loop.stopped.slice(9), iterations: loop.trace.length,
-        toolCalls: trace.length, narrativeRef, pid: process.pid, left: leftover() } });
+      payload: { reason, iterations: loop.trace.length,
+        toolCalls: trace.length, narrativeRef, pid: process.pid, left, parked } });
     return { kind: 'aborted', stopped: loop.stopped, trace, rejections,
       assemblyId: asm.assemblyId, narrativeRef, meta: asm.meta };
   }

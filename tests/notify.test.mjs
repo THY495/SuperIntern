@@ -27,7 +27,7 @@ section('1. 通道从 env 读；空值跳过；--notify 追加');
   eq(channelsFromEnv({}).length, 0, '什么都没配 → 没有通道');
   const ch = channelsFromEnv({ NTFY_URL: 'https://ntfy.sh/t1', FEISHU_WEBHOOK: '  ', DINGTALK_WEBHOOK: 'https://oapi.dingtalk.com/robot/send?access_token=SECRET' }, 'notify-send');
   eq(ch.map((c) => c.kind).join(','), 'ntfy,dingtalk,cmd', '空白的飞书跳过；--notify 变成 cmd 通道');
-  eq(Object.keys(CHANNEL_ENV).length, 5, '五种通道');
+  eq(Object.keys(CHANNEL_ENV).length, 6, '六种通道（含邮件）');
 }
 
 section('2. 各家请求形状');
@@ -42,6 +42,12 @@ section('2. 各家请求形状');
   const w = JSON.parse(buildRequest({ kind: 'wecom', target: 'x' }, { title: 'a', text: 'b' }).init.body);
   eq(w.msgtype, 'text', '企微 msgtype=text');
   try { buildRequest({ kind: 'sms', target: 'x' }, { title: 'a', text: 'b' }); bad('未知通道要抛'); } catch { ok('未知通道要抛'); }
+  // 事项链接：正文末尾单独一行；ntfy 另设点通知就打开
+  const nl = buildRequest({ kind: 'ntfy', target: 'https://ntfy.sh/t' }, { title: 't', text: '正文', link: 'https://si.lan/#q/q_1' });
+  eq(nl.init.headers.click, 'https://si.lan/#q/q_1', 'ntfy：Click 头 = 事项链接（点通知直接打开）');
+  eq(nl.init.body, '正文\n\nhttps://si.lan/#q/q_1', 'ntfy：正文末尾带链接');
+  eq(JSON.parse(buildRequest({ kind: 'feishu', target: 'x' }, { title: 'a', text: 'b', link: 'https://si.lan/#inbox' }).init.body).content.text, 'a\nb\n\nhttps://si.lan/#inbox', '飞书：链接单独一行（会被变成可点的）');
+  eq(buildRequest({ kind: 'ntfy', target: 'https://ntfy.sh/t' }, { title: 't', text: 'x' }).init.headers.click, undefined, '没有链接：不带 Click 头');
 }
 
 section('3. 发送：回执进审计、不记 URL；HTTP 200 但 code≠0 算失败；网络错不抛；cmd 通道走 spawn');
@@ -77,6 +83,43 @@ section('3. 发送：回执进审计、不记 URL；HTTP 200 但 code≠0 算失
   assert(rows.every((p) => JSON.parse(p).notifyKind === 'report' && JSON.parse(p).ref === 'rp_1'), '回执带通知种类与引用');
   const empty = await notify(db, { taskId, kind: 'x', title: 't', text: 'x', channels: [], fetchFn });
   eq(empty.length, 0, '没有通道 → 什么都不发，不报错');
+  db.close();
+}
+
+section('3b. 邮件通道：要配了发信服务器才算通道；发信走 SMTP，审计只记域名');
+{
+  const SMTP = { SMTP_URL: 'smtps://u:pw-SECRET@smtp.x.com', MAIL_FROM: 'SuperIntern <si@x.com>' };
+  eq(channelsFromEnv({ MAIL_TO: 'ops@x.com' }).length, 0, '只填 MAIL_TO、没配发信服务器 → 不算通道');
+  eq(channelsFromEnv({ MAIL_TO: 'ops@x.com', ...SMTP }).map((c) => c.kind).join(','), 'email', 'SMTP_URL + MAIL_FROM + MAIL_TO → 一条邮件通道');
+  const { db, taskId } = fixture();
+  const sent = [];
+  const sendMailFn = async (conn, m) => { sent.push({ conn, m }); return { ok: true }; };
+  const rs = await notify(db, { taskId, kind: 'question.addressed', title: '[SuperIntern] 规格取舍', text: '正文', ref: 'q_9', link: 'https://si.lan/#q/q_9',
+    channels: [{ kind: 'email', target: 'Lin@Example.com' }], env: SMTP, sendMailFn });
+  eq(rs.map((r) => `${r.kind}:${r.ok}`).join(','), 'email:true', '投递成功');
+  eq(sent[0].conn.host, 'smtp.x.com', '发信服务器从 env 的 SMTP_URL 解析');
+  eq(sent[0].m.from, SMTP.MAIL_FROM, '发件人 = MAIL_FROM');
+  eq(sent[0].m.text, '正文\n\nhttps://si.lan/#q/q_9', '正文末尾带事项链接');
+  eq(sent[0].m.headers['X-SuperIntern-Ref'], 'q_9', '信头带事项引用');
+  const audit = db.all(`SELECT payload FROM audit_log WHERE action='notification_sent' AND target_id=?`, taskId).map((r) => r.payload);
+  assert(audit.some((p) => p.includes('"host":"example.com"')) && !audit.some((p) => /lin@|SECRET/i.test(p)), '审计只记收件域名，不记地址和密码');
+  const failing = await notify(db, { taskId, kind: 'x', title: 't', text: 'x', channels: [{ kind: 'email', target: 'a@x.com' }], env: SMTP,
+    sendMailFn: async () => { throw Object.assign(new Error('MAIL FROM：SMTP 550 rejected'), { smtpCode: 550 }); } });
+  eq(`${failing[0].ok}:${failing[0].status}`, 'false:550', '发信失败：不抛，回执带 SMTP 应答码');
+  db.close();
+}
+{
+  // 个人登记的邮箱：没配发信服务器时不算「推得到」
+  const { channelsFor, mailReady } = await import('../src/core/signals.mjs');
+  const { setUserChannel, channelHost } = await import('../src/core/users.mjs');
+  const db = openDb(':memory:');
+  const { userId } = ensureOwner(db);
+  setUserChannel(db, { userId, kind: 'email', target: 'lin@example.com', byUserId: userId });
+  eq(mailReady({}), false, 'mailReady：没配 → false');
+  eq(channelsFor(db, [userId], { env: {} }).length, 0, '没配发信服务器：登记的邮箱不算通道');
+  eq(channelsFor(db, [userId], { env: { SMTP_URL: 'smtp://127.0.0.1:25', MAIL_FROM: 'si@x.com' } }).map((c) => c.kind).join(','), 'email', '配了：算一条邮件通道');
+  eq(channelHost('lin@Example.com'), 'example.com', '成员页只显示邮箱的域名');
+  try { setUserChannel(db, { userId, kind: 'email', target: 'not-an-address', byUserId: userId }); bad('写错的邮箱要拒'); } catch { ok('写错的邮箱要拒'); }
   db.close();
 }
 

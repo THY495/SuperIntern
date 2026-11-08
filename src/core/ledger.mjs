@@ -31,12 +31,12 @@ export function flushLedger(db, client, { taskId, nodeId = null, role }) {
     db.run(`INSERT INTO usage_ledger
               (task_id,node_id,role,model_tier,provider,model_id,upstream,
                input_tokens,cache_read_tokens,cache_write_tokens,output_tokens,reasoning_tokens,
-               micro_usd,billing,billing_fallback,ts,proc_kind,proc_pid,payer_id,payer_scope,started_at,duration_ms,attempts)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+               micro_usd,billing,billing_fallback,ts,proc_kind,proc_pid,payer_id,payer_scope,started_at,duration_ms,attempts,estimated)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
       taskId, nodeId, e.role ?? role, e.tier, e.vendor, e.model, e.upstream ?? null,
       e.inputTokens, e.cacheReadTokens, e.cacheWriteTokens, e.outputTokens, e.reasoningTokens,
       e.microUsd, e.billing, e.billingFallback ? 1 : 0, e.at ?? now(), procKind(), process.pid, payer.payerId, payer.scope,
-      e.startedAt ?? null, e.durationMs ?? null, e.attempts ?? null);
+      e.startedAt ?? null, e.durationMs ?? null, e.attempts ?? null, e.estimated ? 1 : 0);
   }
   // 工具调用的耗时（perf-g4 埋点）：和账一起落，同一个 task / node
   for (const t of (client.toolLog ?? []).splice(0)) {

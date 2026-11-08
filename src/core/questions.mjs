@@ -45,6 +45,11 @@ export function setRecipients(db, questionId, { addressedTo, informed, route, ro
   db.run(`UPDATE questions SET ${cols.join(', ')} WHERE id=?`, ...vals, questionId);
 }
 
+/** 这一类事项不许带默认（routeQuestion 按类型判）：清掉默认；Ⅰ 级必须有默认，所以升成 Ⅱ 级（时限照旧，到期升级而不是替人定）。 */
+export function dropDefault(db, questionId) {
+  db.run(`UPDATE questions SET default_action=NULL, level=CASE WHEN level=1 THEN 2 ELSE level END WHERE id=? AND (default_action IS NOT NULL OR level=1)`, questionId);
+}
+
 /** 冲突事项：把冲突各方记进路由快照（$.parties）。 */
 export function setRouteParties(db, questionId, parties) {
   db.run(`UPDATE questions SET route=json_set(route,'$.parties',json(?)) WHERE id=?`, JSON.stringify(parties), questionId);
@@ -61,6 +66,13 @@ export function markResolved(db, questionId, at = now()) {
 }
 
 /** 级别时限已处理（默认动作已生效 / 已升级）：不再按 timeout_at 触发。 */
+/** 例外管理下按默认直接走：到期时刻拨到提出时刻，下一轮超时扫描按默认结案。 */
+export function dueNow(db, questionId) {
+  db.run(`UPDATE questions SET timeout_at=asked_at WHERE id=? AND level=1 AND default_action IS NOT NULL`, questionId);
+}
+/** 这条 Ⅰ 级事项是不是"不等人、按默认直接走"的（到期时刻 = 提出时刻；正常的Ⅰ级时限总是正数）。 */
+export const isFastDefault = (q) => q.level === 1 && q.timeout_at != null && q.timeout_at <= q.asked_at;
+
 export function clearQuestionTimeout(db, questionId) {
   db.run(`UPDATE questions SET timeout_at=NULL WHERE id=?`, questionId);
 }
@@ -85,12 +97,14 @@ export function resetNotified(db, { questionId = null, taskId = null }) {
 /**
  * 该推送的开放事项：从没推过的，或有收件人 / 知会人还没推过的。每条带 fresh（这次要推的人）与 first（是不是第一次推）。
  */
-export function questionsToNotify(db, { limit = 50 } = {}) {
+export function questionsToNotify(db, { limit = 50, id = null } = {}) {
   const rows = db.all(`SELECT q.*, t.title FROM questions q JOIN tasks t ON t.id=q.task_id
-    WHERE q.status IN ('open','escalated') AND (q.notified_at IS NULL OR EXISTS (
+    WHERE q.status IN ('open','escalated') ${id ? 'AND q.id=?' : ''}
+      AND NOT (q.level=1 AND q.timeout_at IS NOT NULL AND q.timeout_at <= q.asked_at)   -- 按默认直接走的：结案时另有通知，不先推一条"在等你"
+      AND (q.notified_at IS NULL OR EXISTS (
       SELECT 1 FROM (SELECT value FROM json_each(q.addressed_to) UNION SELECT value FROM json_each(q.informed)) r
       WHERE r.value NOT IN (SELECT value FROM json_each(q.notified_to))))
-    ORDER BY q.asked_at LIMIT ?`, limit);
+    ORDER BY q.asked_at LIMIT ?`, ...(id ? [id, limit] : [limit]));
   return rows.map((q) => {
     const all = [...new Set([...JSON.parse(q.addressed_to || '[]'), ...JSON.parse(q.informed || '[]')])];
     const done = new Set(JSON.parse(q.notified_to || '[]'));
@@ -112,7 +126,7 @@ export function resolutionOf(db, q) {
                       WHERE a.question_id=? AND a.stance='answer' ORDER BY a.created_at DESC, a.rowid DESC LIMIT 1`, q.id);
     return { who: a?.display_name ?? tl(L, '系统'), at, when, how: tl(L, '作答'), userId: a?.user_id ?? null };
   }
-  if (q.status === 'defaulted') return { who: tl(L, '系统'), at, when, how: tl(L, '按超时默认动作结案'), userId: null };
+  if (q.status === 'defaulted') return { who: tl(L, '系统'), at, when, how: isFastDefault(q) ? tl(L, '按默认直接走（项目的监督模式是「例外管理」）') : tl(L, '按超时默认动作结案'), userId: null };
   const w = db.one(`SELECT l.actor_id, u.display_name FROM audit_log l LEFT JOIN users u ON u.id=l.actor_id
                     WHERE l.target_id=? AND l.action='status_changed' AND json_extract(l.payload,'$.to')=? ORDER BY l.id DESC LIMIT 1`, q.id, q.status);
   return { who: w?.display_name ?? tl(L, '系统'), at, when, how: q.status === 'withdrawn' ? tl(L, '撤回此事项') : q.status, userId: w?.actor_id ?? null };

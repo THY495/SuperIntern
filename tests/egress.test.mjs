@@ -28,6 +28,8 @@ import { ContainerExecutor, makeSandbox, detectRuntime, SANDBOX_IMAGE, ensureFla
 import { EGRESS_GROUPS, setEgressGroups, egressGroupsOf, hostsOf, ensureCa, ensureCaImage, removeCaImages,
   EgressProxy, ingestEgressAudit, raiseEgressQuestion, openEgressQuestions, deniedHosts } from '../src/core/egress.mjs';
 import { addSourceCredential } from '../src/core/egress-creds.mjs';
+import { parseMcpConfig, startServer } from '../src/core/mcp.mjs';
+import { I18nError } from '../src/i18n/index.mjs';
 
 let pass = 0, fail = 0;
 const section = (t) => console.log(`\n${'─'.repeat(72)}\n${t}\n${'─'.repeat(72)}`);
@@ -211,6 +213,16 @@ execs.push(ctrG);
   assert(/CONNECT tunnel failed|403/.test(deniedCurl.stderr + deniedCurl.stdout),
     `curl 看到的是 CONNECT 阶段失败而非 HTTP 状态码：`
     + `${(deniedCurl.stderr || deniedCurl.stdout).trim().slice(0, 100)}`);
+
+  // 远程 MCP server 的桥在沙箱里，fetch 走同一个出口代理。放行的域：请求到了上游（GitHub 不是 MCP server，回一个 HTTP 状态码 ——
+  // 404 / 405 / 限流 403，或者代理按只读收窄拦下 POST 的 403，都说明链路通了、桥照实报）；没放行的域：CONNECT 阶段就拒，桥说清两种可能
+  const remote = (url) => parseMcpConfig(JSON.stringify({ mcpServers: { r: { type: 'http', url } } }), { source: 'project', file: 'mcp.json' }).servers[0];
+  let ba = null;
+  try { await startServer(remote('https://api.github.com/zen'), { exec: ctrG, workspace: wsG }); } catch (e) { ba = e; }
+  assert(ba instanceof I18nError && /^HTTP {status}/.test(ba.tpl) && Number(ba.params.status) >= 400, `桥经出口代理到了放行的上游（${ba?.message?.slice(0, 120)}）`);
+  let bd = null;
+  try { await startServer(remote('https://example.com/mcp'), { exec: ctrG, workspace: wsG }); } catch (e) { bd = e; }
+  assert(bd instanceof I18nError && /没在「联网」里放行/.test(bd.tpl), `没放行的域：桥说清是没放行或地址错（${bd?.message?.slice(0, 120)}）`);
 
   // E4：拦住它的是**链路**，不是环境变量里的 HTTP_PROXY 自觉
   const direct = await nodeIn(ctrG, wsG,

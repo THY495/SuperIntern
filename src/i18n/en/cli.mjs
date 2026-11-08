@@ -77,8 +77,6 @@ export default {
   '↻ 认领 {nodeId}：启动时它还停在 running —— 上一个进程死在它手里，退回 pending 重来': '↻ Reclaimed {nodeId}: it was still running at startup — the previous process died on it; back to pending to retry',
   '⏱ 超时走默认（{level} 级 {qid}）：无人答复，按登记的默认动作放行 —— {action}': '⏱ Timed out, default taken (level {level} {qid}): nobody answered, so the registered default action goes ahead — {action}',
   '⏱ 超时升级（Ⅱ 级 {qid}）：第一段无人答复；再无人答将退保守默认。请尽快：node src/cli.mjs answer {qid} "..."': '⏱ Timed out, escalated (level Ⅱ {qid}): nobody answered in the first window; if nobody answers again it falls back to the conservative default. Please answer soon: node src/cli.mjs answer {qid} "..."',
-  '[SuperIntern] Ⅱ 级问题超时升级': '[SuperIntern] Level Ⅱ item escalated after timeout',
-  '再无人答将退保守默认。回答：node src/cli.mjs answer {qid} "..."': 'If nobody answers again it falls back to the conservative default. Answer: node src/cli.mjs answer {qid} "..."',
   '⏱ 超时后仍挂起（{qid}）：升级后无人答，且没有默认可退 —— 分支继续等人': '⏱ Still waiting after timeout ({qid}): nobody answered after escalation and there is no default to fall back on — the branch keeps waiting',
   '⬆ 升档 [{nodeId}] {from} → {to}：同一节点已失败 {n} 次，预计再花 {usd}，已过预算与时长闸门': '⬆ Tier up [{nodeId}] {from} → {to}: this step has failed {n} times; estimated extra spend {usd}, within the budget and time gates',
   '执行 [{nodeId}] {title}（档位 {tier}）': 'Running [{nodeId}] {title} (tier {tier})',
@@ -450,7 +448,6 @@ export default {
   '，已通知管理员': '; admins notified',
   '无漂移': 'no drift',
   '；{n} 处拉取失败': '; {n} fetches failed',
-  '✉ 定时待办摘要 → {user}（{items} 项，{ok}/{all} 条送达）': '✉ Scheduled to-do digest → {user} ({items} items, {ok}/{all} delivered)',
   '⇄ 换班（{key}）：{from} → {to}，': '⇄ On-call handover ({key}): {from} → {to}, ',
   '默认表': 'default table',
   '已推 {n} 项待办': 'sent {n} to-dos',
@@ -460,8 +457,6 @@ export default {
   '▶ 拉起 {taskId}（{reason}）pid {pid} · 日志 {log}': '▶ Started {taskId} ({reason}) pid {pid} · log {log}',
   '✗ 拉不起 {taskId}（{reason}）：{err}': '✗ Could not start {taskId} ({reason}): {err}',
   '⛓ 项目 {pid}：{reason}': '⛓ Project {pid}: {reason}',
-  '[SuperIntern] 项目完成 {pid}': '[SuperIntern] Project done {pid}',
-  '全部任务已合进项目分支。交付：node src/cli.mjs project deliver {pid} --remote <url> --pr': 'All tasks are merged into the project branch. Deliver: node src/cli.mjs project deliver {pid} --remote <url> --pr',
   '✗ 项目 {pid} 推进失败（第 {n} 次，按退避等）：{err}': '✗ Advancing project {pid} failed (attempt {n}; backing off): {err}',
   '✗ 守护进程这一轮出错（已记入审计，下一轮照常）：{err}': '✗ This daemon round failed (recorded in the audit log; the next round runs as usual): {err}',
   '收到 {sig}，正在停止（在跑的任务进程不受影响）…': 'Received {sig}, stopping (running task processes are not affected)…',
@@ -601,10 +596,10 @@ export default {
   '令牌写入 {file}（库里只有哈希，这个文件是唯一副本；交给本人，本人用 --token-file 指向它）': 'Token written to {file} (the database only keeps a hash; this file is the only copy. Give it to the person, who points --token-file at it)',
   '要给用户 id': 'Give a user id',
   '标签已改': 'Tags updated',
-  'user channel <用户 id> --ntfy <url> | --feishu <url> | --dingtalk <url> | --wecom <url> | --remove <种类>': 'user channel <user id> --ntfy <url> | --feishu <url> | --dingtalk <url> | --wecom <url> | --remove <kind>',
+  'user channel <用户 id> --ntfy <url> | --feishu <url> | --dingtalk <url> | --wecom <url> | --email <邮箱> | --remove <种类>': 'user channel <user id> --ntfy <url> | --feishu <url> | --dingtalk <url> | --wecom <url> | --email <address> | --remove <kind>',
   '已删 {kind} 通道': 'Removed the {kind} channel',
   '已挂 {n} 条通道（审计只记种类，不记地址）': 'Added {n} channels (the audit log records only the kind, not the address)',
-  '没给通道（--ntfy / --feishu / --dingtalk / --wecom；删除用 --remove <种类>）': 'No channel given (--ntfy / --feishu / --dingtalk / --wecom; to remove: --remove <kind>)',
+  '没给通道（--ntfy / --feishu / --dingtalk / --wecom / --email；删除用 --remove <种类>）': 'No channel given (--ntfy / --feishu / --dingtalk / --wecom / --email; to remove: --remove <kind>)',
   'user role <id> lead|member|observer（lead = 管理员）': 'user role <id> lead|member|observer (lead = admin)',
   '角色已改为 {role}': 'Role changed to {role}',
   '角色没变': 'Role unchanged',
@@ -718,6 +713,7 @@ export default {
   node src/cli.mjs decisions <项目 id|任务 id> [--all] [--void <决定 id> "理由"]   # 决定登记：此刻仍然有效的约定清单（有结论的事项 / 批准过的契约与变更 / 改过的目标）
   node src/cli.mjs stalls [--raise]                          # 停等账本：每个没结束的任务在等谁（自己 / 时钟 / 某个人 / 上游）；⚠ 那几行是说不出在等谁的缺陷，--raise 升成事项
   node src/cli.mjs digest [--user <id|名字>] [--send]        # 我的待办打包：等我答的 / 等冲突结论的 / 等别人的 / 知会我的；负责人另见没人接的、任务状态、未读汇报、异议
+  node src/cli.mjs report [--since 24h|7d|<日期>] [--detail exceptions|summary|full] [--all] [--user <id|名字>]   # 状态报告：这段时间出事了没有、系统替你定了什么、进展、花费
   node src/cli.mjs catalog check [--probe] [--vision] [--vendor <id>] | last # 模型目录漂移：还在不在、能不能调（--probe 花极少的钱）、单价与窗口对不对；只报告，目录由人改
   node src/cli.mjs endpoint [list] | set <id> --adapter … --base-url … --key-env … | enable|disable|remove|test|models <id>   # 服务商（直连厂商 / 聚合平台）；key 只在 .env
   node src/cli.mjs catalog [list] | add|set <服务商/模型> --input <$/M> --output <$/M> [--window N] [--efforts …] | remove|enable|disable <键>   # 模型目录（缺单价不能绑）
@@ -732,6 +728,7 @@ export default {
   node src/cli.mjs run <taskId> [--cycles N] [--once] [--tier ...] [--iterations N]
                                 [--no-commit] [--no-verify] [--no-sandbox]
   node src/cli.mjs revision <taskId> [--approve | --redo "要怎么改" | --reject] [--reservation "批了，但这一条我保留意见：…"]
+  node src/cli.mjs rewind <taskId> <步骤 id> [--note "这次要注意什么"] [--yes]   从做完的某一步重来：先看会退回哪些步骤，加 --yes 才生效
   node src/cli.mjs sandbox [--reap] [--task <taskId>]
   node src/cli.mjs sources [add|remove]                      联网目录（管理员）：内置 5 个软件源，可加镜像 / 私有仓库 / 可信的信息源
   node src/cli.mjs sources cred add <源 id> (--key-file <文件> | --stdin) [--basic] [--allow-write] | revoke <凭据 id>   联网源的凭据：只进出网代理、沙箱看不到，默认只在读请求上带
@@ -742,6 +739,7 @@ export default {
   node src/cli.mjs draft <taskId> [--bind ...]   追问器的一次寿命（守护进程会自动跑；手动也可）
   node src/cli.mjs say <taskId> "<正文>" [--kind instruction|correction|context] [--urgent] [--about <questionId>] [--mode fake --script <响应脚本.json>]
       # 不给 --kind：系统读正文判断是修正（改要做的事）/ 新指令（加一件事）/ 补充信息（不改要做的事），落库标 kind_source=classifier；给了就一字不改
+      # --urgent：修正 / 新指令打断正在执行的步骤、马上重规划（不加就等这一步做完）；补充信息加不加都在执行中途送到
   node src/cli.mjs answer <questionId> "<答复>" [--token-file <路径>]   多人时按路由表数人头；立场不同会生成冲突事项
   node src/cli.mjs answer <questionId> --agree [答复 id]                 附议已有的那条（不写新文本，计入法定人数）
   node src/cli.mjs answer <questionId> --abstain ["说明"]                弃权：这条不归我（从收件人里去掉自己，人数重算）
@@ -757,15 +755,18 @@ export default {
   node src/cli.mjs cred oauth <GitHub App 连接 id> --client-id <id> (--secret-file <文件> | --stdin) | member <GitHub 账号>   用 GitHub 登录
   node src/cli.mjs user spend | budget <id> --usd <美元> | budget <id> --clear   每个人本月 / 上月的花费；单人月度预算
   node src/cli.mjs calendar [--days 60] | tz <时区 | -> | holidays --file <文件> | --clear   部署日历：时区（业务日 / 值班交接 / 月度预算按它算）、节假日与调休
-  node src/cli.mjs user tz [<时区> | -]   自己的时区（只影响给你看的时刻；- = 跟部署时区）
+  node src/cli.mjs user tz [<时区> | -]   自己的时区（给你看的时刻、你的工作时间与状态报告的钟点；- = 跟部署时区）
   node src/cli.mjs routing swap list | add <日期>[..<日期>] <成员 id> [--note 说明] | remove <序号> | clear [--project <id>]   值班代班（那几天整天由他值，不管轮换轮到谁）
   node src/cli.mjs trace <文件:行号 | 提交号> [--repo <仓库目录>] [--task <任务 id>]   修改溯源：这行代码 / 这个提交是哪一步做的、依据契约哪几条、谁的指令、谁批准
   node src/cli.mjs handover preview|run --from <id> --to <id> (--project <id> | --solo | --all) [--note ".."] [--disable]   交接；成员 run = 申请
   node src/cli.mjs handover requests | approve|reject|withdraw <申请 id>
+  node src/cli.mjs skill list | add <目录> | remove <名字> | off|on <层>:<名字>   [--project <id>]   skill（上下文包）：不带 --project 是部署级（管理员）
+  node src/cli.mjs hook list | trust [--id <钩子 id>]...   [--project <id>]   策略钩子：宿主上的（<数据目录>/hooks.json）按内容核准，改了要重新 trust
+  node src/cli.mjs mcp list | check | approve [--server <名字>]... | off|on --server <id> | tool <mcp__…> auto|ask|off   --project <id>   MCP server：check 在沙箱里看工具清单，负责人看过再 approve；变了要重新批准
   node src/cli.mjs routing show | templates | template <名> [--set pm=u_x] | reset | owner <类型> <解析器>... | remove <用户> |
                            duty --users u_a,u_b --start 日期[T09:00] | preview [--template 名] | export --file f | import --file f   [--project <id>]
   node src/cli.mjs tick [taskId] [--notify <cmd>]   扫到期的问题：Ⅰ 级走默认 / Ⅱ 级升级或退默认（给 cron 用）
-  node src/cli.mjs deliver <taskId> [--remote <url>] [--branch <名>] [--pr] [--base <分支>]
+  node src/cli.mjs deliver <taskId> [--remote <url>] [--branch <名>] [--pr] [--base <分支>] [--autofix off] [--hook-ack <确认码>]
   node src/cli.mjs project new --file <项目.json> --source <仓库路径或URL> [--base <ref>]   整批契约建项目（守护进程串着跑）
   node src/cli.mjs project new --brief <规划文本或文件> (--source <仓库> | --empty) [--title <名>] [--visibility all|members]   让规划器切整批契约，人批一次
   node src/cli.mjs project plan <projectId> [--bind …]  规划器的一次寿命（守护进程会自动拉）
@@ -777,13 +778,15 @@ export default {
   node src/cli.mjs project limits <projectId> [--key <项> --value <数> | --key <项> --clear]   项目默认上限（部署默认 → 项目默认 → 任务覆盖）
   node src/cli.mjs project sandbox <projectId> [node|python]      沙箱镜像（默认 python = Node + Python 3，带页面点验用的 Chromium；node = 只有 Node，镜像小一些）
   node src/cli.mjs project concurrency <projectId> [--max <1-4>]   同时最多开几个任务（默认 2；只有开着的任务全都在等人时才让路）
-  node src/cli.mjs project deliver <projectId> --remote <url> [--pr] [--base <分支>] [--accept-pending]
+  node src/cli.mjs project deliver <projectId> --remote <url> [--pr] [--base <分支>] [--accept-pending] [--hook-ack <确认码>]
   node src/cli.mjs project signoff <projectId> [--accept-all]   后置签收：自动挡下 AI 自己加的任务攒着的签收，看清单 / 一次点掉（交付前必须清掉）
+  node src/cli.mjs project issues <projectId> [--repo <owner/repo> --label <标签> | --off]   带这个标签的 GitHub issue 每条起草一轮添加任务（一律要负责人批）；不带参数看现状
+  node src/cli.mjs project schedule <projectId> [add --name <名> --cron "<分 时 日 月 星期>" --brief "<要做什么>" | on|off|rm <定时任务 id>]   定时任务：到点起草一轮添加任务（部署时区）；不带参数列出
                                     push 工作区分支；--pr 在 GitHub 开 PR（凭据见 cred；高风险任务先签收）
   node src/cli.mjs signoff <taskId> --accept | --reject "<理由>"   人工签收；打回 = 一条紧急修正
   node src/cli.mjs web [--port 7357] [--daemon]   看板（只绑 127.0.0.1；--daemon 同时带守护进程；不接 --bind —— 子进程自己读库里的绑定，库空时 --bind 写入一次）
   node src/cli.mjs web --team --public-url https://<内网域名> [--host 127.0.0.1] [--daemon]   团队模式：多人各自登录，放在 HTTPS 反向代理之后（docs/deploy-team.md）
-  node src/cli.mjs daemon [--interval 15] [--notify <cmd>] [--digest-every 8h] [--catalog-check 7d|--no-catalog-check]   守护进程：答完题 / 加额 / 批准后自动拉起 run；含 tick；--digest-every 按间隔给每人推待办摘要，换班时自动给接班人推；--catalog-check 按间隔查模型目录漂移（默认 7d，绑定里出现没查过的模型立刻查）
+  node src/cli.mjs daemon [--interval 15] [--notify <cmd>] [--catalog-check 7d|--no-catalog-check]   守护进程：答完题 / 加额 / 批准后自动拉起 run；含 tick；推送按人排队（工作时间、汇总推送、推送限额见看板「我的通知」），换班时自动给接班人推；--catalog-check 按间隔查模型目录漂移（默认 7d，绑定里出现没查过的模型立刻查）
   node src/cli.mjs show <taskId>
   node src/cli.mjs questions [--all]      列开放 / 已升级的问题（--all 含已答复的最近 20 条）；一眼看有没有人要答
   node src/cli.mjs limit <taskId> [--budget_micro_usd N] [--runtime_ms N] [--llm_calls N]
@@ -817,6 +820,7 @@ run **默认在容器沙箱里**跑命令。
   node src/cli.mjs decisions <project id|task id> [--all] [--void <decision id> "reason"]   # decision registry: the agreed decisions still in effect (settled items / approved contracts and changes / edited goals)
   node src/cli.mjs stalls [--raise]                          # stall ledger: who each unfinished task is waiting for (itself / the clock / a person / upstream); ⚠ rows are defects where it cannot say, --raise turns them into items
   node src/cli.mjs digest [--user <id|name>] [--send]        # my to-do bundle: waiting for my answer / for a disagreement to settle / on others / FYI; owners also see unaddressed items, task status, unread reports, dissent
+  node src/cli.mjs report [--since 24h|7d|<date>] [--detail exceptions|summary|full] [--all] [--user <id|name>]   # status report: did anything go wrong, what the system decided for you, progress, spend
   node src/cli.mjs catalog check [--probe] [--vision] [--vendor <id>] | last # model catalog drift: still there, callable (--probe spends a tiny amount), prices and windows right; report only, people edit the catalog
   node src/cli.mjs endpoint [list] | set <id> --adapter … --base-url … --key-env … | enable|disable|remove|test|models <id>   # providers (direct vendors / gateways); keys live only in .env
   node src/cli.mjs catalog [list] | add|set <provider/model> --input <$/M> --output <$/M> [--window N] [--efforts …] | remove|enable|disable <key>   # model catalog (no price = cannot bind)
@@ -831,6 +835,7 @@ run **默认在容器沙箱里**跑命令。
   node src/cli.mjs run <taskId> [--cycles N] [--once] [--tier ...] [--iterations N]
                                 [--no-commit] [--no-verify] [--no-sandbox]
   node src/cli.mjs revision <taskId> [--approve | --redo "what to change" | --reject] [--reservation "Approved, but I have a reservation on this one: …"]
+  node src/cli.mjs rewind <taskId> <stepId> [--note "what to watch this time"] [--yes]   Redo from a finished step: shows which steps go back first; --yes applies it
   node src/cli.mjs sandbox [--reap] [--task <taskId>]
   node src/cli.mjs sources [add|remove]                      network catalog (admins): 5 built-in package sources; add mirrors / private registries / trusted info sources
   node src/cli.mjs sources cred add <source id> (--key-file <file> | --stdin) [--basic] [--allow-write] | revoke <credential id>   package-source credentials: only the egress proxy gets them, never the sandbox; sent on read requests only by default
@@ -841,6 +846,7 @@ run **默认在容器沙箱里**跑命令。
   node src/cli.mjs draft <taskId> [--bind ...]   one lifetime of the question asker (auto-run does this automatically; you can also run it by hand)
   node src/cli.mjs say <taskId> "<text>" [--kind instruction|correction|context] [--urgent] [--about <questionId>] [--mode fake --script <responses.json>]
       # without --kind: the system reads the text and decides whether it is a correction (changes what to do) / new instruction (adds something) / extra info (does not change what to do), stored with kind_source=classifier; with --kind it is kept as given
+      # --urgent: a correction / new instruction interrupts the step in progress and replans right away (without it, it waits until the step finishes); extra info reaches the step mid-run either way
   node src/cli.mjs answer <questionId> "<answer>" [--token-file <path>]   with several people, counts heads per the routing table; differing positions raise a disagreement item
   node src/cli.mjs answer <questionId> --agree [answer id]                 second an existing answer (no new text; counts toward quorum)
   node src/cli.mjs answer <questionId> --abstain ["note"]                not mine: this one is not mine (removes you from the recipients; quorum recalculated)
@@ -856,15 +862,18 @@ run **默认在容器沙箱里**跑命令。
   node src/cli.mjs cred oauth <GitHub App connection id> --client-id <id> (--secret-file <file> | --stdin) | member <GitHub login>   GitHub login
   node src/cli.mjs user spend | budget <id> --usd <dollars> | budget <id> --clear   each person’s spending this month / last month; one person’s monthly budget
   node src/cli.mjs calendar [--days 60] | tz <zone | -> | holidays --file <file> | --clear   deployment calendar: time zone (business days / shift changes / monthly budgets use it), holidays and make-up workdays
-  node src/cli.mjs user tz [<zone> | -]   your own time zone (only affects times shown to you; - = follow the deployment)
+  node src/cli.mjs user tz [<zone> | -]   your own time zone (times shown to you, your working hours and status report time; - = follow the deployment)
   node src/cli.mjs routing swap list | add <date>[..<date>] <member id> [--note text] | remove <n> | clear [--project <id>]   on-call swaps (that person is on call for those whole days)
   node src/cli.mjs trace <file:line | commit> [--repo <repo dir>] [--task <task id>]   change provenance: which step made this line / commit, which contract clauses, whose instructions, who approved
   node src/cli.mjs handover preview|run --from <id> --to <id> (--project <id> | --solo | --all) [--note ".."] [--disable]   handover; for members, run = request
   node src/cli.mjs handover requests | approve|reject|withdraw <request id>
+  node src/cli.mjs skill list | add <dir> | remove <name> | off|on <layer>:<name>   [--project <id>]   skills (context packs); without --project it is deployment-wide (admins)
+  node src/cli.mjs hook list | trust [--id <hook id>]...   [--project <id>]   policy hooks: host hooks (<data dir>/hooks.json) are trusted by content; trust again after a change
+  node src/cli.mjs mcp list | check | approve [--server <name>]... | off|on --server <id> | tool <mcp__…> auto|ask|off   --project <id>   MCP servers: check lists their tools in the sandbox; the lead reviews, then approves; any change needs approval again
   node src/cli.mjs routing show | templates | template <name> [--set pm=u_x] | reset | owner <type> <resolver>... | remove <user> |
                            duty --users u_a,u_b --start date[T09:00] | preview [--template name] | export --file f | import --file f   [--project <id>]
   node src/cli.mjs tick [taskId] [--notify <cmd>]   sweep due items: level Ⅰ takes the default / level Ⅱ escalates or falls back to the default (for cron)
-  node src/cli.mjs deliver <taskId> [--remote <url>] [--branch <name>] [--pr] [--base <branch>]
+  node src/cli.mjs deliver <taskId> [--remote <url>] [--branch <name>] [--pr] [--base <branch>] [--autofix off] [--hook-ack <code>]
   node src/cli.mjs project new --file <project.json> --source <repo path or URL> [--base <ref>]   create a project from a full set of contracts (auto-run runs them in sequence)
   node src/cli.mjs project new --brief <plan text or file> (--source <repo> | --empty) [--title <name>] [--visibility all|members]   let the planner split it into contracts; people approve once
   node src/cli.mjs project plan <projectId> [--bind …]  one lifetime of the planner (auto-run starts it automatically)
@@ -876,13 +885,15 @@ run **默认在容器沙箱里**跑命令。
   node src/cli.mjs project limits <projectId> [--key <item> --value <number> | --key <item> --clear]   project default limits (deployment default → project default → task override)
   node src/cli.mjs project sandbox <projectId> [node|python]      sandbox image (default python = Node + Python 3, with Chromium for page checks; node = Node only, a smaller image)
   node src/cli.mjs project concurrency <projectId> [--max <1-4>]   how many tasks may be open at once (default 2; the next one only starts when all open tasks are waiting on people)
-  node src/cli.mjs project deliver <projectId> --remote <url> [--pr] [--base <branch>] [--accept-pending]
+  node src/cli.mjs project deliver <projectId> --remote <url> [--pr] [--base <branch>] [--accept-pending] [--hook-ack <code>]
   node src/cli.mjs project signoff <projectId> [--accept-all]   deferred sign-off: sign-offs piled up for tasks the AI added in auto gear; list them / clear them at once (must be cleared before delivery)
+  node src/cli.mjs project issues <projectId> [--repo <owner/repo> --label <label> | --off]   each GitHub issue with this label drafts one add-task round (always needs the lead’s approval); without arguments shows the current state
+  node src/cli.mjs project schedule <projectId> [add --name <name> --cron "<min hour day month weekday>" --brief "<what to do>" | on|off|rm <schedule id>]   schedules: draft an add-task round when due (deployment time zone); without arguments lists them
                                     push the workspace branch; --pr opens a GitHub PR (credentials: see cred; sign off high-risk tasks first)
   node src/cli.mjs signoff <taskId> --accept | --reject "<reason>"   manual sign-off; send back = one urgent correction
   node src/cli.mjs web [--port 7357] [--daemon]   board (binds to 127.0.0.1 only; --daemon also runs auto-run; no --bind — child processes read bindings from the database; with an empty database --bind is written once)
   node src/cli.mjs web --team --public-url https://<intranet domain> [--host 127.0.0.1] [--daemon]   team mode: everyone signs in separately, behind an HTTPS reverse proxy (docs/deploy-team.md)
-  node src/cli.mjs daemon [--interval 15] [--notify <cmd>] [--digest-every 8h] [--catalog-check 7d|--no-catalog-check]   auto-run: starts run after answers / limit raises / approvals; includes tick; --digest-every sends everyone a to-do digest at that interval and the incoming on-call person one at handover; --catalog-check checks model catalog drift at that interval (default 7d; checks at once when a never-checked model shows up in the bindings)
+  node src/cli.mjs daemon [--interval 15] [--notify <cmd>] [--catalog-check 7d|--no-catalog-check]   auto-run: starts run after answers / limit raises / approvals; includes tick; pushes are queued per person (working hours, digest and rate limit: see "My notifications" on the board), and the incoming on-call person gets one at handover; --catalog-check checks model catalog drift at that interval (default 7d; checks at once when a never-checked model shows up in the bindings)
   node src/cli.mjs show <taskId>
   node src/cli.mjs questions [--all]      list open / escalated items (--all includes the 20 most recent answered ones); see at a glance whether anyone needs to answer
   node src/cli.mjs limit <taskId> [--budget_micro_usd N] [--runtime_ms N] [--llm_calls N]
@@ -944,4 +955,44 @@ and every network attempt, refused ones included, goes into the audit trail. The
   "没有可撤销的（已用过、已撤销或已过期）": "Nothing to revoke (already used, revoked or expired)",
   "未知子命令：invite {sub}（可选 list / new / revoke）": "Unknown subcommand: invite {sub} (choose list / new / revoke)",
   "服务账户": "service account",
+  "（还没有 skill）": "(no skills yet)",
+  "用不了": "unusable",
+  "被 {id} 顶掉": "shadowed by {id}",
+  "管理员停用": "disabled by an admin",
+  "本项目停用": "disabled in this project",
+  "  （仓库里的 skill 按项目列：加 --project <id>）": "  (skills in a repository are listed per project: add --project <id>)",
+  "只有这个项目的负责人或管理员能改它的 skill": "Only this project’s lead or an admin can change its skills",
+  "只有管理员能改部署级的 skill": "Only admins can change deployment-wide skills",
+  "要给含 SKILL.md 的目录": "Give a directory that contains SKILL.md",
+  "装好了 {name} → {where}": "Installed {name} → {where}",
+  "卸掉了 {name}": "Removed {name}",
+  "要给 <层>:<名字>（层：{layers}；名字可以是 * 表示整层）": "Give <layer>:<name> (layers: {layers}; the name can be * for the whole layer)",
+  "已启用 {id}": "Enabled {id}",
+  "已停用 {id}": "Disabled {id}",
+  "宿主钩子：{file}": "Host hooks: {file}",
+  "  （没有）": "  (none)",
+  "没核准过或核准后内容变了：不会跑。看过没问题再 hook trust 核准": "Never approved, or changed since approval: it will not run. Review it, then approve it with hook trust",
+  "仓库钩子（项目分支 {branch}，只在沙箱里跑）：": "Repository hooks (project branch {branch}; they run only in the sandbox):",
+  "只有这个项目的负责人或管理员能核准它的宿主钩子": "Only this project’s lead or an admin can approve its host hooks",
+  "只有管理员能核准部署级的宿主钩子": "Only admins can approve deployment-wide host hooks",
+  "已核准 {id}": "Approved {id}",
+  "看过没问题：同一条命令加 --hook-ack {key} 再交付一次": "If it looks fine: run the same command again with --hook-ack {key}",
+  "MCP 按项目批准：要给 --project <id>": "MCP servers are approved per project: pass --project <id>",
+  "已批准": "approved",
+  "批准之后变了，没给 AI 用：重新 check 看过再 approve": "changed since approval and not given to the AI: run check again, review, then approve",
+  "看过、还没批准": "checked, not approved yet",
+  "还没看过：先 mcp check": "not checked yet: run mcp check first",
+  "看的时候起不来": "failed to start when checked",
+  "只有这个项目的负责人或管理员能批准 MCP server、改工具用法": "Only this project’s lead or an admin can approve MCP servers or change tool modes",
+  "没有配置 MCP server（{a}、{b}、仓库的 .mcp.json）": "No MCP servers configured ({a}, {b}, or the repository’s .mcp.json)",
+  "（{at} 看过，协议 {p}）": "(checked {at}, protocol {p})",
+  "看过工具说明没问题，用 mcp approve --project {id} 批准（可加 --server <名字> 只批一个）": "If the tool descriptions look fine, approve with mcp approve --project {id} (add --server <name> to approve just one)",
+  "已批准 {id}": "Approved {id}",
+  "{tool} → {mode}（之后开始的步骤生效）": "{tool} → {mode} (takes effect from the next step that starts)",
+  "负责人停用了（mcp on 重新启用）": "turned off by the project lead (re-enable with mcp on)",
+  "批准时：": "At approval: ",
+  "现在：": "Now: ",
+  "要给一个 --server <server id>（形如 repo:docs，见 mcp list）": "Give one --server <server id> (like repo:docs; see mcp list)",
+  "已停用 {id}：AI 拿不到它的工具": "Turned off {id}: the AI doesn’t get its tools",
+  "已重新启用 {id}：还要是批准过的那一版才给 AI": "Re-enabled {id}: the AI gets it only if it is still the approved version",
 };

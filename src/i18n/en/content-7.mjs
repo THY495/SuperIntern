@@ -125,7 +125,7 @@ export default {
   '（{list}{more}）': ' ({list}{more})',
   '旁观者不能作为接收人，而 {name} {what}{rows}。请先交接，或先调整决策路由': 'Observers cannot be recipients, but {name} {what}{rows}. Hand over first, or adjust the decision routing first',
   '{name} 已停用，请先启用再重新生成令牌': '{name} is disabled; enable them before regenerating the token',
-  '通知通道无效：{kind}（应为 ntfy / feishu / dingtalk / wecom）': 'Invalid notification channel: {kind} (expected ntfy / feishu / dingtalk / wecom)',
+  '通知通道无效：{kind}（应为 ntfy / feishu / dingtalk / wecom / email）': 'Invalid notification channel: {kind} (expected ntfy / feishu / dingtalk / wecom / email)',
   '该成员未配置 {kind} 通知通道': 'This member has no {kind} notification channel',
   '通道地址不能为空': 'The channel address cannot be empty',
   '项目已达成，等你交付：{title}': 'Project done, waiting for you to deliver: {title}',

@@ -38,11 +38,32 @@ import { git, gitEnv, gitRaw, safePositional } from './git.mjs';
 import { newId, now, audit, insertEdge } from '../db/db.mjs';
 import { writeConstitution } from '../db/constitutions.mjs';
 import { insertUserMessage } from '../db/messages.mjs';
-import { insertTask, markTaskMerged } from '../db/tasks.mjs';
+import { insertTask, markTaskMerged, unmarkTaskMerged } from '../db/tasks.mjs';
 import { insertProject } from '../db/projects.mjs';
 import { ensureWorkspace, workspaceStatus, isBuildOutput, discardChanges, describeChanges, pinLineEndings } from './workspace.mjs';
-import { handbackHook, openHandback, raiseDirtyWorkspace } from './handback.mjs';
-import { deliverTask, signoffOf, finalReport, parseGithub, doneHeadOf, signoffHeadOf, raiseSignoffQuestion, connectFor, connectAndPush } from './deliver.mjs';
+import { handbackHook, openHandback, raiseDirtyWorkspace, raiseMergeHookBlocked } from './handback.mjs';
+import { choicesHolding } from './choices.mjs';
+import { trySignal } from './signals.mjs';
+
+/** 进度（任务级）：合进项目分支了 —— 告诉负责人与提这条需求的人（原来提的人只能在摘要里看到，摘要默认不开） */
+function tellMerged(db, { projectId, taskId, head }) {
+  const L = contentLang(db);
+  const p = db.one('SELECT owner_id, title FROM projects WHERE id=?', projectId);
+  const t = db.one('SELECT title, project_order FROM tasks WHERE id=?', taskId);
+  const req = getParam(db, taskId, 'task.requested_by');
+  trySignal(db, 'progress.task_merged', { to: [p?.owner_id, ...(Array.isArray(req) ? req : req ? [req] : [])].filter(Boolean), projectId, taskId, ref: head,
+    title: tl(L, '[SuperIntern] #{order}「{title}」合进项目分支了', { order: t?.project_order ?? '?', title: t?.title ?? taskId }),
+    text: tl(L, '项目「{project}」里的这个任务已经合并（还只在这套系统里；推到你们的代码仓库要负责人点「交付项目」）。', { project: p?.title ?? projectId }) });
+}
+/** 进度（要注意）：项目停下来等人了 */
+function tellStalled(db, { projectId, why }) {
+  const L = contentLang(db);
+  const p = db.one('SELECT owner_id, title FROM projects WHERE id=?', projectId);
+  trySignal(db, 'progress.project_stalled', { to: [p?.owner_id].filter(Boolean), projectId, title: tl(L, '[SuperIntern] 项目「{title}」停下来等你了', { title: p?.title ?? projectId }), text: why });
+}
+import { gateHooks, reasonLines, lazySandbox, makeHookSession } from './hooks.mjs';
+import { deliverTask, signoffOf, finalReport, parseGithub, doneHeadOf, signoffHeadOf, raiseSignoffQuestion, connectFor, connectAndPush, deliverGate, openPrFor } from './deliver.mjs';
+import { recordDeliveredPr, notePrPushed } from './pr-watch.mjs';
 import { pushInitialDefault, remoteIsEmpty } from './push.mjs';
 import { verifyCommandProblems } from './verify-argv.mjs';
 import { validateRules, renderRules, normalizeQuote, foldRules } from './rules.mjs';
@@ -55,7 +76,7 @@ import { waitingOnHuman } from './addressee.mjs';
 import { RESOLUTION_HOOKS } from './answers.mjs';
 import { HTTP_TIMEOUT_MS } from './http.mjs';
 import { transition } from '../db/state.mjs';
-import { acquireLease, releaseLease } from '../db/lease.mjs';
+import { acquireLease, releaseLease, startHeartbeat } from '../db/lease.mjs';
 import { insertQuestion } from './questions.mjs';
 import { bindApproval } from './provenance.mjs';
 import { taskProvenanceMarkdown } from './provenance-render.mjs';
@@ -370,6 +391,9 @@ export function scheduleOf(db, { projectId, home }) {
 
 /** 开工：回归义务 = 此刻已合并的全部任务的验收命令；记漂移提示；从项目分支建工作区。 */
 function startTask(db, { project, task, tasks, home }) {
+  // 开工前再看一眼项目还在进行：推进开头读的那一次可能已经过时（人在合并期间中止了项目）
+  const ps = db.one(`SELECT status FROM projects WHERE id=?`, project.id)?.status;
+  if (ps !== 'active') throw Object.assign(new Error('project_moved'), { projectMoved: ps });
   const merged = tasks.filter((t) => t.merged_at).sort((a, b) => a.merged_at - b.merged_at);
   const extra = merged.map((t) => getParam(db, t.id, 'task.verify_command')).filter((v) => Array.isArray(v) && v.length);
   // 回归义务是宪法层参数，库的约束只许人写：与建任务时一样记在项目负责人名下（每条命令都出自他批准过的契约，这里只是机械汇总）。
@@ -398,6 +422,9 @@ function startTask(db, { project, task, tasks, home }) {
     setParam(db, { taskId: task.id, key: 'task.drift_note', value: note, by: sys, governance: 'execution' });
     audit(db, { actorKind: 'system', action: 'project_task_drift', targetType: 'project', targetId: project.id,
       payload: { taskId: task.id, order: task.project_order, mergedMeanwhile: strangers.map((t) => t.project_order), files: files.length } });
+    { const CL = contentLang(db);
+      trySignal(db, 'fix.drift_noted', { to: ['owner'], projectId: project.id, taskId: task.id, title: tl(CL, '[SuperIntern] #{order}「{title}」开工时项目里已经多了别的改动', { order: task.project_order, title: task.title }),
+        text: tl(CL, '它开工时依据的约定定下来之后，又有 {n} 个和它没有依赖关系的任务先合并了，项目里的代码可能和它看到的不一样。系统已提醒 AI 先读相关文件；和约定对不上时，它会停下来问人。', { n: strangers.length }) }); }
   }
   const ws = ensureWorkspace(db, { taskId: task.id, source: project.repo, dir: join(home, 'workspaces', task.id), ref: project.branch });
   audit(db, { actorKind: 'system', action: 'project_task_started', targetType: 'project', targetId: project.id,
@@ -421,12 +448,16 @@ export async function advanceProject(db, opts) {
   try { lease = acquireLease(db, res, { ttlMs: 30 * 60_000, meta: { pid: process.pid, op: 'advance' }, reclaimDead: opts.alive ?? pidAlive }); }
   catch (e) { if (e.leaseHeld) return { advanced: false, reason: 'busy', holderPid: e.pid }; throw e; }
   try { return await advanceProjectHeld(db, opts); }
+  catch (e) { if (e.projectMoved) return { advanced: false, reason: `status:${e.projectMoved}` }; throw e; }
   finally { try { releaseLease(db, res, lease.epoch); } catch { /* 会自然到期 */ } }
 }
 
 async function advanceProjectHeld(db, { projectId, home, userId = null, makeExec = null, onEvent = () => {} }) {
   const p = db.one(`SELECT * FROM projects WHERE id=?`, projectId);
   if (!p) throw new I18nError('没有这个项目：{id}', { id: projectId });
+  // 认领了、没收尾的合并先补齐（排在状态判断之前：认领是提交点，之后项目被中止也得让项目分支与"已合并"对上）
+  const recovered = finishClaimedMerges(db, p);
+  if (recovered) return recovered;
   if (p.status !== 'active') return { advanced: false, reason: `status:${p.status}` };
   const L = contentLang(db);
   // 预算闸：撞闸之后**不再开新任务**。正在跑的那个不掐 —— 它会在自己的下一轮体检停下来
@@ -438,10 +469,16 @@ async function advanceProjectHeld(db, { projectId, home, userId = null, makeExec
     return { advanced: false, reason: 'budget_exhausted', questionId: q.questionId, spent: budget.spent, gate: budget.gate };
   };
   let sch = scheduleOf(db, { projectId, home });
-  const finish = (extra = {}) => {
-    transition(db, 'projects', projectId, 'done');
-    audit(db, { actorKind: 'system', action: 'project_done', targetType: 'project', targetId: projectId, payload: { tasks: sch.tasks.map((t) => t.id), ...extra } });
+  // 推进里改项目状态都从 active 出发：推进要几秒到几分钟，期间人可能中止了项目。原来盲写：aborted → stalled / done
+  // 不在迁移表里，抛错变成一条"推进失败"；人刚中止又被改回别的就更糟。现在前置状态不对 → 整段（连同一起写的事项、审计）不写，这一拍让开
+  const setStatus = (to) => {
+    const r = transition(db, 'projects', projectId, to, { from: ['active'], onMismatch: 'skip' });
+    if (!r.changed && r.from !== to) throw Object.assign(new Error('project_moved'), { projectMoved: r.from });
   };
+  const finish = (extra = {}) => db.tx(() => {
+    setStatus('done');
+    audit(db, { actorKind: 'system', action: 'project_done', targetType: 'project', targetId: projectId, payload: { tasks: sch.tasks.map((t) => t.id), ...extra } });
+  });
 
   /**
    * 全部任务都合并了 —— 这是这个项目**第一次真的没事做**的时刻，也是
@@ -462,9 +499,12 @@ async function advanceProjectHeld(db, { projectId, home, userId = null, makeExec
     if (st?.kind === 'review' && st.stage === 'reached') {
       const v = await runProjectVerify(db, { projectId, home });
       if (v.ok === false) {
-        const q = raiseProjectVerifyFailed(db, { projectId, carrierId: st.carrierId, result: v });
-        transition(db, 'projects', projectId, 'stalled');
-        audit(db, { actorKind: 'system', action: 'project_verify_failed', targetType: 'project', targetId: projectId, payload: { questionId: q.questionId, argv: v.argv, code: v.code } });
+        const q = db.tx(() => {
+          setStatus('stalled');
+          const q = raiseProjectVerifyFailed(db, { projectId, carrierId: st.carrierId, result: v });
+          audit(db, { actorKind: 'system', action: 'project_verify_failed', targetType: 'project', targetId: projectId, payload: { questionId: q.questionId, argv: v.argv, code: v.code } });
+          return q;
+        });
         return { advanced: true, reason: 'project_verify_failed', questionId: q.questionId };
       }
       finish({ ...extra, verify: v.argv ?? null, verified: v.ok === true });
@@ -475,9 +515,10 @@ async function advanceProjectHeld(db, { projectId, home, userId = null, makeExec
     }
     if (st?.kind === 'review' && st.stage === 'abandoned') {
       // 人回了 C（先放着）。项目不是完成，也不是失败 —— 它在等人：添加任务、或中止。
-      transition(db, 'projects', projectId, 'stalled');
+      setStatus('stalled');
       audit(db, { actorKind: 'system', action: 'project_stalled', targetType: 'project', targetId: projectId,
         payload: { why: tl(L, '复盘被搁置：全部任务已合并，但没有宣布达成。项目等人：添加任务 / 宣布达成 / 中止项目') } });
+      tellStalled(db, { projectId, why: tl(L, '复盘被搁置：全部任务已合并，但没有宣布达成。项目等人：添加任务 / 宣布达成 / 中止项目') });
       return { advanced: true, reason: 'review_abandoned' };
     }
     // 还有排着队的需求就先做它们：复盘要回答"还差什么"，人明确提了的那几条不该让规划器再猜一遍。
@@ -491,8 +532,9 @@ async function advanceProjectHeld(db, { projectId, home, userId = null, makeExec
   // ── 挑这一拍要动的那个任务────────────────────────────────────────
   // 合并永远排在开工前面：项目分支往前挪一步，才谈得上下一个任务从哪儿起。
   // 可合并 = done + 签过收（或后置签收）+ **签的就是现在这一份** + 没有被集成卡住。
+  // 有人发来、还没处理的修正 / 新指令：人要改它，就不合 —— 守护进程会拉编排器重开它（daemon assessTask 的 doneWork）
   const mergeable = sch.open.filter((t) => t.status === 'done' && ['accepted', 'deferred'].includes(t.signoff)
-    && signoffCoversDone(db, t.id, wsHeadOf(home, t.id)) && !blockedAtHead(db, t.id, projectHead(p)));
+    && signoffCoversDone(db, t.id, wsHeadOf(home, t.id)) && !blockedAtHead(db, t.id, projectHead(p)) && !steeringPending(db, t.id) && !choicesHolding(db, t.id));
   const cur = mergeable[0] ?? null;
   if (!cur) {
     // 没有可合并的。看能不能**让路**：开着的任务全都在等人时，独立的下一个可以先跑起来。
@@ -510,16 +552,29 @@ async function advanceProjectHeld(db, { projectId, home, userId = null, makeExec
     // 唯一的任务在草案阶段就被放弃（契约从未批准过）—— 没有可"重做"的契约，停滞的出口不成立，直接中止项目。
     const stage = getParam(db, blocker.id, 'draft.stage');
     if (stage && stage !== 'approved' && sch.tasks.length === 1) {
-      transition(db, 'projects', projectId, 'aborted');
+      setStatus('aborted');
       audit(db, { actorKind: 'system', action: 'project_aborted', targetType: 'project', targetId: projectId,
         payload: { taskId: blocker.id, why: tl(L, '唯一的任务在草案阶段被放弃') } });
       return { advanced: true, reason: 'draft_abandoned', taskId: blocker.id };
     }
-    transition(db, 'projects', projectId, 'stalled');
+    setStatus('stalled');
     audit(db, { actorKind: 'system', action: 'project_stalled', targetType: 'project', targetId: projectId,
       payload: { taskId: blocker.id, aborted: sch.aborted.map((t) => t.id), why: tl(L, '剩下的任务都被已中止的任务卡住；项目等人：恢复 / 重做该任务，或中止项目') } });
+    tellStalled(db, { projectId, why: tl(L, '剩下的任务都被已中止的任务卡住；项目等人：恢复 / 重做该任务，或中止项目') });
     return { advanced: true, reason: 'task_aborted', taskId: blocker.id };
   }
+  // 合并这一个任务的整段（集成、交付、快进）拿着它的任务租约：与编排器（人发来修正、守护进程拉起它重开）、
+  // 「从这里重来」互斥。原来这几步要几秒到几分钟（集成要重跑验收），期间工作区可能被编排器改动、被重来退回，
+  // 合进去的就不是签收的那一份。拿不到 = 有人正在动它，这一拍让开。
+  const tres = `task:${cur.id}`;
+  let tlease;
+  try { tlease = acquireLease(db, tres, { meta: { pid: process.pid, op: 'merge' } }); }
+  catch (e) { if (e.leaseHeld) return { advanced: false, reason: 'busy:task', taskId: cur.id, holderPid: e.pid }; throw e; }
+  const stopBeat = startHeartbeat(db, tres, tlease.epoch);
+  try { return await mergeCur(); }
+  finally { stopBeat(); try { releaseLease(db, tres, tlease.epoch); } catch { /* 会自然到期 */ } }
+
+  async function mergeCur() {
   // 集成（原语是 merge）：并发之后，后完成的那个的分支不再是项目分支的快进。
   // 先机械把项目分支合进来 + 重跑，过了才走下面那条老路；不过就挂一条事项，任务原样留着等人。
   // 串行时这一步恒是 'ff'，什么也不做。
@@ -552,6 +607,9 @@ async function advanceProjectHeld(db, { projectId, home, userId = null, makeExec
       discardChanges(wsDir, junk);
       audit(db, { actorKind: 'system', action: 'workspace_build_output_discarded', targetType: 'task', targetId: cur.id,
         payload: { when: 'before_merge', paths: junk } });
+      { const CL = contentLang(db);
+        trySignal(db, 'fix.build_output_discarded', { to: ['owner'], taskId: cur.id, title: tl(CL, '[SuperIntern] 合并前撤掉了 {n} 个构建产物', { n: junk.length }),
+          text: tl(CL, '工作区里有验收留下的构建产物（{paths}），它们不该进项目分支，系统撤掉后再合并。', { paths: junk.slice(0, 5).join(tl(CL, '、')) }) }); }
     }
     const rest = dirty.filter((f) => !isBuildOutput(f));
     if (rest.length) {
@@ -563,9 +621,33 @@ async function advanceProjectHeld(db, { projectId, home, userId = null, makeExec
       return { advanced: true, reason: 'dirty_workspace', taskId: cur.id, questionId: q.questionId, files: rest };
     }
   }
+  // 合并前的策略钩子（fail-closed）：拦下 / 要人确认 → 一条交回事项；事项开着时安静地等，不每拍重跑
+  const gate = await mergeGate(db, { project: p, task: cur, home, makeExec, wsDir, L });
+  if (gate) return gate;
   let d;
   try {
     d = await deliverTask(db, { taskId: cur.id, workspace: wsDir, remote: p.repo, pr: false, userId, internal: true });
+  } catch (e) {
+    e.taskId = cur.id;   // 守护进程挂"推进反复失败"事项时要知道挂在哪个任务上
+    throw e;
+  }
+  // 认领：快进项目分支是改不回来的那一步。在它之前一个事务里重读 —— 任务还是 done、签收还盖着这一份、
+  // 没有人发来要改它的话、项目还在进行 —— 都成立才记"已合并"，之后人的动作（修正、中止、重来）看到的就是已合并，
+  // 走各自"已合并"的出路（修正转成添加任务……）。原来的顺序是先快进、再记：中间人中止项目、发修正，合并照样落地。
+  const cancel = db.tx(() => {
+    const t = db.one(`SELECT status, merged_at FROM tasks WHERE id=?`, cur.id);
+    const ps = db.one(`SELECT status FROM projects WHERE id=?`, projectId)?.status;
+    const why = ps !== 'active' ? `project:${ps}` : t.merged_at ? 'already_merged' : t.status !== 'done' ? `task:${t.status}`
+      : !['accepted', 'deferred'].includes(signoffOf(db, cur.id)) ? 'signoff_withdrawn'
+      : !signoffCoversDone(db, cur.id, wsHeadOf(home, cur.id)) ? 'signoff_stale' : steeringPending(db, cur.id) ? 'steering_pending' : choicesHolding(db, cur.id) ? 'choices_pending' : null;
+    if (why) { audit(db, { actorKind: 'system', action: 'project_merge_cancelled', targetType: 'task', targetId: cur.id, payload: { projectId, why } }); return why; }
+    markTaskMerged(db, cur.id);
+    // 认领记下要快进到哪个提交：快进之后、合并审计之前进程没了，下一拍照它补齐（finishClaimedMerges）
+    audit(db, { actorKind: 'system', action: 'project_task_merge_claimed', targetType: 'task', targetId: cur.id, payload: { projectId, branch: d.branch, head: d.head } });
+    return null;
+  });
+  if (cancel) return { advanced: false, reason: `merge_cancelled:${cancel}`, taskId: cur.id };
+  try {
     git(p.repo, 'checkout', '-q', p.branch);
     try {
       git(p.repo, 'merge', '--ff-only', d.branch);
@@ -573,13 +655,14 @@ async function advanceProjectHeld(db, { projectId, home, userId = null, makeExec
       throw new I18nError('项目分支 {branch} 无法快进到 {taskBranch}（{detail}）—— 任务分支不是从项目分支当前头起的？', { branch: p.branch, taskBranch: d.branch, detail: String(e.stderr ?? e.message).trim().split('\n').at(-1) });
     }
   } catch (e) {
-    e.taskId = cur.id;   // 守护进程挂"推进反复失败"事项时要知道挂在哪个任务上
+    undoClaim(db, cur.id, projectId, 'ff_failed');   // 没合上：撤掉认领，下一拍照常再试
+    e.taskId = cur.id;
     throw e;
   }
   const head = git(p.repo, 'rev-parse', 'HEAD');
-  markTaskMerged(db, cur.id);
   audit(db, { actorKind: 'system', action: 'project_task_merged', targetType: 'project', targetId: projectId,
     payload: { taskId: cur.id, order: cur.project_order, branch: d.branch, head } });
+  tellMerged(db, { projectId, taskId: cur.id, head });
   sch = scheduleOf(db, { projectId, home });
   if (!sch.unmerged.length) {
     const r = await allMerged({ head });
@@ -591,7 +674,51 @@ async function advanceProjectHeld(db, { projectId, home, userId = null, makeExec
   if (next) startTask(db, { project: p, task: next, tasks: sch.tasks, home });
   if (!next && budget.over) { const q = raiseProjectBudget(db, { projectId, taskId: cur.id }); return { advanced: true, reason: 'merged_budget_exhausted', taskId: cur.id, head, questionId: q.questionId }; }
   return { advanced: true, reason: 'merged', taskId: cur.id, head, nextTaskId: next?.id ?? null, integrated: rb.kind === 'integrated' };
+  }
 }
+
+/** 撤掉合并认领（项目分支没动）：任务回到没合并，留一行审计。 */
+function undoClaim(db, taskId, projectId, why) {
+  db.tx(() => {
+    unmarkTaskMerged(db, taskId);
+    audit(db, { actorKind: 'system', action: 'project_merge_claim_undone', targetType: 'task', targetId: taskId, payload: { projectId, why } });
+  });
+}
+
+/**
+ * 认领了（merged_at 已记）、却没有合并审计的任务：快进或写审计之前进程没了。照认领时记下的提交把项目分支快进到位
+ * （已经到位的话 git 说 Already up to date，什么也不动），再补合并审计。快进不了（项目分支被人动过）→ 撤掉认领，交给下一拍重新走。
+ * 原来的顺序是先快进再记，崩了重跑天然幂等；认领挪到快进前面之后，这一步把幂等补回来。
+ */
+function finishClaimedMerges(db, p) {
+  const rows = db.all(`SELECT c.id, c.target_id AS taskId, c.payload FROM audit_log c JOIN tasks t ON t.id=c.target_id
+    WHERE c.action='project_task_merge_claimed' AND t.project_id=? AND t.merged_at IS NOT NULL
+      AND c.id=(SELECT max(x.id) FROM audit_log x WHERE x.action='project_task_merge_claimed' AND x.target_id=c.target_id)   -- 只看最近一次认领：更早的已撤销
+      AND NOT EXISTS (SELECT 1 FROM audit_log m WHERE m.action='project_task_merged' AND m.target_id=? AND m.id>c.id AND json_extract(m.payload,'$.taskId')=c.target_id)
+    ORDER BY c.id`, p.id, p.id);
+  let last = null;
+  for (const r of rows) {
+    const c = JSON.parse(r.payload);
+    try {
+      git(p.repo, 'checkout', '-q', p.branch);
+      git(p.repo, 'merge', '--ff-only', c.head);
+    } catch (e) {
+      undoClaim(db, r.taskId, p.id, 'recover_ff_failed');
+      e.taskId = r.taskId;
+      throw e;
+    }
+    const head = git(p.repo, 'rev-parse', 'HEAD');
+    const order = db.one(`SELECT project_order FROM tasks WHERE id=?`, r.taskId)?.project_order ?? null;
+    audit(db, { actorKind: 'system', action: 'project_task_merged', targetType: 'project', targetId: p.id,
+      payload: { taskId: r.taskId, order, branch: c.branch, head, recovered: true } });
+    tellMerged(db, { projectId: p.id, taskId: r.taskId, head });
+    last = { advanced: true, reason: 'merged', taskId: r.taskId, head, recovered: true };
+  }
+  return last;
+}
+
+/** 有没有人发来、还没处理的修正 / 新指令（含待比对、等裁定的）。 */
+const steeringPending = (db, taskId) => !!db.one(`SELECT 1 FROM messages WHERE task_id=? AND consumed_at IS NULL AND kind IN ('correction','instruction') LIMIT 1`, taskId);
 
 /**
  * 交付前的一手证据。**纯读，不推任何东西。**
@@ -604,15 +731,21 @@ async function advanceProjectHeld(db, { projectId, home, userId = null, makeExec
  *   - `verify`：项目级验收命令**最近一次的真实输出**（从 `project_verified` / `project_verify_error` 审计里取，
  *     `tail` 是那次跑的输出尾巴）。没设验收命令时 `verify` 为 null —— 那本身就是要在页面上说清的事。
  */
-export function deliveryEvidence(db, { projectId }) {
+export function deliveryEvidence(db, { projectId, cachedOnly = false }) {
   const p = db.one(`SELECT * FROM projects WHERE id=?`, projectId);
   if (!p) return null;
-  let stat = null;
+  let stat = null, pending = false;
   try {
     const range = `${p.base_ref}..${p.branch}`;
     // `--no-merges`：换成 merge 之后，任务分支上会多出"把项目分支合进来"的集成提交，
     // 它们不是任何人写的代码。数进去会让这一页的提交数无端变大，而这一页的全部用处是让人敢点交付。
-    stat = { range, diffstat: git(p.repo, 'diff', '--stat', range), commits: Number(git(p.repo, 'rev-list', '--count', '--no-merges', range)) || 0, head: git(p.repo, 'rev-parse', p.branch) };
+    // 按提交号缓存：看板列表每次刷新都要它，同步 git 会卡住同进程的看板（见 gitMemo）
+    const head = git(p.repo, 'rev-parse', p.branch);
+    // 看板（cachedOnly）：缓存不齐就后台去算，这一次先说"正在读"，不在请求里同步跑几十条 git
+    if (cachedOnly && !evidenceReady(db, p, head)) {
+      void warmDeliveryEvidence(db, p, head).catch(() => {});
+      pending = true;
+    } else stat = { range, ...branchStat(p.repo, p.base_ref, head), head };
   } catch { stat = null; }                       // 仓库读不了就如实说读不了，别编一个空 diff 出来
   const row = db.one(`SELECT ts, action, payload FROM audit_log WHERE target_id=? AND action IN ('project_verified','project_verify_error') ORDER BY id DESC LIMIT 1`, projectId);
   let verify = null;
@@ -628,14 +761,15 @@ export function deliveryEvidence(db, { projectId }) {
   // 哪个文件 / 提交是哪个任务的（交付页要用）：只在仓库读得到时算。
   let byTask = null;
   if (stat) { try { byTask = mergeChainOf(db, p); } catch { byTask = null; } }
-  return { stat, verify, byTask, command: projectVerifyCommand(db, projectId) };
+  return { stat, verify, byTask, command: projectVerifyCommand(db, projectId), ...(pending ? { pending: true } : {}) };
 }
 
 /**
  * 项目交付：把项目分支推到远端；`pr` 时开一个 PR，正文 = 各任务终版汇报摘要。
  * 项目要 done；或已中止但至少合并过一个任务 —— 已合并的前缀逐个经人签收、各带累加的回归验收，是可以交付的成果。
  */
-export async function deliverProject(db, { projectId, remote, pr = false, base = null, token = undefined, env = process.env, fetchFn = globalThis.fetch, userId = null, acceptDeferred = false }) {
+export async function deliverProject(db, { projectId, remote, pr = false, base = null, token = undefined, env = process.env, fetchFn = globalThis.fetch, userId = null, tokenId = null, acceptDeferred = false,
+  home = null, makeExec = null, hookAck = [] }) {
   const p = db.one(`SELECT * FROM projects WHERE id=?`, projectId);
   if (!p) throw new I18nError('没有这个项目：{id}', { id: projectId });
   const L = contentLang(db);
@@ -656,6 +790,7 @@ export async function deliverProject(db, { projectId, remote, pr = false, base =
     throw new I18nError('还有 {n} 个任务的签收被后置了（自动挡下 AI 自己加的）：{list}。交付前要一次签掉：命令行加 --accept-pending，或先 node src/cli.mjs project signoff {id} --accept-all',
       { n: deferred.length, list: deferred.map((t) => `#${t.project_order}「${t.title}」`).join('、'), id: projectId });
   }
+  await projectDeliverGate(db, { p, home, makeExec, hookAck, userId, remote, pr });   // 拦下 / 要确认都抛错，签收还没动
   if (deferred.length) acceptDeferredSignoffs(db, { projectId, userId, tasks: deferred });
   const gh = parseGithub(remote);
   const out = { remote, branch: p.branch, head: null, pr: null, prSkipped: null, basePushed: null, credential: null, partial: partial ? { merged: mergedTasks.length, total: allTasks.length } : null };
@@ -675,7 +810,9 @@ export async function deliverProject(db, { projectId, remote, pr = false, base =
   pushed.cleanup();
   const head = git(p.repo, 'rev-parse', p.branch);
   out.head = head;
-  if (pr) {
+  const open = gh ? openPrFor(db, { projectId }, gh, p.branch) : null;
+  if (open) { out.pr = { url: open.url, number: open.number, base: open.base, updated: true }; notePrPushed(db, { projectId, head }); }
+  if (pr && !open) {
     if (!gh) out.prSkipped = tl(L, '远端不是 GitHub（{remote}），已推送，未创建 PR', { remote });
     else if (!pushed.apiToken) out.prSkipped = tl(L, '已推送，未创建 PR：没有能调用 GitHub 接口的连接。到「设置 → 连接」加一个 GitHub App 或令牌后重新交付即可');
     else {
@@ -696,6 +833,7 @@ export async function deliverProject(db, { projectId, remote, pr = false, base =
       const json = await res.json().catch(() => ({}));
       if (!res.ok) throw new I18nError('开 PR 失败：HTTP {status} {body}', { status: res.status, body: JSON.stringify(json).slice(0, 300) });
       out.pr = { url: json.html_url, number: json.number, base: baseBranch };
+      recordDeliveredPr(db, { projectId, gh, pr: out.pr, branch: p.branch, head, userId, tokenId });
     }
   }
   audit(db, { actorKind: 'user', actorId: userId, action: 'project_delivered', targetType: 'project', targetId: projectId, payload: out });
@@ -870,11 +1008,18 @@ export function raiseProjectVerifyFailed(db, { projectId, carrierId = null, resu
  *     日后追"这个 commit 谁签的"时，批量与逐个必须一样查得到；
  *   - 另有一条 `project_signoff_batch` 记下它们是**一次**点掉的，别让审计轨看起来像人逐个看过。
  */
-export function acceptDeferredSignoffs(db, { projectId, userId, tasks = null }) {
-  const list = tasks ?? deferredSignoffs(db, projectId);
-  if (!list.length) return { accepted: 0, tasks: [] };
-  if (!userId) throw new I18nError('批量签收要说明是谁签的');
+/**
+ * seen：签的人在页面上看到的任务 id（看板传）。只签这几个 —— 打开之后系统又加进来的，他没过目，不替他签，回报出来（unseen）。
+ * 原来"一次签收这些任务"签的是点下去那一刻的全部，页面上列的是打开时的那几个。
+ */
+export function acceptDeferredSignoffs(db, { projectId, userId, tasks = null, seen = null }) {
   return db.tx(() => {
+    const all = tasks ?? deferredSignoffs(db, projectId);
+    const pick = Array.isArray(seen) ? new Set(seen) : null;
+    const list = pick ? all.filter((t) => pick.has(t.id)) : all;
+    const unseen = pick ? all.filter((t) => !pick.has(t.id)).map((t) => t.id) : [];
+    if (!list.length) return { accepted: 0, tasks: [], unseen };
+    if (!userId) throw new I18nError('批量签收要说明是谁签的');
     for (const t of list) {
       setParam(db, { taskId: t.id, key: 'signoff.status', value: 'accepted', by: { kind: 'user', id: userId }, governance: 'constitutional' });
       audit(db, { actorKind: 'user', actorId: userId, action: 'task_signed_off', targetType: 'task', targetId: t.id,
@@ -882,7 +1027,7 @@ export function acceptDeferredSignoffs(db, { projectId, userId, tasks = null }) 
     }
     audit(db, { actorKind: 'user', actorId: userId, action: 'project_signoff_batch', targetType: 'project', targetId: projectId,
       payload: { tasks: list.map((t) => t.id), orders: list.map((t) => t.project_order) } });
-    return { accepted: list.length, tasks: list.map((t) => t.id) };
+    return { accepted: list.length, tasks: list.map((t) => t.id), unseen };
   });
 }
 
@@ -921,6 +1066,60 @@ async function disposeExec(exec) {
   if (!exec) return;
   if (typeof exec.stop === 'function') return await exec.stop({ remove: true });   // 真沙箱
   if (typeof exec.dispose === 'function') return await exec.dispose();             // 测试里的假执行器
+}
+
+/**
+ * 合并前的策略钩子。返回 null = 放行（没有钩子 / 都放行 / 人确认过这一版）；否则是给 advanceProject 的返回值。
+ * 仓库钩子的配置从项目分支当前头读（管这次合并的，是项目里已经生效的钩子，不是这个任务自己带来的版本）；
+ * 任务改了钩子文件 → 不跑仓库钩子，先问负责人（同意之后照任务里的新版本跑）。
+ */
+async function mergeGate(db, { project: p, task: cur, home, makeExec, wsDir, L }) {
+  const open = openHandback(db, cur.id, 'merge_hook');
+  if (open) return { advanced: false, reason: 'waiting:merge_hook', taskId: cur.id, questionId: open.questionId };
+  const head = git(wsDir, 'rev-parse', 'HEAD');
+  const ref = projectHead(p);
+  const key = `${cur.id}:${head}`;
+  const approved = getParam(db, cur.id, 'hooks.merge_approved') === key;
+  let changed = [];
+  try { changed = git(wsDir, 'diff', '--name-only', ref, 'HEAD').split('\n').filter(Boolean); } catch { changed = []; }
+  const r = await gateHooks(db, { event: 'PreMerge', taskId: cur.id, projectId: p.id, workspace: wsDir, ref, allowTamper: approved,
+    makeExec: makeExec ?? lazySandbox(db, cur.id, home),
+    payload: { task: { id: cur.id, title: cur.title, order: cur.project_order }, project: { id: p.id, branch: p.branch, head: ref }, head, changed_files: changed } });
+  if (!r || r.decision === 'allow' || (approved && r.decision === 'ask')) return null;
+  const lines = reasonLines(r, (k, prm) => tl(L, k, prm));
+  const decision = r.decision === 'deny' && r.failed ? 'failed' : r.decision;   // 钩子自己坏了：要修的是钩子，不是代码
+  const q = raiseMergeHookBlocked(db, { taskId: cur.id, decision, lines, tampered: r.tampered, key });
+  audit(db, { actorKind: 'system', action: 'project_task_merge_hook_blocked', targetType: 'task', targetId: cur.id, payload: { projectId: p.id, decision, tampered: r.tampered, questionId: q.questionId } });
+  return { advanced: true, reason: `merge_hook_${decision}`, taskId: cur.id, questionId: q.questionId };
+}
+
+/**
+ * 项目交付前的策略钩子。钩子看的是要推出去的那一版：项目分支当前头的一份干净克隆（有钩子才克隆，跑完删）——
+ * 项目仓库本身是系统合并用的地盘，不拿给沙箱挂。合并时每个任务都过了合并前钩子，所以这里不再查"改了钩子文件"。
+ * 借载体任务的名字跑（审计、沙箱都挂在任务上），同项目级验收。
+ */
+async function projectDeliverGate(db, { p, home, makeExec, hookAck, userId, remote, pr }) {
+  const carrier = db.one(`SELECT id FROM tasks WHERE project_id=? AND project_order=0`, p.id)
+    ?? db.one(`SELECT id FROM tasks WHERE project_id=? ORDER BY project_order DESC LIMIT 1`, p.id);
+  if (!carrier) return;
+  const probe = makeHookSession(db, { taskId: carrier.id, projectId: p.id, workspace: p.repo, exec: null, baseRef: p.branch });
+  if (!probe.entries.some((e) => e.event === 'PreDeliver')) return;
+  const head = projectHead(p);
+  let dir = null;
+  try {
+    if (home) {
+      const root = join(home, 'hookrun');
+      dir = join(root, p.id);
+      rmSync(dir, { recursive: true, force: true });   // 路径是这里拼的（数据目录下固定位置），不是人填的
+      mkdirSync(root, { recursive: true });
+      git(root, '-c', 'core.autocrlf=false', 'clone', '--quiet', '--no-hardlinks', '--branch', p.branch, '--', p.repo, dir);
+    }
+    let changed = [];
+    try { changed = git(p.repo, 'diff', '--name-only', p.base_ref, p.branch).split('\n').filter(Boolean); } catch { changed = []; }
+    await deliverGate(db, { taskId: carrier.id, projectId: p.id, workspace: dir ?? p.repo, ref: dir ? 'HEAD' : p.branch, hookAck, userId,
+      makeExec: makeExec ?? (home ? lazySandbox(db, carrier.id, home) : null),
+      payload: { target: 'project', project: { id: p.id, title: p.title, branch: p.branch }, remote: String(remote).replace(/\/\/[^@/]*@/, '//'), head, pr: !!pr, changed_files: changed } });
+  } finally { if (dir) { try { rmSync(dir, { recursive: true, force: true }); } catch { /* 尽力 */ } } }
 }
 
 /** 起一次沙箱，跑完必清理。跑不起来就抛 —— 调用方一律把"没能跑起来"算作不过。 */
@@ -1253,6 +1452,76 @@ function signerOf(db, taskId) {
  * 链断了（老项目、手工改过库、上一个头不是这一个头的祖先）就停在那里，`broken` 说明断在哪 —— 不猜。
  * @returns {{ tasks: Array<{taskId, order, title, signer, from, head, files, commits}>, broken: string|null, tail: {from, head, commits}|null }}
  */
+/**
+ * 只由提交号决定的 git 结论的缓存（提交号不变，结论就不变 —— 不会过期，只按条数淘汰最早的）。
+ * key 里必须带齐决定结果的全部提交号与仓库路径。keepIf 返回 false 的结果不记（读失败的下次再试）。
+ */
+const GIT_MEMO_MAX = 4000;
+const gitMemoMap = new Map();
+export function gitMemo(key, compute, { keepIf = () => true } = {}) {
+  if (gitMemoMap.has(key)) return gitMemoMap.get(key);
+  const v = compute();
+  if (keepIf(v)) {
+    gitMemoMap.set(key, v);
+    if (gitMemoMap.size > GIT_MEMO_MAX) gitMemoMap.delete(gitMemoMap.keys().next().value);
+  }
+  return v;
+}
+
+const segKey = (repo, prev, head) => `seg\0${repo}\0${prev}\0${head}`;
+/** 合并链的一段（前一个头 → 这一个头）：是不是接得上、改了哪些文件、几个提交。只由两个提交号决定，算一次记住。 */
+function chainSeg(repo, prev, head) {
+  return gitMemo(segKey(repo, prev, head), () => {
+    try { git(repo, 'merge-base', '--is-ancestor', prev, head); } catch { return { err: 'ancestor' }; }
+    try {
+      return { files: git(repo, 'diff', '--name-only', `${prev}..${head}`).split('\n').filter(Boolean),
+        commits: Number(git(repo, 'rev-list', '--count', '--no-merges', `${prev}..${head}`)) || 0 };
+    } catch { return { err: 'read' }; }
+  }, { keepIf: (v) => !v.err });
+}
+const statKey = (repo, base, head) => `stat\0${repo}\0${base}\0${head}`;
+function branchStat(repo, base, head) {
+  return gitMemo(statKey(repo, base, head), () => ({
+    diffstat: git(repo, 'diff', '--stat', `${base}..${head}`), commits: Number(git(repo, 'rev-list', '--count', '--no-merges', `${base}..${head}`)) || 0 }));
+}
+const mergedHeads = (db, projectId) => db.all(`SELECT payload FROM audit_log WHERE action='project_task_merged' AND target_id=? ORDER BY id`, projectId)
+  .map((r) => { try { return JSON.parse(r.payload || '{}').head ?? null; } catch { return null; } }).filter(Boolean);
+
+/**
+ * 交付证据在缓存里齐不齐（看板列表只用齐了的）。第一次算要每个已合并任务 3 条同步 git：
+ * 30 个任务的项目约 2 秒，而看板与守护进程同一个进程 —— 项目刚收工、或重启之后第一个人打开列表，全看板卡住（场景集查出）。
+ * 不齐就交给 warmDeliveryEvidence 在后台一段一段地算（每段之间让出事件循环）。
+ */
+const warmed = new Set(), warming = new Map();
+export function evidenceReady(db, p, head) {
+  if (warmed.has(`${p.id}\0${head}`)) return true;   // 后台算过一遍了（算不出的段也算"齐了"：同步路径只会算到断的那一段）
+  if (!gitMemoMap.has(statKey(p.repo, p.base_ref, head))) return false;
+  let prev = p.base_ref;
+  for (const h of mergedHeads(db, p.id)) { if (!gitMemoMap.has(segKey(p.repo, prev, h))) return false; prev = h; }
+  return true;
+}
+/** 清空 git 结论缓存（测试用：模拟进程刚重启）。 */
+export function clearGitMemo() { gitMemoMap.clear(); warmed.clear(); }
+/** 同一个项目同一个头只算一份：正在算就返回那一份（调用方 await 到的是真算完）。 */
+export function warmDeliveryEvidence(db, p, head) {
+  const k = `${p.id}\0${head}`;
+  if (!warming.has(k)) warming.set(k, warmOnce(db, p, head, k).finally(() => warming.delete(k)));
+  return warming.get(k);
+}
+async function warmOnce(db, p, head, k) {
+  const turn = () => new Promise((ok) => setImmediate(ok));
+  await turn();
+  try { branchStat(p.repo, p.base_ref, head); } catch { /* 读不了：同步路径会如实说 */ }
+  let prev = p.base_ref;
+  for (const h of mergedHeads(db, p.id)) {
+    await turn();   // 每一段（3 条 git）之间让出事件循环
+    if (chainSeg(p.repo, prev, h).err) break;
+    prev = h;
+  }
+  warmed.add(k);
+  if (warmed.size > 200) warmed.delete(warmed.values().next().value);
+}
+
 export function mergeChainOf(db, project) {
   const rows = db.all(`SELECT payload FROM audit_log WHERE action='project_task_merged' AND target_id=? ORDER BY id`, project.id);
   const tasks = [];
@@ -1262,13 +1531,12 @@ export function mergeChainOf(db, project) {
     let pl = {};
     try { pl = JSON.parse(r.payload || '{}'); } catch { continue; }
     if (!pl.head) continue;
-    try { git(project.repo, 'merge-base', '--is-ancestor', prev, pl.head); }
-    catch { broken = tl(L, '#{order} 合并时记下的头接不上前一个（老项目或手工改过）', { order: pl.order ?? '?' }); break; }
-    let files = [], commits = null;
-    try {
-      files = git(project.repo, 'diff', '--name-only', `${prev}..${pl.head}`).split('\n').filter(Boolean);
-      commits = Number(git(project.repo, 'rev-list', '--count', '--no-merges', `${prev}..${pl.head}`)) || 0;
-    } catch { broken = tl(L, '读不到 #{order} 那一段的提交', { order: pl.order ?? '?' }); break; }
+    // 每一段（前一个头 → 这一个头）的结论只由两个提交号决定：算一次记住。看板列表每次刷新都走到这里，
+    // 原来每个已合并任务 3 条同步 git —— 30 个任务的项目一次刷新卡住看板 4 秒（场景集查出）
+    const seg = chainSeg(project.repo, prev, pl.head);
+    if (seg.err === 'ancestor') { broken = tl(L, '#{order} 合并时记下的头接不上前一个（老项目或手工改过）', { order: pl.order ?? '?' }); break; }
+    if (seg.err) { broken = tl(L, '读不到 #{order} 那一段的提交', { order: pl.order ?? '?' }); break; }
+    const { files, commits } = seg;
     const task = db.one(`SELECT title, project_order FROM tasks WHERE id=?`, pl.taskId);
     tasks.push({ taskId: pl.taskId, order: task?.project_order ?? pl.order ?? null, title: task?.title ?? pl.taskId,
       signer: signerOf(db, pl.taskId), from: prev, head: pl.head, files, commits });
@@ -1281,8 +1549,10 @@ export function mergeChainOf(db, project) {
       const head = git(project.repo, 'rev-parse', project.branch);
       if (head !== prev) {
         // 连带谁提交的、写了什么（只给一条 git log 命令的话，等于把"安不安全"整个甩给人去查）
-        const log = git(project.repo, 'log', '--no-merges', `--format=${tl(L, '%h %an：%s')}`, '-n', '5', `${prev}..${head}`).split('\n').filter(Boolean);
-        tail = { from: prev, head, commits: Number(git(project.repo, 'rev-list', '--count', '--no-merges', `${prev}..${head}`)) || 0, log };
+        const t = gitMemo(`tail\0${project.repo}\0${prev}\0${head}\0${L}`, () => ({
+          log: git(project.repo, 'log', '--no-merges', `--format=${tl(L, '%h %an：%s')}`, '-n', '5', `${prev}..${head}`).split('\n').filter(Boolean),
+          commits: Number(git(project.repo, 'rev-list', '--count', '--no-merges', `${prev}..${head}`)) || 0 }));
+        tail = { from: prev, head, ...t };
       }
     } catch { /* 分支读不到：交付页上面那一段已经会说 */ }
   }
@@ -1384,21 +1654,25 @@ export function raiseIntegrateBlocked(db, { project, task, result }) {
 /**
  * 集成卡住那条事项答完之后。
  *
- * 事项给的出路若都是**命令行命令**（`signoff --reject` / `replay` / 中止），而事项本身
- * 底下就是一个答复框，负责人会在答复框里写下完全正确的处置（例如"冲突处把 scripts 合并成
- * {test, demo, start} 三项都保留后再提交签收"）—— 系统若只把它记成一条答复、把事项关掉，
- * 就**什么也没发生**：任务仍然 done + 已签收 +
+ * 事项给的三条出路都是**命令行命令**（`signoff --reject` / `replay` / 中止），而事项本身
+ * 底下就是一个答复框。实际运行上负责人在答复框里写下了完全正确的处置 ——
+ * 「变基冲突是 package.json 里 scripts 字段的机械冲突……请重新变基到 2fd5f00a，
+ *  冲突处把 scripts 合并成 {test, demo, start} 三项都保留后再提交签收」——
+ * 系统把它记成一条答复、把事项关掉，然后**什么也没发生**：任务仍然 done + 已签收 +
  * 卡在 `task.rebase_blocked` 上，`advanceProject` 每拍回一句没有人看得见的 `rebase_blocked`。
  *
- * 停等账本会把它报成 `unknown`（"这句话没有说谁会让它动起来"）——
- * 但报警不等于修好：人已经做了正确的动作，系统该在那一刻就接住。
+ * 停等账本当场把它报成 `unknown`（"守护进程的判断是「status:done」，这句话没有说谁会让它动起来"）——
+ * 那道判据抓到了一个它出生时还不存在的缺陷。但报警不等于修好：人已经做了正确的动作，
+ * 系统该在那一刻就接住。
  *
- * 所以：**答复这条事项 = 打回签收**。答复正文原样当作打回理由，走既有的修正指令那条路
+ * 所以：**答复这条事项 = 打回签收**。答复正文原样当作打回理由，走既有的修正那条路
  * （任务回 running、挂一条紧急 correction、签收作废），与人手敲 `signoff --reject` 一模一样。
  * 唯一的例外是答复明说"中止/不要了"——那要人自己去项目页做，这里不替他做不可逆的动作。
  */
 // 运维类只有"交回给人"那几种与停等报警；前者由 handbackHook 认领，后者没有钩子（答复本身就是确认）
 RESOLUTION_HOOKS.ops = (db, o) => handbackHook(db, o);
+// 合并前钩子要确认（现在是安全审批）：答「同意」放行这一版，与原来走运维时同一个处理；执行器里的钩子 / 门禁 / MCP 审批不挂交回记录，这里返回 null
+RESOLUTION_HOOKS.security = (db, o) => handbackHook(db, o);
 RESOLUTION_HOOKS.structural = (db, o) => projectVerifyHook(db, o) ?? structuralHook(db, o);
 /**
  * 项目验收没过之后的"再跑一次"（原来出路是命令行，而且改完验收命令之后页面上没有路重新确认达成）。
@@ -1531,6 +1805,8 @@ function openWhy(db, list, head) {
   if (!t) return null;
   if (blockedAtHead(db, t.id, head)) return 'integrate_blocked';
   if (t.status !== 'done') return `waiting:${t.status}`;
+  if (steeringPending(db, t.id)) return 'waiting:correction';   // 签过了，但人又发来要改它的话：等编排器重开它
+  if (choicesHolding(db, t.id)) return 'waiting:choices';      // 逐项审批：AI 自己定的几件事还没人过目
   return 'needs_signoff';
 }
 

@@ -118,5 +118,28 @@ section('② v1 形状、各表都有行的库，升上来数据一行不丢');
   d.close();
 }
 
+section('③ v55：升级前就开着的禁默认事项去掉默认（不然到期照样替人定）');
+{
+  const { ensureOwner, newId } = await import('../src/db/db.mjs');
+  const p = join(TMP, 'v54-open-defaults.db');
+  const d0 = openDb(p);
+  const owner = ensureOwner(d0, '负责人'), t0 = 1_800_000_000_000;
+  const tid = newId('t'), nid = newId('n');
+  d0.run(`INSERT INTO tasks (id,owner_id,title,status,created_at) VALUES (?,?,'x','running',?)`, tid, owner.userId, t0);
+  d0.run(`INSERT INTO nodes (id,task_id,title,spec,acceptance,status,priority,created_at) VALUES (?,?,'n','s','a','running',5,?)`, nid, tid, t0);
+  const q = (id, type, status, level = 2) => d0.run(`INSERT INTO questions (id,task_id,node_id,level,level_source,text,default_action,asked_at,timeout_at,status,decision_type)
+    VALUES (?,?,?,?,'classifier','?','撤销改动',?,?,?,?)`, id, tid, nid, level, t0, t0 + 3_600_000, status, type);
+  q('q_struct', 'structural', 'open'); q('q_ops1', 'ops', 'escalated', 1); q('q_spec', 'spec_choice', 'open', 1); q('q_done', 'structural', 'answered');
+  d0.raw.exec(`PRAGMA user_version = 54`);
+  d0.close();
+  const d = openDb(p);
+  const row = (id) => { const r = d.one(`SELECT default_action, level FROM questions WHERE id=?`, id); return [r.default_action, r.level]; };
+  eq(row('q_struct'), [null, 2], '开着的结构矛盾：默认去掉');
+  eq(row('q_ops1'), [null, 2], '升级过的系统卡住：默认去掉，Ⅰ 级抬成 Ⅱ 级（和路由时的处理一样）');
+  eq(row('q_spec'), ['撤销改动', 1], '规格取舍可以有默认：不动');
+  eq(row('q_done'), ['撤销改动', 2], '已经结了的不动（留着当时的记录）');
+  d.close();
+}
+
 console.log(`\n${'═'.repeat(72)}\n${fail ? '❌' : '✅'} ${pass} 通过，${fail} 失败\n${'═'.repeat(72)}`);
 process.exitCode = fail ? 1 : 0;

@@ -55,6 +55,24 @@ export const SETTINGS = {
   'deploy.verifier_vendor': { default: 'different', type: 'enum', values: ['different', 'same'], label: '验收员与执行器（different 落在同一家时换一家 / same 不强求）' },
   // 高风险步骤（规划时标 high）两个不同服务商的验收员会签：两个都通过才算过
   'deploy.verifier_cosign': { default: 'off', type: 'enum', values: ['off', 'high_risk'], label: '两个验收员会签（off 不用 / high_risk 高风险步骤用两家各验一次，都通过才算过）' },
+  // 部署级停用的 skill（`<层>:<名字>`，或 `<层>:*` 停掉整层）。停了的，项目里打不开
+  'deploy.skills_off': { default: [], type: 'list', label: '停用的 skill（对所有项目）' },
+  // 每一步开头给执行器的仓库地图（文件 → 定义的符号，按这一步的范围排序）截到多少 token。
+  // 默认 2048：中小仓库里，执行器开工阶段要读的文件大多能列进去；再大收益递减，而这一段每一轮都要付
+  'deploy.repo_map_tokens': { default: 2048, type: 'int', min: 0, max: 16384, label: '每一步开头给执行器的仓库地图（token，0 = 不给）' },
+  // 2026-11-08：没单独设过监督模式的项目用哪一种（full 逐项审批 / spot 抽检 / exception 例外管理），见 core/signals.mjs
+  // 推送节奏：个人没设时用这里的（个人在「我的通知」里改自己的）
+  'deploy.work_start_hour': { default: 9, type: 'int', min: 0, max: 23, label: '工作时间从几点开始（按各人自己的时区；工作时间外只推紧急的）' },
+  'deploy.work_end_hour': { default: 18, type: 'int', min: 1, max: 24, label: '工作时间到几点结束（24 = 到午夜）' },
+  'deploy.work_days_only': { default: true, type: 'boolean', label: '工作时间只算工作日（按部署的节假日表）' },
+  'deploy.digest_every_min': { default: 60, type: 'int', min: 0, max: 1440, label: '汇总推送间隔（分钟；0 = 不攒，有就推）' },
+  'deploy.push_cap_per_hour': { default: 4, type: 'int', min: 0, max: 60, label: '推送限额：每人每小时最多几条即时推送（0 = 不限；Ⅲ 级与部署健康不受限）' },
+  // 状态报告：部署默认；各人可在「我的通知」里改
+  'deploy.report_every': { default: 'auto', type: 'enum', values: ['auto', 'off', 'day', 'week'], label: '状态报告多久一份（auto 按默认监督模式：逐项审批每天、抽检每周、例外管理每周只报异常 / off 不发 / day 每天 / week 每周）' },
+  'deploy.report_day': { default: 1, type: 'int', min: 1, max: 7, label: '每周的状态报告发在星期几（1 = 周一 … 7 = 周日）' },
+  'deploy.report_hour': { default: 9, type: 'int', min: 0, max: 23, label: '状态报告几点发（按各人时区；那天不是工作日就顺延到下一个工作日）' },
+  'deploy.report_detail': { default: 'auto', type: 'enum', values: ['auto', 'exceptions', 'summary', 'full'], label: '状态报告详略（auto 按默认监督模式 / exceptions 只报异常 / summary 摘要 / full 详细）' },
+  'deploy.oversight_mode': { default: 'spot', type: 'enum', values: ['full', 'spot', 'exception'], label: '默认监督模式（full 逐项审批 / spot 抽检 / exception 例外管理；项目没单独设时用它）' },
   'deploy.test_guard':{ default: 'annotate', type: 'enum', values: ['annotate', 'reject'], label: '原有测试被改弱时（annotate 只标出来给验收员和人看 / reject 交接时直接打回）' },
 };
 

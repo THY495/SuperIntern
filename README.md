@@ -5,7 +5,7 @@
 一个在你自己的机器或服务器上长期运行的自主编码 agent。你交给它一个想法，它先问清细节，再拆步骤，在容器沙箱里写代码、跑验收，最后交给你签收。**你只需要做四件事：回答它的问题、做取舍、提变更、叫停。** 多人使用时，按一张「决策路由表」决定每类事由谁来拍板。
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-![version](https://img.shields.io/badge/version-0.4.0-orange)
+![version](https://img.shields.io/badge/version-0.5.0-orange)
 ![node](https://img.shields.io/badge/node-%E2%89%A5%2022.13-green)
 ![deps](https://img.shields.io/badge/npm%20dependencies-0-brightgreen)
 
@@ -44,13 +44,17 @@
 - **在沙箱里干活**：每一步都在 Docker 容器里执行，默认断网。联网按项目放行，只放行白名单里的域名（npm、PyPI 等，可配国内镜像）。支持 Node 与 Python 项目。
 - **机械核对 + 模型验收**：每一步交一份交接记录，系统机械核对它（改动有没有超出可动路径、验收命令是否真的通过），再由另一个模型当验收员打分，不合格就打回重做。验收员默认换一家厂商的模型；改了界面的步骤，验收员会把应用起起来，在页面上点、填、逐条核对，签收的人看得到它点过的画面。原有测试被删、被跳过、断言变少，会标出来给验收员和签收的人看（也可以设成直接打回）。
 - **不懂就问，不瞎猜**：遇到规格没写清的取舍，它会提问，并只挂起受影响的那一支，其余照常推进。问题带默认选项和到期时间。它自己做的小决定会汇总成「AI 替你定了几件事」，交给对应的人过目。
+- **随时叫停、改方向**：暂停、中止、紧急修正在 AI 的下一轮就生效，写到一半的改动先存起来、恢复后放回；补充信息在执行中途就送到。做完的步骤可以「从这一步重来」。
+- **按你的方式监督**：每个项目选一种监督模式——逐项审批、抽检（默认）、例外管理；负责人可以列出必须有人点头才能跑的命令（审批门禁）。
+- **项目规则与扩展**：仓库里分层的 `AGENTS.md` 交给 AI 遵守；支持 skill、与 Claude Code / Codex 同格式的策略钩子、MCP server（在沙箱里跑，负责人批准后才给 AI）。执行器每一步开头拿到一张仓库地图。
 - **看得见结果**：任务页上有步骤图、系统在沙箱里打开做出来的页面截的图，以及逐行代码改动（统一 / 左右对照）。
 - **多人协作**：用「决策路由表」规定每类决定（规格取舍、结构矛盾、方案批准、签收、上限追加、联网放行、交付……）由谁答、要几个人同意、意见不一致怎么办、没人答怎么办。内置六个模板。答复时可以附议、弃权（「不归我」）、转交。签收可以设成需求提出人签，也可以设成多人会签。
 - **钱和时间都有上限**：花费、时长、调用次数、重试次数都有硬上限，另有按人、按部署的月度预算。碰到上限会停下来问人，既不会悄悄停摆，也不会自己接着跑。管理员可以一键暂停全部自动运行。
-- **交付前让你看清楚**：交付前列出要推送的提交、每个任务带进来的改动，并提示风险（比如项目没有项目级验收命令）。可以推到任意 git 远端，也可以在 GitHub 上开 PR。**交付是整套系统里唯一必须由人亲手点的一步。**
+- **交付前让你看清楚**：交付前列出要推送的提交、每个任务带进来的改动，并提示风险（比如项目没有项目级验收命令）。可以推到任意 git 远端，也可以在 GitHub 上开 PR。**交付是整套系统里唯一必须由人亲手点的一步。** 授权了「AI 跟进」的 PR，CI 没过或成员要求修改时，改好的提交会自动推回同一个 PR 分支；合并仍然只由人在 GitHub 上点。
+- **GitHub 闭环**：盯交付的 PR（状态、CI、评审意见），CI 没过自动修、按评审意见改；带指定标签的 issue 和定时任务会起草成添加任务的草稿。
 - **多厂商模型**：内置 DeepSeek、Anthropic、OpenAI、Gemini、OpenRouter，也可以加任何 OpenAI 兼容的服务商。模型分 light / standard / heavy 三档，每档用哪个模型可以随时换，也可以给某个角色（例如验收员）单独指定；每档可以配备用模型，某家服务商出故障时自动换过去。还能定期检查模型目录（单价、上下文窗口）有没有变化。
 - **可复盘**：所有状态都在一个 SQLite 库里，每个动作都记审计。进程随时可以挂掉，重启后接着干。`replay` 只凭审计记录就能复盘一个任务。
-- **通知**：ntfy、飞书、钉钉、企业微信，或者任意一条命令，按人发送，也可以定时推送待办摘要。
+- **通知**：ntfy、飞书、钉钉、企业微信、邮件，或者任意一条命令，按人发送。紧急的马上推，其余只在各人的工作时间里推、攒成汇总；每条带链接，点开就能答。规格取舍这类事项可以直接回邮件答。另有定期的状态报告，离开一段时间回来时看板上有「你不在时」。
 - **中英双语**：看板与命令行支持中文和英文。每人在看板右上角选自己的界面语言；管理员在「设置 → 成员」里定团队的内容语言（事项正文、汇报、AI 写给人的文字）。答复用哪种语言写都能读懂。
 - **零 npm 依赖**：只用 Node 内置模块（包括 `node:sqlite`）。看板不需要构建。
 
@@ -65,7 +69,7 @@
 | Docker（在运行） | Windows 用 Docker Desktop，保持默认的 Linux 容器模式（如果切到过 Windows 容器，在托盘图标右键选 Switch to Linux containers）；Linux 用 docker-ce。**没有容器运行时，任务不会开跑**（不会退回宿主机裸跑） |
 | 至少一家模型厂商的 API key | [DeepSeek](https://platform.deepseek.com/) / [Anthropic](https://console.anthropic.com/) / [OpenAI](https://platform.openai.com/) / [Gemini](https://aistudio.google.com/) / [OpenRouter](https://openrouter.ai/)，或任何 OpenAI 兼容的服务商 |
 
-下载：在 [Releases](../../releases) 里下载 `superintern-v0.4.0-windows.zip` 或 `superintern-v0.4.0-linux.tar.gz` 并解压，或者直接 `git clone` 本仓库。不需要 `npm install`。
+安装 0.5.0：克隆本仓库并签出 `v0.5.0`。如果需要预打包文件，请在 [Releases](../../releases) 查看该版本是否提供下载。不需要 `npm install`。
 
 > 所有命令都在解压出来的目录里执行：运行时的状态（库、令牌、日志、工作区）放在这个目录下的 `.superintern/` 里。
 
@@ -144,7 +148,9 @@ node src/cli.mjs --version
 node src/cli.mjs digest                        # 我的待办
 node src/cli.mjs questions                     # 所有开放的问题
 node src/cli.mjs answer <问题 id> "..."         # 答复
-node src/cli.mjs say <任务 id> "..."            # 给任务发修正 / 新指令 / 补充信息
+node src/cli.mjs say <任务 id> "..."            # 给任务发修正 / 新指令 / 补充信息（--urgent 打断正在执行的步骤）
+node src/cli.mjs report --since 7d             # 状态报告：这段时间出事了没有、没等你拍板就定下的、进展、花费
+node src/cli.mjs rewind <任务 id> <步骤 id>      # 从做完的这一步重来（先看预览，加 --yes 生效）
 node src/cli.mjs signoff <任务 id> --accept     # 签收（--reject "理由" 打回）
 node src/cli.mjs project deliver <项目 id> --remote <git url> [--pr]
 node src/cli.mjs replay <任务 id>               # 只凭审计记录复盘
@@ -195,6 +201,7 @@ node tests/run.mjs --all --without browser   # 没有 Chrome / Edge / Chromium �
 | `scripts/` | 安装、启动、常驻（Windows 计划任务 / Linux systemd） |
 | `tests/` | 离线回归测试；`tests/live/` 是会实际调用模型、会花钱的测试脚本 |
 | `docs/` | 部署、已知限制 |
+| `THIRD_PARTY_NOTICES.md`、`LICENSES/` | 移植代码的出处与许可证（仓库地图的排序移植自 Aider，Apache-2.0） |
 
 ## 文档
 
@@ -207,3 +214,5 @@ node tests/run.mjs --all --without browser   # 没有 Chrome / Edge / Chromium �
 ## 许可证
 
 [MIT](LICENSE) © 2026 THY495
+
+其中移植的第三方代码保留原许可证，见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。

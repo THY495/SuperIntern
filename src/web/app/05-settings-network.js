@@ -220,7 +220,232 @@ async function renderPsNet(p) {
       <input type="checkbox" data-src="${esc(s.id)}" style="width:auto;margin-top:3px"${on.has(s.id) ? ' checked' : ''}>
       <span><b>${esc(T(s.name))}</b> <span class="small mute">${esc(KIND_NAME[s.kind] ?? s.kind)}${s.readOnly ? ` · ${T('只读')}` : ''}</span>${s.needsTool ? ` <span class="small bad">${T('沙箱里没有 {tool}，放行了也用不上', { tool: esc(s.needsTool) })}</span>` : ''}<br><span class="small mono mute">${s.hosts.map(esc).join(T('　'))}</span></span></label>`).join('')}
     <div class="row" style="margin-top:10px"><span class="small mute">${me?.role === 'lead' ? T('要加目录里没有的地址，去「设置 → 联网目录」') : T('要加目录里没有的地址，请管理员在「设置 → 联网目录」里添加')}</span><span class="grow"></span><button id="psNetSave" class="primary">${T('保存')}</button></div>`;
-  $('#psNetSave').onclick = () => projAct(p.id, 'egress', { sources: [...box.querySelectorAll('input[data-src]:checked')].map((x) => x.dataset.src) }, T('项目联网已保存（下一次开工 / 跑验收时生效）'));
+  // 带上打开时看到的名单：服务端只应用你勾掉 / 新勾的，打开之后别人放行的保留（不整份覆盖）
+  const nameOf = (id) => T(data.sources.find((s) => s.id === id)?.name ?? id);
+  $('#psNetSave').onclick = () => projAct(p.id, 'egress', { sources: [...box.querySelectorAll('input[data-src]:checked')].map((x) => x.dataset.src), base: [...on] },
+    (r) => (r?.result?.keptOthers?.length
+      ? T('已保存。现在放行的是：{all}。其中 {names} 是你打开这一页之后 {who} 刚放行的，你的保存保留了它；不想放行 {names}，取消勾选后再保存', { all: r.result.sources.map(nameOf).join(T('、')), names: r.result.keptOthers.map(nameOf).join(T('、')), who: [...new Set(r.result.keptOthers.map((id) => r.result.keptBy?.[id] ?? T('别人')))].join(T('、')) })
+      : T('项目联网已保存（下一次开工 / 跑验收时生效）')));
+}
+
+// 项目规则文件：仓库里的 AGENTS.md 等。看：所有能看项目的人；改：负责人（服务端再判一次）
+// 走查：编辑框就地展开在那一行下面（和「查看」一样）；同一时间只开一个，有没保存的改动先问；新建时实时显示要建的文件
+async function renderPsRules(p) {
+  const box = $('#psRules'); if (!box) return;
+  let data; try { data = await api(`/api/projects/${p.id}/rules`); } catch (e) { box.innerHTML = `<span class="bad small">${esc(e.message)}</span>`; return; }
+  const row = (f, i) => `<div class="item${f.shadowedBy ? ' off' : ''}" style="margin-top:8px">
+      <div class="row"><b class="mono">${esc(f.path)}</b>${f.shadowedBy ? ` <span class="small" style="color:var(--wait)">${T('AI 不读这份：同一目录里只读 {other}', { other: `<span class="mono">${esc(f.shadowedBy)}</span>` })}</span>` : ''}<span class="grow"></span>
+        <span class="small mute">${f.at ? T('{who} {ago}前改的', { who: esc(f.author ?? ''), ago: ago(f.at) }) : ''}</span>
+        <button class="ghost small" data-rview="${esc(i)}">${T('查看')}</button>${data.canEdit ? `<button class="small" data-redit="${esc(i)}">${T('编辑')}</button>` : ''}</div>
+      <pre class="small hide" data-rbody="${esc(i)}" style="white-space:pre-wrap;margin-top:6px">${esc(f.text)}</pre><div data-rslot="${esc(i)}"></div></div>`;
+  box.innerHTML = `<div class="small mute">${T('AI 每一步都按这些文件里写的构建、测试、代码风格去做，离要改的文件越近的那份越优先。和任务说明或{link}冲突时以那两样为准：下一步开跑前系统会比一遍，对不上就挂一条事项给负责人，选改规则文件还是改约定。', { link: `<a href="#p/${esc(p.id)}">${T('已定的约定')}</a>` })}</div>
+    ${data.files.length ? data.files.map(row).join('') : `<div class="small" style="margin-top:8px">${T('这个项目的仓库里还没有规则文件。')}</div>`}
+    ${data.canEdit ? `<div class="row" style="margin-top:10px"><span class="grow"></span><button id="psRuleNew">${T('新建规则文件')}</button></div><div data-rslot="new"></div>` : ''}`;
+  box.querySelectorAll('[data-rview]').forEach((b) => b.onclick = () => box.querySelector(`[data-rbody="${b.dataset.rview}"]`).classList.toggle('hide'));
+  let openSlot = null, openName = '', orig = '';
+  const dirty = () => openSlot && (($('#psRuleText')?.value ?? '') !== orig || !!($('#psRuleDir')?.value ?? '').trim());
+  const send = async (body, msg) => { try { await api(`/api/projects/${p.id}/rules`, body); toast(msg); renderPsRules(p); } catch (e) { toast(e.message, true); } };
+  const open = (f, slotKey) => {
+    if (openSlot === slotKey) return;
+    if (dirty() && !confirm(T('{path} 还有没保存的改动，丢掉它？', { path: openName }))) return;
+    if (openSlot != null) box.querySelector(`[data-rslot="${openSlot}"]`).innerHTML = '';
+    openSlot = slotKey; openName = f?.path ?? T('新建的规则文件'); orig = f?.text ?? '';
+    const slot = box.querySelector(`[data-rslot="${slotKey}"]`);
+    slot.innerHTML = `<div class="item flag" style="margin-top:8px">
+      ${f?.shadowedBy ? `<div class="small" style="color:var(--wait)">${T('AI 不读这份：同一目录里只读 {other}', { other: `<span class="mono">${esc(f.shadowedBy)}</span>` })}</div>` : ''}
+      ${f ? '' : `<label class="small">${T('目录（相对仓库根，根目录留空）')} <input id="psRuleDir" class="mono" style="width:14em" placeholder="${T('例如 web')}"></label>
+        <div class="small" style="margin-top:4px">${T('将新建：{path}', { path: '<b class="mono" id="psRulePath">AGENTS.md</b>' })} <span class="bad" id="psRuleDup"></span></div>`}
+      <label class="small" style="display:block;margin-top:6px">${T('内容（AI 原样读到，Markdown 写法即可）')}</label>
+      <textarea id="psRuleText" rows="14" class="mono" style="width:100%">${esc(orig)}</textarea>
+      <div class="row" style="margin-top:6px"><span class="small mute">${T('保存＝在项目分支 {branch} 上提交一次。之后开始执行的任务读新版；已经在执行的任务继续用它开始时那一版。', { branch: `<span class="mono">${esc(p.branch ?? '')}</span>` })}</span><span class="grow"></span>
+        ${f ? `<button class="ghost danger small" id="psRuleDel">${T('删除这份')}</button>` : ''}<button class="ghost" id="psRuleCancel">${T('取消')}</button><button class="primary" id="psRuleSave">${T('保存')}</button></div></div>`;
+    const pathOf = () => { const d = ($('#psRuleDir')?.value || '').trim().replace(/\\/g, '/').replace(/^\/+|\/+$/g, ''); return d ? `${d}/AGENTS.md` : 'AGENTS.md'; };
+    if (!f) {
+      const sync = () => { const x = pathOf(); $('#psRulePath').textContent = x; const dup = data.files.some((z) => z.path === x); $('#psRuleDup').textContent = dup ? T('已经有了：在上面的列表里点它的「编辑」') : ''; $('#psRuleSave').disabled = dup; };
+      $('#psRuleDir').oninput = sync; sync(); $('#psRuleDir').focus();
+    } else $('#psRuleText').focus();
+    $('#psRuleCancel').onclick = () => { slot.innerHTML = ''; openSlot = null; };
+    $('#psRuleSave').onclick = () => send({ path: f ? f.path : pathOf(), text: $('#psRuleText').value, base: f?.sha ?? null }, T('已保存，提交到了项目分支'));
+    if (f) $('#psRuleDel').onclick = () => { if (confirm(T('删除 {path}？会在项目分支上提交一次删除，git 历史里找得回来。', { path: f.path }))) send({ path: f.path, delete: true, base: f.sha }, T('已删除')); };
+  };
+  box.querySelectorAll('[data-redit]').forEach((b) => b.onclick = () => open(data.files[Number(b.dataset.redit)], b.dataset.redit));
+  if (data.canEdit) $('#psRuleNew').onclick = () => open(null, 'new');
+}
+
+// skill：按来源分三组；每份一行：名字、一句说明、给不给 AI 用（负责人能开关，只管本项目）、查看正文
+async function renderPsSkills(p) {
+  const box = $('#psSkills'); if (!box) return;
+  let data; try { data = await api(`/api/projects/${p.id}/skills`); } catch (e) { box.innerHTML = `<span class="bad small">${esc(e.message)}</span>`; return; }
+  const msg = (w) => esc(T(w.msg, w.params ?? {}));
+  const GROUPS = [
+    ['deploy', T('服务器上装的（所有项目都能用）'), T('管理员在服务器上用命令 {cmd} 安装。', { cmd: '<code>skill add &lt;目录&gt;</code>' })],
+    ['project', T('服务器上给本项目装的'), T('负责人或管理员在服务器上用命令 {cmd} 安装。', { cmd: `<code>skill add &lt;目录&gt; --project ${esc(p.id)}</code>` })],
+    ['repo', T('仓库里的'), T('放在仓库的 {a} 或 {b}，提交到项目分支后就会出现。', { a: '<code>.agents/skills/&lt;名字&gt;/SKILL.md</code>', b: '<code>.claude/skills/&lt;名字&gt;/SKILL.md</code>' })],
+  ];
+  const state = (s) => s.error ? `<span class="bad small">${T('用不了：{why}', { why: msg(s.error) })}</span>`
+    : s.shadowedBy ? `<span class="small" style="color:var(--wait)">${T('不给 AI：「{group}」里有同名的，用的是那份。要换用这份：把上面那份取消勾选，再勾上这份。', { group: esc(GROUPS.find(([l]) => l === s.shadowedBy.split(':')[0])?.[1] ?? s.shadowedBy) })}</span>`
+    : s.offBy === 'deploy' ? `<span class="small" style="color:var(--wait)">${T('管理员停用了（对所有项目）')}</span>`
+    : !s.invocable ? `<span class="small mute">${T('这份 AI 不会自己挑（它的 SKILL.md 里写了 disable-model-invocation: true）：任务描述或步骤里写出它的名字（{name}）时才给。', { name: `<span class="mono">${esc(s.name)}</span>` })}</span>` : '';
+  const toggle = (s, i) => (s.error || s.shadowedBy || s.offBy === 'deploy' ? ''
+    : `<label class="small"><input type="checkbox" data-sk="${esc(i)}" ${s.enabled ? 'checked' : ''} ${data.canEdit ? '' : 'disabled'}> ${s.invocable ? T('本项目给 AI 用') : T('本项目点名时给 AI')}</label>`);
+  const row = (s, i) => `<div class="item${s.error || s.shadowedBy || s.offBy === 'deploy' ? ' off' : ''}" style="margin-top:6px">
+      <div class="row"><b class="mono">${esc(s.name)}</b>${s.where ? ` <span class="small mute mono">${esc(s.where)}/SKILL.md</span>` : ''}<span class="grow"></span>${toggle(s, i)}<button class="ghost small" data-skv="${esc(i)}">${T('查看')}</button></div>
+      ${s.description ? `<div class="small">${esc(s.description)}</div>` : ''}${state(s) ? `<div>${state(s)}</div>` : ''}
+      ${s.warnings.length ? `<div class="small mute">${s.warnings.map((w) => `⚠ ${msg(w)}`).join('<br>')}</div>` : ''}
+      <div class="hide" data-skb="${esc(i)}"><div class="small mute" style="margin-top:6px">${s.where ? T('在仓库的 {path}', { path: `<span class="mono">${esc(s.where)}/</span>` }) : ''}${s.files ? ` ${T('另有 {n} 个参考文件', { n: esc(s.files) })}` : ''}</div>
+        <pre class="small" style="white-space:pre-wrap;margin-top:4px">${esc(s.body)}</pre></div></div>`;
+  box.innerHTML = `<div class="small mute">${T('Skill 是写好的做法说明（怎么用某个工具、按什么流程做某类事）。和「项目规则」不同：规则每一步都整份给 AI；skill 每一步只先给名字和那句说明，AI 用得上时才取全文。')} ${T('新出现的默认给 AI 用；这里的勾只管本项目，改了从之后开始的步骤起生效。')}${data.canEdit ? '' : ` ${T('只有项目负责人能开关。')}`}</div>
+    ${GROUPS.map(([layer, title, how]) => { const xs = data.skills.map((s, i) => [s, i]).filter(([s]) => s.layer === layer);
+      return `<h3 style="margin-top:14px">${esc(title)}</h3><div class="small mute">${how}</div>${xs.length ? xs.map(([s, i]) => row(s, i)).join('') : `<div class="small" style="margin-top:4px">${T('没有。')}</div>`}`; }).join('')}`;
+  box.querySelectorAll('[data-skv]').forEach((b) => b.onclick = () => box.querySelector(`[data-skb="${b.dataset.skv}"]`).classList.toggle('hide'));
+  box.querySelectorAll('[data-sk]').forEach((c) => c.onchange = async () => {
+    const s = data.skills[Number(c.dataset.sk)];
+    try { await api(`/api/projects/${p.id}/skills`, { id: s.id, enabled: c.checked }); const nm = `${s.name}（${({ deploy: T('服务器上装的'), project: T('给本项目装的'), repo: T('仓库里的') })[s.layer] ?? s.layer}）`;
+      toast(c.checked ? T('{name} 给 AI 用了（之后开始的步骤生效）', { name: nm }) : T('{name} 不再给 AI（之后开始的步骤生效）', { name: nm })); }
+    catch (e) { toast(e.message, true); }
+    renderPsSkills(p);
+  });
+}
+
+// 策略钩子：只读。按"什么时候查"分四段，每段先列系统自带的检查，再列配置的钩子
+// 配置示例：一个时机一组；matcher 只在 PreToolUse 有用（工具名，Claude 的名字与我们的都认）；timeout 秒；onFailure 只在前两个时机有用
+const HOOK_EXAMPLE = JSON.stringify({ hooks: {
+  PreToolUse: [{ matcher: 'Bash', hooks: [{ type: 'command', command: 'node .superintern/hooks/no-rm.mjs', timeout: 10, onFailure: 'block' }] }],
+  PreDeliver: [{ hooks: [{ type: 'command', command: 'node .superintern/hooks/check-remote.mjs' }] }],
+} }, null, 2);
+async function renderPsHooks(p) {
+  const box = $('#psHooks'); if (!box) return;
+  let data; try { data = await api(`/api/projects/${p.id}/hooks`); } catch (e) { box.innerHTML = `<span class="bad small">${esc(e.message)}</span>`; return; }
+  const msg = (w) => esc(T(w.msg, w.params ?? {}));
+  const code = (s) => `<code>${esc(s)}</code>`;
+  // 每个时机固定三行：拦下 / 要人确认 / 钩子自己出错 —— 各自谁收到、怎么回应
+  const FAIL_OPEN = T('默认放行，免得一个坏掉的脚本让 AI 寸步难行；单条钩子写 {k} 就改成拦下', { k: code('"onFailure": "block"') });
+
+  const WHEN = [
+    ['PreToolUse', T('AI 每次用工具之前'), T('读写文件、跑命令、取 skill 之前（提问和交接不经过这一关）。'),
+      [T('这一下不执行，理由交给 AI，让它换个做法'), T('这一步停下，收件箱里来一条事项；回「同意」放行这条操作（之后一模一样的不再问），回别的都算不同意，AI 换别的做法'), FAIL_OPEN]],
+    ['PreHandoff', T('AI 交接一步的时候'), T('AI 说"这一步做完了"、系统自带的检查都过了之后。'),
+      [T('打回给 AI，理由一起给它；同一个理由连续三次，转成一条事项给你'), T('这一步停下，收件箱里来一条事项；回「同意」放行，回别的都算不同意，AI 换别的做法'), FAIL_OPEN]],
+    ['PreMerge', T('合并进项目分支之前'), T('任务签收以后、合进项目分支之前。'),
+      [T('不合并，收件箱里来一条事项；你的答复交给 AI 去改，改完重新签收'), T('不合并，收件箱里来一条事项；回「同意」放行这一版的合并，回别的都当成要 AI 改的意见'),
+        T('一律拦下（合进去之后，后面的任务都从它开始）：收件箱里来一条事项，写明是钩子自己坏了；修好钩子后回一句，系统重新检查')]],
+    ['PreDeliver', T('推到外面之前'), T('交付任务或交付项目、推到远端仓库之前。'),
+      [T('交付报错，不推送'), T('交付先停下，把钩子的话给点交付的人看，确认后才推送。命令行里报错会给一个确认码，同一条命令加 {k} 再交付一次；钩子说的变了，确认码就作废', { k: code('--hook-ack <确认码>') }),
+        T('一律拦下（推出去就收不回来）：交付报错、不推送；修好钩子再交付')]],
+  ];
+  const TOOL = { run_command: T('跑命令'), write_file: T('写文件'), read_file: T('读文件'), grep: T('搜索'), list_dir: T('列目录'), activate_skill: T('取 skill') };
+  const from = (h) => h.source === 'repo' ? T('仓库里的 {file}', { file: `<span class="mono">${esc(h.file)}</span>` }) : h.source === 'project' ? T('服务器上的，只管本项目') : T('服务器上的，管所有项目');
+  const gate = (ev) => ev === 'PreMerge' || ev === 'PreDeliver';
+  const trustCmd = (h) => code(`node src/cli.mjs hook trust${h.source === 'project' ? ` --project ${p.id}` : ''}`);
+  const statusText = (h) => h.status === 'on'
+    ? `<span class="small" style="color:var(--ok)">${h.source === 'repo' ? T('● 生效：跑的是项目分支上已提交的版本') : T('● 生效：管理员核准过这一版')}</span>`
+    : `<span class="small" style="color:var(--wait)">${h.status === 'changed' ? T('○ 没生效：管理员核准之后，命令或它调用的脚本改过了') : T('○ 没生效：新加的，管理员还没核准')}</span>
+       <div class="small mute">${(h.source === 'project' ? T('项目负责人或管理员在服务器上运行 {cmd} 核准后才会跑。', { cmd: trustCmd(h) }) : T('管理员在服务器上运行 {cmd} 核准后才会跑。', { cmd: trustCmd(h) }))}${h.event === 'PreMerge' || h.event === 'PreDeliver' ? T('这一关没核准的钩子算出错，会拦下。') : T('没核准的不跑，这一关照常放行。')}</div>`;
+  const hookRow = (h) => `<div class="item${h.status === 'on' ? '' : ' off'}" style="margin-top:6px">
+      <div class="row"><span class="small">${from(h)}</span>${h.matcher ? ` <span class="small mute">${T('只管 {tools}', { tools: `<span class="mono">${esc(h.matcher)}</span>${h.tool ? `（${esc(TOOL[h.tool])}）` : ''}` })}</span>` : ''}<span class="grow"></span><span class="small mute">${T('超过 {n} 秒算出错', { n: esc(h.timeout) })}</span></div>
+      <div>${statusText(h)}</div>
+      ${h.command ? `<div class="mono small">${esc(h.command)}</div>` : `<div class="small mute">${T('命令只给项目负责人和管理员看')}</div>`}
+      ${!gate(h.event) && h.onFailure === 'block' ? `<div class="small mute">${T('这条钩子出错时拦下（它写了 {k}）', { k: code('"onFailure": "block"') })}</div>` : ''}</div>`;
+  const section = ([ev, title, note, [deny, ask, failed]]) => {
+    const own = data.builtin.filter((x) => x.event === ev), mine = data.hooks.filter((h) => h.event === ev);
+    return `<h3 style="margin-top:16px">${esc(title)} <span class="small mute mono" style="font-weight:400">${esc(ev)}</span></h3><div class="small mute">${esc(note)}</div>
+      <ul class="small" style="margin:4px 0 0 18px"><li><b>${T('钩子说拦下')}</b>：${esc(deny)}</li><li><b>${T('钩子说要人确认')}</b>：${ask}</li><li><b>${T('钩子自己出错')}</b>${T('（脚本崩了、超时、输出看不懂）')}：${failed}</li></ul>
+      <div class="small" style="margin-top:6px"><b>${T('系统自带的检查')}</b>${T('（一直开着）')}</div><ul class="small" style="margin:2px 0 0 18px">${own.map((x) => `<li>${esc(T(x.what))}</li>`).join('')}</ul>
+      <div class="small" style="margin-top:6px"><b>${T('配置的钩子')}</b></div>${mine.length ? mine.map(hookRow).join('') : `<div class="small mute">${T('没有。')}</div>`}`;
+  };
+  // 四处来源：写在哪、写进去之后怎么生效；读配置时跳过的内容挂在它自己的来源下面
+  const SRC = {
+    '.superintern/hooks.json': [T('仓库里的 {file}', { file: code('.superintern/hooks.json') }), T('四个时机都认。提交到项目分支后生效，在任务的沙箱里只读地跑（能不能联网同任务）。AI 改钩子文件会被打回；要改就发一条变更、在任务范围里点名这个文件，合并前还会先问你。')],
+    '.claude/settings.json': [T('仓库里的 {file}', { file: code('.claude/settings.json') }), T('和 Claude Code 共用的那份：只认其中 PreToolUse（用工具之前）的钩子，其余跳过。它也算钩子文件，AI 改它同样会被打回。')],
+    deploy: [T('服务器上的，管所有项目'), T('管理员写在服务器数据目录的 hooks.json 里，核准后才跑。')],
+    project: [T('服务器上的，只管本项目'), T('管理员写在服务器上这个项目目录的 hooks.json 里；项目负责人或管理员核准后才跑。')],
+  };
+  const srcRow = (s) => { const [name, how] = SRC[s.kind === 'repo' ? s.file : s.kind];
+    return `<li><b>${name}</b>：${how}${s.warnings.map((w) => `<div style="color:var(--wait)">⚠ ${msg(w)}${T('（这一条没有生效）')}</div>`).join('')}</li>`; };
+  box.innerHTML = `<div class="small">${T('钩子是自己写的检查脚本。到了下面某个时机，系统把要做的事（用哪个工具、改了哪些文件、要推到哪）交给它，它回答三种之一：放行、拦下、要人确认。')}</div>
+    <div class="small mute" style="margin-top:4px">${T('写法照 Claude Code 的 hooks：脚本从标准输入收到一份 JSON（时机、工具和参数、改了哪些文件、要推到哪……）。退出码 0 = 放行；退出码 2 = 拦下，理由写在标准错误里；其它退出码（包括 1）算钩子自己出错，不是拦下。要人确认或附带说明，就退出码 0、在标准输出打一段 JSON，写 {k}。', { k: code('hookSpecificOutput.permissionDecision: "allow" | "deny" | "ask"') })}
+      <button class="ghost small" id="psHookEx">${T('看配置示例')}</button></div>
+    <pre class="small hide" id="psHookExBody" style="white-space:pre-wrap;margin-top:4px">${esc(HOOK_EXAMPLE)}</pre>
+    <div class="small mute" style="margin-top:4px">${T('这一页只看，不在这里改。')}</div>
+    <h3 style="margin-top:12px">${T('钩子写在哪里')}</h3><ul class="small" style="margin:2px 0 0 18px">${data.sources.map(srcRow).join('')}</ul>
+    ${WHEN.map(section).join('')}`;
+  $('#psHookEx').onclick = () => $('#psHookExBody').classList.toggle('hide');
+}
+
+// MCP：server 给 AI 加工具。怎么才给 AI（写配置 → 检查 → 读过说明批准）写在最上面；每个 server 一张卡：状态、变了什么、工具与用法
+async function renderPsMcp(p) {
+  const box = $('#psMcp'); if (!box) return;
+  let data; try { data = await api(`/api/projects/${p.id}/mcp`); } catch (e) { box.innerHTML = `<span class="bad small">${esc(e.message)}</span>`; return; }
+  const msg = (w) => esc(T(w.msg, w.params ?? {}));
+  const code = (s) => `<code>${esc(s)}</code>`;
+  const SRC = {
+    repo: [T('仓库里的 {file}', { file: code('.mcp.json') }), T('格式同 Claude Code。提交到项目分支后出现在这里。')],
+    project: [T('服务器上的，只管本项目'), T('管理员写在服务器上这个项目目录的 mcp.json 里。')],
+    deploy: [T('服务器上的，管所有项目'), T('管理员写在服务器数据目录的 mcp.json 里；每个项目仍要各自批准。')],
+  };
+  const MODES = [['ask', T('每次调用问人')], ['auto', T('直接用')], ['off', T('不给 AI')]];
+  const CHANGE = { added: T('新加的工具'), removed: T('去掉的工具'), changed: T('说明或参数变了') };
+  const toolText = (t) => `${t.description || T('（没有说明）')}\n${T('参数：')}${JSON.stringify(t.inputSchema?.properties ?? {})}`;
+  // 变了什么：前后两份原文并排（读的就是会进 AI 上下文的东西）
+  const changeBlock = (c) => `<div class="item" style="margin-top:6px"><div class="small"><b>${esc(CHANGE[c.kind])}：</b><span class="mono">${esc(c.name)}</span></div>
+      ${c.before ? `<div class="small mute" style="margin-top:4px">${T('批准时：')}</div><pre class="small" style="white-space:pre-wrap;margin:2px 0 0">${esc(toolText(c.before))}</pre>` : ''}
+      ${c.after ? `<div class="small mute" style="margin-top:4px">${T('现在：')}</div><pre class="small" style="white-space:pre-wrap;margin:2px 0 0">${esc(toolText(c.after))}</pre>` : ''}</div>`;
+  // 工具说明是 server 自己报的：去哪查是谁改的，看 server 从哪来
+  const WHO = {
+    repo: T('仓库里的 server：说明来自它的代码或它读的数据文件，查这些文件在项目分支上的提交记录。'),
+    project: T('服务器上的 server：找管理员，查服务器上它的程序和配置是谁换的。'),
+    deploy: T('服务器上的 server：找管理员，查服务器上它的程序和配置是谁换的。'),
+  };
+  // 变了之后：先列"不用"（判断写在按钮上面），再列"批准新版本"
+  const decideBad = (s) => data.canEdit ? `<div class="row" style="margin-top:6px;gap:8px"><button class="small" data-mcpoff="${esc(s.id)}">${T('不用这个 server')}</button><button class="small ghost" data-mcpok="${esc(s.id)}" data-seen="${esc(s.seen ?? '')}">${T('看过了，没问题，批准新版本')}</button></div>` : '';
+  const decide = (s, okLabel) => data.canEdit ? `<div class="row" style="margin-top:6px;gap:8px"><button class="small" data-mcpok="${esc(s.id)}" data-seen="${esc(s.seen ?? '')}">${okLabel}</button><button class="small" data-mcpoff="${esc(s.id)}">${T('不用这个 server')}</button></div>` : '';
+  const statusLine = (s) => ({
+    approved: `<span class="small" style="color:var(--ok)">${T('● 已批准：AI 拿得到下面"直接用"和"每次调用问人"的工具')}</span>`,
+    new: `<span class="small" style="color:var(--wait)">${T('○ 检查过，还没批准：AI 现在拿不到。读过下面每个工具的说明再决定；下面每个工具的设置，批准时照用')}</span>` + decide(s, T('读过了，批准')),
+    changed: `<span class="small" style="color:var(--wait)">${T('○ 批准之后变了，AI 现在拿不到它的任何工具。先看下面变了什么，再决定')}</span>`
+      + (s.changes.length ? s.changes.map(changeBlock).join('') : `<div class="small mute">${s.fingerprintOnly ? T('（工具没变，是命令、地址或环境变量变了）') : T('（没有批准时那份清单可比）')}</div>`)
+      + `<div class="small" style="margin-top:6px"><b>${T('怎么判断：')}</b>${T('「现在」的说明里要 AI 读密钥、改设置、把东西发出去的，就是被改坏了 —— 选「不用这个 server」，再查是谁改的。')}</div>`
+      + `<div class="small mute">${WHO[s.source]}</div>`
+      + `<div class="small mute" style="margin-top:4px">${T('发现变了的时候，这个 server 的工具已经都回到了「每次调用问人」（之前设的不延续）。不用：这个 server 一直不给 AI，直到你重新启用。批准新版本：按下面每个工具现在的设置给 AI —— 只想停掉其中一个，先把它改成「不给 AI」，再批准。')}</div>`
+      + decideBad(s),
+    off: `<span class="small mute">${T('○ 不用：负责人停用了，AI 拿不到它的工具')}</span>${data.canEdit ? `<div style="margin-top:6px"><button class="small" data-mcpon="${esc(s.id)}">${T('重新启用')}</button></div>` : ''}`,
+    unchecked: `<span class="small mute">${T('○ 还没检查，AI 现在拿不到：点上面的「检查」')}</span>`,
+    error: `<span class="bad small">${T('✗ 检查时起不来，AI 现在拿不到：{why}', { why: !s.error ? '' : typeof s.error === 'string' ? esc(s.error) : msg(s.error) })}</span><div class="small mute">${T('改好之后点上面的「检查」；起得来了还要批准。')}</div>`,
+  })[s.status];
+  const toolRow = (s, t) => `<div class="item" style="margin-top:6px">
+      <div class="row"><b class="mono">${esc(t.name)}</b> <span class="small mute mono">${esc(t.full)}</span><span class="grow"></span>
+        <label class="small">${T('给 AI：')}<select data-mcpmode="${esc(t.full)}" ${data.canEdit ? '' : 'disabled'} style="width:auto">${MODES.map(([v, l]) => `<option value="${esc(v)}"${t.mode === v ? ' selected' : ''}>${esc(l)}</option>`).join('')}</select></label></div>
+      ${s.status !== 'approved' ? `<div class="small mute">${T('这个 server 现在没在用：这里的设置在批准之后照用')}</div>` : ''}
+      <pre class="small" style="white-space:pre-wrap;margin-top:4px">${esc(t.description || T('（没有说明）'))}</pre>
+      ${t.annotations?.readOnlyHint ? `<div class="small mute">${T('server 自称这个工具只读（它自己说的，不作数）')}</div>` : ''}</div>`;
+  const card = (s) => `<div class="item" style="margin-top:10px">
+      <div class="row"><b class="mono">${esc(s.name)}</b> <span class="small mute">${s.source === 'repo' ? T('仓库里的') : s.source === 'project' ? T('服务器上的，只管本项目') : T('服务器上的，管所有项目')}${s.remote ? ` · ${T('远程')}` : ''}</span></div>
+      ${s.command || s.url ? `<div class="mono small">${esc(s.url ?? s.command)}</div>` : `<div class="small mute">${T('命令只给项目负责人和管理员看')}</div>`}
+      ${s.warnings.map((w) => `<div class="small" style="color:var(--wait)">⚠ ${msg(w)}</div>`).join('')}
+      <div style="margin-top:4px">${statusLine(s)}</div>
+      ${s.tools.length ? `<div class="small" style="margin-top:8px"><b>${T('工具（{n} 个）', { n: esc(s.tools.length) })}</b>${s.checkedAt ? ` <span class="mute">${T('{t}前检查的', { t: esc(ago(Date.parse(s.checkedAt))) })}</span>` : ''}</div>${s.tools.map((t) => toolRow(s, t)).join('')}` : ''}</div>`;
+  box.innerHTML = `<div class="small">${T('MCP server 给 AI 加工具（查文档、调内部系统……）。server 在任务的沙箱里跑，能连哪里同任务的「联网」设置。')}</div>
+    <h3 style="margin-top:12px">${T('怎样才给 AI 用')}</h3>
+    <ol class="small" style="margin:2px 0 0 18px">
+      <li>${T('写配置（写在哪里见下）。')}</li>
+      <li>${T('检查：系统在沙箱里把 server 起一遍，列出它的工具和每个工具的说明。说明会原样进 AI 的上下文，所以要人读。')}</li>
+      <li>${T('负责人读过、批准。之后开始的步骤里 AI 才拿得到。命令、地址或任何一个工具的说明变了，就不再给，要重新检查、批准。')}</li>
+    </ol>
+    <div class="small mute" style="margin-top:4px">${T('每个工具再单独定给不给 AI：「每次调用问人」（默认）= AI 调用时停下，收件箱里来一条事项，回「同意」放行这一条；「直接用」= 不问；「不给 AI」= AI 看不到它，说明也不进上下文。')}</div>
+    <div class="small mute" style="margin-top:4px">${T('这一页的改动点了就保存。正在跑的步骤不受影响，从下一个开始的步骤起生效。')}</div>
+    <h3 style="margin-top:12px">${T('配置写在哪里')}</h3>
+    <ul class="small" style="margin:2px 0 0 18px">${data.sources.map((x) => `<li><b>${SRC[x.kind][0]}</b>：${SRC[x.kind][1]}${x.warnings.map((w) => `<div style="color:var(--wait)">⚠ ${msg(w)}</div>`).join('')}</li>`).join('')}</ul>
+    <div class="small mute" style="margin-top:4px">${T('远程 server 写 {t} 和 {u}。它要的令牌别写进配置：管理员在「联网」里按地址配凭据，出口代理注入；MCP 的请求都是 POST，所以那份凭据要勾上允许写。在沙箱里跑的本地 server（command）拿不到令牌：配置里像凭据的环境变量会被去掉。', { t: code('"type": "http"'), u: code('"url"') })}</div>
+    <div class="row" style="margin-top:12px"><h3 style="margin:0">${T('Server（{n} 个）', { n: esc(data.servers.length) })}</h3><span class="grow"></span>${data.canEdit && data.servers.length ? `<button class="small" id="psMcpCheck">${T('检查')}</button>` : ''}</div>
+    ${data.canEdit && data.servers.length ? `<div class="small mute">${T('检查要起一次沙箱，可能要十几秒到一分钟。只看、不批准。')}</div>` : ''}
+    ${data.servers.length ? data.servers.map(card).join('') : `<div class="small" style="margin-top:4px">${T('没有。')}</div>`}
+    ${data.canEdit ? '' : `<div class="small mute" style="margin-top:8px">${T('只有项目负责人能检查、批准、改工具的用法。')}</div>`}`;
+  const post = async (body, ok) => { try { await api(`/api/projects/${p.id}/mcp`, body); if (ok) toast(ok); } catch (e) { toast(e.message, true); } renderPsMcp(p); };
+  if ($('#psMcpCheck')) $('#psMcpCheck').onclick = () => { $('#psMcpCheck').textContent = T('检查中…'); post({ op: 'check' }, T('检查完了，结果在下面')); };
+  box.querySelectorAll('[data-mcpok]').forEach((b) => b.onclick = () => post({ op: 'approve', id: b.dataset.mcpok, seen: b.dataset.seen || null }, T('已批准：之后开始的步骤里生效')));
+  box.querySelectorAll('[data-mcpoff]').forEach((b) => b.onclick = () => post({ op: 'off', id: b.dataset.mcpoff }, T('已停用：AI 拿不到它的工具')));
+  box.querySelectorAll('[data-mcpon]').forEach((b) => b.onclick = () => post({ op: 'on', id: b.dataset.mcpon }, T('已重新启用：还要是批准过的那一版才给 AI')));
+  box.querySelectorAll('[data-mcpmode]').forEach((sel) => sel.onchange = () => post({ op: 'mode', tool: sel.dataset.mcpmode, mode: sel.value }, T('已改：之后开始的步骤里生效')));
 }
 
 function setPsPane(x) {
@@ -230,6 +455,8 @@ function setPsPane(x) {
   // 路由表是表单，不能跟着 SSE 重画：只在切到这一区时画一次
   if (x === 'routing' && projects.some((z) => z.id === curProject)) { routingCtx = { key: curProject, box: '#projRouting', tag: '#projRoutingTag' }; renderRouting(); }
   else if (routingCtx.box === '#projRouting') routingCtx = { key: '', box: '', tag: '' };
+  const p = projects.find((z) => z.id === curProject);
+  if (p) ({ rules: renderPsRules, hooks: renderPsHooks, mcp: renderPsMcp, skills: renderPsSkills, inbound: renderPsInbound })[x]?.(p);
 }
 function renderProjSet() {
   const p = projects.find((x) => x.id === curProject);
@@ -241,6 +468,7 @@ function renderProjSet() {
   if (!p) { $('#psGeneral').innerHTML = `<span class="mute">${T('项目不存在')}</span>`; $('#projMembers').innerHTML = ''; $('#psBudget').innerHTML = ''; $('#psAuto').innerHTML = ''; $('#psDanger').innerHTML = ''; return; }
   $('#psBack').href = `#p/${p.id}`;
   if (lead) void renderPsNet(p);
+  renderPsOversight(p, lead);
   const ownerName = (me?.users ?? []).find((u) => u.id === p.owner_id)?.display_name ?? p.owner_id;
   const pact = (action, body, msg) => projAct(p.id, action, body, msg);
 
@@ -398,7 +626,9 @@ function renderProjSet() {
     if (r.value === 'auto' && !confirm(T('把「{title}」切到「预算内自动开工、合并」？\n\n系统会在复盘后直接建任务并开工，不再等你批准；做完的任务验收通过即合并，签收攒起来等你一次签。\n\n它最多能做到哪一步：整个项目的预算闸 {gate}（花到这里就不再开新任务），单个任务各自的上限见「预算与上限」。交付（push）仍然要你亲自点。\n\n怎么收回：随时切回「提议」—— 已经开工的任务照常做完，但不会再有新任务自动开工。已经合并进项目分支的改动不会自动回滚。', { title: p.title, gate: usd(b.gate) }))) { r.checked = false; document.querySelector('input[name=psGear][value=propose]').checked = true; return; }
     pact('gear', { gear: r.value }, T('挡位已切到「{gear}」', { gear: T(gears[r.value]?.label ?? r.value) }));
   });
-  if ($('#psSignAll')) $('#psSignAll').onclick = () => { if (confirm(T('一次签收这 {n} 个任务？\n\n签收表示你接受它们的产物。它们已经合并进项目分支了 —— 签收不会撤销任何东西，签收之后就可以交付。\n\n还没看过就先别签：上面每个任务名都能点开看产物。', { n: def.length }))) pact('signoff_all', {}, T('已签收 {n} 个任务', { n: def.length })); };
+  if ($('#psSignAll')) $('#psSignAll').onclick = () => { if (confirm(T('一次签收这 {n} 个任务？\n\n签收表示你接受它们的产物。它们已经合并进项目分支了 —— 签收不会撤销任何东西，签收之后就可以交付。\n\n还没看过就先别签：上面每个任务名都能点开看产物。', { n: def.length }))) pact('signoff_all', { tasks: def.map((t) => t.id) }, (r) => (r?.result?.unseen?.length
+    ? T('已签收你看到的 {n} 个任务。另有 {m} 个是你打开这一页之后才做完的，还没有签 —— 页面已刷新，看过再签', { n: r.result.accepted, m: r.result.unseen.length })
+    : T('已签收 {n} 个任务', { n: r?.result?.accepted ?? def.length }))); };
 
   // ⑥ 危险区：不可逆或改变归属的动作
   const canAbort = ['proposed', 'active', 'stalled'].includes(p.status), canHand = !['done', 'aborted'].includes(p.status);
@@ -417,7 +647,7 @@ function renderProjSet() {
 function renderCtx() {
   const t = tasksCache.find((x) => x.id === cur), p = view === 'task' ? projectOf(cur) : view === 'project' ? projects.find((x) => x.id === curProject) : null;
   const pj = view === 'projset' ? projects.find((x) => x.id === curProject) : null;
-  $('#ctx').innerHTML = view === 'inbox' ? T('收件箱') : view === 'settings' ? T('设置') : view === 'new' ? T('新建项目')
+  $('#ctx').innerHTML = view === 'inbox' ? T('收件箱') : view === 'report' ? T('状态报告') : view === 'settings' ? T('设置') : view === 'new' ? T('新建项目')
     : view === 'projset' ? `<a href="#p/${esc(curProject)}">${esc(pj?.title ?? T('项目'))}</a> <span class="mute" style="font-weight:400">›</span> ${T('设置')}`
     : view === 'project' ? esc(p?.title ?? T('项目'))
     : `${p ? `<a href="#p/${esc(p.id)}">${esc(p.title)}</a> <span class="mute" style="font-weight:400">›</span> ` : ''}${esc(t?.title ?? '')}`;
@@ -446,14 +676,14 @@ function renderHealth(rt) {
 function renderPaused(paused, isAdmin) {
   const pb = $('#pauseBar'), b = $('#btnPauseAll');
   if (paused) {
-    setLive(pb, T('<b>管理员暂停了全部自动运行</b>：不会开始新的步骤；正在进行的步骤在当前这次操作结束后停下，不算失败，恢复后这一步重新开始。任务不会被取消。回答问题、签收、看结果照常。只有管理员能恢复，恢复后系统自己接着跑。'));
+    setLive(pb, T('<b>管理员暂停了全部自动运行</b>：不会开始新的步骤；正在执行的步骤立即停下（AI 正在写的回复直接作废，正在跑的命令跑完为止），不算失败，没写完的改动先存起来，恢复后放回接着做。任务不会被取消。回答问题、签收、看结果照常。只有管理员能恢复，恢复后系统自己接着跑。'));
     pb.classList.remove('hide');
   } else pb.classList.add('hide');
   b.classList.toggle('hide', !isAdmin);
   b.textContent = paused ? T('恢复自动运行') : T('暂停全部');
   b.title = paused ? T('让所有任务接着自动运行') : T('立即停下所有任务的自动运行（不中止任务，随时可以恢复）');
   b.onclick = async () => {
-    if (!paused && !confirm(T('暂停全部自动运行？正在进行的步骤在当前这次操作结束后停下，不算失败；任务不会被取消，恢复后自动接着跑。'))) return;
+    if (!paused && !confirm(T('暂停全部自动运行？正在执行的步骤立即停下，不算失败；任务不会被取消，恢复后自动接着跑。'))) return;
     b.disabled = true;
     try { await api('/api/users', { action: 'setting', key: 'deploy.paused', value: !paused }); toast(paused ? T('已恢复自动运行') : T('已暂停全部自动运行')); await loadTasks(); }
     catch (e) { toast(e.message, true); } finally { b.disabled = false; }

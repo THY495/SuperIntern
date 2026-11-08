@@ -1,6 +1,15 @@
 // ── 我的待办（跨任务，按当前身份）──────────────────────────────────────
+/** 还差谁：left = 还没表态的人，need = 还差几票。返回已转义的一句；没有可说的返回 ''。 */
+function waitWho(left, need) {
+  const names = (left ?? []).map((n) => (me && n === me.display_name ? T('你') : n));
+  if (!names.length) return need ? esc(T('还差 {n} 位', { n: need })) : '';
+  const list = names.join(T('、'));
+  if (need && need < names.length) return esc(T('还差 {n} 位：{names} 中任 {n} 位', { n: need, names: list }));
+  return esc(names.length > 1 ? T('还差 {names}（每位都要）', { names: list }) : T('还差 {names}', { names: list }));
+}
 let digestData = null;
 async function renderDigest() {
+  if (me) void renderSignalFeed();   // 收件箱里的「通知」：旁观者也有（别人动了你的事、部署出故障……）
   if (!me || me.role === 'observer') return;
   try { digestData = await api('/api/digest'); } catch (e) { $('#digest').innerHTML = `<span class="mute">${esc(e.message)}</span>`; return; }
   const d = digestData;
@@ -28,6 +37,7 @@ async function renderDigest() {
       <div class="irow-main"><a class="irow-title" href="${openHref(x)}" title="${T('打开所在页面处理')}">${esc(x.headline || String(x.text).slice(0, 90))}</a>
         ${x.src === 'unaddressed' ? `<span class="pill" title="${T('路由表没有匹配到接收人；你是负责人，可以直接处理或转交')}">${T('无人接收')}</span>` : ''}</div>
       <div class="small mute">${where(x)} · ${ago2(x.askedAt)}${due(x)}${x.defaultAction && x.dueAt ? ` · ${T('到期默认：{action}', { action: esc(x.defaultAction.slice(0, 40)) })}` : ''}${x.parties?.length ? ` · ${T('协商方：{names}', { names: esc(x.parties.join(T('、'))) })}` : ''}</div>
+      ${x.decisionType === 'signoff' && x.wait && waitWho(x.wait.left, x.wait.need) ? `<div class="small mute">${T('签收：')}${waitWho(x.wait.left, x.wait.need)}</div>` : ''}
       ${x.decisionType === 'signoff' ? excLineHtml(x.exceptions, openHref(x)) : ''}
       <details class="small"><summary class="mute">${T('摘要')}</summary><div class="body" style="margin-top:4px">${qBodyHtml(x.text, x.decisionType, 'inbox')}</div>${said(x)}</details>
       ${x.decisionType === 'signoff' ? (() => { const k = `sig:${esc(x.taskId)}:${esc(x.questionId)}`;
@@ -46,9 +56,22 @@ async function renderDigest() {
   ];
   const buckets = KINDS.map((k) => ({ ...k, list: [] }));
   for (const x of items) buckets.find((b) => b.test(x)).list.push(x);
+  // 同一组里同一项目的排在一起：项目按组里最急的那件排 —— 有到期的按到期，没有的按提出先后 —— 所以急的不会被挤到后面
+  const urgency = (x) => [x.dueAt ?? Infinity, x.askedAt ?? 0];
+  const before = (a, b) => (a[0] - b[0]) || (a[1] - b[1]);
+  const runs = (list) => {
+    const by = new Map();
+    for (const x of list) { const k = projOf(x); const r = by.get(k) ?? { key: k, list: [], top: urgency(x) }; r.list.push(x); if (before(urgency(x), r.top) < 0) r.top = urgency(x); by.set(k, r); }
+    return [...by.values()].sort((a, b) => before(a.top, b.top));
+  };
+  const bucketBody = (list) => {
+    const rs = runs(list);
+    if (rs.length < 2) return list.map(irow).join('');
+    return rs.map((r) => `<div class="small mute" style="margin:8px 0 2px">${esc(projName(r.list[0]))} · ${T('{n} 件', { n: esc(r.list.length) })}</div>${r.list.map(irow).join('')}`).join('');
+  };
   const bucketHtml = buckets.filter((b) => b.list.length).map((b) => `<section class="ibucket">
       <div class="ibucket-head"><b>${esc(b.title)}</b> <span class="badge">${b.list.length}</span>${b.how ? ` <span class="small mute">— ${esc(b.how)}</span>` : ''}</div>
-      ${b.list.map(irow).join('')}</section>`).join('');
+      ${bucketBody(b.list)}</section>`).join('');
 
   const opts = [...projs.entries()].sort((a, b) => b[1].n - a[1].n);
   const bar = opts.length > 1 ? `<div class="row small" style="margin:4px 0 8px"><label class="mute" for="inboxProj">${T('只看')}</label>
@@ -58,7 +81,7 @@ async function renderDigest() {
   const fyiRow = (x, extra = '') => `<div class="small" style="padding:3px 0">${where(x)} · ${esc(x.headline || '')}${extra}</div>`;
   const fyiParts = [
     (d.requestsDone ?? []).length ? `<div style="margin-top:6px"><b>${T('你提的需求做完了')}</b>${T('（{n}）', { n: d.requestsDone.length })}</div>${d.requestsDone.map((x) => `<div class="small" style="padding:3px 0"><a href="#${esc(x.taskId)}">${esc(x.title)}</a> <span class="mute">· ${esc(x.projectTitle ?? '')} · ${T('已合并进项目分支，{t}前', { t: ago(x.at) })}</span></div>`).join('')}` : '',
-    d.waitingOnOthers.filter(inP).length ? `<div style="margin-top:6px"><b>${T('你已答复，还在等别人')}</b>${T('（{n}）', { n: d.waitingOnOthers.filter(inP).length })}</div>${d.waitingOnOthers.filter(inP).map((x) => fyiRow(x, ` <span class="mute">· ${T('待 {names}', { names: esc(x.missing.join(T('、')) || '—') })}</span>`)).join('')}` : '',
+    d.waitingOnOthers.filter(inP).length ? `<div style="margin-top:6px"><b>${T('你已答复，还在等别人')}</b>${T('（{n}）', { n: d.waitingOnOthers.filter(inP).length })}</div>${d.waitingOnOthers.filter(inP).map((x) => fyiRow(x, ` <span class="mute">· ${waitWho(x.missing, x.need) || '—'}</span>`)).join('')}` : '',
     d.informed.filter(inP).length ? `<div style="margin-top:6px"><b>${T('抄送给你的')}</b>${T('（{n}）', { n: d.informed.filter(inP).length })}</div>${d.informed.filter(inP).map((x) => fyiRow(x)).join('')}` : '',
     d.tasksWaiting.length ? `<div style="margin-top:6px"><b>${T('任务状态')}</b></div>${d.tasksWaiting.map((t) => { const who = t.waitingOn?.length ? esc(t.waitingOn.join(T('、'))) : null; const s = t.status === 'suspended' ? T('已暂停') : t.status === 'awaiting_signoff' ? (who ? T('已完成，待{who}签收', { who: sp(who) }) : T('已完成，待签收')) : (who ? T('待{who}答复', { who: sp(who) }) : T('待答复')); return `<div class="small"><a href="#${esc(t.taskId)}">${esc(t.title ?? t.taskId)}</a> ${s}</div>`; }).join('')}` : '',
     d.unreadReports ? `<div class="small" style="margin-top:6px">${T('<b>未读报告</b> {n} 份：', { n: esc(d.unreadReports) })}${(d.unreadReportTasks ?? []).map((t) => `<a href="#${esc(t.taskId)}">${esc(t.title ?? t.taskId)}</a> ${T('{n} 份', { n: esc(t.n) })}`).join(T('，'))}${T('（在任务页「报告」中查看）')}</div>` : '',
@@ -70,7 +93,7 @@ async function renderDigest() {
   $('#digest').innerHTML = [
     (d.daemonOff ? `<div class="item flag" style="margin-top:6px">${T('<b>自动运行未开启</b>：{n} 个未结束的任务不会自动推进，超时与通知也不会处理。', { n: esc(d.daemonOff.unfinished) })}<div class="small mute" style="margin-top:4px">${T('启动守护进程后恢复：node src/cli.mjs web --daemon（或计划任务）。在此之前需在各任务页手动点击「运行」。')}</div></div>` : ''),
     // 可能在走过场的人（只给管理员）。常显、不收进"不需要你动手"：它要负责人去看，但不拦任何操作
-    (d.rubberStamps ?? []).length ? `<div class="item flag" style="margin-top:6px"><b>⚠ ${T('可能在走过场')}</b> <span class="small mute">${T('只是提醒，不拦任何操作')} · <a href="#settings/users">${T('看批准习惯')}</a></span>${d.rubberStamps.map((x) => `<div class="small">${T('{name}：最近 {n} 次都批准，打开后中位数 {t} 就答', { name: esc(whoName(x.userId, x.name)), n: esc(x.streak), t: esc(durS(x.medianOpenMs)) })}</div>`).join('')}</div>` : '',
+    (d.rubberStamps ?? []).length ? `<div class="item flag" style="margin-top:6px"><b>⚠ ${T('可能在走过场')}</b> <span class="small mute">${T('只是提醒，不拦任何操作')} · <a href="#settings/users">${T('看批准习惯')}</a></span>${d.rubberStamps.map((x) => `<div class="small">${T('{name}：最近 {n} 次都批准，打开后中位数 {t} 就答', { name: esc(whoName(x.userId, x.name)), n: esc(x.streak), t: esc(durS(x.medianOpenMs)) })}${x.pushes7d != null ? `<span class="mute">${T('（最近 7 天被推送打断 {p} 次；推得太多常常是走过场的原因，可以在「设置 → 我的通知」看全员的次数）', { p: esc(x.pushes7d) })}</span>` : ''}</div>`).join('')}</div>` : '',
     (d.credentialsExpiring ?? []).length ? `<section class="ibucket"><div class="ibucket-head"><b>${T('快到期的连接')}</b> <span class="badge">${d.credentialsExpiring.length}</span></div>${d.credentialsExpiring.map((c) => `<div class="irow"><div class="irow-main"><a class="irow-title" href="#settings/conn">${esc(c.name)}</a></div><div class="small mute">${c.expired ? T('已过期') : T('{t}后到期', { t: span(Date.now(), c.expiresAt) })} · ${T('到期后交付会推不上去：在「设置 → 连接」加一份新的，再吊销旧的')}</div></div>`).join('')}</section>` : '',
     (d.toDeliver ?? []).length ? `<section class="ibucket"><div class="ibucket-head"><b>${T('等你交付的项目')}</b> <span class="badge">${d.toDeliver.length}</span></div>${d.toDeliver.map((x) => `<div class="irow"><div class="irow-main"><a class="irow-title" href="#p/${esc(x.projectId)}">${esc(x.title)}</a></div><div class="small mute">${x.again ? T('上次交付之后又合并了 {n} 个任务（{titles}），这些改动还没推到你们的仓库。再点一次「交付项目」，会把项目连同这几个新任务一起推上去，之前推过的内容不受影响。', { n: esc(x.sinceDelivery), titles: (x.newTitles ?? []).map((t) => T('「{t}」', { t: esc(t) })).join(T('、')) }) : T('已达成，{n} 个任务都已合进项目分支 —— 这时还只在这套系统里。', { n: esc(x.merged) })}${T('到项目页点「交付项目」，才会推到你们的代码仓库（只能你亲自点，推出去收不回；点之前页面会列出要推的内容）。交付之后这一条自动消失')}</div></div>`).join('')}</section>` : '',
     (d.stalledProjects ?? []).length ? `<section class="ibucket"><div class="ibucket-head"><b>${T('已停滞的项目')}</b> <span class="badge">${d.stalledProjects.length}</span></div>${d.stalledProjects.map((x) => `<div class="irow"><div class="irow-main"><a class="irow-title" href="#p/${esc(x.projectId)}">${esc(x.title)}</a></div><div class="small mute">${x.kind === 'review_shelved' ? T('全部任务都已合并，复盘时选了「先放着」，还没宣布达成 · 点项目名进项目页，可以「重新复盘」、添加任务或中止项目') : `${T('任务「{title}」已中止，剩下的任务都在等它', { title: esc(x.taskTitle ?? '') })}${x.why ? ` · ${T('中止原因：{why}', { why: esc(String(x.why).slice(0, 80)) })}` : ''} · ${T('到项目页恢复或重做该任务')}`}</div></div>`).join('')}</section>` : '',
@@ -135,7 +158,7 @@ function renderHeader() {
     let txt = '', warn = false;
     if (detail.running) txt = T('正在{verb}', { verb: VERB });
     else if (t.status === 'waiting') txt = T('等待答复：{n} 条待决事项（见下方）', { n: detail.questions.filter((q) => ['open', 'escalated'].includes(q.status)).length });
-    else if (t.status === 'suspended') txt = T('已暂停：点击「继续」后才会推进');
+    else if (t.status === 'suspended') txt = T('已暂停：点击「继续」后才会推进。要改方向，先在下面发一条修正：继续后先按它改计划，存起来的改动按新计划取舍');
     else if (t.status === 'aborted') txt = '';
     else if (t.status === 'done') txt = '';
     else if (gaveUp) { txt = T('自动运行已停止重试（连续失败 {n} 次）。排查日志后点击「立即重试」', { n: sc.attempts ?? '' }); warn = true; }
@@ -151,11 +174,14 @@ function renderHeader() {
     $('#btnRun').title = daemonOn ? T('自动运行已不再重试这一步；排查后手动再试一次') : T('自动运行未开启，需手动启动。当前将{verb}', { verb: VERB }); }
   $('#btnPause').disabled = !['running', 'waiting'].includes(t.status);
   $('#btnResume').disabled = t.status !== 'suspended';
+  // 暂停对参与者开放、继续归负责人或按暂停的人：按服务端算好的 can 显示，不在页面上另判
+  $('#btnPause').classList.toggle('hide', !detail.can?.pause);
+  $('#btnResume').classList.toggle('hide', !detail.can?.resume);
   $('#btnAbort').disabled = ['done', 'aborted'].includes(t.status);
   { const pj = projectOf(cur), superseded = !!t.project_id && t.project_order === null;
     const canReopen = t.status === 'aborted' && !superseded && !(pj && ['aborted', 'done'].includes(pj.status));
     $('#btnReopen').classList.toggle('hide', !canReopen || !isLead());
-    $('#btnAbort').classList.toggle('hide', t.status === 'aborted');
+    $('#btnAbort').classList.toggle('hide', t.status === 'aborted' || !detail.can?.abort);   // 这里会把 task-lead-only 的 hide 盖掉，所以权限一并判
     const ab = $('#btnArchive'); const canArch = !t.project_id && ended(t.status);
     ab.classList.toggle('hide', !canArch || !isLead());
     ab.textContent = t.archived_at ? T('取消归档') : T('归档'); ab.title = t.archived_at ? T('重新显示在侧栏的「已结束」中') : T('从侧栏隐藏（移入「已归档」）；任务状态与记录不变');

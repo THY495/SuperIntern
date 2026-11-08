@@ -153,6 +153,7 @@ section('⑤ 批准习惯');
   // 摘要：管理员的总摘要里有，成员没有
   const d = buildDigest(db, { userId });
   eq((d.rubberStamps ?? []).map((x) => x.name), ['快手'], '管理员的摘要里列出可能在走过场的人');
+  eq(typeof d.rubberStamps?.[0]?.pushes7d, 'number', '带上这个人最近 7 天被推送打断几次（推得太多常是走过场的原因）');
   eq((buildDigest(db, { userId: careful }).rubberStamps ?? []).length, 0, '成员的摘要里没有这一项');
 }
 

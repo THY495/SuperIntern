@@ -29,6 +29,7 @@ import { setProjectParam, getProjectParam, writeParam } from './params.mjs';
 import { getSetting } from './settings.mjs';
 import { markLike, markOf } from '../i18n/marks.mjs';
 import { tl, contentLang, I18nError } from '../i18n/index.mjs';
+import { trySignal, trySignalCoalesced } from './signals.mjs';
 import { transition } from '../db/state.mjs';
 import { insertQuestion } from './questions.mjs';
 
@@ -162,23 +163,50 @@ export function projectEgressOf(db, projectId) {
 export function applyEgressDefaults(db, { projectId, userId }) {
   const want = (getSetting(db, 'deploy.egress_defaults') ?? []).filter((x) => sourceOf(db, x));
   if (!want.length) return null;
-  return setProjectEgress(db, { projectId, sources: want, userId, authorized: true, why: tl(contentLang(db), '新项目默认放行（管理员在「设置 → 联网目录」里设的）') });
+  const r = setProjectEgress(db, { projectId, sources: want, userId, authorized: true, why: tl(contentLang(db), '新项目默认放行（管理员在「设置 → 联网目录」里设的）') });
+  // 安全边界被系统改了（底线通知）：负责人建项目时没点过这几个源
+  const L = contentLang(db);
+  trySignal(db, 'security.egress_defaults', { to: [db.one('SELECT owner_id FROM projects WHERE id=?', projectId)?.owner_id].filter(Boolean), projectId,
+    title: tl(L, '[SuperIntern] 新项目已按部署默认放行联网：{names}', { names: want.map((x) => sourceOf(db, x)?.name ?? x).join(tl(L, '、')) }),
+    text: tl(L, '这几个软件源是管理员设的"新项目默认放行"，AI 装依赖时可以访问。不需要的话，到项目设置的「联网」里取消勾选。') });
+  return r;
 }
-export function setProjectEgress(db, { projectId, sources, userId, why = null, authorized = false, at = now() }) {
+export function setProjectEgress(db, opts) {
+  // 一个事务：读当前名单与写新名单之间不让别人插进来
+  return db.tx(() => setProjectEgressTx(db, opts));
+}
+
+/**
+ * base：保存的人打开页面时看到的名单（看板传）。给了就按"他勾掉了哪些、新勾了哪些"合并到**当前**名单上，
+ * 而不是整份覆盖 —— 原来负责人在页面上点保存，会把他打开之后别人刚批准放行的源（联网事项答"批准"走的是同一个参数）悄悄删掉。
+ * 不给 base（命令行、批准事项）照旧按整份。
+ */
+function setProjectEgressTx(db, { projectId, sources, base = null, userId, why = null, authorized = false, at = now() }) {
   const p = db.one(`SELECT id, owner_id FROM projects WHERE id=?`, projectId);
   if (!p) throw new I18nError('没有这个项目：{id}', { id: projectId });
   if (userId && !authorized && p.owner_id !== userId) {
     const role = db.one(`SELECT role FROM users WHERE id=?`, userId)?.role;
     if (role !== 'lead') throw new I18nError('只有项目负责人能改项目联网');
   }
-  const want = [...new Set(sources ?? [])];
+  const before = projectEgressOf(db, projectId);
+  let want = [...new Set(sources ?? [])];
+  let kept = [];
+  if (Array.isArray(base)) {
+    const seen = new Set(base), picked = new Set(want);
+    const add = want.filter((x) => !seen.has(x)), drop = new Set(base.filter((x) => !picked.has(x)));
+    // 打开之后别人加的：他没见过、也就谈不上勾掉 —— 留着，并回报出来让页面说清
+    kept = before.filter((x) => !seen.has(x) && !drop.has(x));
+    want = [...new Set([...before.filter((x) => !drop.has(x)), ...add])];
+  }
   const bad = want.filter((x) => !sourceOf(db, x));
   if (bad.length) throw new I18nError('联网目录里没有：{ids}', { ids: bad.join('、') });
-  const before = projectEgressOf(db, projectId);
   setProjectParam(db, { projectId, key: PROJECT_EGRESS_KEY, value: want, by: { kind: 'user', id: userId ?? null }, governance: 'constitutional' });
   audit(db, { actorKind: 'user', actorId: userId, action: 'project_egress_set', targetType: 'project', targetId: projectId,
-    payload: { sources: want, added: want.filter((x) => !before.includes(x)), removed: before.filter((x) => !want.includes(x)), why } });
-  return { sources: want };
+    payload: { sources: want, added: want.filter((x) => !before.includes(x)), removed: before.filter((x) => !want.includes(x)), why, ...(kept.length ? { keptOthers: kept } : {}) } });
+  // 保留下来的是谁放行的：页面要说得出名字（走查：只说"别人"，人不知道该找谁）
+  const keptBy = Object.fromEntries(kept.map((id) => [id, db.one(`SELECT u.display_name AS n FROM audit_log l LEFT JOIN users u ON u.id=l.actor_id
+    WHERE l.action='project_egress_set' AND l.target_id=? AND EXISTS (SELECT 1 FROM json_each(l.payload, '$.added') j WHERE j.value=?) ORDER BY l.id DESC LIMIT 1`, projectId, id)?.n ?? null]).filter(([, n]) => n));
+  return { sources: want, ...(kept.length ? { keptOthers: kept, keptBy } : {}) };
 }
 
 // ── 任务实际用哪几个源 ─────────────────────────────────────────────────────
@@ -855,5 +883,34 @@ export function ingestEgressAudit(db, { taskId, auditFile, from = 0 }) {
     audit(db, { actorKind: 'system', action: 'egress_credential_injected', targetType: 'task', targetId: taskId,
       payload: { rules: byRule, total: injected.length } });
   }
+  if (denied.length || injected.length) noteEgress(db, taskId);
   return { denied: denied.length, injected: injected.length, forwarded, lines: lines.length };
+}
+
+/**
+ * 联网被拦 / 凭据注入按任务攒成一条"系统小修"：每次沙箱收工都会搬一次审计，一个任务跑十步就是十次 ——
+ * 正文写这个任务到现在为止的累计（从 audit_log 现算），上一条还没推、没人看过就就地改写它。
+ * 只是让人知道；反复被拦到要停下来问人的，另有"联网连续拦截"上限走事项。
+ */
+export function noteEgress(db, taskId) {
+  const CL = contentLang(db);
+  const t = db.one(`SELECT title, project_order FROM tasks WHERE id=?`, taskId);
+  if (!t) return null;
+  const hosts = {}, rules = {};
+  let denied = 0, injected = 0;
+  for (const r of db.all(`SELECT action, payload FROM audit_log WHERE target_id=? AND action IN ('egress_denied','egress_credential_injected') ORDER BY id`, taskId)) {
+    let p; try { p = JSON.parse(r.payload ?? '{}'); } catch { continue; }
+    if (r.action === 'egress_denied') { denied += p.total ?? 0; for (const [h, n] of Object.entries(p.hosts ?? {})) hosts[h] = (hosts[h] ?? 0) + n; }
+    else { injected += p.total ?? 0; for (const [k, n] of Object.entries(p.rules ?? {})) { const rule = k.split('｜')[0]; rules[rule] = (rules[rule] ?? 0) + n; } }
+  }
+  const top = (m) => Object.entries(m).sort((a, b) => b[1] - a[1]).slice(0, 6).map(([k, n]) => `${k} ×${n}`).join(CL === 'en' ? ', ' : '、');
+  const name = t.project_order ? `#${t.project_order}「${t.title}」` : `「${t.title}」`;
+  const parts = [denied ? tl(CL, '被拦 {n} 次', { n: denied }) : null, injected ? tl(CL, '替它带凭据 {n} 次', { n: injected }) : null].filter(Boolean).join(CL === 'en' ? ', ' : '、');
+  const lines = [tl(CL, '{task} 到现在为止的联网情况：', { task: name })];
+  if (denied) lines.push(tl(CL, '· 被拦 {n} 次（都没连出去）：{hosts}', { n: denied, hosts: top(hosts) }),
+    tl(CL, '  是正常要用的依赖源，就在项目设置「联网」里勾上它所在的那一项（目录里没有的，请管理员先在「设置 → 联网目录」里加）。'),
+    tl(CL, '  不认识的域别放行；它反复出现，就打开任务看是哪一步在连 —— 可能是依赖里的代码，也可能是 AI 读到的内容在引它往外连。'));
+  if (injected) lines.push(tl(CL, '· 出网时替它带上凭据 {n} 次（按你配的规则，没有异常）：{rules}', { n: injected, rules: top(rules) }), tl(CL, '  凭据本身没进沙箱，AI 看不到。'));
+  return trySignalCoalesced(db, 'fix.egress_summary', { to: ['owner'], taskId, ref: `egress:${taskId}`,
+    title: tl(CL, '[SuperIntern] {task} 联网：{parts}', { task: name, parts }), text: lines.join('\n') });
 }

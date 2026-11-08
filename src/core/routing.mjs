@@ -20,7 +20,8 @@ import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import { newId, now, audit } from '../db/db.mjs';
-import { applyRoute, setRecipients, setRouteParties, appendQuestionText, resolutionOf } from './questions.mjs';
+import { applyRoute, setRecipients, setRouteParties, appendQuestionText, resolutionOf, dropDefault, dueNow } from './questions.mjs';
+import { tierOf, QUESTION_CLASS } from './signals.mjs';
 import { getParam } from './params.mjs';
 import { addBusinessDays, UTC_CALENDAR, dayKey, partsAt, daysBetween, validDayKey, zonedTime, fmtAt, addCalendarDays, addDaysKey } from './tz.mjs';
 import { calendarOf, deployTz } from './calendar.mjs';
@@ -43,11 +44,14 @@ export const DECISION_TYPES = {
   egress:            { label: N_('联网放行'),   level3: false, noDefault: true,  desc: N_('沙箱请求访问某类软件源，决定是否放行'), from: '沙箱请求放行某个生态' },
   delivery:          { label: N_('交付'),       level3: false, noDefault: false, desc: N_('将产物推送到远端仓库并创建 PR'), from: 'push / 开 PR（授权，不生成事项）' },
   conflict:          { label: N_('意见不一致'), level3: true,  noDefault: true,  desc: N_('多人答复不一致时，由谁裁定'), from: '冲突检测：同一问题的答复不一致' },
-  // 原来这些都走"结构矛盾"（必须含负责人）—— 每条停等报警都要发两个人。分出来，负责人可以只派给管代码的那一位。
+  // 原来这些都走"结构矛盾"（必须含负责人）—— 每条停等报警都发两个人。分出来，负责人可以只派给管代码的那一位。
+  // 要人点头才能做的操作（策略钩子要确认、MCP 工具设成每次批准、命中审批门禁、合并前钩子要确认）。原来按"规格取舍"派人、
+  // 8 小时后默认不同意 —— 安全的事派给了管产品的人，还会被超时替人定掉。没配这一类的表借"系统卡住"的行（再借结构矛盾）。
+  security:          { label: N_('安全审批'),   level3: false, noDefault: true,  desc: N_('AI 要做一项设成必须有人点头的操作（命中审批门禁、策略钩子要确认、MCP 工具每次要批准），决定放不放行'), from: '执行器的审批门禁 / 钩子 ask / MCP ask；合并前钩子 ask' },
   ops:               { label: N_('系统卡住'),   level3: false, noDefault: true,  desc: N_('系统卡住了（合并出错、工作区里有来路不明的改动、改计划没成、长时间没动静），要有人看一眼、决定怎么办'), from: '交回给人的几种卡住（handback）/ 停等报警（liveness）' },
 };
-/** 已存的路由表里缺某一类时借哪一类的行（加"系统卡住"这一类之前存的表都没有它）：谁管结构矛盾，谁就先管运维。 */
-const TYPE_FALLBACK = { ops: 'structural' };
+/** 已存的路由表里缺某一类时借哪一类的行（早先存的表都没有"运维"）：谁管结构矛盾，谁就先管运维。 */
+const TYPE_FALLBACK = { ops: 'structural', security: 'ops' };
 /** 决策类型在某种语言下的名字（label 由 N_ 登记，目录里有译文）；不认识的类型原样返回。 */
 const typeLabel = (lang, t) => { const l = DECISION_TYPES[t]?.label; return l ? (lang && lang !== 'zh' ? CATALOGS[lang]?.[l] ?? l : l) : t; };
 
@@ -613,8 +617,25 @@ function scopeHits(rules, decisionType, prefixes) {
 export function routeQuestion(db, { questionId, decisionType, typeSource, prefixes = null, advisory = null, parties = [], at = now(), stage = 0 }) {
   const r = computeRoute(db, { questionId, decisionType, prefixes, advisory, parties, at, stage });
   applyRoute(db, questionId, { decisionType, typeSource, quorum: r.quorum, conflictPolicy: r.policy, addressedTo: r.answerers, informed: r.informed, route: r.route, routeDueAt: r.dueAt });
+  // 默认能不能生效由"类型 + 级别"在这一处判定：禁默认的类型（结构矛盾、安全审批、签收、花钱……）不管提问的一方给没给，
+  // 一律没有默认 —— 原来系统代填的结构矛盾带着默认，8 小时后替人"撤销改动 / 照旧接着做"，与路由表"结构矛盾禁默认"矛盾。
+  // 到期照常升级（再喊一次），升级后仍没人答就挂着（并通知），不替人定。
+  if (DECISION_TYPES[decisionType].noDefault) dropDefault(db, questionId);
+  else fastDefault(db, questionId, decisionType, at);
   appendTransferHint(db, questionId, decisionType);
   return { key: r.key, decisionType, answerers: r.answerers, informed: r.informed, route: r.route, dueAt: r.dueAt };
+}
+
+/**
+ * 例外管理：Ⅰ 级、带默认、这一类在这个项目里只到"通知"（目前只有规格取舍）→ 不等人：到期时刻拨到提出时刻，
+ * 下一轮超时扫描按默认结案、告诉收件人。走现成的超时结案路径（答复由系统写、节点解挂、审计都在那里），不另起一条。
+ */
+function fastDefault(db, questionId, decisionType, at) {
+  const q = db.one(`SELECT q.level, q.default_action, t.project_id FROM questions q JOIN tasks t ON t.id=q.task_id WHERE q.id=?`, questionId);
+  if (q?.level !== 1 || !q.default_action) return;
+  if (tierOf(db, QUESTION_CLASS[decisionType] ?? 'spec_choice', { projectId: q.project_id, level: 1 }) !== 'notify') return;
+  dueNow(db, questionId);
+  audit(db, { actorKind: 'system', action: 'question_fast_default', targetType: 'question', targetId: questionId, payload: { decisionType, mode: 'exception', at } });
 }
 
 /** 按现在的路由表算一条事项该发给谁（不写库）。routeQuestion 与改表后的改发（rerouteOpen）共用 */
@@ -745,7 +766,16 @@ export function advanceRoute(db, { questionId, at = now() }) {
  *     负责人可以降（他本来就能一人定）。
  * 转交后 route_due_at 按各行时限从此刻重算，而不是清零 —— 转交不该让 next / default 兜底失效。
  */
-export function transferQuestion(db, { questionId, to, byUserId, reason = null, at = now() }) {
+export function transferQuestion(db, opts) {
+  // 一个事务：原来读状态、改收件人、记审计是三条独立语句，另一个进程的超时改路由、别人的转交夹在中间就互相覆盖
+  return db.tx(() => transferQuestionTx(db, opts));
+}
+
+/**
+ * expectTo：发起转交的人在页面上看到的当前收件人（可选）。对不上 = 页面打开之后有人转过 —— 409，说清谁、何时转给了谁，
+ * 不让负责人在旧页面上把别人刚做的转交静默盖掉。
+ */
+function transferQuestionTx(db, { questionId, to, byUserId, reason = null, expectTo = null, at = now() }) {
   const q = db.one(`SELECT * FROM questions WHERE id=?`, questionId);
   if (!q) throw new I18nError('事项不存在：{id}', { id: questionId });
   if (!['open', 'escalated'].includes(q.status)) {
@@ -755,6 +785,13 @@ export function transferQuestion(db, { questionId, to, byUserId, reason = null, 
   const key = routingKeyOf(db, q.task_id);
   const lead = leadOf(db, q.task_id);
   const cur = JSON.parse(q.addressed_to || '[]');
+  if (Array.isArray(expectTo) && [...expectTo].sort().join(',') !== [...cur].sort().join(',')) {
+    const last = db.one(`SELECT l.ts, u.display_name FROM audit_log l LEFT JOIN users u ON u.id=l.actor_id WHERE l.action IN ('question_transferred','question_rerouted') AND l.target_id=? ORDER BY l.id DESC LIMIT 1`, questionId);
+    const nm = (id) => db.one(`SELECT display_name FROM users WHERE id=?`, id)?.display_name ?? id;
+    const L = contentLang(db);
+    throw Object.assign(new I18nError('没有转交：你打开这条事项之后，{who} 于 {when} 改了接收人，现在是：{now}。页面已刷新成最新的；现在的接收人已经是你要的，就不用再操作，否则重新点「转交」再选', {
+      who: last?.display_name ?? tl(L, '系统'), when: last ? `${new Date(last.ts).toISOString().slice(0, 16).replace('T', ' ')} UTC` : tl(L, '刚才'), now: cur.map(nm).join(tl(L, '、')) || tl(L, '（无）') }), { status: 409, conflict: true });
+  }
   const byLead = byUserId === lead;
   if (!byLead && !cur.includes(byUserId)) throw new I18nError('只有该事项的接收人或负责人能转交');
   const res = resolveRecipients(db, key, to, { at, lead });
@@ -795,10 +832,12 @@ export function transferQuestion(db, { questionId, to, byUserId, reason = null, 
     route.transferred = true;
   }
   setRecipients(db, questionId, { addressedTo: res.answerers, informed, route: route ?? q.route, routeDueAt: due });
+  // 已经投了的票：投票的人不在新收件人里，这一票就不再计入法定人数（answers.mjs 按收件人数）。照实记下、回给转交的人
+  const dropped = db.all(`SELECT DISTINCT user_id FROM answers WHERE question_id=? AND stance IN ('answer','agree')`, questionId).map((r) => r.user_id).filter((u) => u && !res.answerers.includes(u));
   audit(db, { actorKind: 'user', actorId: byUserId, action: 'question_transferred', targetType: 'question', targetId: questionId,
     // 转交附一句理由（否则被转交的人不知道为什么转给自己）。可留空。
-    payload: { from: cur, to: res.answerers, resolvers: to, dueAt: due, reason: String(reason ?? '').trim().slice(0, 500) || null } });
-  return { from: cur, to: res.answerers, dueAt: due };
+    payload: { from: cur, to: res.answerers, resolvers: to, dueAt: due, reason: String(reason ?? '').trim().slice(0, 500) || null, ...(dropped.length ? { droppedVotes: dropped } : {}) } });
+  return { from: cur, to: res.answerers, dueAt: due, ...(dropped.length ? { droppedVotes: dropped } : {}) };
 }
 
 // ── 授权（四种 CLI 动作改查路由表）────────────────────────────────────────

@@ -23,7 +23,8 @@ const section = (s) => console.log(`\n── ${s}`);
 section('① 能力表本身');
 eq(staticProblems(), [], '每个模型角色都登记了；工具都有效果；不经沙箱的会话没有三样齐、也没有能碰外面的工具');
 for (const role of Object.keys(LLM_ROLES)) assert(SESSIONS[role], `角色 ${role} 有登记`);
-eq([...EXECUTOR_TOOLS.map((t) => t.name)].sort(), [...SESSIONS.executor.tools].sort(), '执行器真实的工具清单与登记一致');
+// activate_skill 只在有可用 skill 时才加（executor.mjs 里按清单拼上）
+eq([...EXECUTOR_TOOLS.map((t) => t.name), 'activate_skill'].sort(), [...SESSIONS.executor.tools].sort(), '执行器真实的工具清单（含按需加的 activate_skill）与登记一致');
 for (const [k, s] of Object.entries(SESSIONS)) if (s.sensitive !== 'sandbox') assert(!s.tools.some((t) => ['exec', 'app'].includes(TOOL_EFFECTS[t])), `${k}：不经沙箱，没有跑代码 / 操作应用的工具`);
 
 section('② 每次调用前核对（LlmClient.complete）');

@@ -17,7 +17,7 @@ import { writeConstitution, insertDecision } from '../db/constitutions.mjs';
 import { insertNode } from '../db/nodes.mjs';
 import { insertUserMessage } from '../db/messages.mjs';
 import { markConsumed } from './inbox.mjs';
-import { clearNodeBaseline } from './workspace.mjs';
+import { clearNodeBaseline, setAsideInflight } from './workspace.mjs';
 import { patchFields } from '../agent/replan.mjs';
 import { recordFromRevision, recordReservation } from './decisions.mjs';
 import { normScopePaths } from './project.mjs';
@@ -28,6 +28,8 @@ import { markOf } from '../i18n/marks.mjs';
 import { transition } from '../db/state.mjs';
 import { bindApproval } from './provenance.mjs';
 import { insertQuestion } from './questions.mjs';
+import { timeoutFor } from './timeouts.mjs';
+import { tierOf } from './signals.mjs';
 
 export const DISCARD_THRESHOLD_KEY = 'revision.discard_threshold';
 export const DEFAULT_DISCARD_THRESHOLD = 0.30;   // 确认门，"阈值可配置"
@@ -65,7 +67,7 @@ export function nodesForReplan(db, taskId) {
     deps: db.all(`SELECT to_id FROM edges WHERE from_id=? AND relation='depends_on'
                   AND superseded_at IS NULL`, n.id).map((e) => e.to_id),
     microUsd: db.one(`SELECT COALESCE(SUM(micro_usd),0) AS m FROM usage_ledger WHERE node_id=?`, n.id).m,
-    artifacts: db.one(`SELECT artifacts FROM handoffs WHERE node_id=?`, n.id)?.artifacts ?? null,
+    artifacts: db.one(`SELECT artifacts FROM handoffs WHERE node_id=? ORDER BY created_at DESC, rowid DESC LIMIT 1`, n.id)?.artifacts ?? null,   // 做过几次的取最新一次
   }));
 }
 
@@ -135,6 +137,10 @@ export function gateOf(db, { taskId, rev, nodes }) {
       ratio: (ratio * 100).toFixed(1), threshold: (threshold * 100).toFixed(0),
       discarded: usd(discardedMicro, 4), redone: usd(redoneMicro, 4), done: usd(doneMicro, 4),
       affected: usd(affectedMicro, 4), floor: usd(floorMicro, 2) }));
+  }
+  // 监督模式：逐项审批下，计划的每一处改动都要人批 —— 不只是碰契约、要重来的工作过线的那几种
+  if (!reasons.length && tierOf(db, 'plan_changed', { projectId: db.one('SELECT project_id FROM tasks WHERE id=?', taskId)?.project_id ?? null }) === 'decide') {
+    reasons.push(tl(lang, '项目的监督模式是「逐项审批」：计划的每一处改动都要你批'));
   }
   return {
     lang,   // renderDiff 按它写（服务端 / 命令行拿 gateOf 的结果直接渲染，不用另传语言）
@@ -269,8 +275,11 @@ export function applyRevision(db, { taskId, revisionId, by = 'auto', userId = nu
         // "编码场景下'放弃'**不删代码**，在工程笔记记录
         // '此路径因修正 #N 作废'，git 历史保底。" 决策日志就是那本工程笔记。
         const s = salvage.get(m.node_id);
+        // 这一步被打断时收起的在途工作：不再放回工作区，存在 git 的 ref 上
+        const aside = setAsideInflight(db, { taskId, nodeId: m.node_id, why: rv.message_id });
         const did = insertDecision(db, { taskId, nodeId: m.node_id, summary: tl(L, '节点因修正 {msg} 作废', { msg: rv.message_id }),
           rationale: `${m.reason}\n\n${tl(L, '产物处置：{what}', { what: s ? `${s.disposition} —— ${s.note}` : tl(L, '（未完成，无产物）') })}\n`
+            + (aside ? `${tl(L, '这一步被打断时还没提交的改动（{n} 个文件）没有放回工作区，存在 git 的 {ref} 上。', { n: aside.files.length, ref: aside.ref })}\n` : '')
             + tl(L, '⚠️ 产物**没有被删除**：git 历史里仍然在，这条记录是为了让人知道那条路径不再算数。'),
           actorKind: 'agent', actorId: 'replanner', layer: 'execution', at: t });
         insertEdge(db, did, rv.message_id, 'derived_from', t);
@@ -506,7 +515,8 @@ export function recordReplanQuestion(db, { taskId, message, args }) {
   const t = now();
   const def = args.level === 3 ? null : (args.default_action ?? null);
   return db.tx(() => {
-    insertQuestion(db, { id, taskId, level: args.level, levelSource: 'classifier', text: args.text, defaultAction: def, askedAt: t });
+    const ttl = timeoutFor(db, taskId, args.level);   // 与执行器一致：重规划器的Ⅰ/Ⅱ 级问题也计时
+    insertQuestion(db, { id, taskId, level: args.level, levelSource: 'classifier', text: args.text, defaultAction: def, askedAt: t, timeoutAt: ttl ? t + ttl : null });
     insertEdge(db, id, message.id, 'derived_from', t);
     routeQuestion(db, { questionId: id, ...decisionTypeOfQuestion({ kind: args.kind, text: args.text }), at: t });
     transition(db, 'tasks', taskId, 'waiting');

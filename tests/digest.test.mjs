@@ -8,7 +8,7 @@
 import { openDb, ensureOwner, newId, now, insertEdge, sha256, audit } from '../src/db/db.mjs';
 import { recordAnswer } from '../src/core/answers.mjs';
 import { applyTemplate, saveRules, rulesOf, routeQuestion, setDutyCalendar } from '../src/core/routing.mjs';
-import { buildDigest, renderDigest, sendDigest, scheduledDigests, handoverDigests } from '../src/core/digest.mjs';
+import { buildDigest, renderDigest, sendDigest, handoverDigests } from '../src/core/digest.mjs';
 import { setUserChannel } from '../src/core/users.mjs';
 import { randomBytes } from 'node:crypto';
 
@@ -121,22 +121,6 @@ section('2. 发送：按人的通道；负责人没通道退到部署级；记 d
   eq(r3.sent, true, '负责人没个人通道：退到 .env 的部署级通道');
   const r4 = await sendDigest(db, { userId: carol.id, kind: 'manual', at, env: { NTFY_URL: 'https://ntfy.example/deploy' }, fetchFn, record: false });
   eq(r4.sent, false, '空摘要默认不发（onlyIfAny）');
-}
-
-section('3. 定时摘要：按间隔；没东西不发也不记；有东西才记');
-{
-  const before = sentFetch.length;
-  const at1 = t0 + 2 * 3600_000;
-  const s1 = await scheduledDigests(db, { every: '8h', at: at1, env: {}, fetchFn });
-  eq(s1.map((x) => x.userId), [alice.id], '只有 alice 有通道且有待办：发她');
-  const s2 = await scheduledDigests(db, { every: '8h', at: at1 + 3600_000, env: {}, fetchFn });
-  eq(s2.length, 0, '一小时后：没到间隔，不发');
-  const s3 = await scheduledDigests(db, { every: '8h', at: at1 + 9 * 3600_000, env: {}, fetchFn });
-  eq(s3.map((x) => x.userId), [alice.id], '九小时后：再发');
-  eq(db.one(`SELECT count(*) n FROM digests WHERE user_id=? AND kind='scheduled'`, alice.id).n, 2, 'scheduled 记了两行');
-  eq(sentFetch.length - before, 2, '真发了两次');
-  let threw = null; try { await scheduledDigests(db, { every: 'soon', at: at1 }); } catch (e) { threw = e.message; }
-  assert(/间隔写法不对/.test(threw ?? ''), '间隔写法校验');
 }
 
 section('4. 换班交接：第一次只记不发；值班者变了才给接班人推他范围内的开放事项');

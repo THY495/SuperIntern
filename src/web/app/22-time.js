@@ -24,7 +24,7 @@ async function renderTimeCard() {
   box.innerHTML = `
     <datalist id="tzList">${TZ_NAMES.map((z) => `<option value="${esc(z)}">`).join('')}</datalist>
     <h3 id="tmOwnH">${T('你的时区')}</h3>
-    <div class="small mute">${T('看板上记录下来的时刻（事项、日志、检查时间等）和发给你的待办摘要里的时刻按这个时区显示，都标了时区。只改显示：摘要什么时候发、超时怎么算都不变。值班交接的钟点、代班与节假日的日期按部署时区定，照部署时区写（标着 UTC+8 这样的偏移）。提交记录与 PR 里的时间一律是 UTC。')}</div>
+    <div class="small mute">${T('看板上记录下来的时刻（事项、日志、检查时间等）和发给你的推送里的时刻按这个时区显示，都标了时区。它也决定你的工作时间（不紧急的推送只在这段时间里发）和状态报告几点推；超时怎么算不受它影响。值班交接的钟点、代班与节假日的日期按部署时区定，照部署时区写（标着 UTC+8 这样的偏移）。提交记录与 PR 里的时间一律是 UTC。')}</div>
     <div class="row small" style="margin-top:6px"><input id="tmOwn" aria-labelledby="tmOwnH" list="tzList" style="width:220px" value="${esc(own)}" placeholder="${T('留空 = 跟部署时区（{tz}）', { tz: esc(c.tz) })}">
       <button id="tmOwnSave" class="small">${T('保存')}</button>${BROWSER_TZ && BROWSER_TZ !== (own || c.tz) ? ` <button id="tmOwnBrowser" class="small">${T('用这台电脑的时区（{tz}，{off}）', { tz: esc(BROWSER_TZ), off: esc(fmtWhen(Date.now(), { date: false, time: true, tz: BROWSER_TZ }).split(' ')[1] ?? '') })}</button>` : ''}${own ? ` <button id="tmOwnDeploy" class="small">${T('跟部署时区（{tz}）', { tz: esc(c.tz) })}</button>` : ''}</div>
     <div class="small mute">${T('现在显示用的是：{tz}', { tz: esc(me?.tz ?? c.tz) })}</div>

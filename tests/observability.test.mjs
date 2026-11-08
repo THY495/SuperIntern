@@ -68,7 +68,7 @@ section('① JSON 行日志');
   const h2 = join(TMP, 'h2');
   const dbp = join(h2, 'state.db');
   openDb(dbp).close();
-  const r = spawnSync(process.execPath, ['--no-warnings', join(ROOT, 'src', 'cli.mjs'), 'run', 't_nope', '--db', dbp], { encoding: 'utf8', env: { ...process.env, SUPERINTERN_HOME: h2, SUPERINTERN_PROC: '' } });
+  const r = spawnSync(process.execPath, ['--no-warnings', join(ROOT, 'src', 'cli.mjs'), 'run', 't_nope', '--db', dbp], { encoding: 'utf8', env: { ...process.env, SUPERINTERN_HOME: h2, SUPERINTERN_PROC: '', SUPERINTERN_ENV_FILE: 'none' } });
   const jdir = join(h2, 'logs', 'jsonl');
   const recs2 = existsSync(jdir) ? readdirSync(jdir).flatMap((f) => lines(join(jdir, f))) : [];
   assert(recs2.some((x) => x.task === 't_nope' && x.proc === 'run' && x.level === 'error'), `run 进程写了 JSON 行，错误那一行带着任务 id（退出码 ${r.status}）`, r.stderr.slice(0, 200));

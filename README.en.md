@@ -5,7 +5,7 @@
 SuperIntern is a self-hosted autonomous coding agent that runs for long periods on your own machine or server. You hand it an idea. It asks about anything that is unclear, breaks the work into steps, writes code in a container sandbox and runs the acceptance checks. Then it brings the result to you for sign-off. **You only do four things: answer its questions, make trade-offs, request changes and stop it.** When several people work together, a *decision routing table* decides who gets the final say on each kind of decision.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-![version](https://img.shields.io/badge/version-0.4.0-orange)
+![version](https://img.shields.io/badge/version-0.5.0-orange)
 ![node](https://img.shields.io/badge/node-%E2%89%A5%2022.13-green)
 ![deps](https://img.shields.io/badge/npm%20dependencies-0-brightgreen)
 
@@ -45,6 +45,9 @@ See [docs/known-limits.en.md](docs/known-limits.en.md) for known gaps.
 - **Sandboxed execution.** Every step runs in a Docker container with no network by default. Network access is granted per project, to allow-listed domains only (npm, PyPI and so on; mirrors can be added). Node and Python projects are supported.
 - **Mechanical checks plus a model reviewer.** Each step hands over a record that the system checks mechanically: did it touch only allowed paths, and does the acceptance command really pass? A second model then scores the step and sends it back if needed. By default the reviewer comes from a different vendor than the model that did the work. For steps that change the UI, the reviewer starts the app, clicks and types through the page and checks each item, and the person signing off sees the screens it went through. Weakened existing tests (deleted, skipped, fewer assertions) are flagged for the reviewer and the sign-off (or, if you choose, sent straight back).
 - **Asks instead of guessing.** When the spec is silent on a trade-off, the agent raises a question and suspends only the affected branch. Questions carry a default answer and a deadline. The small decisions it makes on its own are collected into an "AI decided a few things for you" review for the right person.
+- **Stop or change course at any time.** Pause, Abort and urgent corrections take effect at the AI's next turn; half-done changes are set aside and put back on resume, and extra information reaches the AI mid-step. Finished steps can be redone with "Redo from this step".
+- **Oversight your way.** Each project picks an oversight mode: Full oversight, Spot check (default) or Management by exception. The project lead can list commands that need a person's approval before they run (approval gates).
+- **Project rules and extensions.** Layered `AGENTS.md` files in the repository are given to the AI to follow; skills, policy hooks in the Claude Code / Codex format, and MCP servers (run in the sandbox and given to the AI only after the lead approves them) are supported. The executor starts each step with a repository map.
 - **Shows the result.** The task page shows the step graph, a screenshot of the built page taken inside the sandbox, and a line-by-line diff (unified or side by side).
 - **Multi-user collaboration.** The decision routing table sets, for each kind of decision (spec trade-off, structural conflict, plan approval, sign-off, limit raise, network access, delivery…):
   - who answers;
@@ -54,10 +57,11 @@ See [docs/known-limits.en.md](docs/known-limits.en.md) for known gaps.
 
   It ships with six templates. People can second an answer, abstain ("not mine") or hand an item over. Sign-off can go to the person who asked for the feature, or require everyone.
 - **Hard limits on money and time.** Cost, wall time, call count and retries all have hard limits, plus monthly budgets per person and per deployment. At a limit, it stops and asks a human. It never quietly dies and never quietly continues. An admin can pause all automatic work with one click.
-- **A checklist before delivery.** Before pushing, it lists the commits, the changes each task brought in, and risks (for example, no project-level acceptance command). It pushes to any git remote and can open a GitHub PR. **Delivery is the one step a human must always click.**
+- **A checklist before delivery.** Before pushing, it lists the commits, the changes each task brought in, and risks (for example, no project-level acceptance command). It pushes to any git remote and can open a GitHub PR. **Delivery is the one step a human must always click.** For PRs with "AI follow-up" authorized, fixes for failed CI or requested changes are pushed back to the same PR branch automatically; merging is still done only by a person on GitHub.
+- **GitHub loop.** Delivered PRs are watched (status, CI, reviews); failed CI is fixed and review comments acted on. Issues with a chosen label and scheduled jobs are drafted into "Add task" requests.
 - **Multiple model vendors.** DeepSeek, Anthropic, OpenAI, Gemini and OpenRouter are built in, and you can add any OpenAI-compatible endpoint. Three tiers (light / standard / heavy) can each be bound to any model, a role such as the reviewer can get its own model, and each tier can have a fallback model that takes over while a vendor is failing. A catalog check detects price and context-window drift.
 - **Auditable.** All state lives in one SQLite database, and every action is audited. The process can die at any time and resume. `replay` reconstructs a task from the audit log alone.
-- **Notifications.** ntfy, Feishu, DingTalk, WeCom or any shell command, sent per person, plus periodic to-do digests.
+- **Notifications.** ntfy, Feishu, DingTalk, WeCom, email or any shell command, sent per person. Urgent items are pushed right away; the rest only during each person's working hours, combined into digests. Every push links to its item so it can be answered from there, and items such as spec choices can be answered by replying to the email. Periodic status reports are available too, and the board shows "While you were away" when you come back.
 - **English and Chinese.** Interface language per person; content language (items, reports, what the AI writes for people) per team. Answers are understood in either language.
 - **Zero npm dependencies.** It uses only Node built-ins, including `node:sqlite`. The web UI needs no build step.
 
@@ -72,7 +76,7 @@ See [docs/known-limits.en.md](docs/known-limits.en.md) for known gaps.
 | Docker (running) | Docker Desktop on Windows, in its default Linux-containers mode (if you switched to Windows containers, right-click the tray icon → Switch to Linux containers); docker-ce on Linux. **Without a container runtime, tasks will not run.** SuperIntern never falls back to running code on the host |
 | An API key for at least one model vendor | [DeepSeek](https://platform.deepseek.com/) / [Anthropic](https://console.anthropic.com/) / [OpenAI](https://platform.openai.com/) / [Gemini](https://aistudio.google.com/) / [OpenRouter](https://openrouter.ai/), or any OpenAI-compatible endpoint |
 
-**Download:** get `superintern-v0.4.0-windows.zip` or `superintern-v0.4.0-linux.tar.gz` from [Releases](../../releases) and extract it, or `git clone` this repo. No `npm install` needed.
+**Install 0.5.0:** clone this repository and check out `v0.5.0`. For prebuilt archives, check [Releases](../../releases) for downloads for this version. No `npm install` needed.
 
 > Run every command from the extracted directory. Runtime state (database, tokens, logs, workspaces) lives in `.superintern/` inside it.
 
@@ -146,7 +150,9 @@ node src/cli.mjs --version
 node src/cli.mjs digest                          # my to-dos
 node src/cli.mjs questions                       # open questions
 node src/cli.mjs answer <question id> "..."
-node src/cli.mjs say <task id> "..."              # correction / new instruction / extra info
+node src/cli.mjs say <task id> "..."              # correction / new instruction / extra info (--urgent interrupts the running step)
+node src/cli.mjs report --since 7d               # status report: what went wrong, what was decided without you, progress, spending
+node src/cli.mjs rewind <task id> <step id>       # redo from a finished step (shows a preview; add --yes to apply)
 node src/cli.mjs signoff <task id> --accept       # or --reject "reason"
 node src/cli.mjs project deliver <project id> --remote <git url> [--pr]
 node src/cli.mjs replay <task id>                 # reconstruct from the audit log
@@ -197,7 +203,10 @@ Without Docker, those two suites **fail** rather than silently "pass by skipping
 | `scripts/` | Setup, start, and run-permanently scripts (Windows Task Scheduler / Linux systemd) |
 | `tests/` | Offline regression suites; `tests/live/` holds paid live-model scripts |
 | `docs/` | Deployment, known limits |
+| `THIRD_PARTY_NOTICES.md`, `LICENSES/` | Origins and licenses of ported code (the repository map's ranking is ported from Aider, Apache-2.0) |
 
 ## License
 
 [MIT](LICENSE) © 2026 THY495
+
+Ported third-party code keeps its original license; see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).

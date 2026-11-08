@@ -54,8 +54,14 @@ function sampleOf(r) {
   if (r.path) return r.path === '/api/routing' ? `/api/routing?project=${P}` : r.path;
   const src = r.re.source;
   const table = [
+    [/questions.*where/, `/api/questions/${Q}/where`],
     [/questions/, `/api/questions/${Q}/transfer`],
     [/decisions/, `/api/projects/${P}/decisions`],
+    [/projects.*rules\$/, `/api/projects/${P}/rules`],
+    [/projects.*skills\$/, `/api/projects/${P}/skills`],
+    [/projects.*hooks\$/, `/api/projects/${P}/hooks`],
+    [/projects.*mcp\$/, `/api/projects/${P}/mcp`],
+    [/projects.*inbound\$/, `/api/projects/${P}/inbound`],
     [/projects.*diff/, `/api/projects/${P}/diff/${T}`],
     [/projects.*advance/, `/api/projects/${P}/abort`],
     [/tasks\\\/\(\[\^\/\]\+\)\$/, `/api/tasks/${T}`],

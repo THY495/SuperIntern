@@ -2,7 +2,7 @@
 $('#btnRun').onclick = () => act('run', {}, T('已开始运行'));
 $('#btnPause').onclick = () => act('pause', {}, T('已暂停'));
 $('#btnResume').onclick = () => act('resume', {}, daemonOn ? T('已继续') : T('已继续；点击「运行」以继续执行'));
-$('#btnAbort').onclick = () => { const why = prompt(T('中止原因（可选）。中止后可恢复')); if (why !== null) act('abort', { why }, T('已中止；可随时恢复')); };
+$('#btnAbort').onclick = () => { const why = prompt(T('中止会立即停下这个任务。中止原因（可选）；以后可以恢复')); if (why !== null) act('abort', { why }, T('已中止；可随时恢复')); };
 $('#btnReopen').onclick = () => act('reopen', {}, daemonOn ? Tc('task', '已恢复') : T('已恢复；点击「运行」以继续执行'));
 $('#btnRename').onclick = () => { const title = prompt(T('新标题'), detail?.task?.title ?? ''); if (title !== null && title.trim()) act('rename', { title }, T('标题已修改')); };
 $('#btnArchive').onclick = () => act('archive', { archived: !detail?.task?.archived_at }, detail?.task?.archived_at ? T('已取消归档') : T('已归档'));
@@ -11,7 +11,14 @@ $('#btnSignoffNo').onclick = () => { const reason = prompt(T('打回理由（系
 $('#btnDeliver').onclick = async () => { const remote = prompt(T('远端仓库 URL（首次必填；之后留空则沿用上次的值）')) ?? null; if (remote === null) return;
   if (remote.trim() && !(await deliverPreflight(remote.trim()))) return;
   // PR 只有 GitHub 开得了；留空沿用上次的远端时不知道是哪儿，照旧问一句
-  const pr = remote.trim() && !/github\.com[/:]/i.test(remote) ? false : confirm(T('同时创建 PR？')); await act('deliver', { remote: remote || null, pr }, T('已交付')); };
+  const pr = remote.trim() && !/github\.com[/:]/i.test(remote) ? false : confirm(T('同时创建 PR？\n\n取消 = 照样交付，只推送分支，不开 PR。'));
+  // 开 PR 与授权 AI 跟进分开问（认知走查第三轮：捆在一个框里，想开 PR 又不想授权就没得选）。已经开着 PR 的再交付，沿用当时的选择
+  const autofix = pr && !detail?.pr ? confirm(autofixAsk()) : true;
+  if (!cur) return;
+  try { await withHookAck((hookAck) => api(`/api/tasks/${cur}/deliver`, { remote: remote || null, pr, autofix, hookAck })); toast(T('已交付')); await refresh(); } catch (e) { toast(e.message, true); } };
+// 补充信息不分紧急（执行中途就送到），选它时「紧急」灰掉、取消勾选 —— 免得勾了以为它会更快
+const syncUrgent = () => { const ctx = $('#sayKind').value === 'context'; $('#sayUrgent').disabled = ctx; if (ctx) $('#sayUrgent').checked = false; };
+$('#sayKind').addEventListener('change', syncUrgent);
 $('#btnSay').onclick = () => { const body = $('#sayBody').value.trim(); if (!body) return toast(T('内容不能为空'), true);
   const kind = me?.role === 'observer' ? 'context' : $('#sayKind').value;
   const about = $('#sayAbout').value;
